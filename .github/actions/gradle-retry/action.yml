@@ -1,0 +1,39 @@
+name: "Gradle with retry"
+description: >
+  Run a Gradle task with --no-daemon, retrying on failure with linear backoff so
+  a transient CI issue (a network blip during dependency resolution, a flaky
+  runner I/O hiccup) does not fail the whole build or release.
+
+inputs:
+  args:
+    description: "Gradle tasks/arguments (e.g. 'assembleDebug')."
+    required: true
+  max-attempts:
+    description: "Maximum number of attempts before giving up."
+    required: false
+    default: "3"
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        GRADLE_ARGS: ${{ inputs.args }}
+        MAX_ATTEMPTS: ${{ inputs.max-attempts }}
+      run: |
+        attempt=1
+        while true; do
+          # Intentional word-splitting of $GRADLE_ARGS so multiple tasks work.
+          if ./gradlew --no-daemon $GRADLE_ARGS --console=plain; then
+            exit 0
+          fi
+          status=$?
+          if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
+            echo "::error::gradle $GRADLE_ARGS failed after ${attempt} attempt(s)"
+            exit "$status"
+          fi
+          backoff=$((20 * attempt))
+          echo "::warning::gradle $GRADLE_ARGS failed (attempt ${attempt}/${MAX_ATTEMPTS}, exit ${status}); retrying in ${backoff}s"
+          attempt=$((attempt + 1))
+          sleep "$backoff"
+        done

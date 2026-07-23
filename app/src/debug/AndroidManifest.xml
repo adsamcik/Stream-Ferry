@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  DEBUG-ONLY manifest additions. Declares the immediate crash-report screen. It runs in a separate
+  ":crash" process so it survives the dying main process. This file lives in src/debug and is NEVER
+  merged into release builds.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <activity
+            android:name=".app.CrashActivity"
+            android:process=":crash"
+            android:exported="false"
+            android:launchMode="singleInstance"
+            android:excludeFromRecents="true"
+            android:taskAffinity=".crash"
+            android:theme="@style/Theme.JellyfinBridge" />
+    </application>
+</manifest>

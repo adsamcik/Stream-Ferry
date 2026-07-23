@@ -1,0 +1,347 @@
+package com.videobridge.app
+
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
+import android.os.Build
+import coil.ImageLoader
+import coil.memory.MemoryCache
+import coil.request.CachePolicy
+import com.google.android.gms.cast.framework.CastContext
+import com.videobridge.core.session.SessionRegistry
+import com.videobridge.data.cache.CachingMediaLibraryRepository
+import com.videobridge.data.cache.LibraryCache
+import com.videobridge.data.cast.CastTargetController
+import com.videobridge.data.dlna.DlnaTargetController
+import com.videobridge.data.download.DownloadService
+import com.videobridge.data.download.DownloadQueueStore
+import com.videobridge.data.download.DownloadStore
+import com.videobridge.data.download.MediaDownloader
+import com.videobridge.data.jellyfin.HttpJellyfinRepository
+import com.videobridge.data.jellyfin.JellyfinAuthRepository
+import com.videobridge.data.jellyfin.JellyfinClient
+import com.videobridge.data.jellyfin.JellyfinMediaLibraryRepository
+import com.videobridge.data.jellyfin.JellyfinMediaSource
+import com.videobridge.data.language.ShowLanguageStore
+import com.videobridge.data.local.LocalMediaSource
+import com.videobridge.data.local.LocalSourceStore
+import com.videobridge.data.resume.ResumeStore
+import com.videobridge.data.transcode.MediaCodecCapabilityProbe
+import com.videobridge.data.transcode.OnDeviceTranscoder
+import com.videobridge.data.proxy.LocalProxyServer
+import com.videobridge.data.security.KeystoreTokenStore
+import com.videobridge.data.security.ServerConfigStore
+import com.videobridge.diagnostics.CrashReporter
+import com.videobridge.diagnostics.DiagnosticsEventLog
+import com.videobridge.diagnostics.DiagnosticsPreferences
+import com.videobridge.diagnostics.NetworkInfoProvider
+import com.videobridge.domain.MediaLibraryRepository
+import com.videobridge.domain.MediaSource
+import com.videobridge.domain.SecureTokenStore
+import com.videobridge.logging.DiagnosticsLogger
+import com.videobridge.permissions.AndroidNetworkPermissionManager
+import com.videobridge.playback.AndroidPlaybackServiceController
+import com.videobridge.playback.MediaSessionController
+import com.videobridge.playback.PlaybackEngine
+import com.videobridge.playback.PlaybackPreferences
+import com.videobridge.playback.PersistentRendererCapabilityStore
+import com.videobridge.playback.RendererCapabilityStore
+import com.videobridge.playback.reporting.DefaultJellyfinPlaybackReporter
+import com.videobridge.playback.session.DefaultPlaybackSessionCoordinator
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import okhttp3.OkHttpClient
+import java.util.UUID
+import java.util.concurrent.TimeUnit
+
+/**
+ * Minimal manual dependency container (no DI framework, §14). Holds process-scoped singletons that
+ * are cheap to construct; heavier per-session objects are built on demand. Wires the full connect →
+ * browse → cast/DLNA → adaptive-playback graph.
+ */
+class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashReporter: CrashReporter) {
+
+    private val appContext = context.applicationContext
+
+    // ----- infrastructure -----
+    val sessionRegistry: SessionRegistry by lazy { SessionRegistry() }
+    val proxyServer: LocalProxyServer by lazy { LocalProxyServer(sessionRegistry, logger, contentResolver = appContext.contentResolver) }
+    val tokenStore: SecureTokenStore by lazy { KeystoreTokenStore(appContext) }
+    val serverConfigStore: ServerConfigStore by lazy { ServerConfigStore(appContext) }
+    val networkInfo: NetworkInfoProvider by lazy { NetworkInfoProvider(appContext) }
+    val permissions: AndroidNetworkPermissionManager by lazy { AndroidNetworkPermissionManager(appContext) }
+    val diagnosticsPreferences: DiagnosticsPreferences by lazy { DiagnosticsPreferences(appContext) }
+    val playbackPreferences: PlaybackPreferences by lazy { PlaybackPreferences(appContext) }
+    val showLanguageStore: ShowLanguageStore by lazy { ShowLanguageStore(appContext) }
+
+    /**
+     * Persists the redacted event log to disk so a shared diagnostics report survives app restarts (the
+     * logger's in-memory ring is wiped on process death). Build-tagged; the export includes only the
+     * current build's events. See [DiagnosticsEventLog].
+     */
+    val diagnosticsEventLog: DiagnosticsEventLog by lazy {
+        DiagnosticsEventLog(appContext.filesDir, appVersionCode()) { logger.entries() }
+    }
+
+    private val httpClient: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .writeTimeout(30, TimeUnit.SECONDS)
+            .build()
+    }
+
+    private val deviceId: String by lazy {
+        val prefs = appContext.getSharedPreferences("jellyfin_bridge_device", Context.MODE_PRIVATE)
+        prefs.getString(KEY_DEVICE_ID, null) ?: UUID.randomUUID().toString()
+            .also { prefs.edit().putString(KEY_DEVICE_ID, it).apply() }
+    }
+
+    // ----- Jellyfin -----
+    val jellyfinClient: JellyfinClient by lazy {
+        JellyfinClient(
+            httpClient = httpClient,
+            deviceId = deviceId,
+            deviceName = Build.MODEL ?: "Android",
+            appVersion = appVersion(),
+            logger = logger,
+        )
+    }
+    val authRepository: JellyfinAuthRepository by lazy {
+        JellyfinAuthRepository(jellyfinClient, tokenStore, serverConfigStore, logger)
+    }
+
+    // ----- in-app poster images (Coil) -----
+    /**
+     * Coil image loader for in-app posters/thumbnails (gallery + detail). Uses a dedicated OkHttp client
+     * that injects the Jellyfin Authorization header ONLY for image requests to the configured server
+     * host — so the token is sent as a header, never embedded in the URL (hence never in a cache key or a
+     * log). Memory-cache only (no disk): no new on-disk surface — the streaming path stays RAM-only and
+     * posters are simply re-fetched over the LAN if evicted. Posters are shown on THIS phone only and are
+     * never given to the TV.
+     */
+    val imageLoader: ImageLoader by lazy {
+        val imageClient = httpClient.newBuilder()
+            .addInterceptor { chain ->
+                val req = chain.request()
+                val header = jellyfinClient.imageAuthHeader()
+                val authed = if (header != null && req.url.host == jellyfinClient.serverHost()) {
+                    req.newBuilder().header("Authorization", header).build()
+                } else {
+                    req
+                }
+                chain.proceed(authed)
+            }
+            .build()
+        ImageLoader.Builder(appContext)
+            .okHttpClient(imageClient)
+            .memoryCache { MemoryCache.Builder(appContext).maxSizePercent(0.20).build() }
+            .diskCachePolicy(CachePolicy.DISABLED)
+            .crossfade(true)
+            .build()
+    }
+    val mediaRepository: MediaLibraryRepository by lazy {
+        CachingMediaLibraryRepository(
+            delegate = JellyfinMediaLibraryRepository(jellyfinClient, logger),
+            cache = libraryCache,
+            scope = { jellyfinClient.baseUrl?.let { Integer.toHexString(it.hashCode()) } ?: "default" },
+        )
+    }
+
+    // ----- media sources (multi-source gallery) -----
+    val localSourceStore: LocalSourceStore by lazy { LocalSourceStore(appContext) }
+    val resumeStore: ResumeStore by lazy { ResumeStore(appContext) }
+    val jellyfinMediaSource: MediaSource by lazy { JellyfinMediaSource(mediaRepository) }
+    val localMediaSource: LocalMediaSource by lazy {
+        LocalMediaSource(appContext, localSourceStore, logger, hasMediaPermission = { permissions.hasReadMediaVideo() })
+    }
+    /** All browsable sources, in display order (Jellyfin first, then on-device). */
+    val mediaSources: List<MediaSource> by lazy { listOf(jellyfinMediaSource, localMediaSource) }
+    val libraryCache: LibraryCache by lazy { LibraryCache(appContext) }
+    val downloadStore: DownloadStore by lazy { DownloadStore(appContext) }
+    val downloadQueueStore: DownloadQueueStore by lazy { DownloadQueueStore(appContext) }
+    private val jellyfinRepository: HttpJellyfinRepository by lazy {
+        HttpJellyfinRepository(jellyfinClient, logger, httpClient)
+    }
+    private val reporter: DefaultJellyfinPlaybackReporter by lazy {
+        DefaultJellyfinPlaybackReporter(jellyfinClient, deviceId, logger)
+    }
+    private val coordinator: DefaultPlaybackSessionCoordinator by lazy {
+        DefaultPlaybackSessionCoordinator(sessionRegistry, proxyServer, reporter, logger)
+    }
+
+    // ----- targets -----
+    // Google Play Services / the Cast SDK can be momentarily unready (e.g. right after a hard process
+    // death during an active Cast session), making getSharedInstance() throw or return null. Do NOT
+    // cache that failure permanently (a `by lazy` would): retry on each read and cache only a
+    // successful CastContext, so Cast availability self-heals on the next discover/connect attempt.
+    @Volatile private var cachedCastContext: CastContext? = null
+    private val castContext: CastContext?
+        get() = cachedCastContext ?: runCatching {
+            @Suppress("DEPRECATION")
+            CastContext.getSharedInstance(appContext)
+        }.getOrNull()?.also { cachedCastContext = it }
+
+    val castAvailable: Boolean get() = castContext != null
+    // Pass a provider (not a captured value) so the controller always sees the current context once
+    // Cast becomes available, instead of holding an early null for the whole process lifetime.
+    val castController: CastTargetController by lazy { CastTargetController(appContext, { castContext }, logger) }
+    val dlnaController: DlnaTargetController by lazy { DlnaTargetController(logger, networkInfo, httpClient) }
+
+    // ----- on-device hardware transcoding (Media3) -----
+    val onDeviceTranscoder: OnDeviceTranscoder by lazy { OnDeviceTranscoder(appContext, logger) }
+    private val deviceEncodeCaps by lazy { MediaCodecCapabilityProbe.probe() }
+
+    // ----- playback engine -----
+    val rendererCapabilityStore: RendererCapabilityStore by lazy { PersistentRendererCapabilityStore(appContext) }
+
+    val playbackEngine: PlaybackEngine by lazy {
+        PlaybackEngine(
+            jellyfin = jellyfinRepository,
+            coordinator = coordinator,
+            proxy = proxyServer,
+            networkInfo = networkInfo,
+            serviceController = AndroidPlaybackServiceController(appContext),
+            logger = logger,
+            appContext = appContext,
+            onDeviceTranscoder = onDeviceTranscoder,
+            deviceEncodeCapsProvider = { deviceEncodeCaps },
+            rendererCaps = rendererCapabilityStore,
+        )
+    }
+
+    // ----- optional: offline downloads -----
+    private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    val downloader: MediaDownloader by lazy {
+        MediaDownloader(jellyfinRepository, downloadStore, downloadQueueStore, httpClient, logger, ioScope)
+    }
+
+    /** Start the download foreground service so active downloads survive process backgrounding. */
+    fun startDownloadService() { DownloadService.start(appContext) }
+
+    // ----- media session / playback controls (notification + lock screen + media buttons) -----
+    val mediaSessionController: MediaSessionController by lazy {
+        val content = PendingIntent.getActivity(
+            appContext, 0,
+            Intent(appContext, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        MediaSessionController(
+            appContext,
+            object : MediaSessionController.Transport {
+                override fun onPlay() = engineLaunch { playbackEngine.resume() }
+                override fun onPause() = engineLaunch { playbackEngine.pause() }
+                override fun onStop() = engineLaunch { playbackEngine.stop() }
+                override fun onSeekTo(positionSeconds: Long) = engineLaunch { playbackEngine.seekTo(positionSeconds) }
+                override fun onSkip(deltaSeconds: Long) = engineLaunch { playbackEngine.skip(deltaSeconds) }
+                override fun onSetVolume(level: Float) = engineLaunch { playbackEngine.setVolume(level) }
+                override fun onAdjustVolume(direction: Int) = engineLaunch { playbackEngine.adjustVolume(direction) }
+            },
+            content,
+        )
+    }
+
+    private fun engineLaunch(block: suspend () -> Unit) {
+        ioScope.launch { runCatching { block() } }
+    }
+
+    init {
+        // Apply the persisted opt-in TV-tracing preference so detailed Cast/DLNA traffic is captured
+        // from app start if the user previously enabled it.
+        runCatching { logger.traceEnabled = diagnosticsPreferences.tvTracingEnabled }
+        // Keep the media session + notification controls in sync with live playback. MediaSession and
+        // notifications are main-thread framework objects, so observe on Main (this also creates the
+        // lazy controller on the main thread).
+        ioScope.launch(Dispatchers.Main) { playbackEngine.status.collect { mediaSessionController.update(it) } }
+        registerDownloadAutoRecovery()
+        // Persist the redacted event log to disk on a slow cadence so a shared report survives app
+        // restarts (the in-memory ring is otherwise lost on process death). Change-detected, so it's a
+        // no-op when idle; also flushed on demand before a report is built and when playback stops.
+        ioScope.launch {
+            while (isActive) {
+                delay(DIAGNOSTICS_FLUSH_INTERVAL_MS)
+                runCatching { diagnosticsEventLog.flush() }
+            }
+        }
+    }
+
+    /** Persist the current event log to disk now (before building a report, on playback stop, etc.). */
+    fun flushDiagnostics() {
+        // Off the main thread: callers include UI lifecycle (onStop) and the playback-stop path.
+        ioScope.launch { runCatching { diagnosticsEventLog.flush() } }
+    }
+
+    /**
+     * Auto-recover downloads when connectivity returns. If a download exhausted its in-flight retries
+     * while offline, re-enqueue it (resuming from its `.part` file) the moment a usable default network
+     * is available again, and best-effort re-foreground the download service. Fully guarded so a
+     * background foreground-service start (which the OS may reject) can never crash the app.
+     */
+    private fun registerDownloadAutoRecovery() {
+        runCatching {
+            val cm = appContext.getSystemService(ConnectivityManager::class.java) ?: return
+            cm.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    ioScope.launch {
+                        runCatching {
+                            if (downloader.resumePending()) runCatching { startDownloadService() }
+                        }
+                    }
+                }
+            })
+        }
+    }
+
+    /**
+     * Toggle opt-in detailed TV-communication tracing (persisted). When on, Cast/DLNA request/response
+     * traffic is recorded — redacted — into the exportable diagnostics log to help trace playback
+     * issues. Local only; nothing is sent anywhere.
+     */
+    fun setTvTracingEnabled(enabled: Boolean) {
+        diagnosticsPreferences.tvTracingEnabled = enabled
+        logger.traceEnabled = enabled
+        logger.i("Diagnostics", if (enabled) "TV communication tracing enabled" else "TV communication tracing disabled")
+    }
+
+    /** Clears all secrets + in-memory state (Settings → Delete all app data, §13). */
+    suspend fun deleteAllData() {
+        runCatching { playbackEngine.stop() }
+        runCatching { downloader.cancelAllAndJoin() } // stop downloads before wiping their store
+        authRepository.deleteAllData()
+        proxyServer.stop()
+        sessionRegistry.revokeAll()
+        tokenStore.clear()
+        serverConfigStore.clear()
+        libraryCache.clear()
+        downloadStore.clear()
+        runCatching { resumeStore.clear() }
+        runCatching { crashReporter.clear() } // crash reports are app data too
+        runCatching { diagnosticsEventLog.clear() } // persisted event log is app data too
+        runCatching { diagnosticsPreferences.clear() }
+        runCatching { playbackPreferences.clear() }
+        runCatching { rendererCapabilityStore.clear() }
+        runCatching { showLanguageStore.clear() }
+        logger.traceEnabled = false
+        logger.clear()
+    }
+
+    fun appVersionName(): String = appVersion()
+    fun appVersionCode(): String = runCatching {
+        appContext.packageManager.getPackageInfo(appContext.packageName, 0).longVersionCode.toString()
+    }.getOrNull() ?: "0"
+
+    private fun appVersion(): String = runCatching {
+        appContext.packageManager.getPackageInfo(appContext.packageName, 0).versionName
+    }.getOrNull() ?: "0.1.0"
+
+    private companion object {
+        const val KEY_DEVICE_ID = "device_id"
+        const val DIAGNOSTICS_FLUSH_INTERVAL_MS = 10_000L
+    }
+}

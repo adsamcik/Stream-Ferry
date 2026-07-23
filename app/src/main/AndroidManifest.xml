@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!--
+      PERMISSION INVENTORY (full rationale in docs/MANIFEST_PERMISSIONS.md).
+      Only permissions strictly required by the phone-gateway design are declared.
+    -->
+
+    <!-- Reach Jellyfin upstream + serve the local proxy. Normal/install-time. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Detect Wi-Fi/VPN/network transitions for diagnostics + cleanup. Normal. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Obtain the phone LAN IP to build proxy URLs and show diagnostics. Normal. -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+
+    <!--
+      Android 16+/17 local-network access is a runtime-granted permission. Required so the TV can
+      fetch from the phone proxy and for Cast/DLNA discovery/control on the LAN.
+    -->
+    <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
+
+    <!-- SSDP/mDNS discovery requires receiving multicast; only held during active discovery. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+
+    <!-- Persistent playback notification (runtime-granted on API 33+). -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Foreground service used ONLY during active, user-visible playback. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
+    <!--
+      Keep the CPU and the Wi-Fi radio awake WHILE casting so the phone keeps serving the proxy stream
+      to the TV with the screen off / app backgrounded. Unlike a normal media player the phone is a
+      *server* here (it plays no local audio), so nothing else holds the CPU/Wi-Fi awake — without this
+      Doze CPU-idle and Wi-Fi power-save stall the TV's pull. Held only for the duration of active
+      playback by ProxyPlaybackService (a partial wake lock + a high-perf Wi-Fi lock), released on stop.
+      The Wi-Fi lock itself needs no permission (ACCESS_WIFI_STATE, above, suffices).
+    -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!--
+      Screen-off casting reliability: the phone is the media gateway, so it must keep serving the proxy
+      with the screen off. A foreground service + WAKE_LOCK keep the CPU up, but aggressive OEM power
+      management (notably Samsung "deep sleep") can still suspend the app's network unless the user allows
+      it to run unrestricted. This lets the app REQUEST that battery-optimization exemption (user-approved
+      via the system dialog); playback works without it, just less reliably with the screen off.
+    -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+
+    <!--
+      OPTIONAL, user-elective (off by default): the local-video source uses the SAF picker (no
+      permission) by default. Only if the user explicitly chooses "show all my videos" do we request
+      this at runtime to read the device video library; denial falls back to the SAF picker. See
+      docs/MANIFEST_PERMISSIONS.md.
+    -->
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+
+    <application
+        android:name=".app.JellyfinBridgeApplication"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:theme="@style/Theme.JellyfinBridge">
+
+        <activity
+            android:name=".app.MainActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|keyboardHidden|uiMode"
+            android:theme="@style/Theme.JellyfinBridge">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!--
+          The proxy + playback foreground service. Not exported. mediaPlayback type is the correct
+          FGS type because the service exists to keep an active, user-initiated media stream alive
+          to a Cast/DLNA target (see docs/PROXY_DESIGN.md for the FGS-type decision record).
+        -->
+        <service
+            android:name=".playback.proxy.ProxyPlaybackService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
+
+        <!-- Download foreground service. Keeps the process alive while offline downloads are active. -->
+        <service
+            android:name=".data.download.DownloadService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- Shares user-requested redacted diagnostic files from the app-private cache only. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.reportshare"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/report_share_paths" />
+        </provider>
+
+        <!-- Google Cast options provider (Cast SDK requires this metadata). -->
+        <meta-data
+            android:name="com.google.android.gms.cast.framework.OPTIONS_PROVIDER_CLASS_NAME"
+            android:value="com.videobridge.data.cast.CastOptionsProvider" />
+
+    </application>
+
+</manifest>

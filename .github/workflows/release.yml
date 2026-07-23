@@ -1,0 +1,162 @@
+name: Release
+
+# Release-APK publishing pipeline. Triggered when a version tag (e.g. v0.2.1) is
+# pushed: it builds the minified (R8) release APK and publishes it as an asset on
+# a GitHub Release for that tag. A production signing keystore is deliberately
+# never committed (see docs/BUILD.md); when none is present the build signs the
+# release APK with the standard Android *debug* key so the published artifact is
+# installable ("App not installed" happens with an unsigned APK). The debug key is
+# generated per run, so installing a newer build over an older one may require an
+# uninstall first; supply a real keystore for a stable signing identity.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish the release APK for (e.g. v0.2.1)."
+        required: true
+
+permissions:
+  contents: write # needed to create the GitHub Release and upload assets.
+
+jobs:
+  publish-release-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 59
+
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # For manual dispatch, check out the requested tag; for tag pushes the
+          # default checkout already points at the tag.
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Resolve tag name
+        id: tag
+        run: |
+          raw="${{ github.event.inputs.tag || github.ref_name }}"
+          # Strip an optional refs/tags/ prefix so a manually-dispatched
+          # "refs/tags/v0.2.0" resolves to the bare tag name "v0.2.0".
+          echo "name=${raw#refs/tags/}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle (with dependency cache)
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Configure signing key
+        id: signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            # Stable release identity: decode the keystore from secrets and point the build at it via
+            # keystore.properties (read by app/build.gradle.kts). Updates install over each other.
+            ks="$RUNNER_TEMP/release.jks"
+            echo "$KEYSTORE_BASE64" | base64 -d > "$ks"
+            printf 'storeFile=%s\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
+              "$ks" "$KEYSTORE_PASSWORD" "$KEY_ALIAS" "$KEY_PASSWORD" > keystore.properties
+            echo "mode=release-key" >> "$GITHUB_OUTPUT"
+            echo "::notice::Signing the release APK with the configured release keystore."
+          else
+            # Fallback: per-run Android debug key (installable, but a different identity each release —
+            # add the RELEASE_KEYSTORE_* secrets for a stable signing identity; see docs/BUILD.md).
+            ks="$HOME/.android/debug.keystore"
+            if [ ! -f "$ks" ]; then
+              mkdir -p "$HOME/.android"
+              keytool -genkeypair -v -keystore "$ks" -storepass android -keypass android \
+                -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
+                -dname "CN=Android Debug,O=Android,C=US"
+            fi
+            echo "mode=debug-key" >> "$GITHUB_OUTPUT"
+            echo "::notice::No RELEASE_KEYSTORE_* secrets set — signing with a per-run Android debug key."
+          fi
+
+      - name: Build release APK (R8-minified)
+        uses: ./.github/actions/gradle-retry
+        with:
+          args: assembleRelease
+
+      - name: Rename release APK with tag
+        id: apk
+        run: |
+          src=$(find app/build/outputs/apk/release -name '*.apk' | head -n 1)
+          if [ -z "$src" ]; then
+            echo "No release APK was produced." >&2
+            exit 1
+          fi
+          dst="video-bridge-${{ steps.tag.outputs.name }}-release.apk"
+          cp "$src" "$dst"
+          echo "path=$dst" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release APK to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.name }}
+          APK: ${{ steps.apk.outputs.path }}
+          SIGN_MODE: ${{ steps.signing.outputs.mode }}
+        run: |
+          # Build the release notes from CHANGELOG.md: extract the section for this tag's version
+          # (the "## [x.y.z]" heading becomes the release title, so only its body is used). Falls back to
+          # a generic note if the version has no changelog entry yet.
+          version="${TAG#v}"
+          notes=release-notes.md
+          : > "$notes"
+          if [ -f CHANGELOG.md ]; then
+            awk -v hdr="## [$version]" '
+              index($0, hdr) == 1 { grab = 1; next }
+              grab && index($0, "## [") == 1 { exit }
+              grab { print }
+            ' CHANGELOG.md > "$notes"
+          fi
+          sed -i '/./,$!d' "$notes" # strip leading blank lines
+          if [ ! -s "$notes" ]; then
+            echo "Automated release build for \`$TAG\` (R8-minified)." > "$notes"
+          fi
+          {
+            echo ""
+            echo "---"
+            if [ "$SIGN_MODE" = "release-key" ]; then
+              echo "R8-minified release APK, signed with the project release key. Full history: [CHANGELOG.md](CHANGELOG.md)."
+            else
+              echo "R8-minified release APK, signed with a per-run Android **debug** key — installing over an older build may require uninstalling it first (see [docs/BUILD.md](docs/BUILD.md)). Full history: [CHANGELOG.md](CHANGELOG.md)."
+            fi
+          } >> "$notes"
+
+          # Idempotent + retried publish: create the release if needed, otherwise update its notes and
+          # (re)upload the APK, so a transient GitHub API hiccup or a job re-run recovers cleanly.
+          attempt=1
+          max=4
+          while true; do
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              gh release edit "$TAG" --notes-file "$notes" >/dev/null 2>&1 || true
+              gh release upload "$TAG" "$APK" --clobber && exit 0
+            else
+              gh release create "$TAG" "$APK" --title "$TAG" --prerelease --notes-file "$notes" && exit 0
+            fi
+            status=$?
+            if [ "$attempt" -ge "$max" ]; then
+              echo "::error::Publishing the release failed after ${attempt} attempt(s)"
+              exit "$status"
+            fi
+            backoff=$((20 * attempt))
+            echo "::warning::Release publish failed (attempt ${attempt}/${max}); retrying in ${backoff}s"
+            attempt=$((attempt + 1))
+            sleep "$backoff"
+          done
+
+

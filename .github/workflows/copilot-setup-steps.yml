@@ -1,0 +1,89 @@
+name: "Copilot Setup Steps"
+
+# Automatically run the setup steps when they are changed to allow for easy validation, and
+# allow manual testing through the repository's "Actions" tab.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+  pull_request:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+
+jobs:
+  # The job MUST be called `copilot-setup-steps` or it will not be picked up by Copilot.
+  copilot-setup-steps:
+    runs-on: ubuntu-latest
+
+    # Lowest permissions needed: clone the repository to resolve dependencies.
+    permissions:
+      contents: read
+
+    timeout-minutes: 59
+
+    env:
+      # Reuse the GitHub-hosted runner's Android SDK location.
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # The project targets compileSdk/targetSdk 37 (Android 17) with build-tools 37.0.0. The
+      # GitHub-hosted runner image normally ships these already (the CI/release Gradle builds compile
+      # against android-37 fine on the same image), but a stale cmdline-tools manifest can report
+      # "Failed to find package 'platforms;android-37'" (e.g. if API 37 is only in the preview channel).
+      # So this install is BEST-EFFORT: try the stable channel, then preview, and never fail the
+      # pre-warm — the Gradle step below is the real gate and resolves the platform from the runner's
+      # pre-installed SDK (auto-downloading any missing pieces into the cache for offline reuse).
+      - name: Install Android SDK Platform 37 and build-tools 37.0.0 (best-effort)
+        run: |
+          set -uxo pipefail
+          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          pkgs=("platforms;android-37" "build-tools;37.0.0" "platform-tools")
+          "$SDKMANAGER" --install "${pkgs[@]}" \
+            || "$SDKMANAGER" --channel=3 --install "${pkgs[@]}" \
+            || echo "::warning::sdkmanager could not install android-37 explicitly; relying on the runner's pre-installed SDK + Gradle."
+
+      - name: Set up Gradle (with dependency cache)
+        uses: gradle/actions/setup-gradle@v4
+
+      # Warm the Gradle dependency cache from Google Maven (google()) and Maven Central while the
+      # setup runner still has full internet access. The Copilot session firewall blocks
+      # dl.google.com / maven.google.com (see docs/BUILD.md and .github/copilot-instructions.md),
+      # so without this pre-warm the Android Gradle Plugin, AndroidX, Compose and the Google Cast
+      # SDK cannot be resolved during the session. Pre-downloading them here makes the agent able
+      # to build/test offline.
+      - name: Pre-download Gradle plugins and project dependencies
+        run: |
+          set -euxo pipefail
+          # Resolve the Gradle plugins (AGP from google(), Kotlin from Maven Central, etc.).
+          ./gradlew --no-daemon help --console=plain
+          # Actually execute the common build, test and lint tasks so every artifact
+          # (the real Google Maven com.android.*/com.google.*/androidx.* .aar/.jar files,
+          # not just POM metadata) is downloaded into the Gradle cache for offline reuse
+          # during the Copilot session.
+          ./gradlew --no-daemon assembleDebug testDebugUnitTest lintDebug --console=plain
+
+      # The pure-JVM core (com.jellyfinbridge.core) is verified offline with kotlinc + JUnit 4
+      # (see docs/BUILD.md). Pre-fetch JUnit + Hamcrest from Maven Central so that recipe works in
+      # the session even though Maven Central calls are also subject to the session firewall.
+      - name: Pre-fetch offline core-test libraries (JUnit + Hamcrest)
+        run: |
+          set -euxo pipefail
+          LIBS=/tmp/verify/libs
+          mkdir -p "$LIBS"
+          BASE=https://repo1.maven.org/maven2
+          curl -fsSL -o "$LIBS/junit-4.13.2.jar" \
+            "$BASE/junit/junit/4.13.2/junit-4.13.2.jar"
+          curl -fsSL -o "$LIBS/hamcrest-core-1.3.jar" \
+            "$BASE/org/hamcrest/hamcrest-core/1.3/hamcrest-core-1.3.jar"

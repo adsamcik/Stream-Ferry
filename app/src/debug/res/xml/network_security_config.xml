@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  DEBUG-ONLY network security config. Permits cleartext (so a developer can test against a LAN
+  Jellyfin over http) and adds a 'user' trust anchor (so a self-signed cert installed on the test
+  device is trusted). This file lives in src/debug and is NEVER merged into release builds.
+
+  NOTE: Android's network-security-config <domain> matches hostnames/literal IPs only — it does NOT
+  support IP/CIDR ranges, so it cannot express "private LAN ranges only". The meaningful http policy
+  (https preferred, remote http blocked, LAN http only after explicit user approval) is therefore
+  enforced at the application layer by core.net.ServerUrlValidator, which can actually parse the
+  address. See docs/NETWORK_SECURITY.md.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

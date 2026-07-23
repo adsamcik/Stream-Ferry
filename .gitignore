@@ -1,0 +1,27 @@
+# Gradle
+.gradle/
+build/
+**/build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# Android Studio / IntelliJ / IDE
+.idea/
+*.iml
+captures/
+.cxx/
+
+# Local configuration (never commit machine-specific paths or signing secrets)
+local.properties
+*.apk
+*.aab
+# Machine-specific Gradle daemon JVM selection (local toolchain only — CI sets up its own JDK).
+gradle/gradle-daemon-jvm.properties
+
+# Signing — never commit
+keystore.properties
+*.jks
+*.keystore
+
+# OS files
+.DS_Store
+Thumbs.db

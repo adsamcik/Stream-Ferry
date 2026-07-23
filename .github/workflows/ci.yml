@@ -1,0 +1,79 @@
+name: CI
+
+# Continuous-integration build pipeline: compile the debug APK, run the unit
+# tests and the Android lint checks on every push to main and on pull requests.
+# GitHub-hosted runners have full internet access, so (unlike the Copilot
+# sandbox) Google Maven (dl.google.com / maven.google.com) is reachable and the
+# Android Gradle Plugin, AndroidX, Compose and the Cast SDK resolve normally.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref to save runner minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 59
+
+    env:
+      # Reuse the GitHub-hosted runner's pre-installed Android SDK
+      # (platform 37 + build-tools 37), matching copilot-setup-steps.yml.
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle (with dependency cache)
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Assemble debug APK
+        uses: ./.github/actions/gradle-retry
+        with:
+          args: assembleDebug
+
+      - name: Run unit tests
+        uses: ./.github/actions/gradle-retry
+        with:
+          args: testDebugUnitTest
+
+      - name: Run Android lint
+        uses: ./.github/actions/gradle-retry
+        with:
+          args: lintDebug
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      - name: Upload test and lint reports
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports
+          path: |
+            app/build/reports/tests/**
+            app/build/reports/lint-results-*.*
+          if-no-files-found: ignore

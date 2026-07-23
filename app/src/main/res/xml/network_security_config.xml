@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  RELEASE network security config (§13).
+  - System CAs only; NO user/debug trust anchors in release.
+  - cleartextTrafficPermitted=true: the app must reach a LAN Jellyfin over http and serve the
+    phone-hosted proxy to the TV over http. Android's network-security-config cannot express
+    "private LAN ranges only" (its <domain> matches hostnames/literal IPs, not IP/CIDR ranges and
+    there is NO runtime API to inject a per-server policy), so cleartext is permitted here and the
+    real http policy is enforced at the application layer by core.net.ServerUrlValidator: https is
+    preferred, remote http is BLOCKED, and a LAN http server is used only after the user explicitly
+    approves it. JellyfinClient additionally refuses to downgrade a token-bearing upstream onto
+    cleartext when the server itself is reached over https. See docs/NETWORK_SECURITY.md.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>
