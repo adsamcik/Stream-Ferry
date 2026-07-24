@@ -11,6 +11,9 @@ import android.os.PowerManager
 import android.provider.Settings
 import androidx.core.content.ContextCompat
 import com.videobridge.domain.NetworkPermissionManager
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 /**
  * Resolves runtime permission state for local-network access and notifications (§3, §16).
@@ -23,11 +26,19 @@ import com.videobridge.domain.NetworkPermissionManager
 class AndroidNetworkPermissionManager(context: Context) : NetworkPermissionManager {
 
     private val appContext = context.applicationContext
+    private val _localNetworkAccess = MutableStateFlow(readLocalNetworkAccess())
+    /** Updated when Android grants or revokes this app's local-network permission. */
+    val localNetworkAccess: StateFlow<Boolean> = _localNetworkAccess.asStateFlow()
 
-    override fun hasLocalNetworkAccess(): Boolean {
-        // A forward-declared/non-dangerous permission is not a runtime LAN gate on this platform.
-        return !isLocalNetworkRuntimePermission() || isGranted(PERMISSION_ACCESS_LOCAL_NETWORK)
+    /** Refreshes the observable state; AppContainer polls this short-lived platform check for revocation. */
+    fun refreshLocalNetworkAccess(): Boolean = readLocalNetworkAccess().also { granted ->
+        _localNetworkAccess.value = granted
     }
+
+    override fun hasLocalNetworkAccess(): Boolean = refreshLocalNetworkAccess()
+
+    private fun readLocalNetworkAccess(): Boolean =
+        !isRuntimeLocalNetworkPermission() || isGranted(PERMISSION_ACCESS_LOCAL_NETWORK)
 
     override fun hasNotificationsPermission(): Boolean =
         isGranted(Manifest.permission.POST_NOTIFICATIONS)
@@ -62,19 +73,14 @@ class AndroidNetworkPermissionManager(context: Context) : NetworkPermissionManag
         Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${appContext.packageName}"))
 
     override fun localNetworkStatus(): String {
-        if (isGranted(PERMISSION_ACCESS_LOCAL_NETWORK)) return "granted"
-        // ACCESS_LOCAL_NETWORK is a forward-declared permission for Local Network Protection. Current
-        // Android releases don't enforce it (the OS never prompts and LAN access works without it), so a
-        // bare "denied" here is misleading. Only report "denied" when the platform actually defines it as
-        // a dangerous, runtime-grantable permission on this device; otherwise say it isn't enforced.
-        return if (isLocalNetworkRuntimePermission()) "denied" else "not enforced (Android ${Build.VERSION.RELEASE})"
+        if (hasLocalNetworkAccess()) return if (isRuntimeLocalNetworkPermission()) "granted" else "not enforced (Android ${Build.VERSION.RELEASE})"
+        return "denied"
     }
 
-    private fun isLocalNetworkRuntimePermission(): Boolean = runCatching {
-        val protection = appContext.packageManager
-            .getPermissionInfo(PERMISSION_ACCESS_LOCAL_NETWORK, 0)
-            .protection
-        (protection and PermissionInfo.PROTECTION_DANGEROUS) != 0
+    @Suppress("DEPRECATION") // protection-level bitmask remains the compatible public API.
+    private fun isRuntimeLocalNetworkPermission(): Boolean = runCatching {
+        val protection = appContext.packageManager.getPermissionInfo(PERMISSION_ACCESS_LOCAL_NETWORK, 0).protection
+        (protection and PermissionInfo.PROTECTION_MASK_BASE) == PermissionInfo.PROTECTION_DANGEROUS
     }.getOrDefault(false)
 
     private fun isGranted(permission: String): Boolean =

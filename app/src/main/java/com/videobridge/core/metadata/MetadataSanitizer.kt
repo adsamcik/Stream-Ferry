@@ -42,7 +42,7 @@ object MetadataSanitizer {
 
             val type = Character.getType(codePoint)
             if (
-                type == Character.CONTROL ||
+                type == Character.CONTROL.toInt() ||
                 Character.isWhitespace(codePoint) ||
                 Character.isSpaceChar(codePoint)
             ) {

@@ -26,7 +26,16 @@ class NetworkInfoProvider(context: Context) {
      * binding the proxy there would make the phone unreachable by the TV on the real Wi-Fi LAN. The
      * selector demotes tunnel/point-to-point/cellular interfaces and prefers the Wi-Fi/Ethernet LAN.
      */
-    fun lanIpv4(): String? = LanInterfaceSelector.selectBindAddress(lanCandidates())
+    fun lanIpv4(): String? = selectedLanIpv4() ?: LanInterfaceSelector.selectBindAddress(lanCandidates())
+
+    /** Address attached to the same physical LAN Network used for renderer traffic, when available. */
+    private fun selectedLanIpv4(): String? {
+        val cm = appContext.getSystemService(ConnectivityManager::class.java) ?: return null
+        return cm.getLinkProperties(lanNetwork() ?: return null)?.linkAddresses
+            ?.mapNotNull { it.address as? Inet4Address }
+            ?.firstOrNull { it.isSiteLocalAddress }
+            ?.hostAddress
+    }
 
     private fun lanCandidates(): List<LanInterfaceSelector.Candidate> {
         val interfaces = runCatching { NetworkInterface.getNetworkInterfaces()?.toList() }
@@ -66,6 +75,17 @@ class NetworkInfoProvider(context: Context) {
         val net = cm.activeNetwork ?: return false
         val caps = cm.getNetworkCapabilities(net) ?: return false
         return caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+    }
+
+    /** Selected physical LAN Network, preferring Wi-Fi and then Ethernet, never a VPN/default tunnel. */
+    @Suppress("DEPRECATION")
+    fun lanNetwork(): Network? {
+        val cm = appContext.getSystemService(ConnectivityManager::class.java) ?: return null
+        return cm.allNetworks.firstOrNull { net ->
+            val caps = cm.getNetworkCapabilities(net) ?: return@firstOrNull false
+            !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
+                (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) || caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET))
+        }
     }
 
     /**

@@ -172,6 +172,7 @@ class JellyfinAuthRepository(
             currentId
         }
         id?.let { tokenStore.remove(it) }
+        Unit
     }
 
     override suspend fun deleteServerProfile(serverId: String) = authOperationMutex.withLock {

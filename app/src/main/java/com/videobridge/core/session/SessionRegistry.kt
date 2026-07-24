@@ -155,6 +155,9 @@ class SessionRegistry(
 
     fun revoke(id: String) { sessions.remove(id) }
 
+    /** True only while the opaque id is still registered; used to reject relay work racing teardown. */
+    fun isActive(id: String): Boolean = sessions.containsKey(id)
+
     /** Revoke all sessions and clear references (called on stop / delete-all-data). */
     fun revokeAll() { sessions.clear() }
 

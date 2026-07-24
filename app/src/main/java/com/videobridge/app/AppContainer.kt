@@ -45,6 +45,7 @@ import com.videobridge.domain.MediaSource
 import com.videobridge.domain.SecureTokenStore
 import com.videobridge.logging.DiagnosticsLogger
 import com.videobridge.permissions.AndroidNetworkPermissionManager
+import com.videobridge.permissions.LocalNetworkAccessGate
 import com.videobridge.playback.AndroidPlaybackServiceController
 import com.videobridge.playback.MediaSessionController
 import com.videobridge.playback.PlaybackEngine
@@ -57,6 +58,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -78,11 +80,19 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
 
     // ----- infrastructure -----
     val sessionRegistry: SessionRegistry by lazy { SessionRegistry() }
-    val proxyServer: LocalProxyServer by lazy { LocalProxyServer(sessionRegistry, logger, contentResolver = appContext.contentResolver) }
     val tokenStore: SecureTokenStore by lazy { KeystoreTokenStore(appContext) }
     val serverConfigStore: ServerConfigStore by lazy { ServerConfigStore(appContext) }
     val networkInfo: NetworkInfoProvider by lazy { NetworkInfoProvider(appContext) }
     val permissions: AndroidNetworkPermissionManager by lazy { AndroidNetworkPermissionManager(appContext) }
+    val localNetworkGate: LocalNetworkAccessGate by lazy { LocalNetworkAccessGate(permissions) }
+    val proxyServer: LocalProxyServer by lazy {
+        LocalProxyServer(
+            sessionRegistry,
+            logger,
+            contentResolver = appContext.contentResolver,
+            requireLocalNetworkAccess = localNetworkGate::requireAccess,
+        )
+    }
     val diagnosticsPreferences: DiagnosticsPreferences by lazy { DiagnosticsPreferences(appContext) }
     val playbackPreferences: PlaybackPreferences by lazy { PlaybackPreferences(appContext) }
     val showLanguageStore: ShowLanguageStore by lazy { ShowLanguageStore(appContext) }
@@ -256,7 +266,9 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
     // Pass a provider (not a captured value) so the controller always sees the current context once
     // Cast becomes available, instead of holding an early null for the whole process lifetime.
     val castController: CastTargetController by lazy { CastTargetController(appContext, { cachedCastContext }, logger) }
-    val dlnaController: DlnaTargetController by lazy { DlnaTargetController(logger, networkInfo, httpClient) }
+    val dlnaController: DlnaTargetController by lazy {
+        DlnaTargetController(logger, networkInfo, httpClient, localNetworkGate::requireAccess)
+    }
 
     // ----- on-device hardware transcoding (Media3) -----
     val onDeviceTranscoder: OnDeviceTranscoder by lazy { OnDeviceTranscoder(appContext, logger) }
@@ -277,6 +289,7 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
             onDeviceTranscoder = onDeviceTranscoder,
             deviceEncodeCapsProvider = { deviceEncodeCaps },
             rendererCaps = rendererCapabilityStore,
+            requireLocalNetworkAccess = localNetworkGate::requireAccess,
         )
     }
 
@@ -334,6 +347,21 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
         // lazy controller on the main thread).
         ioScope.launch(Dispatchers.Main) { playbackEngine.status.collect { mediaSessionController.update(it) } }
         registerDownloadAutoRecovery()
+        // The public Android API exposes no process-wide permission-change listener here. Refresh the
+        // cheap grant check frequently so an out-of-app revocation tears down local TV exposure promptly.
+        ioScope.launch {
+            while (isActive) {
+                permissions.refreshLocalNetworkAccess()
+                delay(LOCAL_NETWORK_PERMISSION_POLL_MS)
+            }
+        }
+        // A grant may be revoked while a renderer is already streaming. The playback engine's local-first
+        // teardown closes the proxy before attempting any remote control/reporting work.
+        ioScope.launch {
+            permissions.localNetworkAccess.drop(1).collect { granted ->
+                if (!granted) runCatching { playbackEngine.onLocalNetworkPermissionRevoked() }
+            }
+        }
         // Persist the redacted event log to disk on a slow cadence so a shared report survives app
         // restarts (the in-memory ring is otherwise lost on process death). Change-detected, so it's a
         // no-op when idle; also flushed on demand before a report is built and when playback stops.
@@ -416,6 +444,7 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
 
     private companion object {
         const val KEY_DEVICE_ID = "device_id"
+        const val LOCAL_NETWORK_PERMISSION_POLL_MS = 1_000L
         const val DIAGNOSTICS_FLUSH_INTERVAL_MS = 10_000L
         const val CAST_INIT_TIMEOUT_MS = 2_000L
     }

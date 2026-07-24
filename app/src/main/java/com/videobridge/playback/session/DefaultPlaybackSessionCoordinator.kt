@@ -9,10 +9,12 @@ import com.videobridge.domain.PlaybackInfo
 import com.videobridge.domain.PlaybackSessionCoordinator
 import com.videobridge.domain.UpstreamSource
 import com.videobridge.logging.DiagnosticsLogger
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Ties together the three session identities (§8): Jellyfin play session ↔ phone proxy session ↔
@@ -121,19 +123,33 @@ class DefaultPlaybackSessionCoordinator(
     override suspend fun stop(reason: String) = mutex.withLock {
         val info = currentInfo
         val session = _active.value
+        // End renderer access first. A remote Jellyfin report can wait or fail, but it must never keep
+        // an opaque proxy URL, accepted renderer socket, or upstream relay alive.
+        session?.let { sessions.revoke(it.id) }
+        proxy.stop()
+        _active.value = null
+        currentInfo = null
+
+        if (info != null && session != null) {
+            runBoundedRemoteCleanup("report stopped") { reporter.reportStopped(info, lastPositionSeconds) }
+            runBoundedRemoteCleanup("stop transcode") { reporter.stopTranscode(info) }
+        }
+        logger.event("session", "Session stopped ($reason); local proxy revoked before remote cleanup")
+    }
+
+    private suspend fun runBoundedRemoteCleanup(label: String, block: suspend () -> Unit) {
         try {
-            if (info != null && session != null) {
-                runCatching { reporter.reportStopped(info, lastPositionSeconds) }
-                runCatching { reporter.stopTranscode(info) } // §8 cleanup: avoid abandoned transcodes
-            }
-        } finally {
-            session?.let { sessions.revoke(it.id) }
-            proxy.stop()
-            _active.value = null
-            currentInfo = null
-            logger.event("session", "Session stopped ($reason); proxy down, transcode cleanup attempted")
+            val completed = withTimeoutOrNull(REMOTE_CLEANUP_TIMEOUT_MS) { block(); true } ?: false
+            if (!completed) logger.w(TAG, "Timed out while attempting Jellyfin $label")
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            logger.w(TAG, "Jellyfin $label failed", e)
         }
     }
 
-    companion object { private const val TAG = "PlaybackSessionCoordinator" }
+    companion object {
+        private const val TAG = "PlaybackSessionCoordinator"
+        private const val REMOTE_CLEANUP_TIMEOUT_MS = 3_000L
+    }
 }

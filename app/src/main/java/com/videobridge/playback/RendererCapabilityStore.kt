@@ -84,7 +84,7 @@ internal fun rendererCapabilityEntry(deviceKey: String, format: RendererMediaFor
     format.heightPx,
     format.audioCodec,
     format.audioChannels,
-).joinToString("|")(::rendererCapabilityEntryPart)
+).joinToString(separator = "|", transform = ::rendererCapabilityEntryPart)
 
 /** Legacy helper retained for source compatibility; it creates a deliberately separate unknown-format key. */
 @Deprecated("Use the media-format overload")

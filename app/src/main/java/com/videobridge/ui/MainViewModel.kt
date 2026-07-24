@@ -38,6 +38,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -94,6 +95,14 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
     private var lastResumeSaveMs: Long = 0L
 
     init {
+        onLocalNetworkPermissionResult(container.permissions.hasLocalNetworkAccess())
+        // Runtime permission may be revoked outside this activity. Cancel work and remove cached targets
+        // before a stale selection can trigger a reconnect or proxy start.
+        viewModelScope.launch {
+            container.permissions.localNetworkAccess.drop(1).collect { granted ->
+                if (granted) onLocalNetworkPermissionResult(true) else onLocalNetworkPermissionDenied()
+            }
+        }
         // Live playback status from the engine (position, buffering, adaptive bitrate, throughput).
         viewModelScope.launch {
             container.playbackEngine.status.collect { status ->
@@ -1042,6 +1051,10 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
      * message. Idempotent; superseded/cancelled by [stopPlayback]/[play] via [cancelReconnect].
      */
     private fun startReconnect() {
+        if (!container.permissions.hasLocalNetworkAccess()) {
+            onLocalNetworkPermissionDenied()
+            return
+        }
         val ctx = reconnectContext ?: return
         if (reconnectJob?.isActive == true) return
         reconnecting = true
@@ -1049,6 +1062,10 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
         reconnectJob = viewModelScope.launch {
             try {
                 for (attempt in 1..MAX_RECONNECT_ATTEMPTS) {
+                    if (!container.permissions.hasLocalNetworkAccess()) {
+                        onLocalNetworkPermissionDenied()
+                        return@launch
+                    }
                     _state.update { it.copy(playback = it.playback?.copy(reconnecting = true)) }
                     container.logger.event("playback", "Connection lost; reconnecting (attempt $attempt of $MAX_RECONNECT_ATTEMPTS)")
                     delay(minOf(RECONNECT_BASE_DELAY_MS * attempt, RECONNECT_MAX_DELAY_MS))
