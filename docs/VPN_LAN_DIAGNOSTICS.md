@@ -69,10 +69,10 @@ the VPN). Samsung's native share binds everything to Wi-Fi, which is why it work
 `androidx.mediarouter` purges discovered routes the moment **no** `MediaRouter.Callback` is registered.
 The Cast discovery previously removed its callback right after the scan, so the selected route vanished
 before `connect()` could `selectRoute` it — surfacing as "That Cast device is no longer available"
-(reproduced even with the VPN **off**, i.e. not a network issue). `CastTargetController` now keeps one
-active-scan callback registered from discovery until `disconnect()` (Android suppresses active scan in
-the background, so no battery cost when idle) and briefly re-polls in `connect()` to recover a
-momentarily-absent route.
+(reproduced even with the VPN **off**, i.e. not a network issue). The framework Cast chooser owns discovery while visible;
+`CastTargetController` keeps an active callback only during bounded `connect()` recovery, then
+removes it when the picker closes, permission is lost, or connection completes. This retains the chosen
+route without an active scan for the full playback session.
 
 ## Exportable diagnostics + opt-in TV tracing
 

@@ -1,5 +1,7 @@
 package com.videobridge.core.redaction
 
+import com.videobridge.core.metadata.MetadataSanitizer
+
 /**
  * Centralised redaction for logs and diagnostic exports.
  *
@@ -12,6 +14,7 @@ package com.videobridge.core.redaction
 object LogRedactor {
 
     private const val MASK = "***REDACTED***"
+    private const val MAX_LOG_UTF8_BYTES = 8 * 1024
 
     // Query parameters that carry secrets or identifying material in Jellyfin / proxy URLs.
     private val SENSITIVE_QUERY_KEYS = setOf(
@@ -35,7 +38,9 @@ object LogRedactor {
         out = AUTH_HEADER.replace(out) { m -> "${m.groupValues[1]}: $MASK" }
         out = TOKEN_KV.replace(out, "$1=$MASK")
         out = redactUrls(out)
-        return out
+        // Exception and server text is untrusted: keep it single-line and bounded before it reaches
+        // logcat, diagnostics exports, or notification-adjacent UI.
+        return MetadataSanitizer.normalize(out, MAX_LOG_UTF8_BYTES)
     }
 
     /** Replace any http(s) URL in the text with a host-only, query-stripped form. */

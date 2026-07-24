@@ -28,6 +28,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        container.initializeCastContext()
+        viewModel.onLocalNetworkPermissionResult(container.permissions.hasLocalNetworkAccess())
         setContent {
             JellyfinBridgeTheme {
                 val state by viewModel.state.collectAsState()
@@ -36,16 +38,31 @@ class MainActivity : ComponentActivity() {
                 val permissionLauncher = rememberLauncherForActivityResult(
                     ActivityResultContracts.RequestMultiplePermissions(),
                 ) {
-                    viewModel.onLocalNetworkPermissionResult(container.permissions.hasLocalNetworkAccess())
-                    viewModel.scanTargets()
+                    val localNetworkGranted = container.permissions.hasLocalNetworkAccess()
+                    if (localNetworkGranted) {
+                        viewModel.onLocalNetworkPermissionResult(true)
+                        viewModel.scanTargets()
+                    } else {
+                        viewModel.onLocalNetworkPermissionDenied()
+                    }
                 }
                 AppRoot(
                     state = state,
                     viewModel = viewModel,
-                    onScanDevices = { permissionLauncher.launch(AndroidNetworkPermissionManager.PLAYBACK_PERMISSIONS) },
+                    onScanDevices = {
+                        if (container.permissions.hasLocalNetworkAccess()) viewModel.scanTargets()
+                        else permissionLauncher.launch(AndroidNetworkPermissionManager.PLAYBACK_PERMISSIONS)
+                    },
                 )
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        container.initializeCastContext()
+        // Covers settings-driven revocation without treating a denial as an empty device list.
+        viewModel.onLocalNetworkPermissionResult(container.permissions.hasLocalNetworkAccess())
     }
 
     override fun onStop() {

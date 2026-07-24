@@ -322,10 +322,7 @@ class PlaybackEngine(
             // first they queue ahead of onStartCommand on the main thread and blow that deadline
             // (ForegroundServiceDidNotStartInTimeException on a Galaxy S24 / Android 16). Only once
             // foregrounded do we signal the caller to navigate ([onForegrounded]) and start the handshake.
-            serviceController.start()
-            if (!serviceController.awaitForegrounded()) {
-                logger.w(TAG, "Foreground service not confirmed before deadline; proceeding")
-            }
+            ensureProxyServiceForegrounded()
             onForegrounded()
             eventsJob = scope.launch { target.events.collect { onTargetEvent(it) } }
             target.connect(selectedTarget)
@@ -442,33 +439,41 @@ class PlaybackEngine(
         if (isPlaying) pause() else resume()
     }
 
-    suspend fun resume() {
-        val t = target ?: return
-        isPlaying = true // optimistic: flip the control instantly; the next renderer status confirms it
-        publishStatus()
+    suspend fun resume() = mutex.withLock {
+        val t = target ?: return@withLock
         t.play()
+        isPlaying = true
+        publishStatus()
     }
 
-    suspend fun pause() {
-        val t = target ?: return
-        isPlaying = false // optimistic
-        publishStatus()
+    suspend fun pause() = mutex.withLock {
+        val t = target ?: return@withLock
         t.pause()
+        isPlaying = false
+        publishStatus()
     }
 
     /** Seek by a relative amount (used by media-button / notification skip actions). */
     suspend fun skip(deltaSeconds: Long) = seekTo(absolutePositionSeconds + deltaSeconds)
 
-    suspend fun setVolume(level: Float) {
-        volume = level.coerceIn(0f, 1f)
-        runCatching { target?.setVolume(volume) }
+    suspend fun setVolume(level: Float) = mutex.withLock {
+        setVolumeLocked(level)
+    }
+
+    private suspend fun setVolumeLocked(level: Float) {
+        val t = target ?: return
+        val requested = level.coerceIn(0f, 1f)
+        t.setVolume(requested)
+        volume = requested
         publishStatus()
     }
 
     /** Step volume up (direction > 0) or down (direction < 0) by one notch. */
     suspend fun adjustVolume(direction: Int) {
         if (direction == 0) return
-        setVolume(volume + if (direction > 0) VOLUME_STEP else -VOLUME_STEP)
+        mutex.withLock {
+            setVolumeLocked(volume + if (direction > 0) VOLUME_STEP else -VOLUME_STEP)
+        }
     }
 
     /**
@@ -500,10 +505,7 @@ class PlaybackEngine(
             // See play(): foreground FIRST (while the caller is still on the quiet picker screen) and WAIT
             // for startForeground() BEFORE navigating ([onForegrounded]) or starting the renderer handshake,
             // so the startForegroundService() deadline can't be missed behind main-thread work.
-            serviceController.start()
-            if (!serviceController.awaitForegrounded()) {
-                logger.w(TAG, "Foreground service not confirmed before deadline; proceeding")
-            }
+            ensureProxyServiceForegrounded()
             onForegrounded()
             eventsJob = scope.launch { target.events.collect { onTargetEvent(it) } }
             target.connect(selectedTarget)
@@ -607,7 +609,7 @@ class PlaybackEngine(
                 "on ${sel.displayName} (${sel.protocol})",
         )
         tgt.load(url, streamForTv, params.title, effectiveRuntimeSeconds, startPositionSeconds = reportedPositionSeconds)
-        runCatching { tgt.play() }
+        requestPlaybackAfterLoad(tgt)
         armStartupWatchdog()
         publishStatus()
         logger.event("playback", "Playing ${params.title} -> ${sel.displayName} (${sel.protocol})")
@@ -655,15 +657,15 @@ class PlaybackEngine(
             adaptive?.let { it.noteApplied(it.currentIndex, clock()) } // reset window; don't change quality
         } else {
             // The proxy advertises the entity length (direct play) / the HLS playlist is full-timeline, so
-            // the renderer seeks the stream itself. Reflect the target immediately so the scrubber jumps
-            // there; the renderer's next status confirms it. Guard against a status poll that was already in
-            // flight (older position) snapping the scrubber back until the renderer reports near the target.
+            // the renderer seeks the stream itself. Do not move the scrubber until the command succeeds:
+            // a rejected Cast seek must remain visible to the caller instead of looking like a completed
+            // jump. Afterwards, guard against an older status poll snapping the confirmed target back.
+            t.seekTo(pos)
             reportedPositionSeconds = pos
             seekSettleTargetSeconds = pos
             seekSettleUntilMs = clock() + SEEK_SETTLE_WINDOW_MS
             coordinator.notePosition(pos)
             publishStatus()
-            runCatching { t.seekTo(pos) }
         }
     }
 
@@ -870,11 +872,57 @@ class PlaybackEngine(
     private fun deviceKey(t: DiscoveredTarget): String =
         "${t.protocol}:${t.capabilities.modelName ?: t.displayName}"
 
-    /** Record that the current renderer couldn't direct-play the current source container, so the next
-     *  play of that format to it skips straight to a transcode (see [RendererCapabilityStore]). */
-    private fun rememberTranscodeRequirement() {
+    /**
+     * Fail closed on foreground-service setup. The local proxy is not a best-effort convenience: it owns
+     * the network/CPU locks that keep the receiver's URL usable while the app is backgrounded, so a load
+     * must never be issued until the exact start request has been confirmed foregrounded.
+     */
+    private suspend fun ensureProxyServiceForegrounded() {
+        when (val result = serviceController.startAndAwaitForegrounded()) {
+            is ForegroundServiceStartResult.Foregrounded -> {
+                logger.event("playback", "Proxy foreground service confirmed (${result.path})")
+            }
+            is ForegroundServiceStartResult.StartRejected -> {
+                logger.e("playback", "Proxy foreground-service start was rejected; aborting before renderer load", result.cause)
+                throw IllegalStateException("Couldn't start the playback service. Please reopen the app and try again.", result.cause)
+            }
+            is ForegroundServiceStartResult.ConfirmationTimedOut -> {
+                logger.e(
+                    "playback",
+                    "Proxy foreground service was not confirmed within ${result.timeoutMs}ms; aborting before renderer load",
+                )
+                throw IllegalStateException("The playback service didn't start in time. Please try again.")
+            }
+        }
+    }
+
+    /**
+     * Cast's load request already has autoplay enabled. A follow-up play command can race that load and
+     * conceal its failure, while DLNA renderers still require their separate Play request.
+     */
+    private suspend fun requestPlaybackAfterLoad(renderer: PlaybackTargetController) {
+        if (renderer.protocol != Protocol.CAST) runCatching { renderer.play() }
+    }
+
+    /**
+     * Remember a receiver limitation only after a controller supplied explicit decode/source-not-supported
+     * evidence for a direct-play stream. A generic load exception, proxy failure, idle error, or watchdog
+     * timeout can still use the one-off fallback, but must not become a persistent transcode rule.
+     */
+    private fun rememberTranscodeRequirement(
+        qualifiedFormatEvidence: Boolean,
+        wasDirectPlay: Boolean,
+    ) {
         val t = selectedTarget ?: return
-        rendererCaps.recordTranscodeRequired(deviceKey(t), currentInfo?.profile?.container)
+        val profile = currentInfo?.profile
+        if (!shouldPersistTranscodeRequirement(qualifiedFormatEvidence, wasDirectPlay, profile)) {
+            logger.event(
+                "playback",
+                "Not persisting renderer capability downgrade (qualified=$qualifiedFormatEvidence direct=$wasDirectPlay profileKnown=${profile != null})",
+            )
+            return
+        }
+        rendererCaps.recordTranscodeRequired(deviceKey(t), RendererMediaFormat.from(requireNotNull(profile)))
     }
 
     private suspend fun resolveAndLoad(
@@ -927,12 +975,12 @@ class PlaybackEngine(
             deviceProfileOverride = profileOverride,
         ).getOrThrow()
 
-        // Idea 5: if this renderer has already failed to direct-play this source container, don't hand it
-        // the original again — force a transcode from the start (skips the doomed direct-play round-trip +
+        // If this renderer previously rejected this exact direct-play media format, don't hand it the
+        // original again — force a transcode from the start (skips the doomed direct-play round-trip +
         // failure wait). One-level re-resolve: the re-entry has effectiveForceTranscode()=true, so it's skipped.
         val known = selectedTarget
         if (known != null && !effectiveForceTranscode() &&
-            rendererCaps.shouldForceTranscode(deviceKey(known), info.profile.container)
+            rendererCaps.shouldForceTranscode(deviceKey(known), RendererMediaFormat.from(info.profile))
         ) {
             forceTranscodeFallback = true
             logger.event("playback", "Renderer previously rejected this format; transcoding from the start")
@@ -981,7 +1029,7 @@ class PlaybackEngine(
                 "on ${selectedTarget?.displayName} (${selectedTarget?.protocol})",
         )
         target.load(url, upstream.rendererStream, item.title, info.runtimeSeconds, startPositionSeconds = loadStart)
-        runCatching { target.play() }
+        requestPlaybackAfterLoad(target)
         // Watch for the TV silently never starting (ideas 1+7). Only for a fresh start / recovery reload —
         // not a seek or bitrate switch, where playback is already established.
         if (armWatchdog) armStartupWatchdog()
@@ -1003,7 +1051,9 @@ class PlaybackEngine(
         } catch (e: Exception) {
             if (!prefs.preferDirectPlay || prefs.forceTranscode || forceTranscodeFallback) throw e
             logger.w(TAG, "Playback failed to start on the renderer; retrying once with a server transcode", e)
-            if (currentInfo != null) rememberTranscodeRequirement() // only learn when we know the source container
+            // A thrown startup/load exception has no qualified decoder evidence. Recover once, but do not
+            // permanently downgrade this renderer: the cause may have been the proxy, CORS, a range request,
+            // network loss, or an interrupted session rather than an unsupported media format.
             forceTranscodeFallback = true
             resolveAndLoad(positionSeconds, requestedBitrate = requestedBitrate, initialiseAdaptive = true, armWatchdog = true)
         }
@@ -1068,7 +1118,11 @@ class PlaybackEngine(
      * signals from the event collector, the watchdog and the proxy can't double-fire a recovery) are set
      * atomically under [recoveryLock]; the actual reload runs off-lock. See [decideRecovery].
      */
-    private fun handlePlaybackFailure(kind: PlaybackFailureKind, message: String) {
+    private fun handlePlaybackFailure(
+        kind: PlaybackFailureKind,
+        message: String,
+        qualifiedFormatEvidence: Boolean = false,
+    ) {
         // Local on-device transcode AUTO-FALLBACK: if the TV rejected this format before playback started,
         // re-encode to the next codec it can decode (and this phone can encode) before giving up. Guarded by
         // recoveryLock + isReloadingStream so the burst of duplicate error events can't each trigger a reload,
@@ -1158,7 +1212,10 @@ class PlaybackEngine(
             // The renderer couldn't decode the original: fall back once to a server transcode (Cast -> HLS,
             // DLNA -> progressive TS). Remember it so the next play to this renderer skips the doomed attempt.
             RecoveryAction.TRANSCODE_FALLBACK -> {
-                rememberTranscodeRequirement()
+                rememberTranscodeRequirement(
+                    qualifiedFormatEvidence = qualifiedFormatEvidence,
+                    wasDirectPlay = online && !transcoding,
+                )
                 lastNote = "The TV couldn't play the original; switching to a server transcode…"
                 logger.event("playback", "Direct play failed on the receiver; falling back to server transcode")
                 launchRecoveryReload(requestedBitrate = adaptive?.currentBitrateBps, reason = "transcode fallback")
@@ -1397,7 +1454,11 @@ class PlaybackEngine(
                 logger.trace(TAG, "Buffering ${if (event.isBuffering) "started" else "ended"} at ${absolutePositionSeconds}s")
                 publishStatus()
             }
-            is PlaybackTargetEvent.Error -> handlePlaybackFailure(event.kind, event.redactedMessage)
+            is PlaybackTargetEvent.Error -> handlePlaybackFailure(
+                event.kind,
+                event.redactedMessage,
+                event.qualifiedFormatEvidence,
+            )
             is PlaybackTargetEvent.Ended -> {
                 // Ignore a "finished" that fires only because we are mid-reload (HLS seek / bitrate
                 // switch) tearing down the old stream; otherwise it's a real end-of-media -> stop. This

@@ -117,16 +117,18 @@ background-reconnect fallback path (which does use `startForegroundService()`):
 
 1. **Foreground the service while the UI is still on the (static) picker — before navigating to the
    playback screen — and block on a barrier until `startForeground()` has actually run**
-   (`PlaybackEngine.play`/`playLocal` → `PlaybackServiceController.awaitForegrounded`, backed by
-   `ProxyForegroundLatch`). The startup coroutine arms the latch, calls `startForegroundService()` while
-   the main thread is quiet, then *suspends* until the service signals it foregrounded, and only THEN
-   fires `onForegrounded` — the callback the ViewModel uses to switch the route to the playback screen —
-   before beginning `connect()`. The earlier fix that foregrounded *after* `connect()` — and even the one
-   that foregrounded before `connect()` but *after* the route had already changed — still lost the race,
+   (`PlaybackEngine.play`/`playLocal` → `PlaybackServiceController.startAndAwaitForegrounded`, backed by
+   `ProxyForegroundLatch`). The startup coroutine arms a request-token latch, asks Android to start the
+   service (using `startService()` first and the typed `startForegroundService()` fallback when needed),
+   then *suspends* until that exact request signals it foregrounded. Only then does it fire
+   `onForegrounded` — the callback the ViewModel uses to switch the route to the playback screen — before
+   beginning `connect()`. The earlier fix that foregrounded *after* `connect()` — and even the one that
+   foregrounded before `connect()` but *after* the route had already changed — still lost the race,
    because the playback-screen recomposition (queued by the route change) sat ahead of `onStartCommand`
    on the main thread (observed on a Galaxy S24 / Android 16). **Do not navigate to the playback screen,
-   start `connect()`, or do other heavy main-thread work before the foreground barrier resolves.** The
-   wait is best-effort with a ~4 s cap (under the OS deadline): if it times out we log and proceed.
+   start `connect()`, or do other heavy main-thread work before the foreground barrier resolves.** A
+   rejected start or ~4 s confirmation timeout aborts startup before proxy-session creation or renderer
+   load; it is never logged and ignored.
 2. **`onStartCommand` foregrounds with the cheap fallback notification *first***, before touching the
    lazily-constructed `MediaSessionController` (which builds a `MediaSession` + full MediaStyle
    notification), then upgrades to the rich notification. The service signals `ProxyForegroundLatch` the

@@ -25,7 +25,7 @@ object HttpResponsePlan {
     val CORS_HEADERS: Map<String, String> = linkedMapOf(
         "Access-Control-Allow-Origin" to "*",
         "Access-Control-Allow-Methods" to "GET, HEAD, OPTIONS",
-        "Access-Control-Allow-Headers" to "Range, Content-Type",
+        "Access-Control-Allow-Headers" to "Range, Content-Type, Accept-Encoding",
         "Access-Control-Expose-Headers" to "Content-Length, Content-Range, Accept-Ranges, Content-Type",
     )
 

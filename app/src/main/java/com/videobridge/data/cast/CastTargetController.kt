@@ -3,6 +3,7 @@ package com.videobridge.data.cast
 import android.content.Context
 import androidx.mediarouter.media.MediaRouteSelector
 import androidx.mediarouter.media.MediaRouter
+import com.google.android.gms.cast.CastDevice
 import com.google.android.gms.cast.CastMediaControlIntent
 import com.google.android.gms.cast.HlsSegmentFormat as CastHlsSegmentFormat
 import com.google.android.gms.cast.HlsVideoSegmentFormat as CastHlsVideoSegmentFormat
@@ -14,11 +15,13 @@ import com.google.android.gms.cast.MediaSeekOptions
 import com.google.android.gms.cast.MediaStatus
 import com.google.android.gms.cast.framework.CastContext
 import com.google.android.gms.cast.framework.CastSession
+import com.google.android.gms.cast.framework.SessionManager
 import com.google.android.gms.cast.framework.SessionManagerListener
 import com.google.android.gms.cast.framework.media.RemoteMediaClient
 import com.google.android.gms.common.api.PendingResult
 import com.videobridge.core.cast.ConnectOutcome
 import com.videobridge.core.cast.ConnectRetryPolicy
+import com.videobridge.core.metadata.MetadataSanitizer
 import com.videobridge.core.stream.Protocol
 import com.videobridge.core.stream.TargetCapabilities
 import com.videobridge.domain.DiscoveredTarget
@@ -28,12 +31,9 @@ import com.videobridge.domain.PlaybackTargetController
 import com.videobridge.domain.PlaybackTargetEvent
 import com.videobridge.domain.RendererStream
 import com.videobridge.logging.DiagnosticsLogger
-import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -74,26 +74,75 @@ class CastTargetController(
         .addControlCategory(CastMediaControlIntent.categoryForCast(appId))
         .build()
 
-    private var mediaCallback: RemoteMediaClient.Callback? = null
     private var routeCallback: MediaRouter.Callback? = null
-    private var sessionListener: SessionManagerListener<CastSession>? = null
-    // Pending "treat suspension as a disconnect" timer; cancelled if the SDK resumes the session itself.
-    private val controllerScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
-    private var suspendGraceJob: Job? = null
+    /** A picker-close request is deferred until an in-flight route selection has bound a session. */
+    private var stopDiscoveryRequested = false
+    private var routeSelectionInProgress = false
+    /**
+     * Callback ownership matters when the user switches targets: unregistering against the *current*
+     * media client leaks the callback on the previous client. Keep both ends of every registration.
+     */
+    private data class MediaCallbackRegistration(
+        val client: RemoteMediaClient,
+        val callback: RemoteMediaClient.Callback,
+        val generation: Long,
+    )
+
+    /** Keep the originating manager as well as the listener for the same reason as media callbacks. */
+    private data class SessionListenerRegistration(
+        val manager: SessionManager,
+        val listener: SessionManagerListener<CastSession>,
+        val generation: Long,
+    )
+
+    /** Stable identity resolved from the requested MediaRouter route before selecting it. */
+    private data class RequestedCastRoute(
+        val routeId: String,
+        val deviceId: String,
+    )
+
+    /**
+     * One atomic owner for a live Cast connection. Route/device identity proves that the session is for
+     * the requested endpoint; the object reference and SDK session ID make late callbacks unambiguous.
+     */
+    private data class ActiveCastBinding(
+        val generation: Long,
+        val routeId: String,
+        val deviceId: String,
+        val session: CastSession,
+        val sessionId: String?,
+    )
+
+    private data class ActiveMediaClient(
+        val session: CastSession,
+        val client: RemoteMediaClient,
+        val generation: Long,
+    )
+
+    private data class MediaCommandOutcome(
+        val succeeded: Boolean,
+        val statusCode: Int,
+    )
+
+    private var mediaCallbackRegistration: MediaCallbackRegistration? = null
+    private var sessionListenerRegistration: SessionListenerRegistration? = null
+    /** Incremented before every connect/disconnect so delayed callbacks from a superseded session are inert. */
+    private var connectionGeneration = 0L
+    private var activeBinding: ActiveCastBinding? = null
+    /** Prevent resume-failed followed by ended from emitting two disconnected events for one session. */
+    private var terminalDisconnectGeneration: Long? = null
     private var lastBuffering = false
     /** Last Cast player state we logged a transition for, so we emit a high-signal event only on change. */
     private var lastPlayerState: Int? = null
 
-    private val session: CastSession?
-        get() = castContext?.sessionManager?.currentCastSession
-
     override suspend fun discover(timeoutMillis: Long): List<DiscoveredTarget> {
         if (castContext == null) return emptyList()
         return withContext(Dispatchers.Main) {
+            stopDiscoveryRequested = false
             val router = MediaRouter.getInstance(appContext)
-            // Keep the callback registered (do NOT remove after the scan): MediaRouter purges discovered
-            // routes the instant no callback is active, which made the selected route vanish before
-            // connect() could select it ("That Cast device is no longer available.").
+            // Keep the callback registered while the picker remains open: MediaRouter purges discovered
+            // routes the instant no callback is active, which can make a just-selected route vanish before
+            // connect() selects it. The owner calls [stopDiscovery] when the picker closes.
             ensureRouteCallback(router)
             delay(timeoutMillis.milliseconds)
             val results = router.routes
@@ -113,9 +162,9 @@ class CastTargetController(
     }
 
     /**
-     * Register one active-scan MediaRouter callback and keep it alive until [disconnect]. Routes only
-     * exist while a callback is registered. Android suppresses active scan while the app is in the
-     * background, so this does not drain battery when not casting.
+     * Register one active-scan MediaRouter callback while the picker needs live routes. Routes only exist
+     * while a callback is registered; the owner must call [stopDiscovery] on picker exit or permission
+     * loss. Android suppresses active scan while the app is in the background.
      */
     private fun ensureRouteCallback(router: MediaRouter) {
         if (routeCallback != null) return
@@ -129,6 +178,12 @@ class CastTargetController(
         routeCallback = null
     }
 
+    /** Stop active scanning after any in-flight route selection has completed. */
+    suspend fun stopDiscovery() = withContext(Dispatchers.Main) {
+        stopDiscoveryRequested = true
+        if (!routeSelectionInProgress) removeRouteCallback()
+    }
+
     override suspend fun connect(target: DiscoveredTarget) {
         val ctx = castContext ?: run {
             logger.w("connect", "Cast connect failed — Cast is unavailable on this device")
@@ -137,117 +192,163 @@ class CastTargetController(
         logger.event("connect", "Cast connect -> ${target.displayName}")
         logger.trace(TAG, "Cast connect -> ${target.displayName} (route ${target.id})")
         withContext(Dispatchers.Main) {
-            val router = MediaRouter.getInstance(appContext)
-            ensureRouteCallback(router)
-            var route = router.routes.firstOrNull { it.id == target.id }
-            if (route == null) {
-                // A route can still be momentarily absent (just (re)started scanning); poll briefly
-                // before giving up so a transient gap isn't reported as a permanent failure.
-                route = withTimeoutOrNull(ROUTE_RECOVER_MS.milliseconds) {
-                    var r: MediaRouter.RouteInfo? = null
-                    while (r == null) { delay(250.milliseconds); r = router.routes.firstOrNull { it.id == target.id } }
-                    r
+            routeSelectionInProgress = true
+            try {
+                val router = MediaRouter.getInstance(appContext)
+                ensureRouteCallback(router)
+                var route = router.routes.firstOrNull { it.id == target.id }
+                if (route == null) {
+                    // A route can still be momentarily absent (just (re)started scanning); poll briefly
+                    // before giving up so a transient gap isn't reported as a permanent failure.
+                    route = withTimeoutOrNull(ROUTE_RECOVER_MS.milliseconds) {
+                        var r: MediaRouter.RouteInfo? = null
+                        while (r == null) { delay(250.milliseconds); r = router.routes.firstOrNull { it.id == target.id } }
+                        r
+                    }
                 }
+                val selected = route ?: run {
+                    logger.w("connect", "Cast route not found after ${ROUTE_RECOVER_MS}ms: '${target.displayName}'")
+                    error("That Cast device is no longer available.")
+                }
+                val requestedRoute = requestedCastRoute(selected)
+                val generation = ++connectionGeneration
+                // A framework MediaRouteButton can create the requested session before play is tapped. Reuse
+                // that exact receiver rather than ending/restarting it; anything else is an old/mismatched
+                // session and must be cleared before awaiting a new session for this route.
+                val reusableSession = ctx.sessionManager.currentCastSession?.takeIf {
+                    it.isConnected && sessionMatchesRequestedRoute(it, requestedRoute)
+                }
+                val connectedSession = if (reusableSession != null) {
+                    logger.event("connect", "Reusing Cast session already selected by the framework")
+                    detachActiveSession()
+                    reusableSession
+                } else {
+                    detachActiveSession()
+                    clearCurrentSession(ctx, reason = "switching Cast targets")
+                    connectWithRetry(ctx, generation, requestedRoute) { router.selectRoute(selected) }
+                    if (!isCurrentGeneration(generation)) error("Cast connection was superseded.")
+                    ctx.sessionManager.currentCastSession
+                        ?.takeIf { it.isConnected && sessionMatchesRequestedRoute(it, requestedRoute) }
+                        ?: error("Cast route selected but no connected session was established for the requested receiver.")
+                }
+                if (!isCurrentGeneration(generation)) error("Cast connection was superseded.")
+                bindActiveSession(requestedRoute, connectedSession, generation)
+                registerMediaCallback()
+                registerSessionListener(ctx, connectedSession, generation)
+                logger.event("connect", "Cast session connected -> ${target.displayName}")
+                _events.tryEmit(PlaybackTargetEvent.Connected)
+                // Session binding is complete; active discovery is no longer needed.
+                removeRouteCallback()
+            } finally {
+                routeSelectionInProgress = false
+                if (stopDiscoveryRequested) removeRouteCallback()
             }
-            val selected = route ?: run {
-                logger.w("connect", "Cast route not found after ${ROUTE_RECOVER_MS}ms: '${target.displayName}'")
-                error("That Cast device is no longer available.")
-            }
-            val current = ctx.sessionManager.currentCastSession
-            if (current != null && current.isConnected) {
-                router.selectRoute(selected)
-            } else {
-                connectWithRetry(ctx) { router.selectRoute(selected) }
-            }
-            registerMediaCallback()
-            registerSessionListener(ctx)
-            logger.event("connect", "Cast session connected -> ${target.displayName}")
-            _events.tryEmit(PlaybackTargetEvent.Connected)
         }
     }
 
-    override suspend fun load(proxyUrl: String, stream: RendererStream, title: String, durationSeconds: Long?, startPositionSeconds: Long) =
-        withContext(Dispatchers.Main) {
-            val client = session?.remoteMediaClient ?: error("No Cast session")
-            registerMediaCallback()
-            lastPlayerState = null // a fresh load: log the new session's first state transition from "none"
-            val metadata = MediaMetadata(MediaMetadata.MEDIA_TYPE_MOVIE).apply {
-                putString(MediaMetadata.KEY_TITLE, title)
-            }
-            val mediaInfoBuilder = MediaInfo.Builder(proxyUrl) // phone proxy URL ONLY
-                .setStreamType(MediaInfo.STREAM_TYPE_BUFFERED)
-                .setContentType(stream.mimeType)
-                .setMetadata(metadata)
-            durationSeconds?.let { mediaInfoBuilder.setStreamDuration(it * 1000L) }
-            // Cast defaults HLS media to MPEG-TS unless told otherwise. The phone's on-device
-            // transcode is CMAF/fMP4, and Jellyfin can also select fMP4 for HEVC/AV1/VP9 profiles,
-            // so both audio and video segment format must be declared explicitly.
-            when (stream.hlsSegmentFormat) {
-                HlsSegmentFormat.FMP4 -> {
-                    mediaInfoBuilder.setHlsSegmentFormat(CastHlsSegmentFormat.FMP4)
-                    mediaInfoBuilder.setHlsVideoSegmentFormat(CastHlsVideoSegmentFormat.FMP4)
-                }
-                HlsSegmentFormat.MPEG2_TS -> {
-                    // Jellyfin's TS profile uses AAC audio multiplexed into the transport stream.
-                    mediaInfoBuilder.setHlsSegmentFormat(CastHlsSegmentFormat.TS_AAC)
-                    mediaInfoBuilder.setHlsVideoSegmentFormat(CastHlsVideoSegmentFormat.MPEG2_TS)
-                }
-                null -> Unit
-            }
-            val mediaInfo = mediaInfoBuilder.build()
-            // Start AT the resume position via the load request itself (setCurrentTime), NOT a post-load
-            // seek(): load() completes asynchronously, so a seek issued right after it races the load and is
-            // dropped by the receiver, which then autoplays from 0 (the "TV plays from the start" bug).
-            val request = MediaLoadRequestData.Builder()
-                .setMediaInfo(mediaInfo)
-                .setAutoplay(true)
-                .setCurrentTime(startPositionSeconds.coerceAtLeast(0) * 1000L)
-                .build()
-            logger.trace(
-                TAG,
-                "Cast load: type=${stream.mimeType} hlsFormat=${stream.hlsSegmentFormat} " +
-                    "title=$title dur=${durationSeconds}s start=${startPositionSeconds}s url=$proxyUrl",
-            )
-            awaitLoad(client.load(request))
-            logger.i(TAG, "Cast load issued (proxy URL, redacted)")
+    override suspend fun load(
+        proxyUrl: String,
+        stream: RendererStream,
+        title: String,
+        durationSeconds: Long?,
+        startPositionSeconds: Long,
+    ) = withContext(Dispatchers.Main) {
+        val activeClient = requireActiveMediaClient()
+        registerMediaCallback()
+        lastPlayerState = null // a fresh load: log the new session's first state transition from "none"
+        val metadata = MediaMetadata(MediaMetadata.MEDIA_TYPE_MOVIE).apply {
+            putString(MediaMetadata.KEY_TITLE, MetadataSanitizer.receiverTitle(title))
         }
+        val mediaInfoBuilder = MediaInfo.Builder(proxyUrl) // phone proxy URL ONLY
+            .setStreamType(MediaInfo.STREAM_TYPE_BUFFERED)
+            .setContentType(stream.mimeType)
+            .setMetadata(metadata)
+        durationSeconds?.let { mediaInfoBuilder.setStreamDuration(it * 1000L) }
+        // Cast defaults HLS media to MPEG-TS unless told otherwise. The phone's on-device
+        // transcode is CMAF/fMP4, and Jellyfin can also select fMP4 for HLS profiles, so both
+        // audio and video segment format must be declared explicitly.
+        when (stream.hlsSegmentFormat) {
+            HlsSegmentFormat.FMP4 -> {
+                mediaInfoBuilder.setHlsSegmentFormat(CastHlsSegmentFormat.FMP4)
+                mediaInfoBuilder.setHlsVideoSegmentFormat(CastHlsVideoSegmentFormat.FMP4)
+            }
+            HlsSegmentFormat.MPEG2_TS -> {
+                mediaInfoBuilder.setHlsSegmentFormat(CastHlsSegmentFormat.TS_AAC)
+                mediaInfoBuilder.setHlsVideoSegmentFormat(CastHlsVideoSegmentFormat.MPEG2_TS)
+            }
+            null -> Unit
+        }
+        val mediaInfo = mediaInfoBuilder.build()
+        // Start AT the resume position via the load request itself (setCurrentTime), NOT a post-load
+        // seek(): load() completes asynchronously, so a seek issued right after it races the load and is
+        // dropped by the receiver, which then autoplays from 0 (the "TV plays from the start" bug).
+        val request = MediaLoadRequestData.Builder()
+            .setMediaInfo(mediaInfo)
+            .setAutoplay(true)
+            .setCurrentTime(startPositionSeconds.coerceAtLeast(0) * 1000L)
+            .build()
+        logger.trace(
+            TAG,
+            "Cast load: type=${stream.mimeType} hlsFormat=${stream.hlsSegmentFormat} " +
+                "title=$title dur=${durationSeconds}s start=${startPositionSeconds}s url=$proxyUrl",
+        )
+        awaitMediaCommand("load", activeClient.client.load(request), activeClient)
+        logger.i(TAG, "Cast load accepted (proxy URL, redacted)")
+    }
 
-    /**
-     * Await the media-load [PendingResult] so the engine's follow-up calls (play, and progress tracking)
-     * run against a receiver that has actually loaded the media. Bounded so a receiver that never answers
-     * can't hang startup — the startup watchdog then catches a silent no-start. A non-success result is
-     * logged (renderer errors surface via the media callback / IDLE_REASON_ERROR path), not thrown.
-     */
-    private suspend fun awaitLoad(pending: PendingResult<RemoteMediaClient.MediaChannelResult>) {
-        withTimeoutOrNull(LOAD_TIMEOUT_MS) {
-            suspendCancellableCoroutine { cont ->
+    private suspend fun awaitMediaCommand(
+        command: String,
+        pending: PendingResult<RemoteMediaClient.MediaChannelResult>,
+        activeClient: ActiveMediaClient,
+    ) {
+        val outcome = withTimeoutOrNull(LOAD_TIMEOUT_MS.milliseconds) {
+            suspendCancellableCoroutine<MediaCommandOutcome> { cont ->
                 pending.setResultCallback { result ->
-                    if (!result.status.isSuccess) {
-                        logger.w(TAG, "Cast load result not success (statusCode=${result.status.statusCode})")
+                    if (cont.isActive) {
+                        cont.resume(MediaCommandOutcome(result.status.isSuccess, result.status.statusCode))
                     }
-                    if (cont.isActive) cont.resume(Unit)
                 }
                 cont.invokeOnCancellation { runCatching { pending.cancel() } }
             }
-        } ?: logger.w(TAG, "Cast load did not complete within ${LOAD_TIMEOUT_MS}ms; proceeding")
+        } ?: run {
+            logger.w(TAG, "Cast $command did not complete within ${LOAD_TIMEOUT_MS}ms")
+            error("Cast $command timed out.")
+        }
+        if (!outcome.succeeded) {
+            logger.w(TAG, "Cast $command failed (statusCode=${outcome.statusCode})")
+            error("Cast $command failed (status ${outcome.statusCode}).")
+        }
+        if (!isActiveMediaClient(activeClient)) {
+            logger.w(TAG, "Cast session changed while $command was in progress")
+            error("Cast session changed while $command was in progress.")
+        }
     }
 
-    override suspend fun play() = onMain { session?.remoteMediaClient?.play() }
-    override suspend fun pause() = onMain { session?.remoteMediaClient?.pause() }
-    override suspend fun seekTo(positionSeconds: Long) = onMain {
+    override suspend fun play() = runMediaCommand("play") { it.play() }
+    override suspend fun pause() = runMediaCommand("pause") { it.pause() }
+    override suspend fun seekTo(positionSeconds: Long) = runMediaCommand("seek") { client ->
         logger.trace(TAG, "Cast seek -> ${positionSeconds}s")
-        session?.remoteMediaClient?.seek(
-            MediaSeekOptions.Builder().setPosition(positionSeconds * 1000L).build(),
-        )
+        client.seek(MediaSeekOptions.Builder().setPosition(positionSeconds.coerceAtLeast(0) * 1000L).build())
     }
-    override suspend fun stop() = onMain { session?.remoteMediaClient?.stop() }
-    override suspend fun setVolume(level: Float) = onMain { session?.volume = level.toDouble() }
+    override suspend fun stop() = runMediaCommand("stop") { it.stop() }
+    override suspend fun setVolume(level: Float) = withContext(Dispatchers.Main) {
+        val activeClient = requireActiveMediaClient()
+        activeClient.session.volume = level.coerceIn(0f, 1f).toDouble()
+        if (!isActiveMediaClient(activeClient)) error("Cast session changed while setting volume.")
+    }
+
+    private suspend fun runMediaCommand(
+        command: String,
+        action: (RemoteMediaClient) -> PendingResult<RemoteMediaClient.MediaChannelResult>,
+    ) = withContext(Dispatchers.Main) {
+        val activeClient = requireActiveMediaClient()
+        awaitMediaCommand(command, action(activeClient.client), activeClient)
+    }
 
     override suspend fun disconnect() = withContext(Dispatchers.Main) {
-        unregisterMediaCallback()
-        // Remove the persistent session listener BEFORE ending the session so our own intentional end
-        // doesn't fire it as an "unexpected" disconnect.
-        removeSessionListener()
+        ++connectionGeneration
+        // Remove callbacks/listeners before our intentional end so it cannot look like a terminal drop.
+        detachActiveSession()
         removeRouteCallback()
         castContext?.sessionManager?.endCurrentSession(true)
         _events.tryEmit(PlaybackTargetEvent.Disconnected)
@@ -261,35 +362,29 @@ class CastTargetController(
      * deliberate stop never looks like a drop. (The temporary listener in [awaitSessionStart] removes
      * itself on session start, so it can't serve this role.)
      */
-    private fun registerSessionListener(ctx: CastContext) {
-        if (sessionListener != null) return
+    private fun registerSessionListener(ctx: CastContext, expectedSession: CastSession, generation: Long) {
+        val manager = ctx.sessionManager
+        val existing = sessionListenerRegistration
+        if (existing != null && existing.manager === manager && existing.generation == generation) return
+        removeSessionListener()
         val listener = object : SessionManagerListener<CastSession> {
+            private fun isExpectedActiveSession(s: CastSession): Boolean =
+                s === expectedSession && isTrackedActiveSession(s, generation)
+
             override fun onSessionSuspended(s: CastSession, reason: Int) {
-                // Don't react immediately: the Cast SDK transparently resumes brief blips (Wi-Fi handoff,
-                // momentary signal loss). Only treat it as a real drop — and auto-reconnect — if it hasn't
-                // resumed within the grace window, so a recoverable suspension doesn't force a needless
-                // teardown + reload + "reconnecting" flash.
+                if (!isExpectedActiveSession(s)) return
+                // The SDK can resume a suspended session after more than a few seconds. A timer-driven
+                // Disconnected event races that recovery and starts a needless reconnect/reload.
                 logger.event("playback", "Cast session suspended (reason $reason); awaiting auto-recovery")
-                suspendGraceJob?.cancel()
-                suspendGraceJob = controllerScope.launch {
-                    delay(SUSPEND_GRACE_MS.milliseconds)
-                    logger.event("playback", "Cast session did not resume in time — treating as a disconnect")
-                    _events.tryEmit(PlaybackTargetEvent.Disconnected)
-                }
             }
             override fun onSessionResumed(s: CastSession, wasSuspended: Boolean) {
-                // Recovered on its own — cancel the pending disconnect.
+                if (!isExpectedActiveSession(s)) return
                 logger.event("playback", "Cast session resumed (wasSuspended=$wasSuspended) — recovered")
-                suspendGraceJob?.cancel(); suspendGraceJob = null
             }
             override fun onSessionEnded(s: CastSession, error: Int) {
-                suspendGraceJob?.cancel(); suspendGraceJob = null
-                // error != 0 => an unexpected end (our own endCurrentSession removes this listener first,
-                // so it never reaches here for a deliberate stop).
-                if (error != 0) {
-                    logger.w("playback", "Cast session ended unexpectedly (error $error)")
-                    _events.tryEmit(PlaybackTargetEvent.Disconnected)
-                }
+                // Our intentional end removes this listener first. Any matching callback here is terminal,
+                // including error=0 receiver/session termination.
+                emitTerminalDisconnect(s, generation, "ended (error $error)")
             }
             override fun onSessionStarting(s: CastSession) {}
             override fun onSessionStarted(s: CastSession, id: String) {}
@@ -299,18 +394,17 @@ class CastTargetController(
             override fun onSessionEnding(s: CastSession) {}
             override fun onSessionResuming(s: CastSession, id: String) {}
             override fun onSessionResumeFailed(s: CastSession, error: Int) {
-                logger.w("cast", "Cast session resume failed (error $error)")
+                emitTerminalDisconnect(s, generation, "resume failed (error $error)")
             }
         }
-        sessionListener = listener
-        ctx.sessionManager.addSessionManagerListener(listener, CastSession::class.java)
+        sessionListenerRegistration = SessionListenerRegistration(manager, listener, generation)
+        manager.addSessionManagerListener(listener, CastSession::class.java)
     }
 
     private fun removeSessionListener() {
-        suspendGraceJob?.cancel(); suspendGraceJob = null
-        val l = sessionListener ?: return
-        castContext?.sessionManager?.removeSessionManagerListener(l, CastSession::class.java)
-        sessionListener = null
+        val registration = sessionListenerRegistration ?: return
+        registration.manager.removeSessionManagerListener(registration.listener, CastSession::class.java)
+        sessionListenerRegistration = null
     }
 
     /**
@@ -318,17 +412,23 @@ class CastTargetController(
      * hiccup doesn't force the user to tap again. Between attempts it drops any half-open session and settles
      * briefly, then re-selects the route to trigger a fresh start. Throws only after retries are exhausted.
      */
-    private suspend fun connectWithRetry(ctx: CastContext, select: () -> Unit) {
+    private suspend fun connectWithRetry(
+        ctx: CastContext,
+        generation: Long,
+        requestedRoute: RequestedCastRoute,
+        select: () -> Unit,
+    ) {
         var attemptsMade = 0
         var timeoutsSeen = 0
         while (true) {
+            if (!isCurrentGeneration(generation)) error("Cast connection was superseded.")
             if (attemptsMade > 0) {
                 // A fresh attempt clears a transient start failure: drop any half-open session, let the SDK
                 // settle, then re-select the route (below, inside awaitSessionStart) to start anew.
-                runCatching { ctx.sessionManager.endCurrentSession(true) }
+                clearCurrentSession(ctx, reason = "retrying Cast connection")
                 delay(CONNECT_RETRY_DELAY_MS.milliseconds)
             }
-            val outcome = awaitSessionStart(ctx, select)
+            val outcome = awaitSessionStart(ctx, generation, requestedRoute, select)
             attemptsMade++
             if (outcome == ConnectOutcome.TIMED_OUT) timeoutsSeen++
             if (outcome == ConnectOutcome.STARTED) return
@@ -344,56 +444,116 @@ class CastTargetController(
      * (route selection), and await the result up to [CONNECT_TIMEOUT_MS]. Returns the [ConnectOutcome] —
      * never throws — so [connectWithRetry] owns the retry/failure decision.
      */
-    private suspend fun awaitSessionStart(ctx: CastContext, select: () -> Unit): ConnectOutcome {
+    private suspend fun awaitSessionStart(
+        ctx: CastContext,
+        generation: Long,
+        requestedRoute: RequestedCastRoute,
+        select: () -> Unit,
+    ): ConnectOutcome {
         val started = withTimeoutOrNull(CONNECT_TIMEOUT_MS.milliseconds) {
-            suspendCancellableCoroutine { cont ->
+            suspendCancellableCoroutine<Boolean> { cont ->
                 val manager = ctx.sessionManager
                 val listener = object : SessionManagerListener<CastSession> {
-                    private fun done() = manager.removeSessionManagerListener(this, CastSession::class.java)
-                    override fun onSessionStarted(s: CastSession, id: String) { done(); if (cont.isActive) cont.resume(true) }
-                    override fun onSessionResumed(s: CastSession, wasSuspended: Boolean) { done(); if (cont.isActive) cont.resume(true) }
-                    override fun onSessionStartFailed(s: CastSession, error: Int) { done(); if (cont.isActive) cont.resume(false) }
-                    override fun onSessionEnded(s: CastSession, error: Int) {}
+                    private fun isRequestedSession(s: CastSession): Boolean =
+                        isCurrentGeneration(generation) && sessionMatchesRequestedRoute(s, requestedRoute)
+
+                    private fun completeForCurrentRequestedSession(s: CastSession) {
+                        if (!isCurrentGeneration(generation) || manager.currentCastSession !== s) return
+                        if (sessionMatchesRequestedRoute(s, requestedRoute)) {
+                            complete(true)
+                        } else {
+                            logger.w("connect", "Cast session started for a different receiver; retrying requested route")
+                            complete(false)
+                        }
+                    }
+
+                    private var completed = false
+                    private fun complete(outcome: Boolean) {
+                        if (completed) return
+                        completed = true
+                        manager.removeSessionManagerListener(this, CastSession::class.java)
+                        if (cont.isActive) cont.resume(outcome)
+                    }
+                    override fun onSessionStarted(s: CastSession, id: String) {
+                        completeForCurrentRequestedSession(s)
+                    }
+                    override fun onSessionResumed(s: CastSession, wasSuspended: Boolean) {
+                        completeForCurrentRequestedSession(s)
+                    }
+                    override fun onSessionStartFailed(s: CastSession, error: Int) {
+                        if (isRequestedSession(s)) complete(false)
+                    }
+                    override fun onSessionEnded(s: CastSession, error: Int) {
+                        if (isRequestedSession(s)) complete(false)
+                    }
                     override fun onSessionEnding(s: CastSession) {}
                     override fun onSessionResuming(s: CastSession, id: String) {}
-                    override fun onSessionResumeFailed(s: CastSession, error: Int) {}
+                    override fun onSessionResumeFailed(s: CastSession, error: Int) {
+                        if (isRequestedSession(s)) complete(false)
+                    }
                     override fun onSessionStarting(s: CastSession) {}
                     override fun onSessionSuspended(s: CastSession, reason: Int) {}
                 }
                 manager.addSessionManagerListener(listener, CastSession::class.java)
                 cont.invokeOnCancellation { manager.removeSessionManagerListener(listener, CastSession::class.java) }
-                select()
+                if (isCurrentGeneration(generation)) {
+                    runCatching { select() }
+                        .onFailure {
+                            logger.w("cast", "Cast route selection failed: ${it.message ?: it.javaClass.simpleName}")
+                            manager.removeSessionManagerListener(listener, CastSession::class.java)
+                            if (cont.isActive) cont.resume(false)
+                        }
+                } else if (cont.isActive) {
+                    cont.resume(false)
+                }
             }
         }
         return when {
-            started == true || ctx.sessionManager.currentCastSession?.isConnected == true -> ConnectOutcome.STARTED
+            started == true && isCurrentGeneration(generation) &&
+                ctx.sessionManager.currentCastSession?.let {
+                    it.isConnected && sessionMatchesRequestedRoute(it, requestedRoute)
+                } == true -> ConnectOutcome.STARTED
             started == false -> ConnectOutcome.FAILED
             else -> ConnectOutcome.TIMED_OUT
         }
     }
 
     private fun registerMediaCallback() {
-        val client = session?.remoteMediaClient ?: return
-        if (mediaCallback != null) return
+        val activeClient = activeMediaClientOrNull() ?: return
+        val current = mediaCallbackRegistration
+        if (current?.client === activeClient.client && current.generation == activeClient.generation) return
+        unregisterMediaCallback()
         val callback = object : RemoteMediaClient.Callback() {
-            override fun onStatusUpdated() = emitStatus(client)
+            override fun onStatusUpdated() = emitStatus(activeClient.client, activeClient.generation)
             override fun onMediaError(e: com.google.android.gms.cast.MediaError) {
+                if (!isCurrentMediaCallback(activeClient.client, activeClient.generation)) return
                 // Always kept (not just under tracing): a Cast media error is a top diagnostic signal.
-                logger.w("cast", "Cast media error: reason=${e.reason} detailedCode=${e.detailedErrorCode} -> classified ${classifyCastError(e.detailedErrorCode)}")
-                _events.tryEmit(PlaybackTargetEvent.Error(classifyCastError(e.detailedErrorCode), "Cast playback error"))
+                val kind = classifyCastError(e.detailedErrorCode)
+                logger.w("cast", "Cast media error: reason=${e.reason} detailedCode=${e.detailedErrorCode} -> classified $kind")
+                _events.tryEmit(
+                    PlaybackTargetEvent.Error(
+                        kind,
+                        "Cast playback error",
+                        qualifiedFormatEvidence = hasQualifiedFormatEvidence(e.detailedErrorCode),
+                    ),
+                )
             }
         }
-        mediaCallback = callback
-        client.registerCallback(callback)
+        mediaCallbackRegistration = MediaCallbackRegistration(activeClient.client, callback, activeClient.generation)
+        activeClient.client.registerCallback(callback)
     }
 
     private fun unregisterMediaCallback() {
-        val cb = mediaCallback ?: return
-        session?.remoteMediaClient?.unregisterCallback(cb)
-        mediaCallback = null
+        val registration = mediaCallbackRegistration ?: return
+        // Unregister on the exact client that received the registration. The current session may already
+        // point at a replacement client by the time switch/disconnect cleanup runs.
+        mediaCallbackRegistration = null
+        runCatching { registration.client.unregisterCallback(registration.callback) }
+            .onFailure { logger.w(TAG, "Couldn't unregister Cast media callback: ${it.message ?: it.javaClass.simpleName}") }
     }
 
-    private fun emitStatus(client: RemoteMediaClient) {
+    private fun emitStatus(client: RemoteMediaClient, generation: Long) {
+        if (!isCurrentMediaCallback(client, generation)) return
         val status = client.mediaStatus
         val positionSeconds = client.approximateStreamPosition / 1000L
         val state = status?.playerState
@@ -422,16 +582,12 @@ class CastTargetController(
             MediaStatus.PLAYER_STATE_IDLE ->
                 when (status.idleReason) {
                     MediaStatus.IDLE_REASON_FINISHED -> _events.tryEmit(PlaybackTargetEvent.Ended)
-                    // The receiver rejected the media — e.g. an unsupported container/codec on an
-                    // optimistic direct-play (a Cast Default Media Receiver can't demux MKV). Cast does
-                    // NOT always fire onMediaError for this; it often just parks in IDLE with an ERROR
-                    // reason. Surface it here too, or the direct-play -> transcode fallback never runs and
-                    // playback silently dies (observed casting an MKV to an LG webOS receiver).
+                    // There is no detailed error code in an IDLE/ERROR status. It could be an unsupported
+                    // source, but it could just as easily be a proxy/network/receiver failure; only an
+                    // explicit SDK decode/source-not-supported error is qualified format evidence.
                     MediaStatus.IDLE_REASON_ERROR -> {
-                        logger.w("cast", "Cast parked IDLE with error reason — treating as a FORMAT failure")
-                        // No MediaError object here (it's a status idle reason); a receiver parking in
-                        // IDLE/ERROR is overwhelmingly an unsupported format, so classify it as FORMAT.
-                        _events.tryEmit(PlaybackTargetEvent.Error(PlaybackFailureKind.FORMAT, "Cast playback error"))
+                        logger.w("cast", "Cast parked IDLE with error reason — classifying as UNKNOWN without detailed SDK evidence")
+                        _events.tryEmit(PlaybackTargetEvent.Error(PlaybackFailureKind.UNKNOWN, "Cast playback error"))
                     }
                     // NONE / CANCELED / INTERRUPTED are our own stop/reload transitions — ignore them.
                     else -> Unit
@@ -441,14 +597,25 @@ class CastTargetController(
     }
 
     override suspend fun diagnosticStatus(): String = withContext(Dispatchers.Main) {
-        val client = session?.remoteMediaClient ?: return@withContext "no Cast session"
-        runCatching { client.requestStatus() } // nudge a fresh status from the receiver
+        val activeClient = activeMediaClientOrNull() ?: return@withContext "no active Cast session"
+        val refreshState = try {
+            awaitMediaCommand("status refresh", activeClient.client.requestStatus(), activeClient)
+            "ok"
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: IllegalStateException) {
+            logger.w(TAG, "Cast diagnostic status refresh failed: ${e.message ?: e.javaClass.simpleName}")
+            "failed"
+        }
+        if (!isActiveMediaClient(activeClient)) return@withContext "no active Cast session"
+        val client = activeClient.client
         val status = client.mediaStatus
         val info = status?.mediaInfo
         buildString {
             append("cast state=").append(playerStateName(status?.playerState))
             append(" idle=").append(idleReasonName(status?.idleReason))
             append(" pos=").append(client.approximateStreamPosition / 1000L).append('s')
+            append(" refresh=").append(refreshState)
             if (info != null) {
                 append(" contentType=").append(info.contentType)
                 append(" streamType=").append(info.streamType)
@@ -457,8 +624,6 @@ class CastTargetController(
             }
         }
     }
-
-    private suspend inline fun onMain(crossinline block: () -> Unit) = withContext(Dispatchers.Main) { block() }
 
     /**
      * Classify a Cast [MediaError.getDetailedErrorCode] so recovery can be precise: a decode / unsupported
@@ -471,6 +636,117 @@ class CastTargetController(
         -> PlaybackFailureKind.FORMAT
         MediaError.DetailedErrorCode.MEDIA_NETWORK -> PlaybackFailureKind.NETWORK
         else -> PlaybackFailureKind.UNKNOWN
+    }
+
+    private fun hasQualifiedFormatEvidence(detailedErrorCode: Int?): Boolean = when (detailedErrorCode) {
+        MediaError.DetailedErrorCode.MEDIA_DECODE,
+        MediaError.DetailedErrorCode.MEDIA_SRC_NOT_SUPPORTED,
+        -> true
+        else -> false
+    }
+
+    private fun isCurrentGeneration(generation: Long): Boolean = connectionGeneration == generation
+
+    private fun requestedCastRoute(route: MediaRouter.RouteInfo): RequestedCastRoute {
+        val deviceId = route.extras
+            ?.let { CastDevice.getFromBundle(it) }
+            ?.deviceId
+            ?.takeIf { it.isNotBlank() }
+            ?: run {
+                logger.w("connect", "Cast route '${route.name}' has no usable CastDevice identity")
+                error("That Cast route could not be identified safely.")
+            }
+        return RequestedCastRoute(route.id, deviceId)
+    }
+
+    /** A CastSession has no MediaRouter route ID, so device ID is the route-to-session join key. */
+    private fun sessionMatchesRequestedRoute(session: CastSession, requestedRoute: RequestedCastRoute): Boolean =
+        runCatching { session.castDevice?.deviceId == requestedRoute.deviceId }.getOrDefault(false)
+
+    private fun bindActiveSession(
+        requestedRoute: RequestedCastRoute,
+        session: CastSession,
+        generation: Long,
+    ) {
+        if (!isCurrentGeneration(generation) || !session.isConnected || !sessionMatchesRequestedRoute(session, requestedRoute)) {
+            error("Cast session no longer matches the requested receiver.")
+        }
+        activeBinding = ActiveCastBinding(
+            generation = generation,
+            routeId = requestedRoute.routeId,
+            deviceId = requestedRoute.deviceId,
+            session = session,
+            sessionId = session.sessionId,
+        )
+        terminalDisconnectGeneration = null
+    }
+
+    /** A session can be terminal before SessionManager clears currentCastSession, so do not consult it here. */
+    private fun isTrackedActiveSession(castSession: CastSession, generation: Long): Boolean {
+        val binding = activeBinding ?: return false
+        return isCurrentGeneration(generation) &&
+            binding.generation == generation &&
+            binding.session === castSession &&
+            binding.sessionId == castSession.sessionId
+    }
+
+    private fun activeMediaClientOrNull(): ActiveMediaClient? {
+        val binding = activeBinding ?: return null
+        val castSession = binding.session
+        val client = castSession.remoteMediaClient ?: return null
+        val activeClient = ActiveMediaClient(castSession, client, binding.generation)
+        return if (isActiveMediaClient(activeClient)) activeClient else null
+    }
+
+    private fun requireActiveMediaClient(): ActiveMediaClient =
+        activeMediaClientOrNull() ?: error("No active Cast session.")
+
+    private fun isActiveMediaClient(activeClient: ActiveMediaClient): Boolean =
+        isTrackedActiveSession(activeClient.session, activeClient.generation) &&
+            activeClient.session.isConnected &&
+            activeClient.session.remoteMediaClient === activeClient.client &&
+            castContext?.sessionManager?.currentCastSession === activeClient.session
+
+    private fun isCurrentMediaCallback(client: RemoteMediaClient, generation: Long): Boolean {
+        val registration = mediaCallbackRegistration
+        return registration?.client === client && registration.generation == generation &&
+            activeMediaClientOrNull()?.let { it.client === client && it.generation == generation } == true
+    }
+
+    private fun detachActiveSession(clearTerminalDisconnectMarker: Boolean = true) {
+        unregisterMediaCallback()
+        removeSessionListener()
+        activeBinding = null
+        if (clearTerminalDisconnectMarker) terminalDisconnectGeneration = null
+        lastBuffering = false
+        lastPlayerState = null
+    }
+
+    private suspend fun clearCurrentSession(ctx: CastContext, reason: String) {
+        val manager = ctx.sessionManager
+        if (manager.currentCastSession == null) return
+        logger.event("connect", "Ending existing Cast session before $reason")
+        manager.endCurrentSession(true)
+        val cleared = withTimeoutOrNull(SESSION_END_TIMEOUT_MS.milliseconds) {
+            while (manager.currentCastSession != null) delay(SESSION_END_POLL_MS.milliseconds)
+            true
+        } ?: false
+        if (!cleared) {
+            logger.w("cast", "Existing Cast session did not clear before $reason")
+            error("Couldn't close the existing Cast session.")
+        }
+    }
+
+    private fun emitTerminalDisconnect(castSession: CastSession, generation: Long, reason: String) {
+        if (!isTrackedActiveSession(castSession, generation)) {
+            logger.trace(TAG, "Ignoring terminal callback from superseded Cast session: $reason")
+            return
+        }
+        if (terminalDisconnectGeneration == generation) return
+        terminalDisconnectGeneration = generation
+        logger.w("playback", "Cast session $reason")
+        detachActiveSession(clearTerminalDisconnectMarker = false)
+        _events.tryEmit(PlaybackTargetEvent.Disconnected)
     }
 
     /** Human-readable Cast player state, so a shared diagnostics report needn't decode the raw enum int. */
@@ -505,9 +781,8 @@ class CastTargetController(
         private const val CONNECT_RETRY_DELAY_MS = 900L
         private const val LOAD_TIMEOUT_MS = 20_000L
         private const val ROUTE_RECOVER_MS = 4_000L
-        // Grace period after a Cast session suspension before treating it as a real disconnect, so the
-        // SDK's own transparent resume of a brief blip isn't preempted by a needless reconnect.
-        private const val SUSPEND_GRACE_MS = 4_000L
+        private const val SESSION_END_TIMEOUT_MS = 5_000L
+        private const val SESSION_END_POLL_MS = 50L
 
         /**
          * Conservative capability baseline for the Cast Default Media Receiver: it reliably direct-plays

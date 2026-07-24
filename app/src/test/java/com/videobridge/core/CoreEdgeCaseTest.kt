@@ -121,6 +121,7 @@ class CoreEdgeCaseTest {
         for (plan in plans) {
             assertEquals("*", plan.headers["Access-Control-Allow-Origin"])
             assertTrue(plan.headers["Access-Control-Allow-Headers"]!!.contains("Range"))
+            assertTrue(plan.headers["Access-Control-Allow-Headers"]!!.contains("Accept-Encoding"))
             assertTrue(plan.headers["Access-Control-Expose-Headers"]!!.contains("Content-Range"))
         }
     }

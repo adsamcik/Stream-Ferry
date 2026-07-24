@@ -6,9 +6,13 @@ import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Network
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import androidx.core.content.ContextCompat
 import coil.ImageLoader
 import coil.request.CachePolicy
 import com.google.android.gms.cast.framework.CastContext
+import com.google.android.gms.tasks.Task
 import com.videobridge.core.session.SessionRegistry
 import com.videobridge.data.cache.CachingMediaLibraryRepository
 import com.videobridge.data.cache.LibraryCache
@@ -55,7 +59,11 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.OkHttpClient
+import kotlin.coroutines.resume
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 
@@ -185,21 +193,69 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
     }
 
     // ----- targets -----
-    // Google Play Services / the Cast SDK can be momentarily unready (e.g. right after a hard process
-    // death during an active Cast session), making getSharedInstance() throw or return null. Do NOT
-    // cache that failure permanently (a `by lazy` would): retry on each read and cache only a
-    // successful CastContext, so Cast availability self-heals on the next discover/connect attempt.
+    // CastContext's synchronous accessor is main-thread-only and may block while the Cast module loads.
+    // Initialize it once from an Activity owner with the non-blocking Task API; diagnostics and background
+    // work only read the cached completed value and never invoke a Cast SDK method themselves.
     @Volatile private var cachedCastContext: CastContext? = null
-    private val castContext: CastContext?
-        get() = cachedCastContext ?: runCatching {
-            @Suppress("DEPRECATION")
-            CastContext.getSharedInstance(appContext)
-        }.getOrNull()?.also { cachedCastContext = it }
+    private val castContextLock = Any()
+    @Volatile private var castContextTask: Task<CastContext>? = null
 
-    val castAvailable: Boolean get() = castContext != null
+    /** Starts asynchronous Cast initialization. Safe to call repeatedly from activity lifecycle hooks. */
+    fun initializeCastContext() {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            Handler(Looper.getMainLooper()).post { initializeCastContext() }
+            return
+        }
+        if (cachedCastContext != null) return
+        synchronized(castContextLock) {
+            if (cachedCastContext != null || castContextTask != null) return
+            val task = runCatching {
+                CastContext.getSharedInstance(appContext, ContextCompat.getMainExecutor(appContext))
+            }.getOrElse { error ->
+                logger.w("cast", "Couldn't start asynchronous Cast initialization", error)
+                return
+            }
+            castContextTask = task
+            val mainExecutor = ContextCompat.getMainExecutor(appContext)
+            task.addOnSuccessListener(mainExecutor) { context ->
+                cachedCastContext = context
+                logger.event("cast", "Cast SDK initialized")
+            }.addOnFailureListener(mainExecutor) { error ->
+                synchronized(castContextLock) {
+                    if (castContextTask === task) castContextTask = null
+                }
+                logger.w("cast", "Cast SDK is unavailable", error)
+            }
+        }
+    }
+
+    /**
+     * Wait briefly for the activity-owned initialization task. This is used only for a user-triggered
+     * discovery action; a timeout leaves Cast unavailable for this scan while DLNA remains usable.
+     */
+    suspend fun awaitCastContext(timeoutMillis: Long = CAST_INIT_TIMEOUT_MS): CastContext? =
+        withContext(Dispatchers.Main.immediate) {
+            cachedCastContext ?: run {
+                initializeCastContext()
+                val task = synchronized(castContextLock) { castContextTask } ?: return@run null
+                withTimeoutOrNull(timeoutMillis) {
+                    suspendCancellableCoroutine { continuation ->
+                        val executor = ContextCompat.getMainExecutor(appContext)
+                        task.addOnSuccessListener(executor) { context ->
+                            if (continuation.isActive) continuation.resume(context)
+                        }.addOnFailureListener(executor) {
+                            if (continuation.isActive) continuation.resume(null)
+                        }
+                    }
+                }
+            }
+        }
+
+    /** Safe from any dispatcher: this only reads a completed cached value. */
+    val castAvailable: Boolean get() = cachedCastContext != null
     // Pass a provider (not a captured value) so the controller always sees the current context once
     // Cast becomes available, instead of holding an early null for the whole process lifetime.
-    val castController: CastTargetController by lazy { CastTargetController(appContext, { castContext }, logger) }
+    val castController: CastTargetController by lazy { CastTargetController(appContext, { cachedCastContext }, logger) }
     val dlnaController: DlnaTargetController by lazy { DlnaTargetController(logger, networkInfo, httpClient) }
 
     // ----- on-device hardware transcoding (Media3) -----
@@ -256,7 +312,17 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
     }
 
     private fun engineLaunch(block: suspend () -> Unit) {
-        ioScope.launch { runCatching { block() } }
+        ioScope.launch {
+            try {
+                block()
+            } catch (c: kotlinx.coroutines.CancellationException) {
+                throw c
+            } catch (e: Exception) {
+                // System/notification actions have no Compose caller to surface an error, but they must
+                // remain redacted and diagnosable rather than silently discarding a Cast command failure.
+                logger.w("playback", "Media-session control command failed", e)
+            }
+        }
     }
 
     init {
@@ -351,5 +417,6 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
     private companion object {
         const val KEY_DEVICE_ID = "device_id"
         const val DIAGNOSTICS_FLUSH_INTERVAL_MS = 10_000L
+        const val CAST_INIT_TIMEOUT_MS = 2_000L
     }
 }

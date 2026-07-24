@@ -25,10 +25,8 @@ class AndroidNetworkPermissionManager(context: Context) : NetworkPermissionManag
     private val appContext = context.applicationContext
 
     override fun hasLocalNetworkAccess(): Boolean {
-        // The permission constant exists from the API level that introduced local-network access.
-        // On earlier devices in our minSdk..targetSdk window the platform grants LAN access without
-        // this runtime gate, so treat its absence as "granted" only when the constant is unknown.
-        return isGranted(PERMISSION_ACCESS_LOCAL_NETWORK)
+        // A forward-declared/non-dangerous permission is not a runtime LAN gate on this platform.
+        return !isLocalNetworkRuntimePermission() || isGranted(PERMISSION_ACCESS_LOCAL_NETWORK)
     }
 
     override fun hasNotificationsPermission(): Boolean =
@@ -59,18 +57,25 @@ class AndroidNetworkPermissionManager(context: Context) : NetworkPermissionManag
                 .takeIf { it.resolveActivity(appContext.packageManager) != null }
         }.getOrNull() ?: Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
 
+    /** Directs a denied/revoked LAN user to the app's system permission page. */
+    fun appDetailsSettingsIntent(): Intent =
+        Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${appContext.packageName}"))
+
     override fun localNetworkStatus(): String {
         if (isGranted(PERMISSION_ACCESS_LOCAL_NETWORK)) return "granted"
         // ACCESS_LOCAL_NETWORK is a forward-declared permission for Local Network Protection. Current
         // Android releases don't enforce it (the OS never prompts and LAN access works without it), so a
         // bare "denied" here is misleading. Only report "denied" when the platform actually defines it as
         // a dangerous, runtime-grantable permission on this device; otherwise say it isn't enforced.
-        val isRuntimePermission = runCatching {
-            appContext.packageManager.getPermissionInfo(PERMISSION_ACCESS_LOCAL_NETWORK, 0)
-                .protection == PermissionInfo.PROTECTION_DANGEROUS
-        }.getOrDefault(false)
-        return if (isRuntimePermission) "denied" else "not enforced (Android ${Build.VERSION.RELEASE})"
+        return if (isLocalNetworkRuntimePermission()) "denied" else "not enforced (Android ${Build.VERSION.RELEASE})"
     }
+
+    private fun isLocalNetworkRuntimePermission(): Boolean = runCatching {
+        val protection = appContext.packageManager
+            .getPermissionInfo(PERMISSION_ACCESS_LOCAL_NETWORK, 0)
+            .protection
+        (protection and PermissionInfo.PROTECTION_DANGEROUS) != 0
+    }.getOrDefault(false)
 
     private fun isGranted(permission: String): Boolean =
         ContextCompat.checkSelfPermission(appContext, permission) == PackageManager.PERMISSION_GRANTED

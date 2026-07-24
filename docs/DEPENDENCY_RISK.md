@@ -8,7 +8,7 @@ dependency verification metadata and Gradle Wrapper validation are required.
 
 > Verification status: AGP **9.2.1**, Kotlin **2.4.0**, and Jellyfin SDK **1.8.11 (LGPL-3.0)** were
 > verified directly against Maven Central / official release notes. Compose BOM **2026.06.00** and
-> Cast **22.3.0** could not be resolved in the build sandbox because `dl.google.com` /
+> Cast **22.3.1** could not be resolved in the build sandbox because `dl.google.com` /
 > `maven.google.com` is blocked, and **must be re-verified at the first online build** (flagged in the
 > version catalog and [BUILD.md](BUILD.md)). Pin exact versions and regenerate
 > `gradle/verification-metadata.xml` then.
@@ -23,7 +23,7 @@ dependency verification metadata and Gradle Wrapper validation are required.
 | androidx.core:core-ktx | 1.15.0 ⚠ | google() | Apache-2.0 | Core KTX | Re-verify. |
 | androidx.lifecycle (runtime/viewmodel-compose) | 2.9.0 ⚠ | google() | Apache-2.0 | ViewModel + lifecycle | Re-verify. |
 | androidx.activity:activity-compose | 1.9.3 ⚠ | google() | Apache-2.0 | Compose host activity | Re-verify. |
-| play-services-cast-framework | 22.3.0 ⚠ | google() | Closed-source (Google Play Terms) | Google Cast Sender SDK (§10) | Allowed closed-source exception; needs Google Play services on device; re-verify version. |
+| play-services-cast-framework | 22.3.1 ⚠ | google() | Closed-source (Google Play Terms) | Google Cast Sender SDK (§10) | Allowed closed-source exception; needs Google Play services on device; re-verify version. |
 | org.jellyfin.sdk:jellyfin-core | 1.8.11 | mavenCentral() | **LGPL-3.0** | Jellyfin models/SDK (§8) | Verified on Maven Central. LGPL obligations — see [LICENSES.md](LICENSES.md). Currently the playback path uses the documented HTTP API via OkHttp; SDK retained for models/future. |
 | com.squareup.okhttp3:okhttp | 4.12.0 | mavenCentral() | Apache-2.0 | HTTP client for Jellyfin upstream + proxy upstream fetch | Widely used, maintained. |
 | kotlinx-coroutines-android | 1.9.0 | mavenCentral() | Apache-2.0 | Structured concurrency | Official JetBrains. |

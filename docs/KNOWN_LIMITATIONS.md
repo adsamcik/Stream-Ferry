@@ -11,7 +11,7 @@ unmet item be stated with reasons.
   [BUILD.md](BUILD.md) and [API37_MIGRATION.md](API37_MIGRATION.md).
 - **`gradle/verification-metadata.xml` not generated here** (requires resolving Google Maven). It must
   be produced with `./gradlew --write-verification-metadata sha256 help` at the first online build.
-- **Compose BOM 2026.06.00 and Cast 22.3.0 are web-search-only versions**; re-verify and pin at the
+- **Compose BOM 2026.06.00 and Cast 22.3.1 are web-search-only versions**; re-verify and pin at the
   online build (flagged in the version catalog and [DEPENDENCY_RISK.md](DEPENDENCY_RISK.md)).
 
 ## Hardware-dependent acceptance criteria

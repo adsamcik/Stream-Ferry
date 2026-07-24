@@ -1,5 +1,6 @@
 package com.videobridge.ui
 
+import android.content.Intent
 import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -31,8 +32,6 @@ import com.videobridge.ui.state.QuickConnectUiState
 import com.videobridge.ui.state.Route
 import com.videobridge.BuildConfig
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
@@ -190,7 +189,11 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
         return "Downloading$pct (${mb} MiB)"
     }
 
-    fun navigate(route: Route) = _state.update { it.copy(route = route, errorMessage = null) }
+    fun navigate(route: Route) {
+        val leavingTargetPicker = _state.value.route == Route.TARGET_PICKER && route != Route.TARGET_PICKER
+        _state.update { it.copy(route = route, errorMessage = null) }
+        if (leavingTargetPicker) stopTargetDiscovery()
+    }
 
     fun onWelcomeContinue() {
         if (_state.value.loggedIn) openLibraries() else navigate(Route.SERVER_SETUP)
@@ -614,35 +617,90 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
 
     // ----- targets -----
 
-    fun scanTargets() = viewModelScope.launch {
-        _state.update {
-            it.copy(route = Route.TARGET_PICKER, isScanningTargets = true, errorMessage = null, castAvailable = container.castAvailable)
+    fun scanTargets() {
+        if (!container.permissions.hasLocalNetworkAccess()) {
+            onLocalNetworkPermissionDenied()
+            return
         }
-        val (cast, dlna) = coroutineScope {
-            val castJob = async {
-                runCatching { container.castController.discover(CAST_SCAN_MS) }
-                    .onFailure { container.logger.w("discovery", "Cast discovery failed", it) }
-                    .getOrDefault(emptyList())
+        // The framework MediaRouteButton owns live Cast discovery/route updates. This transaction is for
+        // the adjacent DLNA list only, so it never keeps a second active Cast scan alive in the picker.
+        scanJob?.cancel()
+        scanJob = viewModelScope.launch {
+            try {
+                container.castController.stopDiscovery()
+                _state.update {
+                    it.copy(
+                        route = Route.TARGET_PICKER,
+                        isScanningTargets = true,
+                        errorMessage = null,
+                        castAvailable = container.castAvailable,
+                        localNetworkPermissionGranted = true,
+                    )
+                }
+                // Cast module initialization is activity-owned and asynchronous. Its result controls the
+                // framework button; discovery itself is owned by that button rather than this snapshot.
+                val castReady = container.awaitCastContext() != null
+                val dlnaResult = try {
+                    Result.success(container.dlnaController.discover(DLNA_SCAN_MS))
+                } catch (c: CancellationException) {
+                    throw c
+                } catch (e: Exception) {
+                    Result.failure(e)
+                }
+                dlnaResult.exceptionOrNull()?.let { container.logger.w("discovery", "DLNA discovery failed", it) }
+                val dlna = dlnaResult.getOrDefault(emptyList())
+                val scanError = if (dlnaResult.isFailure) {
+                    "Couldn't scan for DLNA devices. You can still select a Cast device."
+                } else null
+                _state.update { current ->
+                    current.copy(
+                        castAvailable = castReady,
+                        castTargets = emptyList(),
+                        dlnaTargets = dlna,
+                        // Cast selection is framework-owned. Only invalidate a vanished DLNA snapshot.
+                        selectedTarget = current.selectedTarget?.takeIf { selected ->
+                            selected.protocol == Protocol.CAST ||
+                                dlna.any { it.protocol == selected.protocol && it.id == selected.id }
+                        },
+                        isScanningTargets = false,
+                        errorMessage = scanError,
+                    )
+                }
+            } catch (c: CancellationException) {
+                throw c
+            } catch (e: Exception) {
+                container.logger.w("discovery", "Target scan couldn't start", e)
+                _state.update {
+                    it.copy(
+                        isScanningTargets = false,
+                        errorMessage = "Couldn't start device discovery. Check local-network access and try again.",
+                    )
+                }
             }
-            val dlnaJob = async {
-                runCatching { container.dlnaController.discover(DLNA_SCAN_MS) }
-                    .onFailure { container.logger.w("discovery", "DLNA discovery failed", it) }
-                    .getOrDefault(emptyList())
-            }
-            castJob.await() to dlnaJob.await()
         }
-        _state.update { it.copy(castTargets = cast, dlnaTargets = dlna, isScanningTargets = false) }
-    }.also { scanJob = it }
+    }
 
     fun selectTarget(target: DiscoveredTarget) = _state.update { it.copy(selectedTarget = target) }
 
     fun play() = viewModelScope.launch {
+        if (!container.permissions.hasLocalNetworkAccess()) {
+            onLocalNetworkPermissionDenied()
+            return@launch
+        }
         // A fresh, user-initiated play supersedes any in-flight auto-reconnect.
         cancelReconnect()
         // Stop any in-flight device scan and its progress spinner (an infinite Compose animation) BEFORE
         // we foreground the proxy service — a still-animating picker would keep posting main-thread frames
         // and could starve the service's onStartCommand, blowing the startForegroundService() deadline.
         scanJob?.cancel()
+        scanJob = null
+        try {
+            container.castController.stopDiscovery()
+        } catch (c: CancellationException) {
+            throw c
+        } catch (e: Exception) {
+            container.logger.w("discovery", "Couldn't stop Cast discovery before playback", e)
+        }
         if (_state.value.isScanningTargets) _state.update { it.copy(isScanningTargets = false) }
         reconnectContext = null
         currentResumeKey = null
@@ -814,18 +872,61 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
     /** Clear any pending offline-cast selection (used when starting a normal online cast). */
     fun clearDownloadSelection() = _state.update { it.copy(selectedDownloadId = null) }
 
-    fun togglePlayPause() = viewModelScope.launch { runCatching { container.playbackEngine.togglePlayPause() } }
-
-    fun seekTo(positionSeconds: Long) = viewModelScope.launch {
-        // An HLS seek re-resolves PlaybackInfo, so an expired token surfaces here — recover instead of
-        // silently no-op'ing the scrubber.
-        runCatching { container.playbackEngine.seekTo(positionSeconds) }
-            .onFailure { e -> if (isSessionExpired(e)) handleSessionExpired() }
+    fun togglePlayPause() = viewModelScope.launch {
+        try {
+            container.playbackEngine.togglePlayPause()
+        } catch (c: CancellationException) {
+            throw c
+        } catch (e: Exception) {
+            handlePlaybackControlFailure("change playback", e)
+        }
     }
 
-    fun adjustVolume(direction: Int) = viewModelScope.launch { runCatching { container.playbackEngine.adjustVolume(direction) } }
+    fun seekTo(positionSeconds: Long) = viewModelScope.launch {
+        try {
+            container.playbackEngine.seekTo(positionSeconds)
+        } catch (c: CancellationException) {
+            throw c
+        } catch (e: Exception) {
+            handlePlaybackControlFailure("seek", e)
+        }
+    }
 
-    fun setVolume(level: Float) = viewModelScope.launch { runCatching { container.playbackEngine.setVolume(level) } }
+    fun adjustVolume(direction: Int) = viewModelScope.launch {
+        try {
+            container.playbackEngine.adjustVolume(direction)
+        } catch (c: CancellationException) {
+            throw c
+        } catch (e: Exception) {
+            handlePlaybackControlFailure("change volume", e)
+        }
+    }
+
+    fun setVolume(level: Float) = viewModelScope.launch {
+        try {
+            container.playbackEngine.setVolume(level)
+        } catch (c: CancellationException) {
+            throw c
+        } catch (e: Exception) {
+            handlePlaybackControlFailure("change volume", e)
+        }
+    }
+
+    /** Surface sender-command failures instead of leaving an optimistic TV control state on screen. */
+    private fun handlePlaybackControlFailure(operation: String, error: Exception) {
+        if (isSessionExpired(error)) {
+            handleSessionExpired()
+            return
+        }
+        container.logger.w("playback", "Couldn't $operation on the TV", error)
+        val message = "Couldn't $operation on the TV. Please try again."
+        _state.update { current ->
+            current.copy(
+                errorMessage = message,
+                playback = current.playback?.copy(errorMessage = message),
+            )
+        }
+    }
 
     /** Switch the audio track (null = server default). Re-resolves the stream, so recover an expired token. */
     fun selectAudioTrack(index: Int?) = viewModelScope.launch {
@@ -1001,6 +1102,22 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
         reconnecting = false
     }
 
+
+    /** Ends active Cast route scanning when the picker is no longer able to use its result. */
+    private fun stopTargetDiscovery() {
+        scanJob?.cancel()
+        scanJob = null
+        if (_state.value.isScanningTargets) _state.update { it.copy(isScanningTargets = false) }
+        viewModelScope.launch {
+            try {
+                container.castController.stopDiscovery()
+            } catch (c: CancellationException) {
+                throw c
+            } catch (e: Exception) {
+                container.logger.w("discovery", "Couldn't stop Cast discovery", e)
+            }
+        }
+    }
     /** Throttled persist of the current local-file playback position ("where you left off"). */
     private fun saveResumeThrottled(positionSeconds: Long) {
         val key = currentResumeKey ?: return
@@ -1114,8 +1231,49 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
 
     // ----- permissions / diagnostics / data -----
 
-    fun onLocalNetworkPermissionResult(granted: Boolean) = _state.update {
-        it.copy(localNetworkPermissionGranted = granted)
+    fun onLocalNetworkPermissionResult(granted: Boolean) {
+        val wasGranted = _state.value.localNetworkPermissionGranted
+        _state.update { it.copy(localNetworkPermissionGranted = granted) }
+        // A settings-driven revocation must be a real teardown, not an empty device list or a background
+        // retry. Keep a non-playback route in place unless the revoked permission was actively in use.
+        if (wasGranted && !granted) {
+            revokeLocalNetworkAccess(moveToTargetPicker = _state.value.route == Route.PLAYBACK)
+        }
+    }
+
+    /** Called after a user denies the playback request, so the picker can explain the next safe action. */
+    fun onLocalNetworkPermissionDenied() = revokeLocalNetworkAccess(moveToTargetPicker = true)
+
+    /** Lets the picker send the user to the app-scoped system permission page without exposing Context to UI. */
+    fun localNetworkPermissionSettingsIntent(): Intent = container.permissions.appDetailsSettingsIntent()
+
+    private fun revokeLocalNetworkAccess(moveToTargetPicker: Boolean) {
+        stopTargetDiscovery()
+        cancelReconnect()
+        reconnectContext = null
+        saveResumeNow()
+        _state.update { current ->
+            current.copy(
+                route = if (moveToTargetPicker) Route.TARGET_PICKER else current.route,
+                localNetworkPermissionGranted = false,
+                castTargets = emptyList(),
+                dlnaTargets = emptyList(),
+                selectedTarget = null,
+                playback = null,
+                isScanningTargets = false,
+                errorMessage = "Local-network access is required to find a TV or stream to it. Enable it in App settings and try again.",
+            )
+        }
+        viewModelScope.launch {
+            try {
+                // PlaybackEngine.stop revokes the proxy session and releases foreground-service locks.
+                container.playbackEngine.stop()
+            } catch (c: CancellationException) {
+                throw c
+            } catch (e: Exception) {
+                container.logger.w("permission", "Couldn't stop playback after local-network access was lost", e)
+            }
+        }
     }
 
     fun refreshDiagnostics() = viewModelScope.launch {
@@ -1278,7 +1436,6 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
     }
 
     private companion object {
-        const val CAST_SCAN_MS = 5_000L
         const val DLNA_SCAN_MS = 4_000L
         const val QUICK_CONNECT_POLL_MS = 3_000L
         const val LIBRARY_ERROR = "Couldn't load your library. Check the connection and try again."

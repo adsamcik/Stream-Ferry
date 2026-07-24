@@ -8,49 +8,67 @@ import kotlin.test.assertTrue
 
 /**
  * Verifies the foreground barrier that closes the `ForegroundServiceDidNotStartInTimeException` race:
- * the playback engine arms the latch just before `startForegroundService()` and blocks on [await] until
- * the service reports it has called `startForeground()`, only then starting the main-thread-saturating
- * renderer handshake. (Runs on virtual time — the "timeout" cases never wait in real wall-clock.)
+ * each service-start request carries a unique token, and only its own `startForeground()` confirmation can
+ * release the engine to begin the renderer handshake. (Runs on virtual time.)
  */
 class ProxyForegroundLatchTest {
 
     @Test
-    fun awaitReturnsTrueOnceForegrounded() = runTest {
-        ProxyForegroundLatch.arm()
-        ProxyForegroundLatch.signalForegrounded()
-        assertTrue(ProxyForegroundLatch.await(1_000), "await should succeed once startForeground() signalled")
+    fun awaitReturnsTrueOnceMatchingRequestForegrounds() = runTest {
+        val token = ProxyForegroundLatch.arm()
+        ProxyForegroundLatch.signalForegrounded(token)
+        assertTrue(ProxyForegroundLatch.await(token, 1_000), "await should succeed once startForeground() signalled")
     }
 
     @Test
     fun awaitTimesOutWhenNeverForegrounded() = runTest {
-        ProxyForegroundLatch.arm()
-        assertFalse(ProxyForegroundLatch.await(1_000), "await should time out (false) if the service never foregrounds")
+        val token = ProxyForegroundLatch.arm()
+        assertFalse(ProxyForegroundLatch.await(token, 1_000), "await should time out if the service never foregrounds")
     }
 
     @Test
-    fun signalIsIdempotent() = runTest {
-        ProxyForegroundLatch.arm()
-        ProxyForegroundLatch.signalForegrounded()
-        ProxyForegroundLatch.signalForegrounded() // a second, redundant signal must not throw
-        assertTrue(ProxyForegroundLatch.await(1_000))
+    fun signalIsIdempotentForTheSameRequest() = runTest {
+        val token = ProxyForegroundLatch.arm()
+        ProxyForegroundLatch.signalForegrounded(token)
+        ProxyForegroundLatch.signalForegrounded(token) // a redundant signal must not throw
+        assertTrue(ProxyForegroundLatch.await(token, 1_000))
     }
 
     @Test
-    fun reArmingResetsTheLatch() = runTest {
-        ProxyForegroundLatch.arm()
-        ProxyForegroundLatch.signalForegrounded()
-        assertTrue(ProxyForegroundLatch.await(1_000))
+    fun reArmingSupersedesThePreviousRequest() = runTest {
+        val oldToken = ProxyForegroundLatch.arm()
+        ProxyForegroundLatch.signalForegrounded(oldToken)
+        assertTrue(ProxyForegroundLatch.await(oldToken, 1_000))
 
-        // A fresh start must not be considered already-foregrounded by a stale completion.
-        ProxyForegroundLatch.arm()
-        assertFalse(ProxyForegroundLatch.await(1_000), "re-arm must supersede the previous (completed) latch")
+        val currentToken = ProxyForegroundLatch.arm()
+        assertFalse(ProxyForegroundLatch.await(currentToken, 1_000), "a fresh start must not inherit a prior completion")
+    }
+
+    @Test
+    fun staleServiceDeliveryCannotConfirmANewerRequest() = runTest {
+        val staleToken = ProxyForegroundLatch.arm()
+        val currentToken = ProxyForegroundLatch.arm()
+        ProxyForegroundLatch.signalForegrounded(staleToken)
+
+        assertFalse(
+            ProxyForegroundLatch.await(currentToken, 1_000),
+            "a late onStartCommand from an earlier start must not release the current request",
+        )
     }
 
     @Test
     fun signalArrivingWhileAwaitingUnblocksIt() = runTest {
-        ProxyForegroundLatch.arm()
-        val awaiting = async { ProxyForegroundLatch.await(10_000) }
-        ProxyForegroundLatch.signalForegrounded()
-        assertTrue(awaiting.await(), "a waiter must be released when the service foregrounds")
+        val token = ProxyForegroundLatch.arm()
+        val awaiting = async { ProxyForegroundLatch.await(token, 10_000) }
+        ProxyForegroundLatch.signalForegrounded(token)
+        assertTrue(awaiting.await(), "a waiter must be released when the matching service start foregrounds")
+    }
+
+    @Test
+    fun cancellingRequestRejectsLaterSignal() = runTest {
+        val token = ProxyForegroundLatch.arm()
+        ProxyForegroundLatch.cancel(token)
+        ProxyForegroundLatch.signalForegrounded(token)
+        assertFalse(ProxyForegroundLatch.await(token, 1_000))
     }
 }

@@ -14,6 +14,7 @@ import android.media.session.PlaybackState
 import android.os.Handler
 import android.os.Looper
 import com.videobridge.R
+import com.videobridge.core.metadata.MetadataSanitizer
 import com.videobridge.playback.proxy.ProxyPlaybackService
 
 /**
@@ -88,9 +89,10 @@ class MediaSessionController(
         }
         ensureChannel()
         session.isActive = true
+        val title = MetadataSanitizer.receiverTitle(status.title)
         session.setMetadata(
             MediaMetadata.Builder()
-                .putString(MediaMetadata.METADATA_KEY_TITLE, status.title.ifBlank { "Video Bridge" })
+                .putString(MediaMetadata.METADATA_KEY_TITLE, title)
                 .putString(MediaMetadata.METADATA_KEY_ARTIST, "${status.targetName} · ${status.protocolName}")
                 .putLong(MediaMetadata.METADATA_KEY_DURATION, (status.durationSeconds ?: 0L) * 1000)
                 .build(),
@@ -102,7 +104,7 @@ class MediaSessionController(
         }
         session.setPlaybackState(stateOf(playerState, status.positionSeconds * 1000, status.isPlaying))
         lastNotification = buildNotification(
-            title = status.title.ifBlank { "Video Bridge" },
+            title = title,
             text = "${status.targetName} · ${if (status.isBuffering) "buffering" else if (status.isPlaying) "playing" else "paused"}",
             playing = status.isPlaying,
         )
@@ -155,7 +157,8 @@ class MediaSessionController(
             .setContentText(text)
             .setSmallIcon(android.R.drawable.stat_sys_upload)
             .setOngoing(playing)
-            .setVisibility(Notification.VISIBILITY_PUBLIC)
+            // Keep server-provided title metadata off a locked device while preserving transport controls.
+            .setVisibility(Notification.VISIBILITY_PRIVATE)
             .setStyle(style)
             .addAction(action(android.R.drawable.ic_media_rew, "Rewind", ACTION_RWND))
             .addAction(playPause)

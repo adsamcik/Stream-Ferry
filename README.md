@@ -40,10 +40,12 @@ Implemented end-to-end:
   rebuffering). See [docs/ADAPTIVE_BITRATE.md](docs/ADAPTIVE_BITRATE.md).
 - **Autoplay next episode** — when a Jellyfin TV episode finishes, the next episode in the series
   (across season boundaries) starts automatically on the same TV. On by default; toggle in **Settings**.
-- **Correct-format playback** — an accurate per-target Jellyfin `DeviceProfile` makes the server
-  transcode incompatible sources (HEVC, AC3, MKV, HDR, …) to a format the renderer can play: HLS
-  H.264/AAC for Cast (playlist + segments proxied so the token never reaches the TV) or progressive
-  MPEG-TS for DLNA. See [docs/STREAM_SELECTION.md](docs/STREAM_SELECTION.md).
+- **Correct-format playback** — Cast first makes a broad direct-play attempt when original quality is
+  enabled, then retries with the conservative H.264/AAC profile only after explicit decode or
+  unsupported-source evidence. Qualified failures are remembered per renderer and media format; generic
+  network/proxy failures are not. DLNA uses its own profile and progressive MPEG-TS fallback. Every
+  receiver URL remains phone-proxied, so the Jellyfin token never reaches the TV. See
+  [docs/STREAM_SELECTION.md](docs/STREAM_SELECTION.md).
 - **Optional offline downloads + library cache** — download a title's original file to app-private
   storage and cast it to a TV later **without the server** (the proxy serves the local file); the
   library listing is cached so browsing works offline. Both are opt-in, app-private, and removed by

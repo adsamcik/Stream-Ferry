@@ -64,6 +64,7 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
@@ -71,6 +72,7 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -81,6 +83,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -88,9 +91,15 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
+import androidx.mediarouter.app.MediaRouteButton
+import androidx.mediarouter.media.MediaRouteSelector
+import androidx.mediarouter.media.MediaRouter
 import coil.compose.AsyncImage
+import com.google.android.gms.cast.CastMediaControlIntent
+import com.google.android.gms.cast.framework.CastButtonFactory
 import com.videobridge.core.adaptive.QualityMenu
 import com.videobridge.core.chapter.chapterIndexForPosition
 import com.videobridge.core.stream.Protocol
@@ -108,6 +117,7 @@ import kotlin.math.sin
 
 @Composable
 fun TargetPickerScreen(state: AppUiState, viewModel: MainViewModel, onRescan: () -> Unit) {
+    val context = LocalContext.current
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
             OutlinedButton(onClick = onRescan, enabled = !state.isScanningTargets) {
@@ -119,11 +129,37 @@ fun TargetPickerScreen(state: AppUiState, viewModel: MainViewModel, onRescan: ()
             }
         }
 
-        Text("Cast (preferred)", style = MaterialTheme.typography.titleMedium)
+        if (!state.localNetworkPermissionGranted) {
+            Text(
+                "Local-network access is required before a TV can fetch the phone-hosted stream.",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            OutlinedButton(
+                onClick = {
+                    runCatching { context.startActivity(viewModel.localNetworkPermissionSettingsIntent()) }
+                },
+            ) {
+                Text("Open app settings")
+            }
+        }
+
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Cast (preferred)", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+            if (state.castAvailable && state.localNetworkPermissionGranted) {
+                FrameworkCastRouteButton(onSelect = viewModel::selectTarget)
+            }
+        }
         if (!state.castAvailable) {
             Text("Google Cast is unavailable on this device.")
+        } else if (!state.localNetworkPermissionGranted) {
+            Text("Grant local-network access to choose a Cast device.", style = MaterialTheme.typography.bodyMedium)
         } else {
-            TargetGroup(state.castTargets, state.selectedTarget, "No Cast devices found yet.") { viewModel.selectTarget(it) }
+            val selectedCast = state.selectedTarget?.takeIf { it.protocol == Protocol.CAST }
+            if (selectedCast != null) {
+                Text("Selected Cast device: ${selectedCast.displayName}", style = MaterialTheme.typography.bodyMedium)
+            } else {
+                Text("Use the Cast button to choose a device.", style = MaterialTheme.typography.bodyMedium)
+            }
         }
 
         Text("DLNA / Smart TV (best effort)", style = MaterialTheme.typography.titleMedium)
@@ -136,12 +172,86 @@ fun TargetPickerScreen(state: AppUiState, viewModel: MainViewModel, onRescan: ()
             // Don't block playback to an already-listed target while a (background) rescan is still
             // running — the target list and selection persist across the scan, so a previously
             // discovered TV is connectable immediately.
-            enabled = state.selectedTarget != null,
+            enabled = state.selectedTarget != null && state.localNetworkPermissionGranted,
             modifier = Modifier.padding(top = 8.dp),
         ) {
             Text("Play to ${state.selectedTarget?.displayName ?: "selected TV"}")
         }
     }
+}
+
+/**
+ * The framework-owned Cast chooser. It provides the connected-device affordance and owns route
+ * discovery/transfer semantics; the surrounding picker remains responsible for DLNA selection.
+ *
+ * A chosen route is mirrored into the app's existing target state, so tapping Play uses the exact
+ * route the Cast framework selected rather than a stale custom-picker row.
+ */
+
+/** Safe policy baseline used only to turn the framework-selected route into the existing app target model. */
+private val FRAMEWORK_CAST_BASELINE = TargetCapabilities(
+    protocol = Protocol.CAST,
+    supportedContainers = setOf("mp4"),
+    supportedVideoCodecs = setOf("h264"),
+    supportedAudioCodecs = setOf("aac", "mp3"),
+    supportsHevc = false,
+    supports10Bit = false,
+    supportsHls = true,
+    supportedExternalSubtitleFormats = setOf("vtt"),
+)
+
+@Composable
+private fun FrameworkCastRouteButton(
+    onSelect: (DiscoveredTarget) -> Unit,
+) {
+    val context = LocalContext.current
+    val latestOnSelect by rememberUpdatedState(onSelect)
+    val selector = remember {
+        MediaRouteSelector.Builder()
+            .addControlCategory(
+                CastMediaControlIntent.categoryForCast(
+                    CastMediaControlIntent.DEFAULT_MEDIA_RECEIVER_APPLICATION_ID,
+                ),
+            )
+            .build()
+    }
+
+    // This is a passive callback: active scanning is owned by the framework button while its chooser
+    // is visible, rather than keeping a power-expensive scan alive for the whole playback lifetime.
+    DisposableEffect(context, selector) {
+        val router = MediaRouter.getInstance(context)
+        val callback = object : MediaRouter.Callback() {
+            override fun onRouteSelected(
+                router: MediaRouter,
+                route: MediaRouter.RouteInfo,
+                reason: Int,
+            ) {
+                // The framework route is authoritative. Constructing the selection from this callback
+                // avoids depending on a delayed custom discovery snapshot that may already be stale.
+                latestOnSelect(
+                    DiscoveredTarget(
+                        id = route.id,
+                        displayName = route.name,
+                        protocol = Protocol.CAST,
+                        capabilities = FRAMEWORK_CAST_BASELINE.copy(modelName = route.description),
+                        lastTestedStatus = null,
+                    ),
+                )
+            }
+        }
+        router.addCallback(selector, callback)
+        onDispose { router.removeCallback(callback) }
+    }
+
+    AndroidView(
+        factory = { viewContext ->
+            MediaRouteButton(viewContext).also { button ->
+                CastButtonFactory.setUpMediaRouteButton(viewContext.applicationContext, viewContext.mainExecutor, button)
+                button.contentDescription = "Choose Cast device"
+            }
+        },
+        modifier = Modifier.size(48.dp),
+    )
 }
 
 @Composable

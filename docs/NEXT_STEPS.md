@@ -19,9 +19,10 @@ Ordered follow-ups to take the MVP scaffold to a fully verified product.
    and whole-library paging (`core.resilience.LibraryPagingPolicy`) are implemented and pure-JVM
    unit-tested. See [RESILIENCE.md](RESILIENCE.md). Still TODO here: rolling-prebuffer/memory-pressure
    integration and on-device socket/seek validation.)*
-6. **Validate HLS end-to-end** against a transcoding server. *(Implemented: accurate per-target
-   DeviceProfiles drive server-side transcode — HLS for Cast, progressive MPEG-TS for DLNA — and the
-   proxy rewrites HLS playlists + proxies segments so the token never reaches the TV
+6. **Validate HLS end-to-end** against a transcoding server. *(Implemented: Cast first attempts broad
+   direct play and falls back to H.264/AAC only after qualified decode evidence; DLNA uses a separate
+   profile and progressive MPEG-TS fallback. The proxy rewrites HLS playlists + proxies segments so the
+   token never reaches the TV
    (`core.hls.HlsSegmentRegistry` + `HlsRewriter`, unit-tested). Still TODO: validate playlist
    refresh / segment streaming / seek on real Cast + DLNA hardware against a transcoding server, and
    per-renderer capability probing via DLNA `GetProtocolInfo`.)*

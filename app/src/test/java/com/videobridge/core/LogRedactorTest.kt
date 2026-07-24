@@ -42,4 +42,12 @@ class LogRedactorTest {
     @Test fun masksToken() {
         assertFalse(LogRedactor.mask("supersecret").contains("supersecret"))
     }
+
+    @Test fun normalizesControlCharactersAndBoundsUntrustedLogText() {
+        val out = LogRedactor.redact("title\u0000\nwith\tcontrols")
+        assertEquals("title with controls", out)
+
+        val long = LogRedactor.redact("x".repeat(20_000))
+        assertEquals(8 * 1024, long.toByteArray(Charsets.UTF_8).size)
+    }
 }

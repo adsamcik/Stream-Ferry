@@ -27,7 +27,7 @@ These were resolved from official release notes / web search but **could not be 
 confirm here:
 
 - Compose BOM `2026.06.00`
-- `play-services-cast-framework 22.3.0`
+- `play-services-cast-framework 22.3.1`
 - AndroidX `core-ktx`, `lifecycle`, `activity-compose`
 
 Confirmed against Maven Central directly: AGP `9.2.1`, Kotlin `2.4.0`, Jellyfin SDK `1.8.11`

@@ -16,8 +16,24 @@ import com.videobridge.app.JellyfinBridgeApplication
 import com.videobridge.app.startForegroundCompat
 import com.videobridge.logging.DiagnosticsLogger
 import com.videobridge.playback.MediaSessionController
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.withTimeoutOrNull
+
+/** Which Android service-start API accepted a foreground-service request. */
+enum class ProxyForegroundStartPath {
+    START_SERVICE,
+    START_FOREGROUND_SERVICE,
+}
+
+/**
+ * Result of requesting the proxy foreground service. This only says Android accepted the request;
+ * [ProxyForegroundLatch] separately confirms the service actually entered the foreground.
+ */
+sealed interface ProxyForegroundStartRequestResult {
+    data class Requested(val path: ProxyForegroundStartPath) : ProxyForegroundStartRequestResult
+    data class Rejected(val cause: Exception) : ProxyForegroundStartRequestResult
+}
 
 /**
  * Foreground service that keeps the in-RAM proxy + active stream alive ONLY during user-visible
@@ -48,7 +64,9 @@ class ProxyPlaybackService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_START -> startForegroundPlayback()
+            ACTION_START -> startForegroundPlayback(
+                intent?.getLongExtra(EXTRA_FOREGROUND_LATCH_TOKEN, NO_FOREGROUND_LATCH_TOKEN) ?: NO_FOREGROUND_LATCH_TOKEN,
+            )
             ACTION_STOP -> stopSelfSafely()
             MediaSessionController.ACTION_PLAY,
             MediaSessionController.ACTION_PAUSE,
@@ -68,7 +86,7 @@ class ProxyPlaybackService : Service() {
         return START_NOT_STICKY
     }
 
-    private fun startForegroundPlayback() {
+    private fun startForegroundPlayback(foregroundLatchToken: Long) {
         // The system gives a service started with startForegroundService() only a few seconds to call
         // startForeground(). On a real Cast/DLNA connection the main thread is busy with the SDK
         // handshake, so do the cheapest possible thing FIRST: foreground with a dependency-free
@@ -76,7 +94,7 @@ class ProxyPlaybackService : Service() {
         // builds a MediaSession + a full MediaStyle notification). Only THEN upgrade to the rich
         // playback-controls notification. Missing this deadline crashed on some devices (e.g. Galaxy
         // S24 / Android 16) with ForegroundServiceDidNotStartInTimeException.
-        enterForeground(fallbackNotification())
+        enterForeground(fallbackNotification(), foregroundLatchToken)
         logForegroundLatency()
         val c = controller ?: run { stopSelfSafely(); return } // nothing to keep alive
         acquireLocks()
@@ -101,11 +119,16 @@ class ProxyPlaybackService : Service() {
         else logger?.d(TAG, msg)
     }
 
-    private fun enterForeground(notification: Notification) {
+    private fun enterForeground(
+        notification: Notification,
+        foregroundLatchToken: Long = NO_FOREGROUND_LATCH_TOKEN,
+    ) {
         startForegroundCompat(MediaSessionController.NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
         // Release the playback engine, which armed this latch and is deliberately blocked BEFORE the
         // (main-thread-saturating) renderer handshake until the startForegroundService() obligation is met.
-        ProxyForegroundLatch.signalForegrounded()
+        if (foregroundLatchToken != NO_FOREGROUND_LATCH_TOKEN) {
+            ProxyForegroundLatch.signalForegrounded(foregroundLatchToken)
+        }
     }
 
     /** Cheap, dependency-free notification used to enter the foreground within the deadline (then upgraded). */
@@ -180,6 +203,8 @@ class ProxyPlaybackService : Service() {
         private const val TAG = "ProxyPlaybackService"
         const val ACTION_START = "com.videobridge.action.START"
         const val ACTION_STOP = "com.videobridge.action.STOP"
+        private const val EXTRA_FOREGROUND_LATCH_TOKEN = "com.videobridge.extra.FOREGROUND_LATCH_TOKEN"
+        private const val NO_FOREGROUND_LATCH_TOKEN = -1L
 
         /** Foreground-latency (ms) at/above which we surface a near-miss warning in the exported diagnostics. */
         private const val FOREGROUND_LATENCY_WARN_MS = 2_000L
@@ -190,8 +215,13 @@ class ProxyPlaybackService : Service() {
         /** Whether the last [start] fell back to the deadline-bound startForegroundService() (app backgrounded). */
         @Volatile private var startedFromBackground: Boolean = false
 
-        fun start(context: Context) {
-            val i = Intent(context, ProxyPlaybackService::class.java).setAction(ACTION_START)
+        fun start(
+            context: Context,
+            foregroundLatchToken: Long,
+        ): ProxyForegroundStartRequestResult {
+            val i = Intent(context, ProxyPlaybackService::class.java)
+                .setAction(ACTION_START)
+                .putExtra(EXTRA_FOREGROUND_LATCH_TOKEN, foregroundLatchToken)
             startRequestedElapsedMs = SystemClock.elapsedRealtime()
             val logger = (context.applicationContext as? JellyfinBridgeApplication)?.container?.logger
             // Prefer a plain startService(): when the app is in the foreground (always true for a
@@ -200,18 +230,42 @@ class ProxyPlaybackService : Service() {
             // up — no ForegroundServiceDidNotStartInTimeException even if the main thread is briefly busy.
             // Fall back to startForegroundService() only when the app is backgrounded (e.g. a screen-off
             // auto-reconnect), where startService() is disallowed; there the deadline applies and the
-            // engine's foreground barrier (awaitForegrounded) plus onStartCommand-foregrounds-first keep us
+            // engine's foreground barrier (startAndAwaitForegrounded) plus onStartCommand-foregrounds-first keep us
             // inside it. See docs/PROXY_DESIGN.md.
-            try {
-                context.startService(i)
+            val initialFailure = try {
+                checkNotNull(context.startService(i)) { "Android did not accept proxy service start" }
+                null
+            } catch (e: Exception) {
+                e
+            }
+            if (initialFailure == null) {
                 startedFromBackground = false
                 logger?.d(TAG, "Proxy FGS start via startService() (app foreground; no start-in-time deadline)")
+                return ProxyForegroundStartRequestResult.Requested(ProxyForegroundStartPath.START_SERVICE)
+            }
+
+            // BackgroundServiceStartNotAllowedException (API 31+) / IllegalStateException: app is in the
+            // background — must use the deadline-bound foreground-service start instead. Unlike the old
+            // best-effort path, failure here is returned to the engine and aborts playback before a proxy
+            // session or renderer load can be created.
+            logger?.w(
+                "playback",
+                "Proxy FGS start fell back to startForegroundService() (app backgrounded; ~5s deadline applies)",
+                initialFailure,
+            )
+            val fallbackFailure = try {
+                checkNotNull(context.startForegroundService(i)) { "Android did not accept proxy foreground-service start" }
+                null
             } catch (e: Exception) {
-                // BackgroundServiceStartNotAllowedException (API 31+) / IllegalStateException: app is in
-                // the background — must use the deadline-bound foreground-service start instead.
+                e
+            }
+            return if (fallbackFailure == null) {
                 startedFromBackground = true
-                logger?.w("playback", "Proxy FGS start fell back to startForegroundService() (app backgrounded; ~5s deadline applies)")
-                runCatching { context.startForegroundService(i) }
+                ProxyForegroundStartRequestResult.Requested(ProxyForegroundStartPath.START_FOREGROUND_SERVICE)
+            } else {
+                startedFromBackground = false
+                logger?.e("playback", "Proxy foreground-service start was rejected; playback will not continue", fallbackFailure)
+                ProxyForegroundStartRequestResult.Rejected(fallbackFailure)
             }
         }
 
@@ -233,17 +287,38 @@ class ProxyPlaybackService : Service() {
  * handshake is then free to saturate the main thread. See docs/PROXY_DESIGN.md.
  */
 internal object ProxyForegroundLatch {
-    @Volatile private var signal: CompletableDeferred<Unit>? = null
+    private data class Pending(val token: Long, val signal: CompletableDeferred<Unit>)
 
-    /** Arm a fresh latch just before `startForegroundService()`; supersedes any previous one. */
-    fun arm() { signal = CompletableDeferred() }
+    private val lock = Any()
+    private val nextToken = AtomicLong(0L)
+    private var pending: Pending? = null
 
-    /** Called by the service the instant `startForeground()` has run (idempotent; safe to call again). */
-    fun signalForegrounded() { signal?.complete(Unit) }
+    /** Arm a fresh latch and return its token; supersedes any previous pending confirmation. */
+    fun arm(): Long = synchronized(lock) {
+        val token = nextToken.incrementAndGet()
+        pending = Pending(token, CompletableDeferred())
+        token
+    }
 
-    /** Suspend until the service foregrounds or [timeoutMs] elapses; true if it foregrounded in time. */
-    suspend fun await(timeoutMs: Long): Boolean {
-        val s = signal ?: return true
-        return withTimeoutOrNull(timeoutMs) { s.await() } != null
+    /**
+     * Called by the service the instant `startForeground()` has run. Only the matching start request can
+     * complete the barrier, which prevents a delayed delivery from an older service start from confirming
+     * a newer playback attempt.
+     */
+    fun signalForegrounded(token: Long) {
+        synchronized(lock) { pending?.takeIf { it.token == token }?.signal?.complete(Unit) }
+    }
+
+    /** Stop accepting a confirmation for [token]. Safe after a success, timeout, or cancellation. */
+    fun cancel(token: Long) {
+        synchronized(lock) {
+            if (pending?.token == token) pending = null
+        }
+    }
+
+    /** Suspend until the matching service start foregrounds or [timeoutMs] elapses. */
+    suspend fun await(token: Long, timeoutMs: Long): Boolean {
+        val signal = synchronized(lock) { pending?.takeIf { it.token == token }?.signal } ?: return false
+        return withTimeoutOrNull(timeoutMs) { signal.await() } != null
     }
 }

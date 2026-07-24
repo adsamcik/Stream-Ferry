@@ -265,8 +265,17 @@ sealed interface PlaybackTargetEvent {
     data class StatusChanged(val positionSeconds: Long, val isPlaying: Boolean) : PlaybackTargetEvent
     /** The renderer started/stopped rebuffering (a stall). Feeds the adaptive-bitrate controller. */
     data class BufferingChanged(val isBuffering: Boolean) : PlaybackTargetEvent
-    /** The renderer reported a playback failure. [kind] drives recovery (see PlaybackRecovery). */
-    data class Error(val kind: PlaybackFailureKind, val redactedMessage: String) : PlaybackTargetEvent
+    /**
+     * The renderer reported a playback failure. [kind] drives recovery (see PlaybackRecovery).
+     * [qualifiedFormatEvidence] is true only when the renderer supplied an explicit decode or
+     * unsupported-source signal. It prevents an ambiguous transport/startup failure from being
+     * remembered as a permanent "this container needs transcoding" capability rule.
+     */
+    data class Error(
+        val kind: PlaybackFailureKind,
+        val redactedMessage: String,
+        val qualifiedFormatEvidence: Boolean = false,
+    ) : PlaybackTargetEvent
     data object Ended : PlaybackTargetEvent
     data object Disconnected : PlaybackTargetEvent
 }
