@@ -147,10 +147,6 @@ fun AppRoot(state: AppUiState, viewModel: MainViewModel, onScanDevices: () -> Un
                     onPreferredAudioLanguageChange = { viewModel.setPreferredAudioLanguage(it) },
                     preferredSubtitleLanguage = viewModel.preferredSubtitleLanguage,
                     onPreferredSubtitleLanguageChange = { viewModel.setPreferredSubtitleLanguage(it) },
-                    transcodeOnlineOnDevice = viewModel.transcodeOnlineOnDevice,
-                    onTranscodeOnlineChange = { viewModel.setTranscodeOnlineOnDevice(it) },
-                    onDeviceAllowCpu = viewModel.onDeviceAllowCpu,
-                    onOnDeviceAllowCpuChange = { viewModel.setOnDeviceAllowCpu(it) },
                     backgroundPlaybackUnrestricted = viewModel.isBackgroundPlaybackUnrestricted(),
                     onAllowBackgroundPlayback = {
                         runCatching { context.startActivity(viewModel.batteryOptimizationRequestIntent()) }

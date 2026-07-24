@@ -68,6 +68,12 @@ data class MediaProfile(
     val audioCodec: String,
     val audioChannels: Int = 2,
     val subtitleFormat: String? = null,
+    /** Display rotation reported by the source container, when known. */
+    val rotationDegrees: Int? = null,
+    /** Pixel aspect ratio (sample-aspect-ratio), when the container exposes one. */
+    val pixelWidthHeightRatio: Float? = null,
+    /** Nominal source frame rate, when known. It is metadata, not an encoder promise. */
+    val frameRate: Float? = null,
 )
 
 /** User preferences (§9). */
@@ -89,8 +95,8 @@ data class StreamPreferences(
      */
     val maxVideoHeight: Int = 2160,
     /**
-     * Opt-in: allow transcoding an ONLINE (Jellyfin) source ON THE PHONE as a last-resort fallback (after
-     * direct play + server transcode), e.g. when the server can't produce a codec the TV needs.
+     * Stored for compatibility with existing settings. Production currently safety-gates this remote
+     * phone-transcode path until its authenticated Media3 source is origin-pinned across redirects.
      */
     val transcodeOnlineOnDevice: Boolean = false,
     /** Allow on-device transcoding to use a software (CPU) encoder when no hardware encoder fits. */

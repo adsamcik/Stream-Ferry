@@ -8,6 +8,7 @@ import com.videobridge.core.transcode.TranscodeNegotiator
 import com.videobridge.core.transcode.VideoCodec
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertNotEquals
 
 class TranscodeNegotiatorTest {
@@ -25,8 +26,8 @@ class TranscodeNegotiatorTest {
         val target = negotiator.negotiate(capableDevice, ReceiverPlaybackCapabilities.CONSERVATIVE)
         assertEquals(VideoCodec.H264, target.videoCodec)
         assertEquals(ResolutionTier.FHD_1080P, target.maxResolution)
-        // Conservative receiver supports TS -> H.264 packaged as classic HLS-TS.
-        assertEquals(StreamContainer.HLS_TS, target.container)
+        // The active client pipeline emits fMP4 only, even when a receiver also supports TS.
+        assertEquals(StreamContainer.HLS_FMP4, target.container)
     }
 
     @Test fun hevc4kWhenBothSidesCapable() {
@@ -39,7 +40,7 @@ class TranscodeNegotiatorTest {
         assertEquals(VideoCodec.HEVC, target.videoCodec)
         assertEquals(ResolutionTier.UHD_4K, target.maxResolution)
         assertEquals(StreamContainer.HLS_FMP4, target.container)
-        assertEquals(true, target.tenBit)
+        assertEquals(false, target.tenBit) // Main10 is not an enforced Transformer output contract yet.
     }
 
     @Test fun fallsBackToH264_4kWhenDeviceCannotHevc() {
@@ -53,6 +54,18 @@ class TranscodeNegotiatorTest {
         val target = negotiator.negotiate(device, receiver)
         assertEquals(VideoCodec.H264, target.videoCodec)
         assertEquals(ResolutionTier.UHD_4K, target.maxResolution)
+    }
+
+    @Test fun selectedCodecRenegotiatesToItsOwnSafeTier() {
+        val device = capableDevice.copy(h264MaxResolution = ResolutionTier.FHD_1080P)
+        val receiver = ReceiverPlaybackCapabilities(
+            h264MaxResolution = ResolutionTier.UHD_4K,
+            hevcMaxResolution = ResolutionTier.UHD_4K,
+            supportsFmp4 = true,
+        )
+        val target = negotiator.negotiate(device, receiver, preferredCodec = VideoCodec.H264)
+        assertEquals(VideoCodec.H264, target.videoCodec)
+        assertEquals(ResolutionTier.FHD_1080P, target.maxResolution)
     }
 
     @Test fun prefer4kFalseNeverPicks4k() {
@@ -76,9 +89,7 @@ class TranscodeNegotiatorTest {
         assertEquals(ResolutionTier.FHD_1080P, target.maxResolution)
     }
 
-    @Test fun hevcSkippedWhenReceiverCannotPackageItWithoutTs() {
-        // Receiver can play HEVC 4k but supports ONLY transport-stream (no fMP4/DASH). HEVC must never
-        // be TS, so HEVC is skipped and we fall back to H.264.
+    @Test fun receiverWithoutFmp4IsRejectedRatherThanAdvertisingTransportStream() {
         val receiver = ReceiverPlaybackCapabilities(
             h264MaxResolution = ResolutionTier.UHD_4K,
             hevcMaxResolution = ResolutionTier.UHD_4K,
@@ -86,9 +97,16 @@ class TranscodeNegotiatorTest {
             supportsTs = true,
             supportsDash = false,
         )
-        val target = negotiator.negotiate(capableDevice, receiver)
-        assertEquals(VideoCodec.H264, target.videoCodec)
-        assertEquals(StreamContainer.HLS_TS, target.container)
+        assertFailsWith<IllegalArgumentException> { negotiator.negotiate(capableDevice, receiver) }
+    }
+
+    @Test fun deviceWithoutH264OrHevcHardwareIsRejected() {
+        val device = DeviceEncodeCapabilities(h264MaxResolution = null, hevcMaxResolution = null)
+        val receiver = ReceiverPlaybackCapabilities(
+            h264MaxResolution = ResolutionTier.FHD_1080P,
+            supportsFmp4 = true,
+        )
+        assertFailsWith<IllegalStateException> { negotiator.negotiate(device, receiver) }
     }
 
     @Test fun clampsToSourceResolution() {

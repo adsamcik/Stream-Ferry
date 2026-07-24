@@ -7,12 +7,13 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
 import java.io.File
+import java.security.MessageDigest
 
 /**
  * Optional on-disk cache of the Jellyfin library **metadata** (titles/ids/years/overviews — no media
  * bytes, no token) so browsing works offline and paints instantly (§8). Stored in app-private internal
  * storage (sandboxed; excluded from backup by `data_extraction_rules`) and removed by "Delete all app
- * data". Keyed by a per-server [scope] so different servers never mix.
+ * data". Keyed by a per-server-and-user [scope] so different accounts never mix.
  */
 class LibraryCache(context: Context) {
 
@@ -42,8 +43,13 @@ class LibraryCache(context: Context) {
 
     private fun fileFor(scope: String, key: String) = File(File(root, safe(scope)), safe(key) + ".json")
 
-    /** Restrict to a flat, safe filename component (no separators / traversal). */
-    private fun safe(s: String): String = s.filter { it.isLetterOrDigit() || it == '-' || it == '_' }.take(80).ifEmpty { "default" }
+    /**
+     * A filesystem-safe, collision-resistant filename component. Filtering/truncating identities made
+     * distinct server/user scopes collide; a SHA-256 digest keeps metadata caches isolated instead.
+     */
+    private fun safe(s: String): String = MessageDigest.getInstance("SHA-256")
+        .digest(s.toByteArray(Charsets.UTF_8))
+        .joinToString("") { "%02x".format(it.toInt() and 0xFF) }
 
     companion object {
         private const val DIR = "libcache"

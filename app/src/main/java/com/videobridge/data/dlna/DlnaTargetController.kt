@@ -13,6 +13,7 @@ import com.videobridge.domain.DiscoveredTarget
 import com.videobridge.domain.PlaybackFailureKind
 import com.videobridge.domain.PlaybackTargetController
 import com.videobridge.domain.PlaybackTargetEvent
+import com.videobridge.domain.RendererStream
 import com.videobridge.logging.DiagnosticsLogger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -299,10 +300,16 @@ class DlnaTargetController(
         _events.tryEmit(PlaybackTargetEvent.Connected)
     }
 
-    override suspend fun load(proxyUrl: String, mimeType: String, title: String, durationSeconds: Long?, startPositionSeconds: Long) =
+    override suspend fun load(proxyUrl: String, stream: RendererStream, title: String, durationSeconds: Long?, startPositionSeconds: Long) =
         withContext(Dispatchers.IO) {
             val r = connected ?: error("Not connected")
-            val didl = DidlLite.build(proxyUrl, title, mimeType, durationSecs = durationSeconds)
+            val didl = DidlLite.build(
+                proxyUrl = proxyUrl,
+                title = title,
+                mimeType = stream.mimeType,
+                byteSeekable = stream.isByteSeekable,
+                durationSecs = durationSeconds,
+            )
             // Remember any resume position; the poll loop issues the Seek once the renderer reports PLAYING.
             pendingResumeSeconds = startPositionSeconds.coerceAtLeast(0)
             val setUri = {
@@ -322,7 +329,7 @@ class DlnaTargetController(
                 val transient = (e is SoapFaultException && e.upnpErrorCode == UPNP_TRANSITION_NOT_AVAILABLE) ||
                     e is java.io.IOException
                 if (!transient) {
-                    logger.e("dlna", "DLNA SetAVTransportURI failed ($mimeType)", e)
+                    logger.e("dlna", "DLNA SetAVTransportURI failed (${stream.mimeType})", e)
                     throw e
                 }
                 logger.w("dlna", "DLNA SetAVTransportURI transient failure (${e.message}); settling ${SET_URI_RETRY_DELAY_MS}ms and retrying once")
@@ -330,11 +337,14 @@ class DlnaTargetController(
                 try {
                     setUri()
                 } catch (e2: Exception) {
-                    logger.e("dlna", "DLNA SetAVTransportURI failed after retry ($mimeType)", e2)
+                    logger.e("dlna", "DLNA SetAVTransportURI failed after retry (${stream.mimeType})", e2)
                     throw e2
                 }
             }
-            logger.event("dlna", "DLNA SetAVTransportURI sent ($mimeType, proxy URL only)")
+            logger.event(
+                "dlna",
+                "DLNA SetAVTransportURI sent (${stream.mimeType}, byteSeek=${stream.isByteSeekable}, proxy URL only)",
+            )
             // A new stream was loaded (initial play OR a seek/bitrate-switch reload). Restart the poll
             // loop so position + end-of-media tracking continues for the new stream — the previous loop
             // breaks when the old stream goes STOPPED during the reload teardown.

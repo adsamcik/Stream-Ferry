@@ -1,6 +1,7 @@
 package com.videobridge.data.download
 
 import com.videobridge.core.download.DownloadPaths
+import com.videobridge.core.net.TrustedMediaOriginPolicy
 import com.videobridge.core.resilience.Backoff
 import com.videobridge.core.resilience.RetryBudget
 import com.videobridge.core.stream.Protocol
@@ -24,6 +25,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ThreadLocalRandom
 import kotlin.coroutines.cancellation.CancellationException
@@ -46,6 +48,12 @@ class MediaDownloader(
     private val logger: DiagnosticsLogger,
     private val scope: CoroutineScope,
 ) {
+    /** Redirects are inspected below before an authenticated download request is re-issued. */
+    private val pinnedHttpClient = httpClient.newBuilder()
+        .followRedirects(false)
+        .followSslRedirects(false)
+        .build()
+
     sealed interface DownloadState {
         data object Queued : DownloadState
         data class Running(val downloadedBytes: Long, val totalBytes: Long?) : DownloadState {
@@ -264,6 +272,8 @@ class MediaDownloader(
         }
         val upstream = jellyfin.resolveUpstream(info)
         require(!upstream.isHls) { "This title can only be streamed, not downloaded." }
+        val originPolicy = TrustedMediaOriginPolicy.fromBaseUrl(upstream.url)
+            ?: throw IOException("Refusing a download with an invalid Jellyfin origin.")
 
         val fileName = DownloadPaths.fileName(item.id, info.profile.container, upstream.contentType)
         val part = store.partFileFor(item.id)
@@ -292,49 +302,78 @@ class MediaDownloader(
             .apply { upstream.authHeader?.let { header("Authorization", it) } }
             .build()
 
+        fun openPinned(request: Request): okhttp3.Response {
+            var current = request
+            repeat(MAX_DOWNLOAD_REDIRECTS + 1) {
+                if (!originPolicy.isTrusted(current.url)) {
+                    throw IOException("Refusing a download request outside the configured Jellyfin origin.")
+                }
+                val response = pinnedHttpClient.newCall(current).execute()
+                if (!response.isRedirect) return response
+                val redirect = response.header("Location")?.let { originPolicy.resolve(it, current.url) }
+                response.close()
+                current = redirect?.let { current.newBuilder().url(it).build() }
+                    ?: throw IOException("Refusing a download redirect outside the configured Jellyfin origin.")
+            }
+            throw IOException("Too many redirects from the configured Jellyfin origin.")
+        }
+
         var resp = if (tryResume) {
-            httpClient.newCall(
+            openPinned(
                 Request.Builder().url(upstream.url).get().apply {
                     upstream.authHeader?.let { header("Authorization", it) }
                     storedValidator?.let { header("If-Range", it) }
                     header("Range", "bytes=$existing-")
                 }.build(),
-            ).execute()
+            )
         } else {
-            httpClient.newCall(fullRequest()).execute()
+            openPinned(fullRequest())
         }
 
         var resumed = false
+        var resumedRange: ContentRange? = null
         if (tryResume) {
-            val crTotal = parseContentRangeTotal(resp.header("Content-Range"))
-            val sizeOk = storedTotal <= 0 || crTotal <= 0 || crTotal == storedTotal
+            val range = parseContentRange(resp.header("Content-Range"))
+            val startsAtExisting = range?.start == existing
+            val sizeOk = storedTotal <= 0 || range?.total == null || range.total == storedTotal
             when {
-                resp.code == 206 && sizeOk -> resumed = true
+                // A matching total alone is insufficient: appending a 206 that starts elsewhere silently
+                // corrupts the offline copy. Require the exact byte the partial file ends at.
+                resp.code == 206 && startsAtExisting && sizeOk -> {
+                    resumed = true
+                    resumedRange = range
+                }
                 resp.code == 200 -> resumed = false // server returned the full entity; use it as a restart
                 else -> {
-                    // Range ignored with a non-200, or the file changed size: discard the stale partial
-                    // and fetch the whole file fresh.
+                    // Range ignored, malformed, or for another offset: discard the stale validator and
+                    // fetch a complete entity rather than splicing incompatible byte ranges together.
                     resp.close()
                     runCatching { meta.delete() }
-                    resp = httpClient.newCall(fullRequest()).execute()
+                    resp = openPinned(fullRequest())
                     resumed = false
                 }
             }
         }
 
         var downloaded = 0L
+        var expectedTotal: Long? = null
         resp.use { r ->
             if (!r.isSuccessful) throw JellyfinHttpException(r.code)
+            if (!resumed && r.code != 200) {
+                throw IOException("Server returned a partial response to a full download request.")
+            }
             val newValidator = r.header("ETag") ?: r.header("Last-Modified")
             val startAt = if (resumed) existing else 0L
             val remaining = r.body?.contentLength()?.takeIf { it >= 0 }
             val total = when {
+                resumed && resumedRange?.total != null -> resumedRange?.total
                 resumed && remaining != null -> startAt + remaining
                 remaining != null -> remaining
                 else -> upstream.totalLength
             }
+            expectedTotal = total?.takeIf { it >= startAt }
             downloaded = startAt
-            setState(item.id, DownloadState.Running(downloaded, total))
+            setState(item.id, DownloadState.Running(downloaded, expectedTotal))
             val body = r.body ?: error("Empty response")
             body.byteStream().use { ins ->
                 val fos = FileOutputStream(part, /* append = */ resumed)
@@ -359,6 +398,14 @@ class MediaDownloader(
                     }
                     out.flush()
                 }
+            }
+        }
+
+        // EOF is not proof of completion for a chunked body. If either the response or Jellyfin's
+        // PlaybackInfo supplied a total, retain the partial file and let normal recovery resume it.
+        expectedTotal?.let { expected ->
+            if (downloaded != expected) {
+                throw IOException("Download ended at $downloaded bytes; expected $expected bytes.")
             }
         }
 
@@ -389,10 +436,16 @@ class MediaDownloader(
     private fun setState(id: String, s: DownloadState) = _states.update { it + (id to s) }
     private fun clearState(id: String) = _states.update { it - id }
 
-    /** Parse the total length from a `Content-Range: bytes start-end/total` header (-1 if unknown). */
-    private fun parseContentRangeTotal(header: String?): Long {
-        val total = header?.substringAfterLast('/', "")?.trim().orEmpty()
-        return total.toLongOrNull() ?: -1L
+    private data class ContentRange(val start: Long, val endInclusive: Long, val total: Long?)
+
+    /** Parse and validate a `Content-Range: bytes start-end/total` response header. */
+    private fun parseContentRange(header: String?): ContentRange? {
+        val match = CONTENT_RANGE.matchEntire(header?.trim().orEmpty()) ?: return null
+        val start = match.groupValues[1].toLongOrNull() ?: return null
+        val end = match.groupValues[2].toLongOrNull() ?: return null
+        val total = match.groupValues[3].takeIf { it != "*" }?.toLongOrNull()
+        if (start < 0L || end < start || (total != null && (total <= end || total <= 0L))) return null
+        return ContentRange(start, end, total)
     }
 
     private fun friendly(e: Exception): String = when (e) {
@@ -404,6 +457,8 @@ class MediaDownloader(
     companion object {
         private const val TAG = "MediaDownloader"
         private const val PROGRESS_EMIT_BYTES = 1024L * 1024 // emit progress ~every 1 MiB
+        private const val MAX_DOWNLOAD_REDIRECTS = 3
+        private val CONTENT_RANGE = Regex("""bytes\s+(\d+)-(\d+)/(\d+|\*)""", RegexOption.IGNORE_CASE)
 
         /** Broad direct-play capabilities so Jellyfin returns the ORIGINAL file (no transcode) to save. */
         private val DOWNLOAD_CAPS = TargetCapabilities(

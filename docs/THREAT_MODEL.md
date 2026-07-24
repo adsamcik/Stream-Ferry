@@ -7,10 +7,11 @@ credentials, user-selected local file `content://` URIs / SAF grants, and host d
 memory/availability.
 
 In-app poster art is fetched by the phone from Jellyfin with the token sent as an HTTP **header** (added
-only for the configured Jellyfin host, never embedded in the URL → never in a cache key or log), cached
-in memory only, and rendered on the phone UI only — a poster URL is never given to the TV. The playback
-controls' seek-preview scrubber fetches Jellyfin **chapter ("section") images** the same way (token in a
-header, host-scoped, phone-UI only); a chapter image or its URL is never given to the TV.
+only for the configured Jellyfin host, never embedded in the URL → never in a cache key or log) and
+rendered on the phone UI only — no image memory or disk cache survives an account change. A poster URL
+is never given to the TV. The playback controls' seek-preview scrubber fetches Jellyfin **chapter
+("section") images** the same way (token in a header, host-scoped, phone-UI only); a chapter image or
+its URL is never given to the TV.
 
 Trust boundaries:
 - **Phone ↔ Jellyfin**: authenticated, TLS for remote (HTTP allowed only for explicit user-approved
@@ -41,7 +42,7 @@ Trust boundaries:
 | 17 | VPN route leakage | LAN traffic captured by VPN / "block connections without VPN" | Diagnostics detect VPN, verify phone↔Jellyfin and TV↔phone reachability; actionable failure messages. See [VPN_LAN_DIAGNOSTICS.md](VPN_LAN_DIAGNOSTICS.md). |
 | 18 | Guest Wi-Fi isolation / VLAN | TV cannot reach phone | Diagnostics test target fetch of a tiny resource from phone; clear error. |
 | 19 | Foreground-service abuse | Server kept open without playback | FGS started only for active playback (type `mediaPlayback`), stopped on stop/error/cancel/expiry; never auto-start on boot. |
-| 20 | Local-file URI leakage / arbitrary file read | Picked `content://` exposed to TV, or proxy coerced to open an arbitrary file | On-device source uses user-elective SAF/MediaStore grants; the `content://` URI is **fixed on the session** and opened on the phone via `ContentResolver` — only the proxy URL reaches the TV, and the proxy never opens a request-supplied path (same `SessionRegistry` guard as threat 15). On-device transcoding (when added) re-encodes locally and likewise serves only the proxy URL. |
+| 20 | Local-file URI leakage / arbitrary file read | Picked `content://` exposed to TV, or proxy coerced to open an arbitrary file | On-device source uses user-elective SAF/MediaStore grants; the `content://` URI is **fixed on the session** and opened on the phone via `ContentResolver` — only the proxy URL reaches the TV, and the proxy never opens a request-supplied path (same `SessionRegistry` guard as threat 15). The experimental on-device local Cast path re-encodes locally and likewise serves only the proxy URL. |
 
 Residual/accepted risks: plaintext phone→TV HTTP on LAN (threat 7); reliance on OEM honoring Android
 local-network and foreground-service rules; orphaned transcodes after abrupt process death are

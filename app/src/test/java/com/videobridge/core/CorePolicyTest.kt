@@ -69,7 +69,18 @@ class CorePolicyTest {
         assertTrue(xml.contains("Movie &amp; &lt;Friends&gt;"))
         assertTrue(xml.contains("http://10.0.0.5:5000/session/ID/stream"))
         assertTrue(xml.contains("1:01:01"))
+        assertTrue(xml.contains("DLNA.ORG_OP=00"))
         assertFalse(xml.contains("<Friends>"))
+    }
+
+    @Test fun didlAdvertisesByteSeekOnlyForRangeCapableOutput() {
+        val xml = DidlLite.build(
+            proxyUrl = "http://10.0.0.5:5000/session/ID/stream",
+            title = "Direct play",
+            mimeType = "video/mp4",
+            byteSeekable = true,
+        )
+        assertTrue(xml.contains("DLNA.ORG_OP=01"))
     }
 
     // --- SSDP parsing ---

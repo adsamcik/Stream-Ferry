@@ -1,115 +1,89 @@
 # On-Device Transcoding
 
-When a video the TV can't decode comes from a source with **no server to transcode** (a local file),
-the phone transcodes it itself, hardware-accelerated, into a **seekable, phone-hosted HLS/CMAF origin**.
-The TV still only ever receives the phone proxy URL — the security invariant is fully preserved (and
-strengthened: no Jellyfin transcode session is involved).
+On-device transcoding is a **limited, experimental recovery path for local video files** that a
+receiver cannot direct-play. When it is admitted, the phone hardware-encodes the local source and
+hosts a seekable VOD HLS origin; the TV still receives only an opaque phone-proxy URL.
 
-For Jellyfin sources the server still transcodes (preferred). When the user opts in (**Transcode online
-videos on this device**), the same machinery is also a **last-resort fallback** for Jellyfin sources —
-see "Multi-codec negotiation & the fallback chain" below.
+This is not a general phone-transcoding platform. The active path is **Cast-only** and produces
+**HLS with fragmented-MP4 (fMP4) media**. It is not used for DLNA. Jellyfin server transcoding remains
+the normal online-media path and is described separately in [STREAM_SELECTION.md](STREAM_SELECTION.md).
 
-## Multi-codec negotiation & the fallback chain
+## Active phone-output contract
 
-Codecs supported end-to-end: **H.264, HEVC, VP9, AV1** (server transcode and on-device where the phone
-has an encoder). The pure `com.videobridge.core.transcode.PlaybackPlanner` expresses the strategy: pick
-the best **quality band** the TV can play (Native → Max → Very High → High → Standard → Low), preferring
-direct play, and satisfy it with the best **engine** in priority order:
+The phone path has a deliberately narrow contract:
 
-```
-direct play  >  server transcode  >  on-device hardware  >  on-device CPU (software)
-```
+- **Container/transport:** VOD HLS with fMP4 initialization and media fragments. The phone does not
+  publish DASH or MPEG-TS output.
+- **Video/audio:** H.264 + AAC is the best-effort compatibility floor. HEVC + AAC is considered only
+  when both the phone's hardware encoder and the selected Cast receiver admit it.
+- **Encoder:** hardware only. There is no active CPU/software encoder fallback.
+- **Colour and profile:** output is 8-bit. There is no explicit Main10 or HDR conversion contract;
+  HDR/10-bit online fallback is rejected rather than silently changing colour treatment.
+- **Not active in this path:** AV1 and VP9 encoding, DASH, MPEG-TS, CPU encoding, Main10, and HDR
+  output. Types or planning code that model those choices are not a production phone-output promise.
 
-with the most efficient codec the TV supports (AV1 > HEVC > VP9 > H.264); STANDARD/LOW pin to H.264 as
-the universally-decodable floor. At runtime the engine realises this via:
+The maximum resolution selected by negotiation is a capability-admission ceiling, not a guarantee of
+realtime 4K operation, a fixed frame rate, a fixed bitrate, or sustained performance. The server-side
+Jellyfin profile may have broader capabilities; do not infer them from this phone-output contract.
 
-- **Server side** — `DeviceProfiles` offers the best TV-supported codec first (AV1/VP9/HEVC/H.264), so a
-  forced transcode preserves 4K/10-bit/quality; H.264 stays the capped fallback.
-- **Escalation** — `decideRecovery` walks direct → server transcode → (opt-in) **on-device transcode of
-  the Jellyfin original** on a decode/format failure. Separately, if a **server transcode keeps
-  rebuffering at the lowest quality rung** (adaptive bitrate has nothing left to give — the server can't
-  keep up), the playback monitor escalates to on-device transcode automatically (opt-in, one-shot, only
-  after playback started). Both use `reloadAsOnDeviceOnlineTranscode`, which resolves the untouched
-  original (`DeviceProfiles.forOriginalDirectStream`) and feeds it to `OnDeviceTranscoder` with the
-  Jellyfin Authorization header attached to the **source request only** — the original URL/token stay on
-  the phone; the TV still only ever gets the proxy URL.
-- **Encoder probing** — `MediaCodecCapabilityProbe` reports each codec's hardware encode tier plus which
-  codecs have a software encoder (the opt-in CPU band, bounded to 720p).
+## Online Jellyfin fallback is safety-gated
 
-**Preferences** (Settings): *Transcode online videos on this device* (opt-in), *Allow CPU on-device
-transcode* (hardware-only by default). **Manual controls** (playback quality card): a **Quality** picker
-(Auto + bitrate rungs) and a **Codec** picker (Auto + the codecs the TV can accept) re-resolve live.
+The optional idea of falling back from a Jellyfin server transcode to a phone transcode is **currently
+disabled**. Media3's remote input must enforce the same trusted-origin and authenticated-redirect policy
+as the Jellyfin proxy before the app can attach an Authorization header safely. Until that exists, the
+fallback stops with a clear error instead of fetching a remote original on the phone. A preference does
+not override this safety gate.
 
-> Experimental: realtime on-device transcode of a **remote** 4K source is device- and network-dependent;
-> AV1/VP9 hardware encoders are rare and software/CPU transcode rarely keeps up above low resolutions, so
-> negotiation simply skips engines the phone can't sustain. A failure surfaces (it is not retried).
+Consequently, the production online recovery chain is direct play → Jellyfin server transcode. The
+phone's local-file path is separate and never exposes a Jellyfin URL or token to the receiver.
 
-## Why HLS/CMAF (not raw frames, not whole-file)
-
-Google Cast is **receiver-fetches-media**: the receiver loads a URL from the phone's LAN IP. So the
-phone is a realtime transcoder **plus** a local HTTP origin — never a raw-frame pusher, and the TV is
-never handed a `localhost`/`content://` URL. A **seekable VOD HLS playlist** (the whole runtime is
-advertised) lets the receiver seek anywhere; the phone transcodes the requested segment on demand.
-
-## Pipeline
+## Runtime flow
 
 ```
-content:// source ──▶ Media3 Transformer (HW decode → Surface/GL → HW encode → fMP4) ──▶ fragment bytes
-        per segment [startMs,endMs)                                                         │
-                                                                                            ▼
-                                          Fmp4Splitter → init segment (ftyp+moov) + media segment (moof+mdat)
-                                                                                            │
-   TV ◀── http://PHONE_LAN_IP:PORT/session/<id>/stream(?seg=init | ?seg=N) ◀── LocalProxyServer ◀──┘
+local content URI/file ──▶ Media3 Transformer (hardware decode/encode) ──▶ fragmented MP4
+                                                                                  │
+                                                                                  ▼
+                                               fMP4 splitter ──▶ init + media fragments
+                                                                                  │
+Cast receiver ◀── phone proxy HLS playlist / opaque segment URLs ◀── LocalProxyServer ◀──┘
 ```
 
-- **`OnDeviceTranscoder`** (`data.transcode`) — AndroidX **Media3 Transformer**. Each call transcodes a
-  clip `[startMs, endMs)` (via `ClippingConfiguration`) to a **fragmented MP4** using
-  `InAppFragmentedMp4Muxer` + the device's HW encoder (H.264/AAC, optionally HEVC). The output height is
-  **capped to the negotiated tier** with a `Presentation.createForHeight(...)` video effect, so a source
-  taller than the phone's encoder can handle (e.g. a 4K file negotiated down to 1080p) is scaled down
-  instead of being handed to the encoder at full resolution (which fails). Transformer runs on a
-  dedicated `HandlerThread` Looper. Media3's `@UnstableApi` opt-in is confined here.
-- **`core.transcode.Fmp4Splitter`** (pure, unit-tested) — splits each transcoded fragment into the
-  shared CMAF **init** (`ftyp`+`moov`) and a bare **media** segment (`moof`…). One `EXT-X-MAP` init
-  serves every segment because the encoder config is identical across segments. **Timeline continuity:**
-  each segment is an independent clip transcode, so its encoder resets the media timeline to ~0; if served
-  as-is, every segment claims to start at t=0 and the renderer can't sequence them (Cast never leaves
-  LOADING; DLNA loops a few frames). `applyMediaTiming` therefore rewrites every `moof/traf` `tfdt`
-  baseMediaDecodeTime to the segment's true cumulative offset (in each track's `mdhd` timescale,
-  preserving intra-clip multi-fragment gaps) and stamps the `mfhd` sequence number, producing one
-  continuous, monotonic timeline. `trackTimescales` reads the per-track timescale from the init `moov`.
-- **`core.hls.MediaPlaylistPlanner`** (pure, unit-tested) — builds the **seekable VOD** playlist and
-  maps a seek position to a segment index (the full-seek mechanism).
-- **`ClientTranscodeSession`** (`data.transcode`) ties these together with a small LRU segment cache;
-  transcoding is serialized (one HW encode at a time).
-- **`LocalProxyServer`** serves the session: no `seg` → playlist; `seg=init` → init; `seg=N` → media
-  segment N (transcoded on demand).
+- **`OnDeviceTranscoder`** uses AndroidX Media3 Transformer to export a requested clip to a
+  fragmented-MP4 file. It requests H.264 or HEVC video and AAC audio, and applies the negotiated output
+  height as a cap.
+- **`Fmp4Splitter`** separates the initialization data from media fragments so the proxy can expose an
+  HLS `EXT-X-MAP` plus opaque segment URLs. This is an fMP4 delivery implementation; it is not a claim of
+  independently certified CMAF conformance across phones or receivers.
+- **`ClientTranscodeSession`** serializes hardware exports and keeps a short in-memory segment cache.
+  A segment failure is represented as an HTTP failure, never as a successful empty media segment.
+- **`LocalProxyServer`** serves the master playlist, media playlist, initialization data, and on-demand
+  media fragments. A `HEAD` probe does not need to start a hardware export.
 
-## Capability negotiation (4K is negotiated, never assumed)
+The playlist advertises the full local runtime, allowing a compatible Cast receiver to request a
+position on demand. It is not a raw-frame push or a whole-file pretranscode.
 
-`PlaybackEngine.playLocal` decides direct-play vs transcode:
+## Admission and fallback
 
-1. **`LocalMediaProbe`** (`MediaExtractor`) → a `MediaProfile` (codecs, resolution).
-2. `core.stream.StreamSelectionService` + `core.transcode.PlaybackRouter` →
-   `RouteKind.DIRECT_PLAY` or `CLIENT_TRANSCODE` (local sources can't server-transcode).
-3. If transcoding, `core.transcode.TranscodeNegotiator` picks the `TranscodeTarget` by gating BOTH the
-   phone's HW encoders (`MediaCodecCapabilityProbe` → `DeviceEncodeCapabilities`) and the receiver,
-   following the ladder **HEVC-4K → H.264-4K → 1080p → 720p** (all + AAC). Default is 1080p H.264/AAC;
-   HEVC is only ever packaged as fMP4/CMAF, never MPEG-TS.
+`PlaybackEngine.playLocal` first attempts direct play. For an incompatible local file it considers the
+phone path only when the selected receiver can play HLS/fMP4. `TranscodeNegotiator` then gates the
+candidate on both receiver support and the phone's hardware-encoder capabilities, selecting H.264 or
+opportunistic HEVC at an admitted height. If no candidate is admitted, the app declines phone
+transcoding rather than advertising a different container or encoder path.
 
-If any probe/negotiation step fails, playback falls back to direct play.
+DLNA does not receive this HLS/fMP4 output. An incompatible local file on a DLNA renderer must be made
+directly playable or played through a supported server-side route.
 
 ## Security
 
-- The TV receives only `…/session/<id>/stream` proxy URLs (playlist + opaque `?seg=` segments).
-- The `content://` source is opened on the phone; its URI is never sent to the TV.
-- No Jellyfin URL/token is ever involved in the local-transcode path.
+- The receiver receives only `…/session/<id>/stream` URLs and opaque segment identifiers.
+- The local `content://` URI is opened by the phone and is never sent to the receiver.
+- The local path carries no Jellyfin credential. Remote Jellyfin phone fallback remains disabled until
+  authenticated redirects can be origin-pinned in the Media3 source.
 
-## Encoding defaults & limitations
+## Validation status and limits
 
-- ~2 s segments; one HW encode at a time; recent segments cached (LRU).
-- Initial target set: H.264/AAC (broadest Cast support), HEVC where both sides support it. Resolution
-  capping via `Presentation` effects and 4K30/thermal tuning are follow-ups.
-- **Device-validated:** the Media3/codec/GL pipeline cannot be unit-tested in the build sandbox; it is
-  validated on real hardware. The pure-JVM pieces (`Fmp4Splitter`, `MediaPlaylistPlanner`,
-  `TranscodeNegotiator`, `PlaybackRouter`) are unit-tested.
+This path is not yet a production-reliability claim across Cast devices or OEM phones. It still requires
+physical validation of sustained encode speed, thermal behaviour, random-access segment boundaries,
+audio/video continuity, speculative receiver requests, receiver fMP4 handling, and HDR conversion
+behaviour. The pure playlist/splitting/negotiation helpers can be unit tested, but they cannot establish
+MediaCodec, Media3, network, or receiver interoperability on their own.

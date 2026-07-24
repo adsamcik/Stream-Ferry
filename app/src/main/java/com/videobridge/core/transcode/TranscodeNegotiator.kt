@@ -8,13 +8,23 @@ package com.videobridge.core.transcode
  */
 class TranscodeNegotiator {
 
+    /**
+     * The active phone pipeline always publishes HLS/fMP4. It deliberately limits output to the Media3
+     * Transformer codecs it can request and package consistently here (H.264 and HEVC); AV1/VP9, DASH,
+     * MPEG-TS, Main10, explicit bitrate, and fixed-frame-rate contracts remain feature-gated.
+     */
     fun negotiate(
         device: DeviceEncodeCapabilities,
         receiver: ReceiverPlaybackCapabilities,
         sourceMaxResolution: ResolutionTier = ResolutionTier.UHD_4K,
         prefer4k: Boolean = true,
+        /** Optional user-selected codec; its tier is still negotiated against both endpoints. */
+        preferredCodec: VideoCodec? = null,
     ): TranscodeTarget {
-        val fps = device.maxFps.coerceAtLeast(1)
+        require(receiver.supportsFmp4) {
+            "on-device transcoding requires an HLS fragmented-MP4 capable receiver"
+        }
+        val fpsAdmissionBound = device.maxFps.coerceAtLeast(1)
         val fourK = minTier(ResolutionTier.UHD_4K, sourceMaxResolution)
         val fhd = minTier(ResolutionTier.FHD_1080P, sourceMaxResolution)
         val hd = minTier(ResolutionTier.HD_720P, sourceMaxResolution)
@@ -30,38 +40,30 @@ class TranscodeNegotiator {
         }
 
         for ((codec, tier) in ladder) {
+            if (preferredCodec != null && codec != preferredCodec) continue
             if (codec == VideoCodec.HEVC && receiver.hevcMaxResolution == null) continue
-            if (!device.canEncode(codec, tier)) continue
+            if (!device.canEncodeHardware(codec, tier)) continue
             if (!receiver.canPlay(codec, tier)) continue
-            val container = chooseContainer(codec, receiver) ?: continue
-            val tenBit = codec == VideoCodec.HEVC && device.hevcMain10
-            return TranscodeTarget(codec, AudioCodec.AAC, container, tier, fps, tenBit)
+            // maxFps is an encoder-capability admission bound, not a Media3 output request: do not infer
+            // that the produced bitstream has a fixed frame rate or bit depth from this target.
+            return TranscodeTarget(
+                videoCodec = codec,
+                audioCodec = AudioCodec.AAC,
+                container = StreamContainer.HLS_FMP4,
+                maxResolution = tier,
+                maxFps = fpsAdmissionBound,
+                tenBit = false,
+            )
         }
 
-        // Guaranteed best-effort floor: H.264 @ the smallest tier. The Android layer attempts it and
-        // degrades on playback failure. Prefer TS (most universally supported by the default receiver),
-        // else fMP4.
-        val floor = if (receiver.supportsFmp4 && !receiver.supportsTs) StreamContainer.HLS_FMP4
-        else StreamContainer.HLS_TS
-        return TranscodeTarget(VideoCodec.H264, AudioCodec.AAC, floor, hd, fps)
+        // Do not manufacture a nominal H.264 floor when the phone has no admitted hardware encoder.
+        // PlaybackEngine catches this and leaves the local file on the direct-play path instead of
+        // starting a Transformer job that cannot possibly be fulfilled.
+        throw IllegalStateException(
+            "No compatible hardware H.264/HEVC fMP4 target is available" +
+                preferredCodec?.let { " for the selected $it codec" }.orEmpty() + ".",
+        )
     }
-
-    /** Pick a receiver-supported container for [codec], honoring the H.264-only-TS rule. Null if none. */
-    private fun chooseContainer(codec: VideoCodec, receiver: ReceiverPlaybackCapabilities): StreamContainer? =
-        when (codec) {
-            // H.264: TS first (most compatible with the default receiver), else fMP4.
-            VideoCodec.H264 -> when {
-                receiver.supportsTs -> StreamContainer.HLS_TS
-                receiver.supportsFmp4 -> StreamContainer.HLS_FMP4
-                else -> null
-            }
-            // HEVC/VP9/AV1: fMP4/CMAF preferred, DASH next; never TS.
-            VideoCodec.HEVC, VideoCodec.VP9, VideoCodec.AV1 -> when {
-                receiver.supportsFmp4 -> StreamContainer.HLS_FMP4
-                receiver.supportsDash -> StreamContainer.DASH_FMP4
-                else -> null
-            }
-        }
 
     private fun minTier(a: ResolutionTier, b: ResolutionTier): ResolutionTier =
         if (a.maxHeightPx <= b.maxHeightPx) a else b

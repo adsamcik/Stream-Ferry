@@ -4,6 +4,8 @@ import android.content.Context
 import androidx.mediarouter.media.MediaRouteSelector
 import androidx.mediarouter.media.MediaRouter
 import com.google.android.gms.cast.CastMediaControlIntent
+import com.google.android.gms.cast.HlsSegmentFormat as CastHlsSegmentFormat
+import com.google.android.gms.cast.HlsVideoSegmentFormat as CastHlsVideoSegmentFormat
 import com.google.android.gms.cast.MediaError
 import com.google.android.gms.cast.MediaInfo
 import com.google.android.gms.cast.MediaLoadRequestData
@@ -20,9 +22,11 @@ import com.videobridge.core.cast.ConnectRetryPolicy
 import com.videobridge.core.stream.Protocol
 import com.videobridge.core.stream.TargetCapabilities
 import com.videobridge.domain.DiscoveredTarget
+import com.videobridge.domain.HlsSegmentFormat
 import com.videobridge.domain.PlaybackFailureKind
 import com.videobridge.domain.PlaybackTargetController
 import com.videobridge.domain.PlaybackTargetEvent
+import com.videobridge.domain.RendererStream
 import com.videobridge.logging.DiagnosticsLogger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -162,7 +166,7 @@ class CastTargetController(
         }
     }
 
-    override suspend fun load(proxyUrl: String, mimeType: String, title: String, durationSeconds: Long?, startPositionSeconds: Long) =
+    override suspend fun load(proxyUrl: String, stream: RendererStream, title: String, durationSeconds: Long?, startPositionSeconds: Long) =
         withContext(Dispatchers.Main) {
             val client = session?.remoteMediaClient ?: error("No Cast session")
             registerMediaCallback()
@@ -170,12 +174,27 @@ class CastTargetController(
             val metadata = MediaMetadata(MediaMetadata.MEDIA_TYPE_MOVIE).apply {
                 putString(MediaMetadata.KEY_TITLE, title)
             }
-            val mediaInfo = MediaInfo.Builder(proxyUrl) // phone proxy URL ONLY
+            val mediaInfoBuilder = MediaInfo.Builder(proxyUrl) // phone proxy URL ONLY
                 .setStreamType(MediaInfo.STREAM_TYPE_BUFFERED)
-                .setContentType(mimeType)
+                .setContentType(stream.mimeType)
                 .setMetadata(metadata)
-                .apply { durationSeconds?.let { setStreamDuration(it * 1000L) } }
-                .build()
+            durationSeconds?.let { mediaInfoBuilder.setStreamDuration(it * 1000L) }
+            // Cast defaults HLS media to MPEG-TS unless told otherwise. The phone's on-device
+            // transcode is CMAF/fMP4, and Jellyfin can also select fMP4 for HEVC/AV1/VP9 profiles,
+            // so both audio and video segment format must be declared explicitly.
+            when (stream.hlsSegmentFormat) {
+                HlsSegmentFormat.FMP4 -> {
+                    mediaInfoBuilder.setHlsSegmentFormat(CastHlsSegmentFormat.FMP4)
+                    mediaInfoBuilder.setHlsVideoSegmentFormat(CastHlsVideoSegmentFormat.FMP4)
+                }
+                HlsSegmentFormat.MPEG2_TS -> {
+                    // Jellyfin's TS profile uses AAC audio multiplexed into the transport stream.
+                    mediaInfoBuilder.setHlsSegmentFormat(CastHlsSegmentFormat.TS_AAC)
+                    mediaInfoBuilder.setHlsVideoSegmentFormat(CastHlsVideoSegmentFormat.MPEG2_TS)
+                }
+                null -> Unit
+            }
+            val mediaInfo = mediaInfoBuilder.build()
             // Start AT the resume position via the load request itself (setCurrentTime), NOT a post-load
             // seek(): load() completes asynchronously, so a seek issued right after it races the load and is
             // dropped by the receiver, which then autoplays from 0 (the "TV plays from the start" bug).
@@ -184,7 +203,11 @@ class CastTargetController(
                 .setAutoplay(true)
                 .setCurrentTime(startPositionSeconds.coerceAtLeast(0) * 1000L)
                 .build()
-            logger.trace(TAG, "Cast load: type=$mimeType title=$title dur=${durationSeconds}s start=${startPositionSeconds}s url=$proxyUrl")
+            logger.trace(
+                TAG,
+                "Cast load: type=${stream.mimeType} hlsFormat=${stream.hlsSegmentFormat} " +
+                    "title=$title dur=${durationSeconds}s start=${startPositionSeconds}s url=$proxyUrl",
+            )
             awaitLoad(client.load(request))
             logger.i(TAG, "Cast load issued (proxy URL, redacted)")
         }

@@ -3,6 +3,9 @@ package com.videobridge.core
 import com.videobridge.core.transcode.Fmp4Splitter
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
+import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
 class Fmp4SplitterTest {
@@ -87,6 +90,16 @@ class Fmp4SplitterTest {
     private fun tfdtV1(base: Long) = box("tfdt", byteArrayOf(1, 0, 0, 0) + u64(base))
     private fun tfdtV0(base: Long) = box("tfdt", verFlags0 + u32(base))
 
+    private fun trunWithDurations(vararg durations: Long): ByteArray =
+        box(
+            "trun",
+            byteArrayOf(0, 0, 1, 0) + u32(durations.size.toLong()) +
+                durations.fold(ByteArray(0)) { bytes, duration -> bytes + u32(duration) },
+        )
+
+    private fun timedTraf(trackId: Long, tfdt: ByteArray, vararg durations: Long): ByteArray =
+        box("traf", tfhd(trackId) + tfdt + trunWithDurations(*durations))
+
     private fun segment(seq: Long, videoTfdt: ByteArray, audioTfdt: ByteArray): ByteArray {
         val mfhd = box("mfhd", verFlags0 + u32(seq))
         val trafV = box("traf", tfhd(1) + videoTfdt)
@@ -133,6 +146,55 @@ class Fmp4SplitterTest {
         assertTrue(seg.contains(u64(990_000L)), "second fragment keeps its +1s intra-clip offset")
     }
 
+    @Test fun continuousTrackTimelineAcceptsExactPerTrackCadence() {
+        val media = box(
+            "moof",
+            box("mfhd", verFlags0 + u32(1)) +
+                timedTraf(1, tfdtV1(0), 180_000) +
+                timedTraf(2, tfdtV0(0), 96_000),
+        ) + box("mdat", byteArrayOf(1))
+        val timescales = mapOf(1 to 90_000L, 2 to 48_000L)
+        Fmp4Splitter.applyMediaTiming(media, sequenceNumber = 5, startSeconds = 10.0, timescales = timescales)
+        assertTrue(Fmp4Splitter.hasContinuousTrackTimeline(media, timescales, startSeconds = 10.0, durationSeconds = 2.0))
+    }
+
+    @Test fun continuousTrackTimelineRejectsDriftOnAShorterTrack() {
+        val media = box(
+            "moof",
+            box("mfhd", verFlags0 + u32(1)) +
+                timedTraf(1, tfdtV1(0), 180_000) +
+                timedTraf(2, tfdtV0(0), 96_001),
+        ) + box("mdat", byteArrayOf(1))
+        assertFalse(
+            Fmp4Splitter.hasContinuousTrackTimeline(
+                media,
+                mapOf(1 to 90_000L, 2 to 48_000L),
+                startSeconds = 0.0,
+                durationSeconds = 2.0,
+            ),
+        )
+    }
+
+    @Test fun continuousTrackTimelineRejectsAnIntraTrackGap() {
+        val first = box(
+            "moof",
+            box("mfhd", verFlags0 + u32(1)) + timedTraf(1, tfdtV1(0), 90_000),
+        )
+        val second = box(
+            "moof",
+            box("mfhd", verFlags0 + u32(2)) + timedTraf(1, tfdtV1(90_001), 90_000),
+        )
+        val media = first + box("mdat", byteArrayOf(1)) + second + box("mdat", byteArrayOf(2))
+        assertFalse(
+            Fmp4Splitter.hasContinuousTrackTimeline(
+                media,
+                mapOf(1 to 90_000L),
+                startSeconds = 0.0,
+                durationSeconds = 2.0,
+            ),
+        )
+    }
+
     // ----- codecInfo (init-segment codec/resolution parse for the HLS master playlist) -----
 
     private fun stsd(entry: ByteArray) = box("stsd", verFlags0 + u32(1) + entry)
@@ -147,8 +209,23 @@ class Fmp4SplitterTest {
 
     private fun videoTrak(entry: ByteArray) =
         box("trak", box("mdia", box("minf", box("stbl", stsd(entry)))))
+    private fun aacEsds(audioSpecificConfig: ByteArray = byteArrayOf(0x12, 0x10)) =
+        box("esds", verFlags0 + byteArrayOf(0x05, audioSpecificConfig.size.toByte()) + audioSpecificConfig)
+
     private fun audioTrak() =
-        box("trak", box("mdia", box("minf", box("stbl", stsd(box("mp4a", ByteArray(28)))))))
+        box("trak", box("mdia", box("minf", box("stbl", stsd(box("mp4a", ByteArray(28) + aacEsds()))))))
+
+    private fun hvc1(width: Int, height: Int): ByteArray {
+        val fixed = ByteArray(78)
+        fixed[24] = (width ushr 8).toByte(); fixed[25] = width.toByte()
+        fixed[26] = (height ushr 8).toByte(); fixed[27] = height.toByte()
+        // hvcC: Main profile, compatibility 6, constraint B0, level 120.
+        val hvcC = box("hvcC", byteArrayOf(1, 1, 0, 0, 0, 6, 0xB0.toByte(), 0, 0, 0, 0, 0, 120.toByte()))
+        return box("hvc1", fixed + hvcC)
+    }
+
+    private fun fingerprintTrak(trackId: Long, timescale: Long, entry: ByteArray): ByteArray =
+        box("trak", tkhd(trackId) + box("mdia", mdhd(timescale) + box("minf", box("stbl", stsd(entry)))))
 
     @Test fun codecInfoParsesAvcAndAacAndResolution() {
         val init = box("ftyp", ByteArray(4)) +
@@ -161,7 +238,60 @@ class Fmp4SplitterTest {
         assertEquals("avc1.640028,mp4a.40.2", info.hlsCodecs)
     }
 
+    @Test fun codecInfoPreservesAvc3SampleEntryPrefix() {
+        val entry = avc1(1280, 720, 0x64, 0x00, 0x28).also { bytes ->
+            "avc3".forEachIndexed { i, c -> bytes[4 + i] = c.code.toByte() }
+        }
+        val init = box("ftyp", ByteArray(4)) + box("moov", videoTrak(entry))
+        assertEquals("avc3.640028", Fmp4Splitter.codecInfo(init)?.videoCodec)
+    }
+
     @Test fun codecInfoNullWhenNoMoov() {
         assertEquals(null, Fmp4Splitter.codecInfo(box("ftyp", ByteArray(4))))
+    }
+
+    @Test fun codecInfoParsesHevcConfigurationRatherThanBareSampleEntry() {
+        val init = box("ftyp", ByteArray(4)) + box("moov", videoTrak(hvc1(1920, 1080)) + audioTrak())
+        val info = Fmp4Splitter.codecInfo(init)!!
+        assertEquals("hvc1.1.6.L120.B0", info.videoCodec)
+        assertEquals("mp4a.40.2", info.audioCodec)
+    }
+
+    @Test fun initFingerprintRejectsChangedSampleDescription() {
+        val first = box("ftyp", ByteArray(4)) + box("moov", fingerprintTrak(1, 90_000, avc1(1280, 720, 0x64, 0, 0x28)))
+        val changed = box("ftyp", ByteArray(4)) + box("moov", fingerprintTrak(1, 90_000, avc1(1280, 720, 0x4D, 0, 0x1F)))
+        val firstFingerprint = Fmp4Splitter.initFingerprint(first)
+        assertEquals(firstFingerprint, Fmp4Splitter.initFingerprint(first.copyOf()))
+        assertNotEquals(firstFingerprint, Fmp4Splitter.initFingerprint(changed))
+    }
+
+    @Test fun rejectsUnrepresentableLargeBoxLength() {
+        val malformed = ByteArray(16)
+        malformed[3] = 1 // large-size box
+        "moof".forEachIndexed { i, c -> malformed[4 + i] = c.code.toByte() }
+        malformed[8] = 0x80.toByte() // unsigned 64-bit value above Long.MAX_VALUE
+        assertEquals(-1, Fmp4Splitter.firstBoxOffset(malformed, "moof"))
+    }
+
+    @Test fun rejectsAnEmptyMoofAndMdatAsMedia() {
+        assertFalse(Fmp4Splitter.isValidMediaSegment(box("moof") + box("mdat")))
+    }
+
+    @Test fun timingRefusesVersionZeroTfdtOverflowRatherThanClamping() {
+        val seg = segment(seq = 1, videoTfdt = tfdtV0(0), audioTfdt = tfdtV0(0))
+        assertFailsWith<IllegalArgumentException> {
+            Fmp4Splitter.applyMediaTiming(
+                seg,
+                sequenceNumber = 1,
+                startSeconds = 50_000.0,
+                timescales = mapOf(1 to 90_000L, 2 to 48_000L),
+            )
+        }
+    }
+
+    @Test fun mediaDurationUsesTrunSampleDurations() {
+        val trun = box("trun", byteArrayOf(0, 0, 1, 0) + u32(2) + u32(500) + u32(1_000))
+        val media = box("moof", box("traf", tfhd(1) + trun)) + box("mdat", byteArrayOf(1))
+        assertEquals(1.5, Fmp4Splitter.mediaDurationSeconds(media, mapOf(1 to 1_000L)))
     }
 }

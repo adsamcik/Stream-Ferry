@@ -29,7 +29,7 @@ dependency verification metadata and Gradle Wrapper validation are required.
 | kotlinx-coroutines-android | 1.9.0 | mavenCentral() | Apache-2.0 | Structured concurrency | Official JetBrains. |
 | kotlinx-serialization-json | 1.7.3 | mavenCentral() | Apache-2.0 | Parse Jellyfin JSON | Official JetBrains; pinned. |
 | io.coil-kt:coil-compose | 2.7.0 | mavenCentral() | Apache-2.0 | In-app poster/thumbnail loading (memory-cache only; shares app OkHttp; header auth) | Official Coil; phone-UI only, never forwarded to the TV. |
-| androidx.media3:media3-transformer / -muxer / -common | 1.10.1 | google() | Apache-2.0 | On-device hardware video transcoding (Surface-to-Surface) into a seekable phone-hosted HLS/CMAF origin, for local files the TV can't decode | Official AndroidX/Media3; uses platform HW codecs; output served only as the phone proxy URL (`@UnstableApi` usage confined behind `data.transcode`). |
+| androidx.media3:media3-transformer / -muxer / -common | 1.10.1 | google() | Apache-2.0 | Experimental local-file hardware transcoding into a Cast-only phone-hosted HLS/fMP4 origin | Official AndroidX/Media3; uses platform HW codecs; output served only as the phone proxy URL (`@UnstableApi` usage confined behind `data.transcode`). |
 | junit:junit | 4.13.2 | mavenCentral() | EPL-1.0 | Unit tests | Test-only. |
 | kotlinx-coroutines-test | 1.9.0 | mavenCentral() | Apache-2.0 | Coroutine tests | Test-only. |
 | io.mockk:mockk | 1.13.13 | mavenCentral() | Apache-2.0 | Mocking | Test-only. |

@@ -30,15 +30,20 @@ class CachingMediaLibraryRepository(
         freshOrCached(LibraryCache.KEY_RESUME) { delegate.continueWatching() }
 
     private suspend fun freshOrCached(key: String, fetch: suspend () -> Result<List<MediaItem>>): Result<List<MediaItem>> {
+        // Bind this request to the account that existed when it began. A network request may finish
+        // after logout or a server/account switch; never publish that response into the new account's
+        // cache (or serve a prior account's fallback to the now-active UI).
+        val requestScope = scope()
         val result = fetch()
+        if (scope() != requestScope) return result
         return result.fold(
-            onSuccess = { items -> cache.put(scope(), key, items); result },
+            onSuccess = { items -> cache.put(requestScope, key, items); result },
             onFailure = { e ->
                 // Never mask an expired session (401) with stale cache — the ViewModel must see the
                 // auth failure to route the user back to login. Only connectivity failures fall back
                 // to the cache so genuine offline browsing still works.
                 if (e is JellyfinHttpException && e.isUnauthorized) result
-                else cache.get(scope(), key)?.let { Result.success(it) } ?: result
+                else cache.get(requestScope, key)?.let { Result.success(it) } ?: result
             },
         )
     }

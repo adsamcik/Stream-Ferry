@@ -24,9 +24,13 @@ class MediaPlaylistPlanner(
 
     /** Even segmentation across [runtimeSeconds]; the final segment carries the remainder. */
     fun planSegments(runtimeSeconds: Double): List<Segment> {
-        require(runtimeSeconds >= 0) { "runtimeSeconds must be >= 0" }
+        require(runtimeSeconds.isFinite() && runtimeSeconds >= 0.0) { "runtimeSeconds must be finite and >= 0" }
         if (runtimeSeconds == 0.0) return emptyList()
-        val count = Math.ceil(runtimeSeconds / targetSegmentSeconds).toInt()
+        val countAsDouble = Math.ceil(runtimeSeconds / targetSegmentSeconds)
+        require(countAsDouble <= MAX_SEGMENTS.toDouble()) {
+            "runtime exceeds the ${MAX_SEGMENTS}-segment on-device HLS safety limit"
+        }
+        val count = countAsDouble.toInt()
         return (0 until count).map { i ->
             val start = i * targetSegmentSeconds
             val duration = if (i == count - 1) runtimeSeconds - start else targetSegmentSeconds
@@ -55,6 +59,10 @@ class MediaPlaylistPlanner(
         segmentUri: (Int) -> String,
         initUri: (() -> String)? = null,
     ): String {
+        require(segments.size <= MAX_SEGMENTS) { "too many HLS segments" }
+        require(segments.all { it.durationSeconds.isFinite() && it.durationSeconds > 0.0 }) {
+            "HLS segment durations must be finite and positive"
+        }
         val maxDuration = segments.maxOfOrNull { it.durationSeconds } ?: targetSegmentSeconds
         val target = Math.ceil(maxDuration).toInt().coerceAtLeast(1)
         val sb = StringBuilder()
@@ -107,5 +115,7 @@ class MediaPlaylistPlanner(
 
     companion object {
         const val DEFAULT_SEGMENT_SECONDS = 2.0
+        /** 24 h at the default two-second cadence; prevents overflow/unbounded manifest allocation. */
+        const val MAX_SEGMENTS = 43_200
     }
 }

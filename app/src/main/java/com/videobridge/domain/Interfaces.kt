@@ -194,11 +194,36 @@ interface JellyfinRepository {
     suspend fun mediaSegments(itemId: String): List<com.videobridge.core.segments.MediaSegment> = emptyList()
 }
 
+/** Actual media-segment packaging for an HLS playlist handed to a Cast receiver. */
+enum class HlsSegmentFormat {
+    /** HLS media is carried in MPEG-2 transport-stream segments. */
+    MPEG2_TS,
+
+    /** HLS media is carried in fragmented-MP4 / CMAF segments. */
+    FMP4,
+}
+
+/**
+ * Renderer-facing stream metadata. This describes the bytes behind the phone proxy URL, rather than
+ * the original source container. It lets Cast select the correct HLS pipeline and lets DLNA advertise
+ * byte seeking only when the proxy can actually provide it.
+ */
+data class RendererStream(
+    val mimeType: String,
+    val hlsSegmentFormat: HlsSegmentFormat? = null,
+    val isByteSeekable: Boolean = false,
+)
+
 /** Secret upstream descriptor — never logged or sent to the TV. */
 data class UpstreamSource(
     val url: String,
     val authHeader: String?,
+    /** MIME of the phone-proxied resource (the HLS playlist itself for HLS). */
     val contentType: String,
+    /** Actual encoded output container, from Jellyfin's TranscodingContainer when transcoding. */
+    val outputContainer: String,
+    /** Actual HLS segment packaging; null for a progressive resource. */
+    val hlsSegmentFormat: HlsSegmentFormat? = null,
     val isHls: Boolean,
     /**
      * True when this is a live server-side transcode (HLS for Cast, progressive for DLNA). A transcode
@@ -206,9 +231,24 @@ data class UpstreamSource(
      * (Jellyfin honours `startTimeTicks`); a direct-play stream is byte-range seekable via the proxy.
      */
     val isTranscoding: Boolean,
+    /** True only when the proxy can safely honour byte-range requests for this resource. */
+    val isByteSeekable: Boolean,
     /** Byte length of a direct-play entity when known, null for a transcode (unknown live length). */
     val totalLength: Long?,
-)
+) {
+    init {
+        require(isHls == (hlsSegmentFormat != null)) {
+            "HLS streams must declare a segment format; progressive streams must not."
+        }
+        require(!isTranscoding || !isByteSeekable) {
+            "Live transcoded streams must not advertise byte seeking."
+        }
+    }
+
+    /** The complete metadata passed to the Cast or DLNA controller. */
+    val rendererStream: RendererStream
+        get() = RendererStream(contentType, hlsSegmentFormat, isByteSeekable)
+}
 
 // ----- Targets -----
 
@@ -245,13 +285,19 @@ interface PlaybackTargetController {
     suspend fun discover(timeoutMillis: Long): List<DiscoveredTarget>
     suspend fun connect(target: DiscoveredTarget)
     /**
-     * @param proxyUrl phone proxy URL only. @param mimeType resolved MIME.
+     * @param proxyUrl phone proxy URL only. @param stream actual proxied output metadata.
      * @param startPositionSeconds where playback should begin (a resume/reload position). The controller
      *   is responsible for starting AT this offset (Cast sets it in the load request; DLNA seeks once the
      *   renderer is playing), so callers must NOT issue a separate post-load seek — that races the load and
      *   is silently dropped, leaving the TV playing from the start.
      */
-    suspend fun load(proxyUrl: String, mimeType: String, title: String, durationSeconds: Long?, startPositionSeconds: Long = 0)
+    suspend fun load(
+        proxyUrl: String,
+        stream: RendererStream,
+        title: String,
+        durationSeconds: Long?,
+        startPositionSeconds: Long = 0,
+    )
     suspend fun play()
     suspend fun pause()
     suspend fun seekTo(positionSeconds: Long)

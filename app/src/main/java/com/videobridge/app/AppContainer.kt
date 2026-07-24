@@ -7,7 +7,6 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.os.Build
 import coil.ImageLoader
-import coil.memory.MemoryCache
 import coil.request.CachePolicy
 import com.google.android.gms.cast.framework.CastContext
 import com.videobridge.core.session.SessionRegistry
@@ -121,17 +120,20 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
     /**
      * Coil image loader for in-app posters/thumbnails (gallery + detail). Uses a dedicated OkHttp client
      * that injects the Jellyfin Authorization header ONLY for image requests to the configured server
-     * host — so the token is sent as a header, never embedded in the URL (hence never in a cache key or a
-     * log). Memory-cache only (no disk): no new on-disk surface — the streaming path stays RAM-only and
-     * posters are simply re-fetched over the LAN if evicted. Posters are shown on THIS phone only and are
-     * never given to the TV.
+     * origin. Redirects are disabled here, so an image request can never carry that header elsewhere.
+     * The token stays in a header, never embedded in the URL (hence never in a cache key or a
+     * log). Both memory and disk caching are disabled: a tokenless image URL alone does not distinguish
+     * two accounts on the same server, and a late in-flight response must not repopulate another account's
+     * cache. Posters are shown on THIS phone only and are never given to the TV.
      */
     val imageLoader: ImageLoader by lazy {
         val imageClient = httpClient.newBuilder()
+            .followRedirects(false)
+            .followSslRedirects(false)
             .addInterceptor { chain ->
                 val req = chain.request()
                 val header = jellyfinClient.imageAuthHeader()
-                val authed = if (header != null && req.url.host == jellyfinClient.serverHost()) {
+                val authed = if (header != null && jellyfinClient.isTrustedServerUrl(req.url)) {
                     req.newBuilder().header("Authorization", header).build()
                 } else {
                     req
@@ -141,7 +143,7 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
             .build()
         ImageLoader.Builder(appContext)
             .okHttpClient(imageClient)
-            .memoryCache { MemoryCache.Builder(appContext).maxSizePercent(0.20).build() }
+            .memoryCachePolicy(CachePolicy.DISABLED)
             .diskCachePolicy(CachePolicy.DISABLED)
             .crossfade(true)
             .build()
@@ -150,7 +152,13 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
         CachingMediaLibraryRepository(
             delegate = JellyfinMediaLibraryRepository(jellyfinClient, logger),
             cache = libraryCache,
-            scope = { jellyfinClient.baseUrl?.let { Integer.toHexString(it.hashCode()) } ?: "default" },
+            // Library/resume data is account-specific. Use the authenticated server + user identity,
+            // never a collision-prone URL hash, so offline fallback cannot cross accounts or servers.
+            scope = {
+                authRepository.currentUser.value
+                    ?.let { "server_${it.serverId}_user_${it.userId}" }
+                    ?: "unauthenticated"
+            },
         )
     }
 

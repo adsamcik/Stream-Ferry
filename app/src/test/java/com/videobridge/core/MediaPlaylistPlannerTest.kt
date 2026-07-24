@@ -44,6 +44,13 @@ class MediaPlaylistPlannerTest {
         assertFailsWith<IllegalArgumentException> { planner.planSegments(-1.0) }
     }
 
+    @Test fun nonFiniteOrOversizedRuntimeRejectedBeforeAllocation() {
+        assertFailsWith<IllegalArgumentException> { planner.planSegments(Double.POSITIVE_INFINITY) }
+        assertFailsWith<IllegalArgumentException> {
+            planner.planSegments((MediaPlaylistPlanner.MAX_SEGMENTS + 1) * MediaPlaylistPlanner.DEFAULT_SEGMENT_SECONDS)
+        }
+    }
+
     @Test fun masterPlaylistDeclaresCodecsAndPointsAtMedia() {
         // Cast/CMAF receivers need the CODECS attribute to start an fMP4 stream; the master must carry it
         // and reference the media playlist.

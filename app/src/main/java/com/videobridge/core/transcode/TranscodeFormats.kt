@@ -49,7 +49,9 @@ data class TranscodeTarget(
     val audioCodec: AudioCodec,
     val container: StreamContainer,
     val maxResolution: ResolutionTier,
+    /** Encoder capability-admission bound; the active Media3 path does not force output frame rate. */
     val maxFps: Int,
+    /** Requested only by broader planners; the active on-device fMP4 path feature-gates Main10. */
     val tenBit: Boolean = false,
 ) {
     init {

@@ -67,11 +67,16 @@ On-device local sessions also participate in the same **auto-reconnect**: if the
 the app retries with bounded (capped) backoff and resumes at the last position, and the CPU + Wi-Fi
 locks are held for the whole session so multi-hour, screen-off playback keeps working.
 
-## Incompatible codecs → on-device transcode
+## Incompatible codecs → experimental on-device transcode
 
-When a local file's codec/container can't be played by the target, there is no server to transcode it,
-so the phone transcodes it itself (hardware-accelerated, via AndroidX Media3 Transformer) into a
-seekable, phone-hosted HLS/CMAF origin. `PlaybackEngine.playLocal` probes the file
-(`core.transcode.PlaybackRouter` → `RouteKind.CLIENT_TRANSCODE`, `TranscodeNegotiator`,
-`core.hls.MediaPlaylistPlanner`, `core.transcode.Fmp4Splitter`) and routes to direct-play or on-device
-transcode automatically. See [ONDEVICE_TRANSCODE.md](ONDEVICE_TRANSCODE.md).
+When a local file's codec/container cannot be played by the target, there is no server to transcode it.
+The phone can offer a limited hardware-accelerated fallback **only to a compatible Cast receiver**. It
+publishes a seekable VOD HLS playlist with fMP4 fragments: H.264/AAC is the compatibility floor and
+HEVC/AAC is selected only when both phone and receiver admit it. `PlaybackEngine.playLocal` probes the
+file (`core.transcode.PlaybackRouter` → `RouteKind.CLIENT_TRANSCODE`, `TranscodeNegotiator`,
+`core.hls.MediaPlaylistPlanner`, `core.transcode.Fmp4Splitter`) and routes to direct play or that
+on-device path.
+
+The phone does not produce DASH or MPEG-TS here, has no CPU/AV1/VP9/Main10/HDR contract, and does not
+send this output to DLNA. It remains device-validation-dependent rather than a general local-media
+compatibility guarantee. See [ONDEVICE_TRANSCODE.md](ONDEVICE_TRANSCODE.md).

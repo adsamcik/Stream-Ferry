@@ -20,6 +20,11 @@ unmet item be stated with reasons.
   Chromecast/Google TV and Samsung/LG hardware, which are unavailable in the sandbox. The code paths,
   controllers, and the [compatibility matrix](COMPATIBILITY_MATRIX.md) are in place; the live gate
   must be executed on real devices.
+- **On-device local transcoding is experimental, not production-certified.** Its active path is
+  Cast-only HLS/fMP4 using a hardware H.264/AAC floor and opportunistic HEVC/AAC. Sustained encoder
+  speed, thermal throttling, fMP4 timeline/seek behaviour, A/V continuity, and receiver behaviour under
+  speculative requests still require physical validation. It must not be represented as reliable across
+  OEM phones or Cast devices.
 - No Jellyfin test server was available in-sandbox, so live auth/playback-info/media-source/reporting
   flows are implemented against the documented HTTP API but not executed end-to-end here.
 
@@ -28,6 +33,14 @@ unmet item be stated with reasons.
 - **HLS memory-only proxying** is implemented at the core level (`HlsRewriter`) but the full
   live-transcode HLS path (playlist refresh, segment streaming, CORS for Web Receiver) must be
   validated against a transcoding Jellyfin server; the verified primary path is file/range proxying.
+- **The phone transcode output is deliberately narrow.** It publishes HLS with fMP4 fragments for
+  compatible Cast receivers only. There is no phone DASH or MPEG-TS muxer, no AV1/VP9 or CPU encoder
+  path, and no Main10/HDR output or conversion contract. H.264/AAC is the compatibility floor; HEVC/AAC
+  is hardware- and receiver-gated. DLNA does not receive an on-device HLS/fMP4 stream.
+- **Online phone fallback is safety-gated off.** The app will not send a Jellyfin Authorization header
+  through Media3's remote input until that input can enforce the same trusted-origin and redirect policy
+  as the authenticated Jellyfin proxy. An opt-in setting does not enable the fallback today; Jellyfin
+  server transcoding remains the supported online recovery path.
 - **Rolling in-memory prebuffer** (Phase 9) policy + decisions are implemented and unit-tested; wiring
   it into the live streaming loop beyond pass-through is a follow-up.
 - **Jellyfin SDK vs HTTP API:** the playback path uses the documented Jellyfin **HTTP API** (OkHttp)
@@ -39,9 +52,10 @@ unmet item be stated with reasons.
   playback path.
 - Audio/video track switching, embedded/ASS/SSA/PGS subtitles, and codec probing are treated as
   unverified / test-required, not guaranteed.
-- Out of scope by design (§1): direct Jellyfin-to-TV, screen mirroring, phone transcoding, full-file
-  predownload, disk cache, offline downloads, music/photos/live-TV/SyncPlay, native TV apps, Media3
-  Cast.
+- Out of scope by design (§1): direct Jellyfin-to-TV, screen mirroring, broad/general-purpose phone
+  transcoding, full-file predownload, disk cache, offline downloads, music/photos/live-TV/SyncPlay,
+  native TV apps, Media3 Cast. The limited experimental local Cast HLS/fMP4 path above is the only
+  phone-transcoding exception.
 - **DRM / protected content is out of scope and not relayable.** An encrypted/DRM-protected stream
   cannot be proxied (or screen-captured) without the rights system's keys, so it is a deliberate
   non-goal rather than a regression. Jellyfin personal media is generally DRM-free.
@@ -60,4 +74,7 @@ unmet item be stated with reasons.
 
 - Phone→TV uses plaintext HTTP on the LAN (accepted residual risk; mitigated by session-limited,
   high-entropy URLs — [NETWORK_SECURITY.md](NETWORK_SECURITY.md)).
+- Authenticated Jellyfin media is intentionally same-origin only. Cross-origin PlaybackInfo/HLS resources
+  and redirects are rejected instead of forwarding the Jellyfin Authorization header; external CDN or
+  `.strm` sources therefore need a separately safe server-side route.
 - Orphaned Jellyfin transcodes after abrupt process death are handled best-effort only.

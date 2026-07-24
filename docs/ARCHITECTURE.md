@@ -46,7 +46,7 @@ construction, or playback reporting. It depends only on the domain interfaces in
 | `data.local` | On-device video source: user-elective SAF folder/file grants (`LocalSourceStore`) + optional MediaStore, enumerated and exposed as a `MediaSource` (`LocalMediaSource`). |
 | `data.resume` | Local "continue where you left off" store (`ResumeStore`) for on-device files, which have no server-side resume point. |
 | `playback` | `PlaybackEngine` orchestrates select → proxy → renderer and runs adaptive bitrate; failure **recovery** is factored into pure, tested units — `PlaybackRecovery` (`decideRecovery`), `StartupWatchdog` (silent-failure/early-bail heuristics) and `RendererCapabilityStore` (learns per-renderer transcode needs). Also `MediaSessionController` (system playback controls) and `PlaybackServiceController`. |
-| `playback.streamselection` | Chooses a TV-compatible Jellyfin stream server-side (the phone doesn't transcode Jellyfin). On-device transcoding for local files lives in `data.transcode`. |
+| `playback.streamselection` | Chooses a TV-compatible Jellyfin stream server-side. The remote Jellyfin → phone transcode fallback is safety-gated off until Media3 can enforce authenticated redirect/origin policy; the active phone path is limited to local files in `data.transcode`. |
 | `playback.proxy` | `ProxyPlaybackService` foreground service (type `mediaPlayback`) hosting the MediaStyle controls notification. |
 | `playback.buffer` | Memory buffer policy (pass-through + rolling prebuffer). |
 | `playback.session` | `PlaybackSessionCoordinator` ties Jellyfin ↔ proxy ↔ Cast/DLNA sessions. |
@@ -78,10 +78,11 @@ tests (`./gradlew testDebugUnitTest`, or the `kotlinc` procedure in [BUILD.md](B
 - `core.hls.HlsRewriter` — rewrites HLS playlist URIs to proxy URLs.
 - `core.hls.HlsSegmentRegistry` — bounded, opaque (non-reversible) map of HLS segment/key/sub URLs so
   the rewritten playlist never exposes a Jellyfin URL or token to the TV.
-- `core.hls.MediaPlaylistPlanner` — seekable VOD HLS playlist + seek→segment mapping for on-device
-  (client-side) transcoding, giving the TV full seek over a live transcode.
-- `core.transcode.*` — on-device transcode target negotiation (4K-negotiated HEVC→H.264 ladder,
-  HEVC-never-MPEG-TS) + per-source routing (DIRECT_PLAY / SERVER_TRANSCODE / CLIENT_TRANSCODE).
+- `core.hls.MediaPlaylistPlanner` — seekable VOD HLS playlist + seek→segment mapping for the limited
+  local on-device path, so a compatible Cast receiver can request a position on demand.
+- `core.transcode.*` — phone-side HLS/fMP4 target admission (hardware H.264 and opportunistic HEVC only)
+  plus per-source routing (DIRECT_PLAY / SERVER_TRANSCODE / CLIENT_TRANSCODE). It does not establish a
+  phone DASH, MPEG-TS, AV1/VP9, CPU, Main10, HDR, or production-reliability contract.
 - `core.local.LocalMediaRules` — local-file video filtering, display titles, and container MIME.
 - `core.resume.ResumePolicy` — resume-vs-restart-vs-finished decision from a saved position + duration.
 - `core.dlna.SecureXml` — XXE-hardened XML parsing.

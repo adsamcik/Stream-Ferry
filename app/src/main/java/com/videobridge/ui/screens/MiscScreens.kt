@@ -450,10 +450,6 @@ fun SettingsScreen(
     onPreferredAudioLanguageChange: (String) -> Unit,
     preferredSubtitleLanguage: String,
     onPreferredSubtitleLanguageChange: (String) -> Unit,
-    transcodeOnlineOnDevice: Boolean,
-    onTranscodeOnlineChange: (Boolean) -> Unit,
-    onDeviceAllowCpu: Boolean,
-    onOnDeviceAllowCpuChange: (Boolean) -> Unit,
     backgroundPlaybackUnrestricted: Boolean,
     onAllowBackgroundPlayback: () -> Unit,
     onResetTvCapabilities: () -> Unit,
@@ -466,8 +462,6 @@ fun SettingsScreen(
     var autoSkip by remember { mutableStateOf(autoSkipSegments) }
     var audioLang by remember { mutableStateOf(preferredAudioLanguage) }
     var subtitleLang by remember { mutableStateOf(preferredSubtitleLanguage) }
-    var transcodeOnline by remember { mutableStateOf(transcodeOnlineOnDevice) }
-    var allowCpu by remember { mutableStateOf(onDeviceAllowCpu) }
     var capsReset by remember { mutableStateOf(false) }
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text(
@@ -525,27 +519,27 @@ fun SettingsScreen(
         SettingsToggleRow(
             icon = Icons.Rounded.HighQuality,
             label = "Transcode local videos on this device",
-            description = "When a local file is in a format the TV can't play, re-encode it on the phone " +
-                "(hardware) instead of just sending it. On by default \u2014 directly-playable files are still sent as-is.",
+            description = "For compatible Cast receivers and 8-bit SDR local files, re-encode an incompatible " +
+                "format on the phone (hardware) instead of just sending it. Directly-playable files stay as-is.",
             checked = transcodeLocal,
             onCheckedChange = { transcodeLocal = it; onTranscodeLocalChange(it) },
         )
         SettingsToggleRow(
             icon = Icons.Rounded.HighQuality,
-            label = "Transcode online videos on this device",
-            description = "Experimental. If the server can't produce a format the TV needs (or can't keep " +
-                "up), transcode the Jellyfin video on the phone as a last resort, after direct play and a " +
-                "server transcode. Off by default \u2014 the server normally does the transcoding.",
-            checked = transcodeOnline,
-            onCheckedChange = { transcodeOnline = it; onTranscodeOnlineChange(it) },
+            label = "Online phone transcoding",
+            description = "Temporarily unavailable for authenticated Jellyfin media while redirect-safe " +
+                "phone-side source handling is completed. Server transcoding remains the safe fallback.",
+            checked = false,
+            enabled = false,
+            onCheckedChange = { /* Safety-gated until an origin-pinned Media3 source is available. */ },
         )
         SettingsToggleRow(
             icon = Icons.Rounded.HighQuality,
-            label = "Allow CPU on-device transcode",
-            description = "Let on-device transcoding fall back to a software (CPU) encoder when no hardware " +
-                "encoder fits. Off by default \u2014 CPU encoding is slow and may not keep up above low resolutions.",
-            checked = allowCpu,
-            onCheckedChange = { allowCpu = it; onOnDeviceAllowCpuChange(it) },
+            label = "CPU on-device transcoding",
+            description = "Temporarily unavailable. The active local fallback uses hardware H.264/HEVC output only.",
+            checked = false,
+            enabled = false,
+            onCheckedChange = { /* The active pipeline intentionally has no CPU encoder path. */ },
         )
         SettingsToggleRow(
             icon = Icons.Rounded.BatteryStd,
@@ -675,10 +669,11 @@ private fun SettingsToggleRow(
     label: String,
     description: String,
     checked: Boolean,
+    enabled: Boolean = true,
     onCheckedChange: (Boolean) -> Unit,
 ) {
     Card(
-        modifier = Modifier.fillMaxWidth().clickable { onCheckedChange(!checked) },
+        modifier = Modifier.fillMaxWidth().clickable(enabled = enabled) { onCheckedChange(!checked) },
         shape = RoundedCornerShape(20.dp),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
     ) {
@@ -696,7 +691,11 @@ private fun SettingsToggleRow(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-            Switch(checked = checked, onCheckedChange = onCheckedChange)
+            Switch(
+                checked = checked,
+                onCheckedChange = if (enabled) onCheckedChange else null,
+                enabled = enabled,
+            )
         }
     }
 }

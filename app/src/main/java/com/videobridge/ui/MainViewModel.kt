@@ -14,6 +14,7 @@ import com.videobridge.data.download.DownloadFormat
 import com.videobridge.data.download.MediaDownloader.DownloadState
 import com.videobridge.data.jellyfin.HttpApprovalRequiredException
 import com.videobridge.data.jellyfin.JellyfinHttpException
+import com.videobridge.data.jellyfin.QuickConnectSession
 import com.videobridge.domain.DiscoveredTarget
 import com.videobridge.domain.MediaItem
 import com.videobridge.domain.MediaSource
@@ -201,15 +202,23 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
     }
 
     /** Switch the active Jellyfin server; resume its library, or go to login if it needs re-auth / can't verify. */
-    fun switchServer(serverId: String) = viewModelScope.launch {
-        val session = container.authRepository.switchServer(serverId)
-        if (session != null) openLibraries()
-        else _state.update { it.copy(route = Route.SERVER_SETUP, loggedIn = false, errorMessage = "Sign in to that server to continue.") }
+    fun switchServer(serverId: String) {
+        // A device code belongs to one Jellyfin server. Clear it before the repository changes origins so
+        // the UI cannot keep polling or display a code from the previous server while the switch queues.
+        cancelQuickConnect()
+        viewModelScope.launch {
+            val session = container.authRepository.switchServer(serverId)
+            if (session != null) openLibraries()
+            else _state.update { it.copy(route = Route.SERVER_SETUP, loggedIn = false, errorMessage = "Sign in to that server to continue.") }
+        }
     }
 
-    fun forgetServer(serverId: String) = viewModelScope.launch {
-        container.authRepository.deleteServerProfile(serverId)
-        _state.update { it.copy(servers = container.authRepository.servers()) }
+    fun forgetServer(serverId: String) {
+        cancelQuickConnect()
+        viewModelScope.launch {
+            container.authRepository.deleteServerProfile(serverId)
+            _state.update { it.copy(servers = container.authRepository.servers()) }
+        }
     }
 
     /** Skip Jellyfin entirely and browse on-device videos. */
@@ -226,38 +235,42 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
 
     fun onAllowHttpChanged(allow: Boolean) = _state.update { it.copy(allowHttp = allow) }
 
-    fun testConnectionAndContinue() = viewModelScope.launch {
-        val s = _state.value
-        _state.update { it.copy(connectionState = ConnectionState.TESTING, isBusy = true, errorMessage = null) }
-        container.authRepository.setServer(s.serverUrlInput, s.allowHttp).fold(
-            onSuccess = { profile ->
-                _state.update {
-                    it.copy(
-                        connectionState = ConnectionState.CONNECTED,
-                        serverName = profile.name,
-                        isBusy = false,
-                        needsHttpApproval = false,
-                        errorMessage = null,
-                        route = Route.LOGIN,
-                    )
-                }
-            },
-            onFailure = { e ->
-                if (e is HttpApprovalRequiredException) {
-                    _state.update {
-                        it.copy(connectionState = ConnectionState.IDLE, needsHttpApproval = true, isBusy = false, errorMessage = null)
-                    }
-                } else {
+    fun testConnectionAndContinue() {
+        // Submitting a new address supersedes any displayed code before the repository reconfigures the client.
+        cancelQuickConnect()
+        viewModelScope.launch {
+            val s = _state.value
+            _state.update { it.copy(connectionState = ConnectionState.TESTING, isBusy = true, errorMessage = null) }
+            container.authRepository.setServer(s.serverUrlInput, s.allowHttp).fold(
+                onSuccess = { profile ->
                     _state.update {
                         it.copy(
-                            connectionState = ConnectionState.FAILED,
+                            connectionState = ConnectionState.CONNECTED,
+                            serverName = profile.name,
                             isBusy = false,
-                            errorMessage = e.message ?: "Couldn't connect to that server.",
+                            needsHttpApproval = false,
+                            errorMessage = null,
+                            route = Route.LOGIN,
                         )
                     }
-                }
-            },
-        )
+                },
+                onFailure = { e ->
+                    if (e is HttpApprovalRequiredException) {
+                        _state.update {
+                            it.copy(connectionState = ConnectionState.IDLE, needsHttpApproval = true, isBusy = false, errorMessage = null)
+                        }
+                    } else {
+                        _state.update {
+                            it.copy(
+                                connectionState = ConnectionState.FAILED,
+                                isBusy = false,
+                                errorMessage = e.message ?: "Couldn't connect to that server.",
+                            )
+                        }
+                    }
+                },
+            )
+        }
     }
 
     // ----- auth -----
@@ -281,7 +294,7 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
 
     /**
      * Start a Quick Connect handshake: show the code, then poll until the user approves it on their
-     * Jellyfin server (or cancels). The secret is held only here and never surfaced to the UI.
+     * Jellyfin server (or cancels). The opaque session stays here; its secret is never surfaced to UI state.
      */
     fun startQuickConnect() {
         quickConnectJob?.cancel()
@@ -305,7 +318,7 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
                     _state.update {
                         it.copy(isBusy = false, quickConnect = QuickConnectUiState(code = handshake.code))
                     }
-                    pollQuickConnect(handshake.secret)
+                    pollQuickConnect(handshake)
                 },
                 onFailure = { e ->
                     if (e is CancellationException) throw e
@@ -317,10 +330,10 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
         }
     }
 
-    private suspend fun pollQuickConnect(secret: String) {
+    private suspend fun pollQuickConnect(session: QuickConnectSession) {
         while (currentCoroutineContext().isActive && _state.value.quickConnect != null) {
             delay(QUICK_CONNECT_POLL_MS)
-            val poll = container.authRepository.pollQuickConnect(secret)
+            val poll = container.authRepository.pollQuickConnect(session)
             poll.exceptionOrNull()?.let { e ->
                 if (e is CancellationException) throw e
                 // The secret expired or was revoked server-side: stop and let the user retry.
@@ -330,7 +343,7 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
                 return
             }
             if (poll.getOrDefault(false) != true) continue
-            container.authRepository.completeQuickConnect(secret).fold(
+            container.authRepository.completeQuickConnect(session).fold(
                 onSuccess = {
                     _state.update { it.copy(quickConnect = null, loggedIn = true, errorMessage = null) }
                     openLibraries()
@@ -353,10 +366,13 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
         _state.update { it.copy(quickConnect = null, isBusy = false) }
     }
 
-    fun logout() = viewModelScope.launch {
-        runCatching { container.playbackEngine.stop() }
-        container.authRepository.logout()
-        _state.value = AppUiState()
+    fun logout() {
+        cancelQuickConnect()
+        viewModelScope.launch {
+            runCatching { container.playbackEngine.stop() }
+            container.authRepository.logout()
+            _state.value = AppUiState()
+        }
     }
 
     // ----- gallery -----
@@ -1211,10 +1227,13 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
         refreshDiagnostics()
     }
 
-    fun deleteAllData() = viewModelScope.launch {
-        _state.update { it.copy(isBusy = true) }
-        container.deleteAllData()
-        _state.value = AppUiState() // reset to a clean welcome state
+    fun deleteAllData() {
+        cancelQuickConnect()
+        viewModelScope.launch {
+            _state.update { it.copy(isBusy = true) }
+            container.deleteAllData()
+            _state.value = AppUiState() // reset to a clean welcome state
+        }
     }
 
     private fun PlaybackStatus.toUi() = PlaybackUiState(

@@ -10,6 +10,7 @@ import com.videobridge.core.http.HttpRange
 import com.videobridge.core.http.HttpResponsePlan
 import com.videobridge.core.http.RangeParseResult
 import com.videobridge.core.net.ConnectionLimiter
+import com.videobridge.core.net.TrustedMediaOriginPolicy
 import com.videobridge.core.resilience.ResilientStreamPolicy
 import com.videobridge.core.resilience.ThroughputWatchdog
 import com.videobridge.core.resilience.UpstreamRetry
@@ -23,7 +24,6 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -65,6 +65,15 @@ class LocalProxyServer(
     /** Bounds concurrent LAN connections (global + per-IP) to resist a hostile peer flooding the proxy. */
     private val connectionLimiter: ConnectionLimiter = ConnectionLimiter(),
 ) {
+    /**
+     * Redirects are handled below so a Jellyfin Authorization header is never automatically followed
+     * to another origin. This also applies when callers inject an otherwise default OkHttp client.
+     */
+    private val upstreamHttpClient = httpClient.newBuilder()
+        .followRedirects(false)
+        .followSslRedirects(false)
+        .build()
+
     private var serverSocket: ServerSocket? = null
     private var scope: CoroutineScope? = null
     @Volatile private var boundAddress: String? = null
@@ -273,7 +282,7 @@ class LocalProxyServer(
 
         // Safety net: a non-HLS session must never relay an HLS playlist (it would contain Jellyfin
         // segment URLs + the token). If the upstream unexpectedly returns one, refuse.
-        if (looksLikePlaylist(session.upstreamUrl, first.header("Content-Type"))) {
+        if (looksLikePlaylist(first.request.url.toString(), first.header("Content-Type"))) {
             runCatching { first.close() }
             writeStatus(out, 502, "Bad Gateway")
             logger.w(TAG, "Refusing to relay an HLS playlist on a non-HLS session")
@@ -297,24 +306,37 @@ class LocalProxyServer(
      * Jellyfin URL/token never reaches the TV.
      */
     private fun serveHls(session: ProxySession, req: RequestLine, segParam: String?, out: OutputStream, head: Boolean) {
+        val originPolicy = TrustedMediaOriginPolicy.fromBaseUrl(session.upstreamUrl)
+        if (originPolicy == null) {
+            writeStatus(out, 502, "Bad Gateway")
+            logger.w(TAG, "Refusing HLS request with an invalid upstream origin")
+            return
+        }
         val registry = hlsRegistries.computeIfAbsent(session.id) { _ -> HlsSegmentRegistry() }
         val resourceUrl = if (segParam == null) session.upstreamUrl else registry.resolve(segParam)
-        if (resourceUrl == null) {
+        val trustedResourceUrl = resourceUrl?.let(originPolicy::trustedAbsolute)
+        if (trustedResourceUrl == null) {
             writeStatus(out, 404, "Not Found"); return
         }
         // The top-level playlist is always fetched whole; only `?seg=` resources (segments) honour a
         // client Range, so we never request a partial playlist.
         val upstreamRange = if (segParam == null) null else req.rangeHeader
         logger.trace(TAG, "TV fetched HLS ${if (segParam == null) "master/media playlist" else "segment"}${req.rangeHeader?.let { " range=$it" } ?: ""}")
-        val resp = openHlsUpstream(resourceUrl, session.upstreamAuthHeader, upstreamRange)
+        val resp = openHlsUpstream(trustedResourceUrl.toString(), session.upstreamAuthHeader, upstreamRange, originPolicy)
         if (resp == null) {
             writeStatus(out, 502, "Bad Gateway")
             logger.w(TAG, "HLS upstream open failed or returned non-success")
             return
         }
         resp.use { r ->
+            val resolvedResourceUrl = r.request.url
+            if (!originPolicy.isTrusted(resolvedResourceUrl)) {
+                writeStatus(out, 502, "Bad Gateway")
+                logger.w(TAG, "Refusing an HLS redirect outside the trusted upstream origin")
+                return
+            }
             val contentType = r.header("Content-Type")
-            if (looksLikePlaylist(resourceUrl, contentType)) {
+            if (looksLikePlaylist(resolvedResourceUrl.toString(), contentType)) {
                 // Bound the playlist read (§16): a semi-trusted Jellyfin server must not be able to
                 // return an unbounded "playlist" and exhaust the phone heap. Oversized/missing -> 502.
                 val bodyBytes = r.body?.byteStream()?.let { BoundedBody.readAtMost(it, MAX_PLAYLIST_BYTES) }
@@ -325,14 +347,22 @@ class LocalProxyServer(
                 }
                 val body = bodyBytes.toString(Charsets.UTF_8)
                 val proxyBase = "http://$boundAddress:$boundPort/session/${session.id}"
-                val rewritten = HlsRewriter(proxyBase).rewrite(body) { uri ->
-                    registry.encode(resolveUri(resourceUrl, uri))
+                val rewritten = runCatching {
+                    HlsRewriter(proxyBase).rewrite(body) { uri ->
+                        val nestedUrl = originPolicy.resolve(uri, resolvedResourceUrl)
+                            ?: throw IllegalArgumentException("Untrusted HLS URI")
+                        registry.encode(nestedUrl.toString())
+                    }
+                }.getOrElse {
+                    writeStatus(out, 502, "Bad Gateway")
+                    logger.w(TAG, "Rejected an HLS URI outside the trusted upstream origin")
+                    return
                 }
                 val bytes = rewritten.toByteArray(Charsets.UTF_8)
                 writeSimpleHeaders(out, 200, "OK", "application/vnd.apple.mpegurl", bytes.size.toLong(), acceptRanges = false, extra = null)
                 if (!head) { out.write(bytes); out.flush() }
             } else {
-                val mime = contentType ?: guessSegmentMime(resourceUrl)
+                val mime = contentType ?: guessSegmentMime(resolvedResourceUrl.toString())
                 val length = r.body?.contentLength()?.takeIf { it >= 0 }
                 val code = if (r.code == 206) 206 else 200
                 val reason = if (code == 206) "Partial Content" else "OK"
@@ -343,13 +373,39 @@ class LocalProxyServer(
     }
 
     private fun openUpstream(session: ProxySession, rangeHeaderValue: String?): Response =
-        openUpstreamUrl(session.upstreamUrl, session.upstreamAuthHeader, rangeHeaderValue)
+        openUpstreamUrl(
+            session.upstreamUrl,
+            session.upstreamAuthHeader,
+            rangeHeaderValue,
+            TrustedMediaOriginPolicy.fromBaseUrl(session.upstreamUrl)
+                ?: throw IOException("Refusing an invalid upstream origin"),
+        )
 
-    private fun openUpstreamUrl(url: String, authHeader: String?, rangeHeaderValue: String?): Response {
-        val builder = Request.Builder().url(url).get()
-        authHeader?.let { builder.header("Authorization", it) }
-        rangeHeaderValue?.let { builder.header("Range", it) }
-        return httpClient.newCall(builder.build()).execute()
+    /**
+     * Open an authenticated upstream request, following only a small number of redirects that remain
+     * on the already-pinned origin. An origin change never receives an Authorization header because no
+     * request is created for it.
+     */
+    private fun openUpstreamUrl(
+        url: String,
+        authHeader: String?,
+        rangeHeaderValue: String?,
+        originPolicy: TrustedMediaOriginPolicy,
+    ): Response {
+        var target = originPolicy.trustedAbsolute(url)
+            ?: throw IOException("Refusing an upstream URL outside the trusted origin")
+        repeat(MAX_UPSTREAM_REDIRECTS + 1) {
+            val builder = Request.Builder().url(target).get()
+            authHeader?.let { builder.header("Authorization", it) }
+            rangeHeaderValue?.let { builder.header("Range", it) }
+            val response = upstreamHttpClient.newCall(builder.build()).execute()
+            if (!response.isRedirect) return response
+
+            val redirect = response.header("Location")?.let { originPolicy.resolve(it, target) }
+            response.close()
+            target = redirect ?: throw IOException("Refusing an upstream redirect outside the trusted origin")
+        }
+        throw IOException("Too many upstream redirects")
     }
 
     /**
@@ -359,10 +415,15 @@ class LocalProxyServer(
      * server is just slow to produce the segment, so another 30s attempt would only stall the TV further.
      * Returns a successful (200/206) [Response] to stream, or null (caller sends 502).
      */
-    private fun openHlsUpstream(url: String, authHeader: String?, rangeHeaderValue: String?): Response? {
+    private fun openHlsUpstream(
+        url: String,
+        authHeader: String?,
+        rangeHeaderValue: String?,
+        originPolicy: TrustedMediaOriginPolicy,
+    ): Response? {
         var attempt = 0
         while (true) {
-            val result = runCatching { openUpstreamUrl(url, authHeader, rangeHeaderValue) }
+            val result = runCatching { openUpstreamUrl(url, authHeader, rangeHeaderValue, originPolicy) }
             val resp = result.getOrNull()
             if (resp != null && UpstreamRetry.isSuccess(resp.code)) return resp
             val code = resp?.code
@@ -520,7 +581,7 @@ class LocalProxyServer(
         when (val seg = queryParam(req.path, "seg")) {
             null -> {
                 val base = "http://$boundAddress:$boundPort/session/${session.id}"
-                val body = source.playlist(base).toByteArray(Charsets.UTF_8)
+                val body = source.playlist(base, allowExport = !head).toByteArray(Charsets.UTF_8)
                 // Always-on event (redacted) so a shared report shows EXACTLY what the TV was served —
                 // the master playlist + its CODECS declaration is the #1 reason a Cast fMP4 stream won't start.
                 logger.event("transcode", "Served TV master playlist (${body.size} B): ${playlistHead(body)}")
@@ -536,13 +597,13 @@ class LocalProxyServer(
             }
             "init" -> {
                 logger.trace(TAG, "TV fetched on-device transcode init segment")
-                serveSegmentBytes(source.initSegment(), out, head)
+                serveSegmentResource(source.initSegment(allowExport = !head), out, head)
             }
             else -> {
                 val index = seg.toIntOrNull()
                 if (index == null) { writeStatus(out, 404, "Not Found"); return }
                 logger.trace(TAG, "TV fetched on-device transcode segment #$index")
-                serveSegmentBytes(source.mediaSegment(index), out, head)
+                serveSegmentResource(source.mediaSegment(index, allowExport = !head), out, head)
             }
         }
     }
@@ -551,15 +612,20 @@ class LocalProxyServer(
     private fun playlistHead(body: ByteArray): String =
         String(body, Charsets.UTF_8).replace("\n", " | ").take(300)
 
+    private fun serveSegmentResource(resource: ClientTranscodeSource.Resource, out: OutputStream, head: Boolean) {
+        when (resource) {
+            is ClientTranscodeSource.Resource.Ready -> serveSegmentBytes(resource.bytes, out, head)
+            ClientTranscodeSource.Resource.NotFound -> writeStatus(out, 404, "Not Found")
+            // An export failure/cancellation is retryable by the receiver, but must not masquerade as a
+            // successful zero-byte fMP4 response. HEAD follows the same state mapping without exporting.
+            ClientTranscodeSource.Resource.Unavailable -> writeStatus(out, 503, "Service Unavailable")
+            ClientTranscodeSource.Resource.TimedOut -> writeStatus(out, 504, "Gateway Timeout")
+        }
+    }
+
     private fun serveSegmentBytes(bytes: ByteArray, out: OutputStream, head: Boolean) {
         writeSimpleHeaders(out, 200, "OK", "video/mp4", bytes.size.toLong(), acceptRanges = false, extra = null)
         if (!head) { out.write(bytes); runCatching { out.flush() } }
-    }
-
-    private fun resolveUri(base: String, ref: String): String {
-        if (ref.startsWith("http://") || ref.startsWith("https://")) return ref
-        val baseUrl = base.toHttpUrlOrNull() ?: return ref
-        return baseUrl.resolve(ref)?.toString() ?: ref
     }
 
     private fun looksLikePlaylist(url: String, contentType: String?): Boolean {
@@ -803,6 +869,8 @@ class LocalProxyServer(
         // read timeout is not retried (see openHlsUpstream / UpstreamRetry.shouldRetryOpen).
         private const val HLS_OPEN_MAX_RETRIES = 2
         private const val HLS_OPEN_RETRY_BACKOFF_MS = 250L
+        /** Same-origin redirects are handled manually; this bounds loops without exposing Location. */
+        private const val MAX_UPSTREAM_REDIRECTS = 3
 
         /** Hard cap on an upstream HLS playlist read into memory (a semi-trusted Jellyfin response). */
         private const val MAX_PLAYLIST_BYTES = 4 * 1024 * 1024

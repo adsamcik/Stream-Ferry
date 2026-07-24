@@ -25,6 +25,10 @@ import com.videobridge.core.transcode.VideoCodec
 import com.videobridge.logging.DiagnosticsLogger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 
 /**
@@ -45,10 +49,28 @@ class OnDeviceTranscoder(
     private val thread = HandlerThread("ondevice-transcoder").apply { start() }
     private val handler = Handler(thread.looper)
 
-    /** The export currently running on the looper thread, so [cancelInFlight] can abort it on stop. */
+    /** The export currently reserved or running, so cancellation also covers the pre-start window. */
     @Volatile private var inFlight: InFlight? = null
+    @Volatile private var released = false
 
-    private class InFlight(val transformer: Transformer, val done: CompletableDeferred<Unit>)
+    private class InFlight(
+        val done: CompletableDeferred<Unit>,
+        /** Identity token of the session that reserved this export, if any. */
+        val owner: Any? = null,
+        /** Lets a session that was released just before reservation prevent a late start. */
+        val abortIf: (() -> Boolean)? = null,
+        /** Completes only after Media3 has actually returned from the export lifecycle. */
+        val stopped: CompletableDeferred<Unit> = CompletableDeferred(),
+        @Volatile var transformer: Transformer? = null,
+        @Volatile var cancelled: Boolean = false,
+    )
+
+    /** Raised when an export did not complete inside its duration-derived deadline. */
+    class ExportDeadlineExceededException(
+        message: String,
+        /** True only when the cancelled Media3 lifecycle had finished before this exception was raised. */
+        val stopped: Boolean,
+    ) : Exception(message)
 
     /** Transcode `[startMs, endMs)` of [sourceUri] into [outFile] as a fragmented MP4. Suspends until done.
      *  [sourceHeaders] (e.g. an Authorization header for a Jellyfin origin) are attached to the source HTTP
@@ -60,96 +82,220 @@ class OnDeviceTranscoder(
         target: TranscodeTarget,
         outFile: File,
         sourceHeaders: Map<String, String>? = null,
+        /** Opaque session identity used to cancel only this caller's export during teardown. */
+        owner: Any? = null,
+        /** Checked on the Transformer looper before start so release/reservation races do not start work. */
+        abortIf: (() -> Boolean)? = null,
     ) {
+        check(!released) { "on-device transcoder is released" }
+        require(endMs > startMs) { "transcode segment must have a positive duration" }
+
         val done = CompletableDeferred<Unit>()
+        val flight = InFlight(done, owner, abortIf)
+        synchronized(this) {
+            check(!released) { "on-device transcoder is released" }
+            // The process owns one HW export pipeline. Failing a second concurrent owner is safer than
+            // overwriting its cancellation handle and leaving a Transformer orphaned.
+            check(inFlight == null) { "another on-device export is already active" }
+            inFlight = flight
+        }
+
         val codec = codecLabel(target.videoCodec)
         val maxHeight = target.maxResolution.maxHeightPx
         val startedAt = System.currentTimeMillis()
-        logger.trace(TAG, "HW transcode start: $codec ${maxHeight}p seg [${startMs}-${endMs}ms]")
-        handler.post {
-            try {
-                val clipping = MediaItem.ClippingConfiguration.Builder()
-                    .setStartPositionMs(startMs)
-                    .setEndPositionMs(endMs)
-                    .build()
-                val mediaItem = MediaItem.Builder()
-                    .setUri(Uri.parse(sourceUri))
-                    .setClippingConfiguration(clipping)
-                    .build()
-                // Cap the OUTPUT height to the negotiated tier (preserving aspect ratio). Without this the
-                // encoder is handed the source's full resolution — a 4K source then exceeds what most phone
-                // HW encoders can do and the export fails, so on-device transcoding of high-res files never
-                // works. Presentation only scales down here because the tier is derived from the source.
-                val edited = EditedMediaItem.Builder(mediaItem)
-                    .setEffects(Effects(emptyList(), listOf(Presentation.createForHeight(maxHeight))))
-                    .build()
-                val videoMime = videoMimeFor(target.videoCodec)
-                val builder = Transformer.Builder(appContext)
-                    .setVideoMimeType(videoMime)
-                    .setAudioMimeType(MimeTypes.AUDIO_AAC)
-                    .setMuxerFactory(InAppFragmentedMp4Muxer.Factory())
-                    .setLooper(thread.looper)
-                // A remote (Jellyfin) origin needs its auth header on the source request; the header is set
-                // on the input DataSource only, so it's never exposed to the TV. Local files need no headers.
-                if (!sourceHeaders.isNullOrEmpty()) {
-                    val dataSourceFactory = DefaultHttpDataSource.Factory().setDefaultRequestProperties(sourceHeaders)
-                    val assetLoaderFactory = ExoPlayerAssetLoader.Factory(
-                        appContext,
-                        DefaultDecoderFactory.Builder(appContext).build(),
-                        Clock.DEFAULT,
-                        DefaultMediaSourceFactory(dataSourceFactory),
-                    )
-                    builder.setAssetLoaderFactory(assetLoaderFactory)
+        val deadlineMs = exportDeadlineMs(startMs, endMs)
+        logger.trace(
+            TAG,
+            "HW transcode start: $codec ${maxHeight}p seg [${startMs}-${endMs}ms], deadline=${deadlineMs}ms",
+        )
+        val posted = runCatching {
+            handler.post {
+                if (flight.cancelled || shouldAbort(flight)) {
+                    completeFailure(flight, CancellationException("transcode cancelled before start"))
+                    return@post
                 }
-                val transformer = builder
-                    .addListener(object : Transformer.Listener {
-                        override fun onCompleted(composition: Composition, result: ExportResult) {
-                            logger.trace(
-                                TAG,
-                                "HW transcode done: $codec seg [${startMs}-${endMs}ms] " +
-                                    "in ${System.currentTimeMillis() - startedAt}ms (${outFile.length() / 1024} KiB)",
-                            )
-                            done.complete(Unit)
-                        }
+                try {
+                    val clipping = MediaItem.ClippingConfiguration.Builder()
+                        .setStartPositionMs(startMs)
+                        .setEndPositionMs(endMs)
+                        .build()
+                    val mediaItem = MediaItem.Builder()
+                        .setUri(Uri.parse(sourceUri))
+                        .setClippingConfiguration(clipping)
+                        .build()
+                    // Cap the OUTPUT height to the negotiated tier (preserving aspect ratio). Without this
+                    // the encoder is handed the source's full resolution, which frequently makes a 4K
+                    // source exceed a phone hardware encoder's practical throughput.
+                    val edited = EditedMediaItem.Builder(mediaItem)
+                        .setEffects(Effects(emptyList(), listOf(Presentation.createForHeight(maxHeight))))
+                        .build()
+                    val builder = Transformer.Builder(appContext)
+                        .setVideoMimeType(videoMimeFor(target.videoCodec))
+                        .setAudioMimeType(MimeTypes.AUDIO_AAC)
+                        .setMuxerFactory(InAppFragmentedMp4Muxer.Factory())
+                        .setLooper(thread.looper)
+                    // A remote origin needs its auth header on the phone-side input request only.
+                    if (!sourceHeaders.isNullOrEmpty()) {
+                        val dataSourceFactory = DefaultHttpDataSource.Factory().setDefaultRequestProperties(sourceHeaders)
+                        val assetLoaderFactory = ExoPlayerAssetLoader.Factory(
+                            appContext,
+                            DefaultDecoderFactory.Builder(appContext).build(),
+                            Clock.DEFAULT,
+                            DefaultMediaSourceFactory(dataSourceFactory),
+                        )
+                        builder.setAssetLoaderFactory(assetLoaderFactory)
+                    }
+                    val transformer = builder
+                        .addListener(object : Transformer.Listener {
+                            override fun onCompleted(composition: Composition, result: ExportResult) {
+                                logger.trace(
+                                    TAG,
+                                    "HW transcode done: $codec seg [${startMs}-${endMs}ms] " +
+                                        "in ${System.currentTimeMillis() - startedAt}ms (${outFile.length() / 1024} KiB)",
+                                )
+                                completeSuccess(flight)
+                            }
 
-                        override fun onError(composition: Composition, result: ExportResult, exception: ExportException) {
-                            // Always kept (not just under tracing): an on-device transcode failure is a
-                            // top reason casting a local/incompatible file fails, so it must be diagnosable.
-                            logger.w(TAG, "HW transcode failed: $codec seg [${startMs}-${endMs}ms] errorCode=${exception.errorCode}", exception)
-                            done.completeExceptionally(exception)
-                        }
-                    })
-                    .build()
-                inFlight = InFlight(transformer, done)
-                transformer.start(edited, outFile.absolutePath)
-            } catch (t: Throwable) {
-                logger.w(TAG, "HW transcode setup failed: $codec seg [${startMs}-${endMs}ms]", t)
-                done.completeExceptionally(t)
+                            override fun onError(composition: Composition, result: ExportResult, exception: ExportException) {
+                                logger.w(
+                                    TAG,
+                                    "HW transcode failed: $codec seg [${startMs}-${endMs}ms] errorCode=${exception.errorCode}",
+                                    exception,
+                                )
+                                completeFailure(flight, exception)
+                            }
+                        })
+                        .build()
+                    flight.transformer = transformer
+                    if (flight.cancelled || shouldAbort(flight)) {
+                        runCatching { transformer.cancel() }
+                        completeFailure(flight, CancellationException("transcode cancelled before start"))
+                    } else {
+                        transformer.start(edited, outFile.absolutePath)
+                    }
+                } catch (t: Throwable) {
+                    logger.w(TAG, "HW transcode setup failed: $codec seg [${startMs}-${endMs}ms]", t)
+                    completeFailure(flight, t)
+                }
             }
+        }.getOrDefault(false)
+        if (!posted) {
+            completeFailure(flight, IllegalStateException("on-device transcoder looper is unavailable"))
         }
+
         try {
-            done.await()
-        } finally {
-            inFlight = null
+            withTimeout(deadlineMs) { done.await() }
+        } catch (e: TimeoutCancellationException) {
+            cancel(flight, "transcode deadline exceeded")
+            val stopped = awaitStopped(flight, CANCEL_DRAIN_WAIT_MS)
+            if (!stopped) {
+                // Keep the reservation: a late Media3 callback must never overlap a new hardware export.
+                logger.w(TAG, "Timed out waiting for cancelled $codec export to terminate; encoder remains reserved")
+            }
+            throw ExportDeadlineExceededException(
+                "on-device $codec export exceeded its ${deadlineMs}ms deadline for [${startMs}-${endMs}ms]",
+                stopped = stopped,
+            )
+        } catch (e: CancellationException) {
+            if (!done.isCompleted) cancel(flight, "transcode caller cancelled")
+            throw e
         }
+    }
+
+    /** Abort the active export (including a queued-but-not-yet-started one). */
+    fun cancelInFlight() {
+        inFlight?.let { cancel(it, "transcode cancelled on stop") }
     }
 
     /**
-     * Aborts the export currently in progress (if any) and unblocks its awaiting caller. Posted to the
-     * transcoder's looper because Media3 [Transformer.cancel] must run on the thread the Transformer was
-     * built on. Called on stop so the HW muxer stops cleanly *before* the session deletes its cache dir —
-     * without this the muxer's output file is yanked mid-write and the export fails with muxing error 7001.
+     * Abort the active export and wait only a finite amount of time for its callback/unwind. This is used
+     * before a session removes its temporary directory, preventing the muxer from writing into deleted
+     * storage indefinitely.
      */
-    fun cancelInFlight() {
-        val f = inFlight ?: return
-        handler.post {
-            runCatching { f.transformer.cancel() }
-            f.done.completeExceptionally(CancellationException("transcode cancelled on stop"))
-        }
+    fun cancelInFlightAndAwait(timeoutMs: Long = RELEASE_WAIT_MS): Boolean {
+        val flight = inFlight ?: return true
+        cancel(flight, "transcode cancelled on stop")
+        return awaitStopped(flight, timeoutMs)
+    }
+
+    /**
+     * Cancel and drain an export only when [owner] still owns the active reservation.
+     *
+     * A playback session may be finishing while a newer session has already started. Global cancellation
+     * from stale cleanup would tear down that newer export; identity ownership keeps the two lifecycles
+     * isolated. A missing/mismatched reservation means this owner has no writer left to drain.
+     */
+    fun cancelOwnedInFlightAndAwait(owner: Any, timeoutMs: Long = RELEASE_WAIT_MS): Boolean {
+        val flight = inFlight?.takeIf { it.owner === owner } ?: return true
+        cancel(flight, "transcode cancelled on owning session stop")
+        return awaitStopped(flight, timeoutMs)
     }
 
     fun release() {
+        if (released) return
+        released = true
+        if (!cancelInFlightAndAwait()) {
+            logger.w(TAG, "Timed out waiting for the active on-device export to stop")
+        }
         runCatching { thread.quitSafely() }
+    }
+
+    private fun cancel(flight: InFlight, reason: String) {
+        flight.cancelled = true
+        val posted = runCatching {
+            handler.post {
+                val transformer = flight.transformer
+                if (transformer == null) {
+                    // The start runnable either has not run (and observed cancelled) or could not create
+                    // a Transformer. In both cases there is no native export left to drain.
+                    completeFailure(flight, CancellationException(reason))
+                } else {
+                    runCatching { transformer.cancel() }
+                    // Unblock the HTTP caller now, but leave [stopped] and the reservation for Media3's
+                    // completion callback so a late native export cannot overlap the next request.
+                    flight.done.completeExceptionally(CancellationException(reason))
+                }
+            }
+        }.getOrDefault(false)
+        if (!posted) {
+            completeFailure(flight, CancellationException(reason))
+        }
+    }
+
+    private fun shouldAbort(flight: InFlight): Boolean =
+        runCatching { flight.abortIf?.invoke() == true }.getOrDefault(true)
+
+    private fun completeSuccess(flight: InFlight) {
+        flight.done.complete(Unit)
+        flight.stopped.complete(Unit)
+        clearInFlight(flight)
+    }
+
+    private fun completeFailure(flight: InFlight, error: Throwable) {
+        flight.done.completeExceptionally(error)
+        flight.stopped.complete(Unit)
+        clearInFlight(flight)
+    }
+
+    private fun awaitStopped(flight: InFlight, timeoutMs: Long): Boolean = runBlocking {
+        withTimeoutOrNull(timeoutMs) {
+            // Do not swallow TimeoutCancellationException here: callers use false to retain a
+            // working file/cache that Media3 may still be writing.
+            flight.stopped.await()
+            true
+        } ?: false
+    }
+
+    private fun clearInFlight(flight: InFlight) {
+        synchronized(this) {
+            if (inFlight === flight) inFlight = null
+        }
+    }
+
+    private fun exportDeadlineMs(startMs: Long, endMs: Long): Long {
+        val durationMs = (endMs - startMs).coerceAtLeast(MIN_SEGMENT_DURATION_MS)
+        return (EXPORT_STARTUP_GRACE_MS + durationMs * EXPORT_TIME_MULTIPLIER)
+            .coerceAtMost(MAX_EXPORT_DEADLINE_MS)
     }
 
     private fun codecLabel(codec: VideoCodec): String = when (codec) {
@@ -168,5 +314,11 @@ class OnDeviceTranscoder(
 
     companion object {
         private const val TAG = "OnDeviceTranscoder"
+        private const val MIN_SEGMENT_DURATION_MS = 1_000L
+        private const val EXPORT_STARTUP_GRACE_MS = 10_000L
+        private const val EXPORT_TIME_MULTIPLIER = 10L
+        private const val MAX_EXPORT_DEADLINE_MS = 90_000L
+        private const val CANCEL_DRAIN_WAIT_MS = 5_000L
+        private const val RELEASE_WAIT_MS = 5_000L
     }
 }

@@ -1,11 +1,14 @@
 package com.videobridge.data.jellyfin
 
+import com.videobridge.core.http.BoundedBody
+import com.videobridge.core.net.TrustedMediaOriginPolicy
 import com.videobridge.core.resilience.Backoff
 import com.videobridge.core.resilience.RetryBudget
 import com.videobridge.core.resilience.UpstreamRetry
 import com.videobridge.core.segments.MediaSegment
 import com.videobridge.core.segments.SegmentType
 import com.videobridge.data.jellyfin.HttpJellyfinRepository.Companion.TICKS_PER_SECOND
+import com.videobridge.domain.HlsSegmentFormat
 import com.videobridge.domain.MediaChapter
 import com.videobridge.domain.MediaItem
 import com.videobridge.domain.MediaTrack
@@ -60,6 +63,13 @@ class JellyfinClient(
 
     @Volatile var baseUrl: String? = null
         private set
+    /** Pinned at server configuration time; every auth-bearing media URL must remain on this origin. */
+    @Volatile private var trustedMediaOrigin: TrustedMediaOriginPolicy? = null
+    /** Redirects are evaluated explicitly below before a request can retain its Authorization header. */
+    private val pinnedHttpClient = httpClient.newBuilder()
+        .followRedirects(false)
+        .followSslRedirects(false)
+        .build()
     @Volatile private var accessToken: String? = null
     @Volatile var userId: String? = null
         private set
@@ -104,8 +114,8 @@ class JellyfinClient(
     /** Current MediaBrowser Authorization header for image requests, or null when not logged in. */
     fun imageAuthHeader(): String? = if (accessToken != null) authHeaderValue() else null
 
-    /** Host of the configured Jellyfin server, used to scope the image-auth header. */
-    fun serverHost(): String? = baseUrl?.toHttpUrlOrNull()?.host
+    /** True when [url] is on the exact configured scheme, host and effective port. */
+    fun isTrustedServerUrl(url: HttpUrl): Boolean = trustedMediaOrigin?.isTrusted(url) == true
 
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
@@ -119,7 +129,26 @@ class JellyfinClient(
 
     // ----- session management (used by the auth repository) -----
 
-    fun configureServer(normalizedBaseUrl: String) { baseUrl = normalizedBaseUrl }
+    fun configureServer(normalizedBaseUrl: String) {
+        val policy = TrustedMediaOriginPolicy.fromBaseUrl(normalizedBaseUrl)
+            ?: throw IllegalArgumentException("Server URL must be an http or https URL without user-info.")
+        // This method is the server-switch boundary. A token from the prior server must never survive
+        // long enough to be attached to discovery or control-plane requests for the new one.
+        clearAuth()
+        trustedMediaOrigin = policy
+        baseUrl = normalizedBaseUrl
+    }
+
+    /**
+     * Adopt the final canonical base discovered by a credential-free public-info request. Authentication
+     * is deliberately left untouched: callers invoke this only before installing a token.
+     */
+    fun adoptDiscoveredServer(canonicalBaseUrl: String) {
+        val policy = TrustedMediaOriginPolicy.fromBaseUrl(canonicalBaseUrl)
+            ?: throw IllegalArgumentException("Discovered server URL must be an http or https URL without user-info.")
+        trustedMediaOrigin = policy
+        baseUrl = canonicalBaseUrl
+    }
 
     fun setAuth(token: String, userId: String) {
         this.accessToken = token
@@ -133,6 +162,7 @@ class JellyfinClient(
     }
 
     fun clearAll() {
+        trustedMediaOrigin = null
         baseUrl = null
         clearAuth()
     }
@@ -143,13 +173,33 @@ class JellyfinClient(
 
     data class PublicInfo(val serverId: String?, val name: String)
 
-    /** Public, unauthenticated server info — name + the stable server Id used for anti-spoof pinning. */
-    suspend fun publicInfo(): PublicInfo? = withContext(Dispatchers.IO) {
+    /** A credential-free discovery result plus the final canonical base to persist and pin. */
+    data class ServerDiscovery(val info: PublicInfo, val canonicalBaseUrl: String)
+
+    /**
+     * Discover a server before login. It follows a small number of safe, credential-free canonical
+     * redirects (for example HTTP → HTTPS or a hostname alias), then returns the final origin to pin.
+     */
+    suspend fun discoverServer(): ServerDiscovery? = withContext(Dispatchers.IO) {
         catchingNonCancel {
-            val body = exec(get(path("System", "Info", "Public")))
-            val info = json.decodeFromString(PublicSystemInfo.serializer(), body)
-            PublicInfo(info.id, listOfNotNull(info.serverName, info.version?.let { "v$it" }).joinToString(" ").ifBlank { "Jellyfin" })
+            val response = executeUnauthenticatedDiscovery(publicGet(path("System", "Info", "Public")))
+            val canonicalBaseUrl = canonicalBaseUrlForPublicInfo(response.url)
+                ?: throw IOException("Public server-info redirect did not resolve to a canonical Jellyfin base URL.")
+            ServerDiscovery(parsePublicInfo(response.body), canonicalBaseUrl)
         }.getOrNull()
+    }
+
+    /** Public, unauthenticated server info on the already pinned origin (used for token restoration). */
+    suspend fun publicInfo(): PublicInfo? = withContext(Dispatchers.IO) {
+        catchingNonCancel { parsePublicInfo(exec(publicGet(path("System", "Info", "Public")))) }.getOrNull()
+    }
+
+    private fun parsePublicInfo(body: String): PublicInfo {
+        val info = json.decodeFromString(PublicSystemInfo.serializer(), body)
+        return PublicInfo(
+            info.id,
+            listOfNotNull(info.serverName, info.version?.let { "v$it" }).joinToString(" ").ifBlank { "Jellyfin" },
+        )
     }
 
     override suspend fun authenticateByName(username: String, password: String): JellyfinApi.AuthResult =
@@ -383,7 +433,8 @@ class JellyfinClient(
         val subtitleTracks = source.mediaStreams.filter { it.type.equals("Subtitle", true) }.toMediaTracks()
         logger.event(
             "jellyfin",
-            "PlaybackInfo resolved (container=${source.container}, video=${video?.codec} ${video?.width}x${video?.height}, " +
+            "PlaybackInfo resolved (container=${source.container}, transcodeContainer=${source.transcodingContainer}, " +
+                "video=${video?.codec} ${video?.width}x${video?.height}, " +
                 "audio=${audio?.codec}, bitrateBps=${source.bitrate}, hls=${resolved.isHls}, " +
                 "psid present=${response.playSessionId != null}, " +
                 "audioTracks=${audioTracks.size}, subtitleTracks=${subtitleTracks.size})",
@@ -438,31 +489,40 @@ class JellyfinClient(
                 "(canDirect=$canDirect, forced=$requireTranscode, container=${source.container})",
         )
 
-        val (rawUrl, isHls, contentType) = when {
+        val (rawUrl, isHls, outputContainer) = when {
             useTranscode -> {
                 val hls = source.transcodingSubProtocol.equals("hls", true) ||
                     transcodingUrl.contains(".m3u8")
                 Triple(
                     transcodingUrl,
                     hls,
-                    if (hls) "application/vnd.apple.mpegurl" else mimeForContainer(source.container),
+                    transcodeOutputContainer(source, transcodingUrl),
                 )
             }
             source.directStreamUrl != null ->
-                Triple(source.directStreamUrl, false, mimeForContainer(source.container))
+                Triple(source.directStreamUrl, false, directOutputContainer(source))
             else ->
-                Triple(directStreamPath(itemId, source.id ?: itemId, playSessionId), false, mimeForContainer(source.container))
+                Triple(directStreamPath(itemId, source.id ?: itemId, playSessionId), false, directOutputContainer(source))
+        }
+        val hlsSegmentFormat = if (isHls) {
+            hlsSegmentFormatFor(outputContainer)
+                ?: error("Jellyfin HLS transcode has unsupported output container '$outputContainer'.")
+        } else {
+            null
         }
         return UpstreamSource(
             url = absoluteUpstreamUrl(rawUrl),
             authHeader = authHeaderValue(),
-            contentType = contentType,
+            contentType = if (isHls) HLS_MIME else mimeForContainer(outputContainer),
+            outputContainer = outputContainer,
+            hlsSegmentFormat = hlsSegmentFormat,
             isHls = isHls,
             isTranscoding = useTranscode,
             // Direct play serves a static file whose byte length is Jellyfin's reported MediaSource size,
             // so the proxy can advertise it and the renderer can byte-range seek. A transcode is a live
             // stream of unknown length (source.size is the ORIGINAL file, not the transcode) and is seeked
             // server-side, so leave it null.
+            isByteSeekable = !useTranscode && source.size != null,
             totalLength = if (useTranscode) null else source.size,
         )
     }
@@ -521,6 +581,17 @@ class JellyfinClient(
         val b = base().newBuilder()
         segments.forEach { b.addPathSegment(it) }
         return b.build()
+    }
+
+    /** Builds a discovery request that deliberately contains no device or user Authorization header. */
+    private fun publicGet(segments: List<String>, vararg query: Pair<String, String>): Request {
+        val b = base().newBuilder()
+        segments.forEach { b.addPathSegment(it) }
+        query.forEach { (k, v) -> b.addQueryParameter(k, v) }
+        return Request.Builder().url(b.build())
+            .header("Accept", "application/json")
+            .get()
+            .build()
     }
 
     private fun get(segments: List<String>, vararg query: Pair<String, String>): Request {
@@ -610,31 +681,164 @@ class JellyfinClient(
         }
     }
 
-    /** Run one HTTP request on OkHttp's pool, cancelling the call if the coroutine is cancelled. */
+    /**
+     * Execute one control-plane request with redirects disabled at the HTTP stack. GET/HEAD redirects
+     * are followed manually only after the target passes the configured origin policy; credentialed
+     * non-GET redirects are rejected rather than replaying a request body under ambiguous semantics.
+     */
     private suspend fun execOnce(request: Request): String = suspendCancellableCoroutine { cont ->
-        val call = httpClient.newCall(request)
-        cont.invokeOnCancellation { runCatching { call.cancel() } }
-        call.enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) {
-                if (!cont.isCancelled) cont.resumeWithException(e)
+        val policy = trustedMediaOrigin
+        if (policy == null || !policy.isTrusted(request.url)) {
+            cont.resumeWithException(IOException("Refusing an API request outside the configured Jellyfin origin."))
+        } else {
+            val activeCall = java.util.concurrent.atomic.AtomicReference<Call?>(null)
+
+            fun finishFailure(error: Throwable) {
+                if (cont.isActive) cont.resumeWithException(error)
             }
 
-            override fun onResponse(call: Call, response: Response) {
-                // A body-phase failure (read timeout / reset) throws here; OkHttp will NOT call
-                // onFailure again, so we must resume the continuation ourselves or the coroutine hangs.
-                try {
-                    response.use { resp ->
-                        val body = resp.body?.string().orEmpty()
-                        if (!resp.isSuccessful) {
-                            val reason = ServerErrorReason.extract(body, resp.header("Content-Type"), json)
-                            cont.resumeWithException(JellyfinHttpException(resp.code, reason))
-                        } else cont.resume(body)
+            fun enqueue(current: Request, redirects: Int) {
+                if (!cont.isActive) return
+                if (!policy.isTrusted(current.url)) {
+                    finishFailure(IOException("Refusing an API redirect outside the configured Jellyfin origin."))
+                    return
+                }
+                val call = pinnedHttpClient.newCall(current)
+                activeCall.set(call)
+                call.enqueue(object : Callback {
+                    override fun onFailure(call: Call, e: IOException) {
+                        activeCall.compareAndSet(call, null)
+                        finishFailure(e)
                     }
-                } catch (t: Throwable) {
-                    if (!cont.isCancelled) cont.resumeWithException(t)
+
+                    override fun onResponse(call: Call, response: Response) {
+                        activeCall.compareAndSet(call, null)
+                        try {
+                            if (response.isRedirect) {
+                                val nextUrl = response.header("Location")?.let { policy.resolve(it, current.url) }
+                                val canFollow = current.method == "GET" || current.method == "HEAD"
+                                response.close()
+                                when {
+                                    !canFollow -> finishFailure(
+                                        IOException("Refusing a redirect for a non-GET Jellyfin request."),
+                                    )
+                                    nextUrl == null -> finishFailure(
+                                        IOException("Refusing an API redirect outside the configured Jellyfin origin."),
+                                    )
+                                    redirects >= MAX_API_REDIRECTS -> finishFailure(
+                                        IOException("Too many redirects from the configured Jellyfin origin."),
+                                    )
+                                    else -> enqueue(current.newBuilder().url(nextUrl).build(), redirects + 1)
+                                }
+                                return
+                            }
+                            // A body-phase failure (read timeout / reset) throws here; OkHttp will NOT
+                            // call onFailure again, so resume the continuation ourselves or it hangs.
+                            response.use { resp ->
+                                val body = readControlPlaneBody(resp)
+                                if (!resp.isSuccessful) {
+                                    val reason = ServerErrorReason.extract(body, resp.header("Content-Type"), json)
+                                    finishFailure(JellyfinHttpException(resp.code, reason))
+                                } else if (cont.isActive) {
+                                    cont.resume(body)
+                                }
+                            }
+                        } catch (t: Throwable) {
+                            finishFailure(t)
+                        }
+                    }
+                })
+            }
+
+            cont.invokeOnCancellation { activeCall.getAndSet(null)?.cancel() }
+            enqueue(request, redirects = 0)
+        }
+    }
+
+    /** Response returned by the credential-free canonical-discovery flow. */
+    private data class DiscoveryResponse(val body: String, val url: HttpUrl)
+
+    /**
+     * Execute public discovery with no Authorization header. Cross-origin redirects are allowed only in
+     * this phase, and only to safe HTTP(S) targets; HTTPS is never downgraded and an HTTP redirect may
+     * not change authority. Once this succeeds, [adoptDiscoveredServer] pins the final origin before any
+     * authenticated request exists.
+     */
+    private fun executeUnauthenticatedDiscovery(initial: Request): DiscoveryResponse {
+        var current = initial
+        var redirects = 0
+        while (true) {
+            if (!isSafeDiscoveryUrl(current.url)) {
+                throw IOException("Refusing an unsafe Jellyfin discovery URL.")
+            }
+            var next: HttpUrl? = null
+            pinnedHttpClient.newCall(current).execute().use { response ->
+                if (response.isRedirect) {
+                    val location = response.header("Location")
+                    val canFollow = current.method == "GET" || current.method == "HEAD"
+                    next = location?.let { resolveDiscoveryRedirect(it, current.url) }
+                    when {
+                        !canFollow -> throw IOException("Refusing a redirect for a non-GET Jellyfin discovery request.")
+                        next == null -> throw IOException("Refusing an unsafe Jellyfin discovery redirect.")
+                        redirects >= MAX_DISCOVERY_REDIRECTS -> throw IOException("Too many Jellyfin discovery redirects.")
+                    }
+                } else {
+                    val body = readControlPlaneBody(response)
+                    if (!response.isSuccessful) {
+                        val reason = ServerErrorReason.extract(body, response.header("Content-Type"), json)
+                        throw JellyfinHttpException(response.code, reason)
+                    }
+                    return DiscoveryResponse(body, response.request.url)
                 }
             }
-        })
+            current = current.newBuilder().url(next ?: error("missing discovery redirect")).build()
+            redirects += 1
+        }
+    }
+
+    private fun isSafeDiscoveryUrl(url: HttpUrl): Boolean =
+        url.scheme in setOf("http", "https") && url.username.isEmpty() && url.password.isEmpty()
+
+    private fun resolveDiscoveryRedirect(location: String, current: HttpUrl): HttpUrl? {
+        val target = current.resolve(location) ?: return null
+        if (!isSafeDiscoveryUrl(target)) return null
+        // Credentials never exist on discovery requests, but do not allow a server to downgrade a
+        // user-entered/redirected HTTPS connection or pivot an approved HTTP endpoint to another host.
+        if (current.scheme == "https" && target.scheme != "https") return null
+        if (target.scheme == "http" &&
+            (current.scheme != "http" || target.host != current.host || target.port != current.port)
+        ) return null
+        return target
+    }
+
+    /** Remove `/System/Info/Public` from the successful final URL and retain any Jellyfin base path. */
+    private fun canonicalBaseUrlForPublicInfo(url: HttpUrl): String? {
+        if (!isSafeDiscoveryUrl(url)) return null
+        val paths = url.pathSegments.let { if (it.lastOrNull().isNullOrEmpty()) it.dropLast(1) else it }
+        val publicEndpoint = listOf("System", "Info", "Public")
+        val endsAtPublicInfo = paths.size >= publicEndpoint.size &&
+            paths.takeLast(publicEndpoint.size).zip(publicEndpoint).all { (actual, expected) ->
+                actual.equals(expected, ignoreCase = true)
+            }
+        if (!endsAtPublicInfo) return null
+        val base = HttpUrl.Builder()
+            .scheme(url.scheme)
+            .host(url.host)
+            .port(url.port)
+            .apply { paths.dropLast(publicEndpoint.size).forEach { addPathSegment(it) } }
+            .build()
+            .toString()
+            .removeSuffix("/")
+        return base.takeIf { TrustedMediaOriginPolicy.fromBaseUrl(it) != null }
+    }
+
+    /** Read a JSON/control-plane response under a hard cap before parsing or logging its body. */
+    private fun readControlPlaneBody(response: Response): String {
+        val body = response.body ?: return ""
+        val bytes = BoundedBody.readAtMost(body.byteStream(), MAX_CONTROL_PLANE_BODY_BYTES)
+            ?: throw IOException("Jellyfin control-plane response exceeded the ${MAX_CONTROL_PLANE_BODY_BYTES / (1024 * 1024)} MiB limit.")
+        val charset = body.contentType()?.charset(Charsets.UTF_8) ?: Charsets.UTF_8
+        return bytes.toString(charset)
     }
 
     private fun directStreamPath(itemId: String, mediaSourceId: String, playSessionId: String?): String {
@@ -649,18 +853,9 @@ class JellyfinClient(
     }
 
     private fun absoluteUpstreamUrl(rawUrl: String): String {
-        val absolute = if (rawUrl.startsWith("http://") || rawUrl.startsWith("https://")) {
-            rawUrl
-        } else {
-            base().resolve(rawUrl)?.toString() ?: (baseUrl!!.trimEnd('/') + rawUrl)
-        }
-        // Defense-in-depth: when the server itself is reached over HTTPS, never fetch the
-        // token-bearing upstream over cleartext — a misbehaving/compromised server must not be able
-        // to downgrade the token (api_key / Authorization) onto an http connection.
-        if (base().isHttps && absolute.startsWith("http://")) {
-            throw IllegalStateException("Refusing to stream over cleartext from an HTTPS server.")
-        }
-        return absolute
+        val policy = trustedMediaOrigin ?: error("Server origin is not configured")
+        return policy.resolve(rawUrl)?.toString()
+            ?: throw IllegalStateException("Refusing a media URL outside the configured Jellyfin origin.")
     }
 
     private fun authHeaderValue(): String = buildString {
@@ -672,7 +867,44 @@ class JellyfinClient(
         accessToken?.let { append(", Token=\"").append(it).append("\"") }
     }
 
-    private fun mimeForContainer(container: String?): String = when (container?.lowercase()) {
+    /** Jellyfin's response field is authoritative for a transcode; MediaSource.Container is original. */
+    private fun transcodeOutputContainer(source: MediaSourceDto, rawUrl: String): String =
+        normalizeContainer(source.transcodingContainer)
+            ?: transcodingContainerFromUrl(rawUrl)
+            ?: error("Jellyfin did not declare the transcode output container.")
+
+    private fun directOutputContainer(source: MediaSourceDto): String =
+        normalizeContainer(source.container) ?: "mp4"
+
+    /** Older Jellyfin servers may only include the actual container on the transcoding URL query. */
+    private fun transcodingContainerFromUrl(rawUrl: String): String? {
+        val url = absoluteUpstreamUrl(rawUrl).toHttpUrlOrNull() ?: return null
+        val key = url.queryParameterNames.firstOrNull {
+            it.equals("container", ignoreCase = true) || it.equals("transcodingContainer", ignoreCase = true)
+        } ?: return null
+        return normalizeContainer(url.queryParameter(key))
+    }
+
+    private fun normalizeContainer(container: String?): String? = container
+        ?.substringBefore(',')
+        ?.trim()
+        ?.lowercase()
+        ?.takeIf { it.isNotEmpty() }
+        ?.let {
+            when (it) {
+                "mpegts", "mpeg-ts", "m2ts" -> "ts"
+                "fmp4", "cmaf", "m4s" -> "mp4"
+                else -> it
+            }
+        }
+
+    private fun hlsSegmentFormatFor(container: String): HlsSegmentFormat? = when (normalizeContainer(container)) {
+        "ts" -> HlsSegmentFormat.MPEG2_TS
+        "mp4" -> HlsSegmentFormat.FMP4
+        else -> null
+    }
+
+    private fun mimeForContainer(container: String?): String = when (normalizeContainer(container)) {
         "mp4", "m4v" -> "video/mp4"
         "mkv" -> "video/x-matroska"
         "webm" -> "video/webm"
@@ -735,6 +967,12 @@ class JellyfinClient(
         private val FOLDER_TYPES = setOf("CollectionFolder", "Series", "Season", "BoxSet", "Folder", "UserView")
         // Codecs used for attached cover-art/thumbnail streams (not the real video feed).
         private val IMAGE_CODECS = setOf("mjpeg", "png", "gif", "bmp", "jpeg", "jpg", "webp")
+        private const val HLS_MIME = "application/vnd.apple.mpegurl"
+        /** Same-origin GET/HEAD redirects are explicit and bounded; other methods never replay. */
+        private const val MAX_API_REDIRECTS = 3
+        private const val MAX_DISCOVERY_REDIRECTS = 3
+        /** Prevent a semi-trusted Jellyfin control-plane response from exhausting app memory. */
+        private const val MAX_CONTROL_PLANE_BODY_BYTES = 8 * 1024 * 1024
     }
 }
 
@@ -870,6 +1108,8 @@ private data class MediaSourceDto(
     @SerialName("SupportsTranscoding") val supportsTranscoding: Boolean? = null,
     @SerialName("TranscodingUrl") val transcodingUrl: String? = null,
     @SerialName("TranscodingSubProtocol") val transcodingSubProtocol: String? = null,
+    /** Actual mux/container selected by Jellyfin for TranscodingUrl (not the original media container). */
+    @SerialName("TranscodingContainer") val transcodingContainer: String? = null,
     @SerialName("DirectStreamUrl") val directStreamUrl: String? = null,
     @SerialName("MediaStreams") val mediaStreams: List<MediaStreamDto> = emptyList(),
 )

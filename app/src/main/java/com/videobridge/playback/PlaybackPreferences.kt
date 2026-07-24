@@ -21,9 +21,10 @@ class PlaybackPreferences(context: Context) {
         }
 
     /**
-     * When on (default), a local file whose format the TV can't play is transcoded on-device (HW)
-     * instead of being sent as-is; directly-playable files are still sent unchanged. When off, all local
-     * files are direct-played (handed to the TV to decode).
+     * When on (default), an incompatible local 8-bit SDR file is transcoded on-device (HW) only for a
+     * compatible Cast receiver; directly-playable files remain unchanged. HDR/10-bit and non-Cast paths
+     * stay direct-play because the active local pipeline has no verified color or DLNA contract. When off,
+     * all local files are handed to the TV unchanged.
      */
     var transcodeLocalOnDevice: Boolean
         get() = prefs.getBoolean(KEY_TRANSCODE_LOCAL, true)
@@ -44,10 +45,9 @@ class PlaybackPreferences(context: Context) {
         }
 
     /**
-     * When on, the app may fall back to transcoding an ONLINE (Jellyfin) source **on the phone** — after
-     * direct play and a server transcode — e.g. when the server can't produce a codec the TV needs or
-     * can't keep up. Off by default: it's experimental and CPU/bandwidth-intensive (the server normally
-     * transcodes). Local files are always eligible for on-device transcode (see [transcodeLocalOnDevice]).
+     * Retained setting for the experimental remote phone-transcode path. It is currently safety-gated
+     * while authenticated redirects cannot yet be enforced inside the Media3 source. Local files remain
+     * eligible for on-device transcode (see [transcodeLocalOnDevice]).
      */
     var transcodeOnlineOnDevice: Boolean
         get() = prefs.getBoolean(KEY_TRANSCODE_ONLINE, false)

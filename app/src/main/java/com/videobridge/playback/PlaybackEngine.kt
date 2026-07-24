@@ -11,6 +11,7 @@ import com.videobridge.core.stream.TargetCapabilities
 import com.videobridge.data.proxy.LocalProxyServer
 import com.videobridge.diagnostics.NetworkInfoProvider
 import com.videobridge.domain.DiscoveredTarget
+import com.videobridge.domain.HlsSegmentFormat
 import com.videobridge.domain.JellyfinRepository
 import com.videobridge.domain.MediaItem
 import com.videobridge.domain.MediaTrack
@@ -18,6 +19,7 @@ import com.videobridge.domain.PlaybackFailureKind
 import com.videobridge.domain.PlaybackInfo
 import com.videobridge.domain.PlaybackTargetController
 import com.videobridge.domain.PlaybackTargetEvent
+import com.videobridge.domain.RendererStream
 import com.videobridge.logging.DiagnosticsLogger
 import com.videobridge.playback.session.DefaultPlaybackSessionCoordinator
 import com.videobridge.core.stream.StreamSelectionService
@@ -573,7 +575,7 @@ class PlaybackEngine(
         reportedPositionSeconds = startPos
         seekSettleTargetSeconds = null
         coordinator.notePosition(reportedPositionSeconds)
-        val mimeForTv: String
+        val streamForTv: RendererStream
         val url: String
         if (transcodeTarget != null) {
             val cacheDir = File(File(appContext.cacheDir, "transcode"), "ct_$playGeneration")
@@ -581,10 +583,19 @@ class PlaybackEngine(
                 onDeviceTranscoder, params.filePath, (effectiveRuntimeSeconds ?: 0L).toDouble(), transcodeTarget, cacheDir, logger,
             )
             url = coordinator.startClientTranscodeAndBuildUrl(session, phoneIp).second
-            mimeForTv = "application/vnd.apple.mpegurl"
+            // Media3's active phone transcode path always emits fragmented MP4 behind HLS.
+            streamForTv = RendererStream(
+                mimeType = "application/vnd.apple.mpegurl",
+                hlsSegmentFormat = HlsSegmentFormat.FMP4,
+            )
         } else {
             url = coordinator.startLocalAndBuildUrl(params.filePath, params.contentType, phoneIp).second
-            mimeForTv = params.contentType
+            // A file-backed local resource has a known byte range. SAF descriptors may not, so
+            // keep their DLNA metadata conservative rather than advertising a range we cannot prove.
+            streamForTv = RendererStream(
+                mimeType = params.contentType,
+                isByteSeekable = !params.filePath.startsWith("content://") && File(params.filePath).isFile,
+            )
         }
         // Track byte flow + early TV bail-out so the startup watchdog can catch a local file the TV
         // silently never plays (local has no server transcode, so recovery surfaces the failure).
@@ -592,10 +603,10 @@ class PlaybackEngine(
         proxy.onDownstreamClosed = { bytes, durationMs, completed -> onDownstreamClosedEarly(bytes, durationMs, completed) }
         logger.event(
             "playback",
-            "Loading ${if (transcodeTarget != null) "on-device HLS transcode" else "direct-play ($mimeForTv)"} " +
+            "Loading ${if (transcodeTarget != null) "on-device HLS transcode" else "direct-play (${streamForTv.mimeType})"} " +
                 "on ${sel.displayName} (${sel.protocol})",
         )
-        tgt.load(url, mimeForTv, params.title, effectiveRuntimeSeconds, startPositionSeconds = reportedPositionSeconds)
+        tgt.load(url, streamForTv, params.title, effectiveRuntimeSeconds, startPositionSeconds = reportedPositionSeconds)
         runCatching { tgt.play() }
         armStartupWatchdog()
         publishStatus()
@@ -965,10 +976,11 @@ class PlaybackEngine(
         logger.event(
             "playback",
             "Loading ${if (upstream.isTranscoding) "transcode" else "direct-play"} " +
-                "(${if (upstream.isHls) "HLS" else "progressive"}, ${upstream.contentType}) at ${loadStart}s " +
+                "(${if (upstream.isHls) "HLS/${upstream.hlsSegmentFormat}" else "progressive"}, " +
+                    "${upstream.contentType}, output=${upstream.outputContainer}) at ${loadStart}s " +
                 "on ${selectedTarget?.displayName} (${selectedTarget?.protocol})",
         )
-        target.load(url, upstream.contentType, item.title, info.runtimeSeconds, startPositionSeconds = loadStart)
+        target.load(url, upstream.rendererStream, item.title, info.runtimeSeconds, startPositionSeconds = loadStart)
         runCatching { target.play() }
         // Watch for the TV silently never starting (ideas 1+7). Only for a fresh start / recovery reload —
         // not a seek or bitrate switch, where playback is already established.
@@ -1018,71 +1030,14 @@ class PlaybackEngine(
     }
 
     /**
-     * Last-resort recovery for an ONLINE source (opt-in): transcode the Jellyfin ORIGINAL on the phone and
-     * serve it to the TV as a phone-hosted HLS origin, after direct play and a server transcode have both
-     * failed. The original bytes + auth stay on the phone (fed to the on-device transcoder via a phone-only
-     * Authorization header); the TV only ever receives the proxy URL. Experimental — realtime on-device
-     * transcode of a remote source is device- and network-dependent; a failure here surfaces (guarded by
-     * [onDeviceTranscodeAttempted] so it isn't retried in a loop).
+     * Online phone transcoding is intentionally gated until its Media3 HTTP source can enforce the same
+     * origin policy as the authenticated Jellyfin proxy on every redirect. Passing a token as a default
+     * DataSource header is not an acceptable substitute: a redirected request could otherwise receive it.
      */
-    private suspend fun reloadAsOnDeviceOnlineTranscode(positionSeconds: Long) {
-        val item = this.item ?: return
-        val renderer = this.target ?: return
-        val sel = selectedTarget ?: return
-        isReloadingStream = true
-        try {
-            runCatching { renderer.prepareReload() }
-            runCatching { coordinator.stop("on-device transcode fallback") }
-            val phoneIp = networkInfo.lanIpv4()
-                ?: throw IllegalStateException("No Wi-Fi/LAN address to host the stream.")
-            // Resolve the untouched original so the phone (not the server) can re-encode it.
-            val info = jellyfin.playbackInfo(
-                itemId = item.id,
-                capabilities = sel.capabilities,
-                maxBitrateBps = null,
-                forceTranscode = false,
-                allowSubtitleBurnIn = false,
-                audioStreamIndex = audioSelection,
-                subtitleStreamIndex = subtitleSelection ?: -1,
-                startPositionSeconds = 0,
-                deviceProfileOverride = DeviceProfiles.forOriginalDirectStream(),
-            ).getOrThrow()
-            val upstream = jellyfin.resolveUpstream(info)
-            val runtime = info.runtimeSeconds ?: item.runtimeSeconds ?: 0L
-            if (runtime <= 0L) throw IllegalStateException("Unknown duration; can't plan an on-device transcode.")
-            val transcodeTarget = transcodeNegotiator.negotiate(
-                deviceEncodeCaps,
-                receiverCapsFor(sel.capabilities),
-                sourceMaxResolution = cappedSourceTier(info.profile.heightPx),
-                prefer4k = prefs.allow4kHdr,
-            )
-            val headers = upstream.authHeader?.let { mapOf("Authorization" to it) }
-            val cacheDir = File(File(appContext.cacheDir, "transcode"), "ondev_$playGeneration")
-            val session = ClientTranscodeSession(
-                onDeviceTranscoder, upstream.url, runtime.toDouble(), transcodeTarget, cacheDir, logger, headers,
-            )
-            val url = coordinator.startClientTranscodeAndBuildUrl(session, phoneIp).second
-            currentInfo = info
-            currentIsHls = true // the on-device VOD HLS playlist is full-timeline, so seeking is native
-            currentIsTranscoding = true
-            onDeviceTranscodeTarget = transcodeTarget // surface the on-device output in the "what's playing" UI
-            streamStartSeconds = 0
-            reportedPositionSeconds = positionSeconds
-            seekSettleTargetSeconds = null
-            coordinator.notePosition(positionSeconds)
-            renderer.load(url, "application/vnd.apple.mpegurl", item.title, runtime, startPositionSeconds = positionSeconds)
-            runCatching { renderer.play() }
-            armStartupWatchdog()
-            lastNote = "Transcoding on the phone (${transcodeTarget.videoCodec} ${transcodeTarget.maxResolution.maxHeightPx}p) — experimental"
-            publishStatus()
-            logger.event(
-                "playback",
-                "On-device transcode started for online source " +
-                    "(${transcodeTarget.videoCodec} ${transcodeTarget.maxResolution.maxHeightPx}p)",
-            )
-        } finally {
-            isReloadingStream = false
-        }
+    private suspend fun reloadAsOnDeviceOnlineTranscode(positionSeconds: Long): Nothing {
+        val reason = "On-device fallback for online media is unavailable until authenticated redirects are origin-pinned."
+        logger.event("playback", "Skipping on-device online fallback at ${positionSeconds}s: $reason")
+        throw IllegalStateException(reason)
     }
 
     /**
@@ -1168,7 +1123,7 @@ class PlaybackEngine(
                 preferDirectPlay = prefs.preferDirectPlay,
                 alreadyTranscoding = transcoding,
                 alreadyRetried = retriedOnce,
-                onDeviceOnlineEnabled = prefs.transcodeOnlineOnDevice,
+                onDeviceOnlineEnabled = prefs.transcodeOnlineOnDevice && ONLINE_ONDEVICE_TRANSCODE_ENABLED,
                 onDeviceAlreadyAttempted = onDeviceTranscodeAttempted,
                 // Only Cast can play the phone's HLS/CMAF on-device transcode; a DLNA renderer can't, so the
                 // policy surfaces instead of falling into an HLS-over-DLNA dead end (UPnP 701 / silent hang).
@@ -1360,7 +1315,8 @@ class PlaybackEngine(
      * on-device, and only after playback actually started (so normal startup buffering doesn't count).
      */
     private fun shouldEscalateToOnDevice(adaptive: AdaptiveBitrateController, now: Long): Boolean =
-        prefs.transcodeOnlineOnDevice &&
+        ONLINE_ONDEVICE_TRANSCODE_ENABLED &&
+            prefs.transcodeOnlineOnDevice &&
             currentInfo != null &&
             currentIsTranscoding &&
             !onDeviceTranscodeAttempted &&
@@ -1497,6 +1453,15 @@ class PlaybackEngine(
             logger.event("transcode", "Local media probe failed for a $container file; direct-playing as-is")
             return null
         }
+        // Transformer has no receiver-aware HDR preservation or tone-mapping contract. Do not silently
+        // turn an HDR/Main10 local source into an unspecified output; leave it on the direct-play path.
+        if (profile.isHdr || profile.bitDepth > 8) {
+            logger.event(
+                "transcode",
+                "Local ${profile.videoCodec}/$container is HDR or >8-bit; on-device transcoding is disabled until color conversion is explicit",
+            )
+            return null
+        }
         val decision = streamSelection.select(target.capabilities, profile, StreamPreferences())
         val route = playbackRouter.route(decision, SourceCapabilities(canServerTranscode = false, isSeekable = true))
         if (route.kind != RouteKind.CLIENT_TRANSCODE) {
@@ -1515,17 +1480,18 @@ class PlaybackEngine(
             )
             return null
         }
-        val negotiated = transcodeNegotiator.negotiate(
-            deviceEncodeCaps,
-            receiverCapsFor(target.capabilities),
-            sourceMaxResolution = cappedSourceTier(profile.heightPx),
-        )
-        // Codecs the TV can decode AND this phone can encode, for the manual picker; a manual pick (or an
-        // auto codec fallback) overrides the negotiator's automatic choice but keeps the negotiated tier.
+        // Codecs the TV can decode AND this phone can encode, for the manual picker. A selected codec
+        // is fed back through the negotiator rather than copied onto an automatic tier: H.264 and HEVC
+        // often have different phone/renderer height ceilings.
         val options = localTranscodeCodecOptions(target.capabilities)
         localTranscodeCodecOptions = options
         val forced = forcedLocalCodec?.takeIf { it in options }
-        val chosen = if (forced != null && forced != negotiated.videoCodec) negotiated.copy(videoCodec = forced) else negotiated
+        val chosen = transcodeNegotiator.negotiate(
+            deviceEncodeCaps,
+            receiverCapsFor(target.capabilities),
+            sourceMaxResolution = cappedSourceTier(profile.heightPx),
+            preferredCodec = forced,
+        )
         logger.event(
             "transcode",
             "On-device transcode chosen for local ${profile.videoCodec}/$container -> " +
@@ -1536,13 +1502,14 @@ class PlaybackEngine(
         return chosen
     }
 
-    /** Codecs the given TV can decode AND this phone can HW/SW encode, best-first (H.264 floor if encodable). */
+    /**
+     * Codecs the active phone fMP4 pipeline can request and package. AV1/VP9 capability discovery remains
+     * useful for server/direct play, but must not become a selectable Transformer target until qualified.
+     */
     private fun localTranscodeCodecOptions(caps: TargetCapabilities): List<VideoCodec> {
         val tv = caps.supportedVideoCodecs.map { it.lowercase() }.toSet()
         val enc = deviceEncodeCaps
         return buildList {
-            if ("av1" in tv && enc.av1MaxResolution != null) add(VideoCodec.AV1)
-            if ("vp9" in tv && enc.vp9MaxResolution != null) add(VideoCodec.VP9)
             if ((caps.supportsHevc || "hevc" in tv || "h265" in tv) && enc.hevcMaxResolution != null) add(VideoCodec.HEVC)
             if (enc.h264MaxResolution != null) add(VideoCodec.H264)
         }
@@ -1773,6 +1740,10 @@ class PlaybackEngine(
         // bitrates (~100 Mbps) so the server direct-plays the original instead of transcoding to fit.
         private const val HDR_PASSTHROUGH_MAX_BITRATE_BPS = 120_000_000L
 
+        // DefaultHttpDataSource applies default request headers across redirects. Keep the experimental
+        // online fallback off until it uses a redirect-aware, origin-pinned authenticated source.
+        private const val ONLINE_ONDEVICE_TRANSCODE_ENABLED = false
+
         /**
          * Broad, optimistic Cast capabilities for the first (direct-play) attempt — the common formats a
          * modern Cast device / TV-with-Chromecast-built-in can usually decode. Advertising these lets
@@ -1791,4 +1762,3 @@ class PlaybackEngine(
         )
     }
 }
-

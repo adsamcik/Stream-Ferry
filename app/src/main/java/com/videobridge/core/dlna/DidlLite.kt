@@ -12,6 +12,7 @@ object DidlLite {
      * @param proxyUrl phone proxy stream URL (the only URL the TV ever receives).
      * @param title display title (escaped).
      * @param mimeType resolved MIME type (e.g. "video/mp4").
+     * @param byteSeekable whether the phone proxy can honour byte-range requests for this resource.
      * @param dlnaProfile optional DLNA.ORG profile (e.g. "MP4_H264_..."); omitted if null.
      * @param durationSecs optional duration for res@duration.
      */
@@ -19,6 +20,7 @@ object DidlLite {
         proxyUrl: String,
         title: String,
         mimeType: String,
+        byteSeekable: Boolean = false,
         dlnaProfile: String? = null,
         durationSecs: Long? = null,
     ): String {
@@ -27,8 +29,11 @@ object DidlLite {
             if (dlnaProfile != null) {
                 append("DLNA.ORG_PN=").append(escape(dlnaProfile)).append(';')
             }
-            // DLNA flags advertising streaming, byte-seek and background transfer support.
-            append("DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000")
+            // DLNA.ORG_OP=01 advertises byte seeking. Live progressive transcodes have no known
+            // byte length and are seeked by re-resolving server-side, so claiming it would induce
+            // unsupported renderer Range requests.
+            append("DLNA.ORG_OP=").append(if (byteSeekable) "01" else "00")
+                .append(";DLNA.ORG_FLAGS=01700000000000000000000000000000")
         }
         val durationAttr = durationSecs?.let { " duration=\"${formatDuration(it)}\"" } ?: ""
         return """<?xml version="1.0" encoding="UTF-8"?>""" +
