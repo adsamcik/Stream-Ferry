@@ -9,6 +9,7 @@ import com.videobridge.core.http.BoundedBody
 import com.videobridge.core.http.HttpRange
 import com.videobridge.core.http.HttpResponsePlan
 import com.videobridge.core.http.RangeParseResult
+import com.videobridge.core.http.UpstreamRangeVerifier
 import com.videobridge.core.net.ConnectionLimiter
 import com.videobridge.core.resilience.ResilientStreamPolicy
 import com.videobridge.core.resilience.ThroughputWatchdog
@@ -23,6 +24,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import okhttp3.Call
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -64,11 +66,23 @@ class LocalProxyServer(
     private val contentResolver: ContentResolver? = null,
     /** Bounds concurrent LAN connections (global + per-IP) to resist a hostile peer flooding the proxy. */
     private val connectionLimiter: ConnectionLimiter = ConnectionLimiter(),
+    /** Fresh operation-level Android local-network permission check. */
+    private val requireLocalNetworkAccess: () -> Unit = {},
 ) {
     private var serverSocket: ServerSocket? = null
     private var scope: CoroutineScope? = null
     @Volatile private var boundAddress: String? = null
     @Volatile private var boundPort: Int = -1
+    @Volatile private var stopping = false
+
+    /** Serializes stop/start with registration of sockets and in-flight upstream calls. */
+    private val lifecycleLock = Any()
+    /** Active renderer sockets, closed synchronously when the session is revoked. */
+    private val activeClients = ConcurrentHashMap.newKeySet<Socket>()
+    /** In-flight upstream HTTP calls, indexed by the opaque proxy session. */
+    private val activeCallsBySession = ConcurrentHashMap<String, MutableSet<Call>>()
+    /** Lets normal response cleanup remove its call from the active-session registry. */
+    private val responseCalls = ConcurrentHashMap<Response, Call>()
 
     /**
      * Optional sink notified of each chunk of bytes successfully delivered downstream (to the TV).
@@ -110,7 +124,9 @@ class LocalProxyServer(
     /** Bind on the given LAN IP and an ephemeral port. Returns "ip:port". */
     @Synchronized
     fun start(lanIp: String): String {
+        requireLocalNetworkAccess()
         if (serverSocket != null) return "$boundAddress:$boundPort"
+        synchronized(lifecycleLock) { stopping = false }
         val socket = ServerSocket()
         socket.reuseAddress = true
         // Ephemeral port (0) bound only to the LAN interface — not 0.0.0.0 unless required.
@@ -125,20 +141,39 @@ class LocalProxyServer(
         return "$lanIp:$boundPort"
     }
 
-    /** Stop accepting, close sockets, revoke all sessions and clear buffers (§6 cleanup). */
+    /**
+     * Stop local exposure before any remote cleanup can run: revoke opaque URLs, cancel every
+     * upstream call, close every accepted renderer socket, then close the listener and buffers.
+     */
     @Synchronized
     fun stop() {
-        scope?.cancel()
-        scope = null
-        runCatching { serverSocket?.close() }
-        serverSocket = null
-        sessions.revokeAll()
+        val calls: List<Call>
+        val clients: List<Socket>
+        val listener: ServerSocket?
+        val oldScope: CoroutineScope?
+        synchronized(lifecycleLock) {
+            stopping = true
+            sessions.revokeAll()
+            calls = activeCallsBySession.values.flatMap { it.toList() }
+            clients = activeClients.toList()
+            activeCallsBySession.clear()
+            responseCalls.clear()
+            activeClients.clear()
+            listener = serverSocket
+            serverSocket = null
+            oldScope = scope
+            scope = null
+        }
+        calls.forEach { call -> runCatching { call.cancel() } }
+        clients.forEach { client -> runCatching { client.close() } }
+        runCatching { listener?.close() }
+        oldScope?.cancel()
         hlsRegistries.clear()
         clientTranscoders.values.forEach { runCatching { it.release() } }
         clientTranscoders.clear()
         boundAddress = null
         boundPort = -1
-        logger.i(TAG, "Proxy stopped; sessions revoked, buffers cleared")
+        logger.i(TAG, "Proxy stopped; sessions revoked and active relay resources closed")
     }
 
     private suspend fun acceptLoop(socket: ServerSocket) {
@@ -152,8 +187,17 @@ class LocalProxyServer(
             // Bound concurrency (§16 DoS): a hostile LAN peer must not be able to open unbounded
             // connections and exhaust coroutines / file descriptors / upstream sockets.
             val ip = client.inetAddress?.hostAddress ?: "unknown"
-            if (!connectionLimiter.tryAcquire(ip)) {
+            val allowed = runCatching { requireLocalNetworkAccess(); true }.getOrDefault(false)
+            if (!allowed || !connectionLimiter.tryAcquire(ip)) {
                 logger.w(TAG, "Connection limit reached; rejecting a LAN connection")
+                runCatching { client.close() }
+                continue
+            }
+            val accepted = synchronized(lifecycleLock) {
+                if (stopping) false else activeClients.add(client)
+            }
+            if (!accepted) {
+                connectionLimiter.release(ip)
                 runCatching { client.close() }
                 continue
             }
@@ -161,6 +205,7 @@ class LocalProxyServer(
                 try {
                     handle(client)
                 } finally {
+                    activeClients.remove(client)
                     connectionLimiter.release(ip)
                 }
             }
@@ -232,61 +277,75 @@ class LocalProxyServer(
             serveHls(session, req, queryParam(req.path, "seg"), out, head)
             return
         }
-        // The upstream entity length: known for a direct-play static file (so we advertise Content-Length
-        // + a proper Content-Range and the renderer can byte-range SEEK), unknown (-1) for a live transcode
-        // (seeked server-side instead). Resolved on the session from Jellyfin's MediaSource size.
-        val totalLength = session.totalLength ?: req.knownTotalLength ?: -1L
-        val rangeResult = HttpRange.parse(req.rangeHeader, totalLength)
 
-        if (rangeResult is RangeParseResult.Unsatisfiable) {
-            val plan = HttpResponsePlan.plan(rangeResult, totalLength, session.contentType)
-            writeHeaders(out, plan)
+        // A progressive transcode whose total size is unknown is deliberately non-seekable. Returning a
+        // synthetic 206 here would claim bytes we cannot verify, so answer a normal 200 without ranges.
+        val totalLength = session.totalLength ?: req.knownTotalLength ?: -1L
+        if (totalLength < 0) {
+            serveUnknownLengthUpstream(session, out, head)
             return
         }
 
-        val plan = HttpResponsePlan.plan(rangeResult, totalLength, session.contentType, head)
-
-        // Resolve the absolute byte window we must deliver, and the initial upstream Range header.
-        val rangeStart: Long
-        val rangeEndInclusive: Long?
-        val initialRangeHeader: String?
-        if (rangeResult is RangeParseResult.Satisfiable) {
-            val r = rangeResult.range
-            rangeStart = r.start
-            rangeEndInclusive = if (r.endInclusive == Long.MAX_VALUE) null else r.endInclusive
-            initialRangeHeader = "bytes=$rangeStart-${rangeEndInclusive?.toString() ?: ""}"
-        } else {
-            // No / malformed Range -> full entity (200).
-            rangeStart = 0
-            rangeEndInclusive = if (totalLength >= 0) totalLength - 1 else null
-            initialRangeHeader = null
+        val rangeResult = HttpRange.parse(req.rangeHeader, totalLength)
+        if (rangeResult is RangeParseResult.Unsatisfiable) {
+            writeHeaders(out, HttpResponsePlan.plan(rangeResult, totalLength, session.contentType))
+            return
         }
-
-        // First upstream fetch. Validate BEFORE writing headers so we can return 502 cleanly.
-        val first = runCatching { openUpstream(session, initialRangeHeader) }.getOrNull()
-        if (first == null || !UpstreamRetry.isSuccess(first.code)) {
-            runCatching { first?.close() }
+        val plan = HttpResponsePlan.plan(rangeResult, totalLength, session.contentType, head)
+        val requestedRange = (rangeResult as? RangeParseResult.Satisfiable)?.range
+        val rangeStart = requestedRange?.start ?: 0L
+        val rangeEndInclusive = requestedRange?.endInclusive ?: totalLength - 1
+        val first = runCatching {
+            if (requestedRange != null) {
+                openVerifiedRangeUpstream(session, requestedRange, totalLength)
+            } else {
+                openFullUpstream(session, totalLength)
+            }
+        }.getOrNull()
+        if (first == null) {
             writeStatus(out, 502, "Bad Gateway")
-            logger.w(TAG, "Upstream open failed or returned non-success")
+            logger.w(TAG, "Upstream did not prove the requested media response")
             return
         }
 
         // Safety net: a non-HLS session must never relay an HLS playlist (it would contain Jellyfin
         // segment URLs + the token). If the upstream unexpectedly returns one, refuse.
         if (looksLikePlaylist(session.upstreamUrl, first.header("Content-Type"))) {
-            runCatching { first.close() }
+            closeUpstream(first)
             writeStatus(out, 502, "Bad Gateway")
             logger.w(TAG, "Refusing to relay an HLS playlist on a non-HLS session")
             return
         }
 
-        logger.trace(TAG, "TV ${req.method} direct stream: ${plan.status.code} range=${req.rangeHeader ?: "full"} total=${if (totalLength >= 0) totalLength.toString() else "unknown"}")
+        logger.trace(TAG, "TV ${req.method} direct stream: ${plan.status.code} range=${req.rangeHeader ?: "full"} total=$totalLength")
         writeHeaders(out, plan)
         if (head) {
-            runCatching { first.close() }
+            closeUpstream(first)
             return
         }
-        streamResilient(session, first, rangeStart, rangeEndInclusive, out)
+        streamResilient(session, first, rangeStart, rangeEndInclusive, totalLength, out, canResume = true)
+    }
+
+    private fun serveUnknownLengthUpstream(session: ProxySession, out: OutputStream, head: Boolean) {
+        val first = runCatching { openFullUpstream(session) }.getOrNull()
+        if (first == null) {
+            writeStatus(out, 502, "Bad Gateway")
+            logger.w(TAG, "Unknown-length upstream open failed")
+            return
+        }
+        if (looksLikePlaylist(session.upstreamUrl, first.header("Content-Type"))) {
+            closeUpstream(first)
+            writeStatus(out, 502, "Bad Gateway")
+            logger.w(TAG, "Refusing to relay an HLS playlist on a non-HLS session")
+            return
+        }
+        val contentLength = first.body?.contentLength()?.takeIf { it >= 0 }
+        writeSimpleHeaders(out, 200, "OK", session.contentType, contentLength, acceptRanges = false, extra = null)
+        if (head) {
+            closeUpstream(first)
+            return
+        }
+        streamResilient(session, first, rangeStart = 0, rangeEndInclusive = null, expectedTotalLength = -1, out = out, canResume = false)
     }
 
     /**
@@ -306,18 +365,34 @@ class LocalProxyServer(
         // client Range, so we never request a partial playlist.
         val upstreamRange = if (segParam == null) null else req.rangeHeader
         logger.trace(TAG, "TV fetched HLS ${if (segParam == null) "master/media playlist" else "segment"}${req.rangeHeader?.let { " range=$it" } ?: ""}")
-        val resp = openHlsUpstream(resourceUrl, session.upstreamAuthHeader, upstreamRange)
+        val resp = openHlsUpstream(session, resourceUrl, upstreamRange)
         if (resp == null) {
             writeStatus(out, 502, "Bad Gateway")
             logger.w(TAG, "HLS upstream open failed or returned non-success")
             return
         }
-        resp.use { r ->
-            val contentType = r.header("Content-Type")
-            if (looksLikePlaylist(resourceUrl, contentType)) {
+        try {
+            val contentType = resp.header("Content-Type")
+            val playlist = looksLikePlaylist(resourceUrl, contentType)
+            val responseValid = when {
+                playlist -> upstreamRange == null && resp.code == 200
+                upstreamRange == null -> resp.code == 200 && hasValidContentLength(resp)
+                else -> hasValidContentLength(resp) && UpstreamRangeVerifier.matchesRequestHeader(
+                    statusCode = resp.code,
+                    contentRanges = resp.headers("Content-Range"),
+                    contentLength = declaredContentLength(resp),
+                    requestHeader = upstreamRange,
+                )
+            }
+            if (!responseValid) {
+                writeStatus(out, 502, "Bad Gateway")
+                logger.w(TAG, "HLS upstream did not prove the requested response range")
+                return
+            }
+            if (playlist) {
                 // Bound the playlist read (§16): a semi-trusted Jellyfin server must not be able to
                 // return an unbounded "playlist" and exhaust the phone heap. Oversized/missing -> 502.
-                val bodyBytes = r.body?.byteStream()?.let { BoundedBody.readAtMost(it, MAX_PLAYLIST_BYTES) }
+                val bodyBytes = resp.body?.byteStream()?.let { BoundedBody.readAtMost(it, MAX_PLAYLIST_BYTES) }
                 if (bodyBytes == null) {
                     writeStatus(out, 502, "Bad Gateway")
                     logger.w(TAG, "HLS playlist missing or exceeded the size cap")
@@ -333,23 +408,98 @@ class LocalProxyServer(
                 if (!head) { out.write(bytes); out.flush() }
             } else {
                 val mime = contentType ?: guessSegmentMime(resourceUrl)
-                val length = r.body?.contentLength()?.takeIf { it >= 0 }
-                val code = if (r.code == 206) 206 else 200
+                val length = declaredContentLength(resp)
+                val code = if (upstreamRange != null) 206 else 200
                 val reason = if (code == 206) "Partial Content" else "OK"
-                writeSimpleHeaders(out, code, reason, mime, length, acceptRanges = true, extra = r.header("Content-Range")?.let { "Content-Range" to it })
-                if (!head) r.body?.byteStream()?.let { copyTo(it, out) }
+                writeSimpleHeaders(out, code, reason, mime, length, acceptRanges = true, extra = resp.header("Content-Range")?.let { "Content-Range" to it })
+                if (!head) resp.body?.byteStream()?.let { copyTo(it, out) }
             }
+        } finally {
+            closeUpstream(resp)
         }
     }
 
     private fun openUpstream(session: ProxySession, rangeHeaderValue: String?): Response =
-        openUpstreamUrl(session.upstreamUrl, session.upstreamAuthHeader, rangeHeaderValue)
+        openUpstreamUrl(session.id, session.upstreamUrl, session.upstreamAuthHeader, rangeHeaderValue)
 
-    private fun openUpstreamUrl(url: String, authHeader: String?, rangeHeaderValue: String?): Response {
+    /** A full response must start at byte zero; a 206 without a Range request is not safe to relay. */
+    private fun openFullUpstream(session: ProxySession, expectedTotalLength: Long? = null): Response? {
+        val response = openUpstream(session, null)
+        val declaredLength = declaredContentLength(response)
+        val valid = response.code == 200 &&
+            hasValidContentLength(response) &&
+            (expectedTotalLength == null || declaredLength == null || declaredLength == expectedTotalLength)
+        if (valid) return response
+        closeUpstream(response)
+        return null
+    }
+
+    /**
+     * Open a byte range only when the origin proves the precise range and representation size we are
+     * about to advertise downstream. Returning null denotes a protocol-invalid response; I/O failures
+     * are intentionally thrown so the retry policy can distinguish them.
+     */
+    private fun openVerifiedRangeUpstream(session: ProxySession, requested: com.videobridge.core.http.ByteRange, totalLength: Long): Response? {
+        val response = openUpstream(session, "bytes=${requested.start}-${requested.endInclusive}")
+        val valid = hasValidContentLength(response) && UpstreamRangeVerifier.isExact(
+            statusCode = response.code,
+            contentRanges = response.headers("Content-Range"),
+            contentLength = declaredContentLength(response),
+            requested = requested,
+            expectedTotalLength = totalLength,
+        )
+        if (valid) return response
+        closeUpstream(response)
+        return null
+    }
+
+    private fun hasValidContentLength(response: Response): Boolean {
+        val values = response.headers("Content-Length")
+        return values.isEmpty() ||
+            (values.size == 1 && values.single().toLongOrNull()?.let { it >= 0 } == true)
+    }
+
+    private fun declaredContentLength(response: Response): Long? =
+        response.headers("Content-Length").singleOrNull()?.toLongOrNull()?.takeIf { it >= 0 }
+
+    private fun openUpstreamUrl(sessionId: String, url: String, authHeader: String?, rangeHeaderValue: String?): Response {
         val builder = Request.Builder().url(url).get()
         authHeader?.let { builder.header("Authorization", it) }
         rangeHeaderValue?.let { builder.header("Range", it) }
-        return httpClient.newCall(builder.build()).execute()
+        val call = httpClient.newCall(builder.build())
+        synchronized(lifecycleLock) {
+            if (stopping || !sessions.isActive(sessionId)) {
+                throw IOException("Proxy session is no longer active")
+            }
+            activeCallsBySession.computeIfAbsent(sessionId) { ConcurrentHashMap.newKeySet() }.add(call)
+        }
+        try {
+            val response = call.execute()
+            synchronized(lifecycleLock) {
+                if (stopping || !sessions.isActive(sessionId)) {
+                    runCatching { response.close() }
+                    throw IOException("Proxy session was revoked while opening upstream")
+                }
+                responseCalls[response] = call
+            }
+            return response
+        } catch (t: Throwable) {
+            untrackCall(call)
+            throw t
+        }
+    }
+
+    /** Unregister the call only after the response body has been closed or cancellation has completed. */
+    private fun closeUpstream(response: Response) {
+        responseCalls.remove(response)?.let(::untrackCall)
+        runCatching { response.close() }
+    }
+
+    private fun untrackCall(call: Call) {
+        activeCallsBySession.entries.forEach { (sessionId, calls) ->
+            calls.remove(call)
+            if (calls.isEmpty()) activeCallsBySession.remove(sessionId, calls)
+        }
     }
 
     /**
@@ -359,14 +509,14 @@ class LocalProxyServer(
      * server is just slow to produce the segment, so another 30s attempt would only stall the TV further.
      * Returns a successful (200/206) [Response] to stream, or null (caller sends 502).
      */
-    private fun openHlsUpstream(url: String, authHeader: String?, rangeHeaderValue: String?): Response? {
+    private fun openHlsUpstream(session: ProxySession, url: String, rangeHeaderValue: String?): Response? {
         var attempt = 0
         while (true) {
-            val result = runCatching { openUpstreamUrl(url, authHeader, rangeHeaderValue) }
-            val resp = result.getOrNull()
-            if (resp != null && UpstreamRetry.isSuccess(resp.code)) return resp
-            val code = resp?.code
-            runCatching { resp?.close() }
+            val result = runCatching { openUpstreamUrl(session.id, url, session.upstreamAuthHeader, rangeHeaderValue) }
+            val response = result.getOrNull()
+            if (response != null && UpstreamRetry.isSuccess(response.code)) return response
+            val code = response?.code
+            response?.let(::closeUpstream)
             val timedOut = result.exceptionOrNull() is java.io.InterruptedIOException // incl. SocketTimeoutException
             if (attempt >= HLS_OPEN_MAX_RETRIES || !UpstreamRetry.shouldRetryOpen(code, timedOut)) return null
             attempt++
@@ -625,7 +775,9 @@ class LocalProxyServer(
         initialResp: Response,
         rangeStart: Long,
         rangeEndInclusive: Long?,
+        expectedTotalLength: Long,
         out: OutputStream,
+        canResume: Boolean,
     ) {
         val policy = ResilientStreamPolicy(rangeStart, rangeEndInclusive)
         val watchdog = ThroughputWatchdog()
@@ -634,29 +786,30 @@ class LocalProxyServer(
         try {
             while (true) {
                 if (response == null) {
-                    response = runCatching { openUpstream(session, policy.resumeRangeHeader()) }
-                        .getOrNull()?.takeIf { UpstreamRetry.isSuccess(it.code) }
-                    if (response == null) {
+                    if (!canResume || policy.rangeEndInclusive == null) return
+                    val requested = com.videobridge.core.http.ByteRange(policy.nextOffset, policy.rangeEndInclusive)
+                    response = try {
+                        openVerifiedRangeUpstream(session, requested, expectedTotalLength)
+                    } catch (_: Exception) {
                         if (!retryOrGiveUp(policy)) return else continue
+                    }
+                    // A protocol-invalid resume response (for example a 200 from byte zero) must never
+                    // be spliced into the renderer response. End rather than retrying corrupted bytes.
+                    if (response == null) {
+                        logger.w(TAG, "Upstream did not honour the resume range; ending transfer")
+                        return
                     }
                 }
                 val resp = response
                 response = null
-                // If a resume request was answered with 200 (Range ignored), discard the prefix we
-                // already delivered so the downstream byte stream stays contiguous.
-                val skip = if (policy.bytesForwarded > 0 && !UpstreamRetry.rangeHonoured(resp.code)) {
-                    policy.nextOffset
-                } else {
-                    0L
-                }
                 val result = try {
                     val body = resp.body
                     if (body == null) StreamResult.UPSTREAM_FAILED
-                    else copyStream(body.byteStream(), out, buf, policy, skip, watchdog)
-                } catch (e: Exception) {
+                    else copyStream(body.byteStream(), out, buf, policy, watchdog)
+                } catch (_: Exception) {
                     StreamResult.UPSTREAM_FAILED
                 } finally {
-                    runCatching { resp.close() }
+                    closeUpstream(resp)
                 }
                 when (result) {
                     StreamResult.COMPLETE, StreamResult.DOWNSTREAM_GONE -> return
@@ -668,7 +821,7 @@ class LocalProxyServer(
                 }
             }
         } finally {
-            runCatching { response?.close() }
+            response?.let(::closeUpstream)
             runCatching { out.flush() }
         }
     }
@@ -700,22 +853,9 @@ class LocalProxyServer(
         out: OutputStream,
         buf: ByteArray,
         policy: ResilientStreamPolicy,
-        skipBytes: Long,
         watchdog: ThroughputWatchdog,
     ): StreamResult {
         input.use { ins ->
-            var toSkip = skipBytes
-            while (toSkip > 0) {
-                val skipped = ins.skip(toSkip)
-                if (skipped <= 0) {
-                    val n = ins.read(buf, 0, minOf(buf.size.toLong(), toSkip).toInt())
-                    if (n < 0) return StreamResult.UPSTREAM_FAILED // premature EOF while skipping
-                    toSkip -= n
-                } else {
-                    toSkip -= skipped
-                }
-            }
-
             var sinceFlush = 0L
             while (true) {
                 val n = ins.read(buf)

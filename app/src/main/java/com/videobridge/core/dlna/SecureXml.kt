@@ -54,6 +54,10 @@ object SecureXml {
      * Never resolves external references (entity resolver returns empty content).
      */
     fun parse(xml: String): org.w3c.dom.Document {
+        // Do not rely on a parser-specific "disallow-doctype" feature: Android parser support varies.
+        if (xml.contains("<!DOCTYPE", ignoreCase = true)) {
+            throw SecurityException("DOCTYPE is not allowed in renderer XML")
+        }
         if (xml.toByteArray(Charsets.UTF_8).size > MAX_XML_BYTES) {
             throw XmlTooLargeException("XML exceeds ${MAX_XML_BYTES} bytes")
         }

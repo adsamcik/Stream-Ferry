@@ -142,6 +142,8 @@ class PlaybackEngine(
     deviceEncodeCapsProvider: () -> DeviceEncodeCapabilities,
     private val rendererCaps: RendererCapabilityStore,
     private val clock: () -> Long = System::currentTimeMillis,
+    /** Fresh local-network permission check for UI, notification, autoplay, and reconnect paths. */
+    private val requireLocalNetworkAccess: () -> Unit = {},
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     // Evaluated lazily (thread-safe) on first on-device-transcode use, always from an off-main path.
@@ -293,6 +295,7 @@ class PlaybackEngine(
         // call startForeground() within its deadline — otherwise the system raises
         // ForegroundServiceDidNotStartInTimeException (seen on Galaxy S24 / Android 16).
         mutex.withLock {
+        requireLocalNetworkAccess()
         stopInternalLocked("starting new playback")
         playGeneration++
         connectionLost = false
@@ -363,6 +366,7 @@ class PlaybackEngine(
      */
     suspend fun playNext(item: MediaItem, prefs: StreamPreferences): Boolean = withContext(Dispatchers.Default) {
         mutex.withLock {
+            requireLocalNetworkAccess()
             val tgt = target
             val sel = selectedTarget
             if (tgt == null || sel == null) return@withLock false // no live session — caller falls back to full play
@@ -441,6 +445,7 @@ class PlaybackEngine(
     }
 
     suspend fun resume() {
+        requireLocalNetworkAccess()
         val t = target ?: return
         isPlaying = true // optimistic: flip the control instantly; the next renderer status confirms it
         publishStatus()
@@ -448,6 +453,7 @@ class PlaybackEngine(
     }
 
     suspend fun pause() {
+        requireLocalNetworkAccess()
         val t = target ?: return
         isPlaying = false // optimistic
         publishStatus()
@@ -458,6 +464,7 @@ class PlaybackEngine(
     suspend fun skip(deltaSeconds: Long) = seekTo(absolutePositionSeconds + deltaSeconds)
 
     suspend fun setVolume(level: Float) {
+        requireLocalNetworkAccess()
         volume = level.coerceIn(0f, 1f)
         runCatching { target?.setVolume(volume) }
         publishStatus()
@@ -487,6 +494,7 @@ class PlaybackEngine(
     ) = withContext(Dispatchers.Default) {
         // Off the main thread so the foreground service can foreground within its deadline (see play()).
         mutex.withLock {
+        requireLocalNetworkAccess()
         stopInternalLocked("starting downloaded playback")
         playGeneration++
         this@PlaybackEngine.target = target
@@ -522,6 +530,7 @@ class PlaybackEngine(
      * connection. Assumes [target]/[selectedTarget]/[localPlayback] are set; throws on load failure.
      */
     private suspend fun loadLocalStreamLocked(startPos: Long) {
+        requireLocalNetworkAccess()
         val params = localPlayback ?: error("No local media selected")
         val sel = selectedTarget ?: error("No target")
         val tgt = target ?: error("No target")
@@ -615,6 +624,7 @@ class PlaybackEngine(
         startupBytesServed = 0
         terminalFailureSurfaced = false
         try {
+            proxy.stop()
             // Tell a polled controller (DLNA) we're tearing down first, then Stop before the new URI (many
             // renderers need it), then reload in place from the current position.
             runCatching { target?.prepareReload() }
@@ -626,6 +636,7 @@ class PlaybackEngine(
     }
 
     suspend fun seekTo(absoluteSeconds: Long) = mutex.withLock {
+        requireLocalNetworkAccess()
         val t = target ?: return@withLock
         val pos = absoluteSeconds.coerceAtLeast(0)
         // Only a progressive (non-HLS) transcode is a non-seekable live stream that must be re-resolved at
@@ -657,6 +668,23 @@ class PlaybackEngine(
     }
 
     suspend fun stop() = mutex.withLock { stopInternalLocked("user stopped") }
+
+    /**
+     * Invoked by the permission monitor. Close local exposure before waiting for [mutex], which can be
+     * held by a slow renderer/Jellyfin startup path; the remaining target/session cleanup is idempotent.
+     */
+    suspend fun onLocalNetworkPermissionRevoked() {
+        val hadActivePlayback = target != null || proxy.isRunning
+        if (!hadActivePlayback) return
+        proxy.stop()
+        runCatching { serviceController.stop() }
+        mutex.withLock {
+            if (target != null || hadActivePlayback) {
+                logger.event("playback", "Local network permission revoked; ending the active TV session")
+                stopInternalLocked("local network permission revoked")
+            }
+        }
+    }
 
     /**
      * Switch the active audio track to the server stream [index] (null = server default) and re-resolve
@@ -872,6 +900,7 @@ class PlaybackEngine(
         initialiseAdaptive: Boolean,
         armWatchdog: Boolean = false,
     ) {
+        requireLocalNetworkAccess()
         val item = this.item ?: error("No media selected")
         val target = this.target ?: error("No target")
         // A fresh stream resolve: clear the terminal-failure guard so this attempt can surface its own
@@ -1006,6 +1035,9 @@ class PlaybackEngine(
     private suspend fun reloadStream(positionSeconds: Long, requestedBitrate: Long?, reason: String, armWatchdog: Boolean = false) {
         isReloadingStream = true
         try {
+            // Revoke the old phone-hosted stream before any renderer control call can block. The
+            // coordinator then clears its session bookkeeping and performs bounded remote cleanup.
+            proxy.stop()
             // Tell the target we're about to tear down the current stream so a polled controller (DLNA)
             // stops its poll BEFORE the renderer is forced to STOP — otherwise the old poll can emit a
             // stale end-of-media that survives the reload window and stops the new stream.
@@ -1031,6 +1063,7 @@ class PlaybackEngine(
         val sel = selectedTarget ?: return
         isReloadingStream = true
         try {
+            proxy.stop()
             runCatching { renderer.prepareReload() }
             runCatching { coordinator.stop("on-device transcode fallback") }
             val phoneIp = networkInfo.lanIpv4()
@@ -1624,6 +1657,9 @@ class PlaybackEngine(
         fallbackJob?.cancel(); fallbackJob = null
         proxy.byteListener = null
         proxy.onDownstreamClosed = null
+        // Close the local relay before any renderer/Jellyfin RPC can block. coordinator.stop() repeats
+        // this idempotently while it clears its bookkeeping and performs bounded remote cleanup.
+        proxy.stop()
         target?.let {
             runCatching { it.stop() }
             runCatching { it.disconnect() }

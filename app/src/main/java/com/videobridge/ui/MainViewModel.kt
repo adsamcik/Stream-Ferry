@@ -38,6 +38,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -94,6 +95,28 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
     private var lastResumeSaveMs: Long = 0L
 
     init {
+        onLocalNetworkPermissionResult(container.permissions.hasLocalNetworkAccess())
+        // Runtime permission may be revoked outside this activity. Cancel work and remove cached targets
+        // before a stale selection can trigger a reconnect or proxy start.
+        viewModelScope.launch {
+            container.permissions.localNetworkAccess.drop(1).collect { granted ->
+                onLocalNetworkPermissionResult(granted)
+                if (!granted) {
+                    scanJob?.cancel()
+                    cancelReconnect()
+                    reconnectContext = null
+                    _state.update {
+                        it.copy(
+                            isScanningTargets = false,
+                            castTargets = emptyList(),
+                            dlnaTargets = emptyList(),
+                            selectedTarget = null,
+                            errorMessage = "Local network permission was revoked. Grant it to discover or play to a TV.",
+                        )
+                    }
+                }
+            }
+        }
         // Live playback status from the engine (position, buffering, adaptive bitrate, throughput).
         viewModelScope.launch {
             container.playbackEngine.status.collect { status ->
@@ -599,6 +622,11 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
     // ----- targets -----
 
     fun scanTargets() = viewModelScope.launch {
+        if (!container.permissions.hasLocalNetworkAccess()) {
+            onLocalNetworkPermissionResult(false)
+            _state.update { it.copy(isScanningTargets = false, errorMessage = "Grant local network permission to discover TVs.") }
+            return@launch
+        }
         _state.update {
             it.copy(route = Route.TARGET_PICKER, isScanningTargets = true, errorMessage = null, castAvailable = container.castAvailable)
         }
@@ -621,6 +649,11 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
     fun selectTarget(target: DiscoveredTarget) = _state.update { it.copy(selectedTarget = target) }
 
     fun play() = viewModelScope.launch {
+        if (!container.permissions.hasLocalNetworkAccess()) {
+            onLocalNetworkPermissionResult(false)
+            _state.update { it.copy(errorMessage = "Grant local network permission before playing to a TV.") }
+            return@launch
+        }
         // A fresh, user-initiated play supersedes any in-flight auto-reconnect.
         cancelReconnect()
         // Stop any in-flight device scan and its progress spinner (an infinite Compose animation) BEFORE
@@ -925,6 +958,12 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
      * message. Idempotent; superseded/cancelled by [stopPlayback]/[play] via [cancelReconnect].
      */
     private fun startReconnect() {
+        if (!container.permissions.hasLocalNetworkAccess()) {
+            onLocalNetworkPermissionResult(false)
+            cancelReconnect()
+            _state.update { it.copy(errorMessage = "Local network permission is required to reconnect to the TV.") }
+            return
+        }
         val ctx = reconnectContext ?: return
         if (reconnectJob?.isActive == true) return
         reconnecting = true
@@ -932,6 +971,10 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
         reconnectJob = viewModelScope.launch {
             try {
                 for (attempt in 1..MAX_RECONNECT_ATTEMPTS) {
+                    if (!container.permissions.hasLocalNetworkAccess()) {
+                        onLocalNetworkPermissionResult(false)
+                        return@launch
+                    }
                     _state.update { it.copy(playback = it.playback?.copy(reconnecting = true)) }
                     container.logger.event("playback", "Connection lost; reconnecting (attempt $attempt of $MAX_RECONNECT_ATTEMPTS)")
                     delay(minOf(RECONNECT_BASE_DELAY_MS * attempt, RECONNECT_MAX_DELAY_MS))

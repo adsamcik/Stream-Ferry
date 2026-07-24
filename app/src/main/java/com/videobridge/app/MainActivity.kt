@@ -36,8 +36,9 @@ class MainActivity : ComponentActivity() {
                 val permissionLauncher = rememberLauncherForActivityResult(
                     ActivityResultContracts.RequestMultiplePermissions(),
                 ) {
-                    viewModel.onLocalNetworkPermissionResult(container.permissions.hasLocalNetworkAccess())
-                    viewModel.scanTargets()
+                    val granted = container.permissions.hasLocalNetworkAccess()
+                    viewModel.onLocalNetworkPermissionResult(granted)
+                    if (granted) viewModel.scanTargets()
                 }
                 AppRoot(
                     state = state,
