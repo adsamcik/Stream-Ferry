@@ -28,7 +28,7 @@ GitHub-hosted runners assemble the Android app, run unit tests, and run lint:
 - **`ci.yml`** runs on pushes and pull requests to `main` and uploads the debug APK and reports.
 - **`release.yml`** runs from a `vMAJOR.MINOR.PATCH` tag. It requires the stable release key,
   builds the R8-minified APK and AAB, publishes the APK/AAB/checksum/signer report as a public
-  GitHub Release, and sends the AAB to Google Play.
+  GitHub Release, and attaches the AAB for optional manual Google Play upload.
 
 Release signing, the protected GitHub Environment, Play service-account access, public-certificate
 verification, and the exact tagging process are documented in [RELEASE.md](RELEASE.md). The release

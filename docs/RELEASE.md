@@ -1,21 +1,22 @@
 # Public releases
 
-Every public release is built once from a signed Git tag and delivered in two forms:
+Every release is built from a signed Git tag and published on GitHub with:
 
-- **GitHub Release:** a directly installable, R8-minified APK and its SHA-256 checksum.
-- **Google Play:** a signed Android App Bundle (AAB), published to the selected Play track.
+- a directly installable, R8-minified APK;
+- an AAB for an optional **manual** upload through Play Console;
+- a SHA-256 checksum and signer-certificate report.
 
-The same long-lived signing identity is used for both. GitHub users can therefore install an update
-over an earlier GitHub APK without uninstalling it. If Play App Signing is enabled (recommended),
-Google re-signs the AAB it serves to Play users; the project key remains the upload key.
+The workflow never contacts Google Play. GitHub users can install an update over an earlier GitHub
+APK because every release uses the same long-lived signing identity.
 
 ## Signing identity — create once, back up forever
 
-**Never commit, attach, or otherwise publish the private `.jks` file or its password.** Possession
+**Never commit, attach, or otherwise publish the private `.p12` file or its password.** Possession
 of it lets somebody ship an app update under this project's identity. The only signing material that
 belongs in Git is the public certificate PEM; it lets users compare the signer fingerprint.
 
-Run this once from the repository root on a trusted developer machine (OpenSSL required; JDK 17+ is preferred but optional):
+Run this once from the repository root on a trusted developer machine (OpenSSL required; JDK 17+ is
+preferred but optional):
 
 ```bash
 ./tools/create-release-signing-key.sh
@@ -30,7 +31,7 @@ It creates these files:
 | `docs/release-signing-certificate.pem` | Public certificate; commit this file. |
 
 Copy the private directory to two independent encrypted backups before relying on it. Losing the
-key can permanently prevent updates to the GitHub APK lineage and makes upload-key recovery harder.
+key can permanently prevent updates to the GitHub APK lineage.
 
 ### GitHub configuration
 
@@ -42,17 +43,7 @@ Add the following **repository Actions secrets**, exactly as written in
 - `RELEASE_KEY_ALIAS`
 - `RELEASE_KEY_PASSWORD`
 
-Create the `google-play-production` GitHub Environment and require an appropriate reviewer before
-deploying. Store the Play service-account JSON as the `GOOGLE_PLAY_SERVICE_ACCOUNT_JSON` secret in
-that environment, not as a repository secret. This keeps production publishing protected even if a
-tag is pushed by mistake.
-
-For the Play Console, enable Play App Signing and register the public upload certificate generated
-above when Google asks for it. Create a dedicated Google Cloud service account, enable the Google
-Play Android Developer API, then grant that account only the release permissions it needs for this
-app in Play Console. The workflow's service-account credential is kept only in the protected
-environment secret. Google’s Publishing API uses transactional edits to upload the AAB and assign
-it to a track. [Google Play Developer API](https://developers.google.com/android-publisher)
+No Google service account or Google Play credential is used by this repository.
 
 ## Cut a release
 
@@ -61,16 +52,14 @@ it to a track. [Google Play Developer API](https://developers.google.com/android
 3. Create and push a strict semantic-version tag, for example:
 
    ```bash
-   git tag -a v0.2.33 -m "Stream Ferry 0.2.33"
-   git push origin v0.2.33
+   git tag -a v0.3.0 -m "Stream Ferry 0.3.0"
+   git push origin v0.3.0
    ```
 
-The release workflow verifies the tag has the form `vMAJOR.MINOR.PATCH`, derives a monotonic
-Android version code (`MAJOR * 1,000,000 + MINOR * 1,000 + PATCH`), requires the production signing
-secrets, then builds the APK and AAB. It creates/updates the GitHub Release with the APK, AAB,
-checksum, and signer fingerprint, and uploads the AAB to Play production. A manual dispatch allows
-a published tag to be rebuilt and sent to `internal` or `production`; only use that to recover a
-failed workflow because Play rejects a version code that already exists.
+The release workflow verifies the tag has the form `vMAJOR.MINOR.PATCH`, derives a monotonic Android
+version code (`MAJOR * 1,000,000 + MINOR * 1,000 + PATCH`), requires the stable signing secrets, then
+builds the APK and AAB. It creates or updates the public GitHub Release with the APK, AAB, checksum,
+and signer report. A manual dispatch can rebuild an already-published tag.
 
 ### Verify a GitHub APK
 
@@ -89,10 +78,8 @@ inspected locally with:
 keytool -printcert -file docs/release-signing-certificate.pem
 ```
 
-## First Play upload
+## Manual Google Play upload
 
-Play must know the app package (`com.adsamcik.streamferry`) and have its required store listing and
-policy declarations completed. If Play does not allow a first production release through the API,
-run the workflow once with the `internal` track or complete the first release in Play Console, then
-use the normal tagged production release. The service account must be invited in Play Console and
-granted permission for this specific app; its JSON must never be committed.
+If you choose to distribute through Google Play, download the signed `.aab` from the corresponding
+GitHub Release and upload it in Play Console yourself. Enable Play App Signing if desired and keep the
+same upload key backed up; no Google credential is stored in this repository or exposed to CI.

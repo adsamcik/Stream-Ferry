@@ -1,8 +1,8 @@
 name: Public release
 
-# A signed semantic-version tag produces both a direct-download APK on GitHub
-# and a signed AAB for Google Play. Production credentials live in the protected
-# google-play-production Environment, never in the repository.
+# A signed semantic-version tag creates a public GitHub Release with a directly
+# installable APK, an AAB for optional manual Play Console upload, checksums, and
+# a signer report. This workflow never contacts Google Play.
 on:
   push:
     tags:
@@ -13,22 +13,6 @@ on:
         description: "Existing vMAJOR.MINOR.PATCH tag to release."
         required: true
         type: string
-      play_track:
-        description: "Google Play track (use internal for first-upload validation)."
-        required: true
-        default: production
-        type: choice
-        options:
-          - production
-          - internal
-      play_status:
-        description: "Google Play release state."
-        required: true
-        default: completed
-        type: choice
-        options:
-          - completed
-          - draft
 
 permissions:
   contents: write
@@ -41,10 +25,6 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     timeout-minutes: 59
-    # Configure this Environment in GitHub with required reviewers and place
-    # GOOGLE_PLAY_SERVICE_ACCOUNT_JSON there. It protects all public releases.
-    environment: google-play-production
-
     env:
       ANDROID_HOME: /usr/local/lib/android/sdk
       ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
@@ -176,17 +156,6 @@ jobs:
             gh release create "$TAG" "$APK" "$AAB" "$CHECKSUM" "$CERTIFICATE" \
               --title "$TAG" --notes-file "$notes"
           fi
-
-      - name: Upload AAB to Google Play
-        uses: r0adkll/upload-google-play@v1.1.5
-        with:
-          serviceAccountJsonPlainText: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
-          packageName: com.adsamcik.streamferry
-          releaseFiles: app/build/outputs/bundle/release/app-release.aab
-          tracks: ${{ github.event.inputs.play_track || 'production' }}
-          status: ${{ github.event.inputs.play_status || 'completed' }}
-          releaseName: ${{ steps.release.outputs.tag }}
-          mappingFile: app/build/outputs/mapping/release/mapping.txt
 
       - name: Remove temporary signing configuration
         if: ${{ always() }}
