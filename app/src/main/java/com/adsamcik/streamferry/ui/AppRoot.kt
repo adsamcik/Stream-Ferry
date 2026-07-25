@@ -234,7 +234,7 @@ private fun backActionFor(state: AppUiState, viewModel: MainViewModel): (() -> U
     Route.MEDIA_DETAIL -> ({ viewModel.navigate(Route.GALLERY) })
     Route.TARGET_PICKER -> ({ viewModel.navigate(Route.MEDIA_DETAIL) })
     Route.PLAYBACK -> ({ viewModel.stopPlayback() })
-    Route.DOWNLOADS -> ({ viewModel.navigate(Route.GALLERY) })
+    Route.DOWNLOADS -> ({ viewModel.navigate(state.downloadsBackRoute) })
     Route.DIAGNOSTICS -> ({ viewModel.navigate(Route.SETTINGS) })
     Route.SETTINGS -> ({ viewModel.navigate(Route.GALLERY) })
     Route.ABOUT -> ({ viewModel.navigate(Route.SETTINGS) })

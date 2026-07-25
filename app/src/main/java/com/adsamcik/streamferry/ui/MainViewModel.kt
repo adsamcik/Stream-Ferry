@@ -870,7 +870,13 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
 
     fun openDownloads() = viewModelScope.launch {
         refreshDownloadEntries()
-        _state.update { it.copy(route = Route.DOWNLOADS, errorMessage = null) }
+        _state.update {
+            it.copy(
+                route = Route.DOWNLOADS,
+                downloadsBackRoute = it.route,
+                errorMessage = null,
+            )
+        }
     }
 
     /** Begin casting a downloaded copy offline: remember it, then trigger device scan + picker. */

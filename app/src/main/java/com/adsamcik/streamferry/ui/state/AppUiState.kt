@@ -68,6 +68,7 @@ data class AppUiState(
 
     // ----- offline downloads -----
     val downloads: List<DownloadUiItem> = emptyList(),
+    val downloadsBackRoute: Route = Route.GALLERY,
     val selectedDownloadId: String? = null,    // when casting a downloaded copy offline
 
     val diagnostics: DiagnosticsUiState = DiagnosticsUiState(),
