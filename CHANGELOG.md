@@ -12,6 +12,19 @@ there is **no telemetry** and nothing leaves the device unless you share a repor
 
 ## [Unreleased]
 
+### Changed
+- Reworked the Compose UI around three durable destinations (Library, Downloads, and Settings),
+  adaptive bottom/rail navigation, bounded large-screen content, stable expressive colour/shape/type
+  tokens, and a persistent mini-player for active TV sessions.
+- Back from Now Playing now returns to browsing without stopping the TV; stopping playback remains an
+  explicit transport action. Downloads Back state is validated so repeated or restored navigation cannot
+  point to an unavailable contextual screen.
+- Added explicit sensitive Quick Connect copying, accessible seek/set-progress behavior, 48 dp gallery
+  index targets, download deletion confirmation, and reduced decorative playback motion.
+- Removed the unavailable online phone-transcoding and CPU/software live-transcoding paths. Online
+  Jellyfin media now always uses direct play, remux, or Jellyfin server transcoding; the retained phone
+  path is the experimental, local-file-only Cast hardware-transcode exception.
+
 ## [0.3.0] - 2026-07-25
 
 ### Added

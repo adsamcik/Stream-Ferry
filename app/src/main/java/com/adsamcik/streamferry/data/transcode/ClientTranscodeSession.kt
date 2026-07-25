@@ -27,8 +27,6 @@ class ClientTranscodeSession(
     private val target: TranscodeTarget,
     private val cacheDir: File,
     private val logger: DiagnosticsLogger,
-    /** Headers for the source request (e.g. Jellyfin Authorization for an online origin); phone-only. */
-    private val sourceHeaders: Map<String, String>? = null,
 ) : ClientTranscodeSource {
 
     private val planner = MediaPlaylistPlanner()
@@ -145,7 +143,6 @@ class ClientTranscodeSession(
                     endMs,
                     target,
                     outFile,
-                    sourceHeaders = sourceHeaders,
                     owner = exportOwner,
                     abortIf = { released },
                 )

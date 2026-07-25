@@ -7,15 +7,10 @@ import android.os.Handler
 import android.os.HandlerThread
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
-import androidx.media3.common.util.Clock
-import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.effect.Presentation
-import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.transformer.Composition
-import androidx.media3.transformer.DefaultDecoderFactory
 import androidx.media3.transformer.EditedMediaItem
 import androidx.media3.transformer.Effects
-import androidx.media3.transformer.ExoPlayerAssetLoader
 import androidx.media3.transformer.ExportException
 import androidx.media3.transformer.ExportResult
 import androidx.media3.transformer.InAppFragmentedMp4Muxer
@@ -72,16 +67,13 @@ class OnDeviceTranscoder(
         val stopped: Boolean,
     ) : Exception(message)
 
-    /** Transcode `[startMs, endMs)` of [sourceUri] into [outFile] as a fragmented MP4. Suspends until done.
-     *  [sourceHeaders] (e.g. an Authorization header for a Jellyfin origin) are attached to the source HTTP
-     *  request only — they stay on the phone and never reach the TV. */
+    /** Transcode `[startMs, endMs)` of a local [sourceUri] into [outFile] as a fragmented MP4. */
     suspend fun transcodeSegment(
         sourceUri: String,
         startMs: Long,
         endMs: Long,
         target: TranscodeTarget,
         outFile: File,
-        sourceHeaders: Map<String, String>? = null,
         /** Opaque session identity used to cancel only this caller's export during teardown. */
         owner: Any? = null,
         /** Checked on the Transformer looper before start so release/reservation races do not start work. */
@@ -89,6 +81,10 @@ class OnDeviceTranscoder(
     ) {
         check(!released) { "on-device transcoder is released" }
         require(endMs > startMs) { "transcode segment must have a positive duration" }
+        val localSourceUri = Uri.parse(sourceUri)
+        require(localSourceUri.scheme == "content" || localSourceUri.scheme == "file") {
+            "on-device transcoding accepts only local content:// or file:// sources"
+        }
 
         val done = CompletableDeferred<Unit>()
         val flight = InFlight(done, owner, abortIf)
@@ -120,7 +116,7 @@ class OnDeviceTranscoder(
                         .setEndPositionMs(endMs)
                         .build()
                     val mediaItem = MediaItem.Builder()
-                        .setUri(Uri.parse(sourceUri))
+                        .setUri(localSourceUri)
                         .setClippingConfiguration(clipping)
                         .build()
                     // Cap the OUTPUT height to the negotiated tier (preserving aspect ratio). Without this
@@ -134,17 +130,6 @@ class OnDeviceTranscoder(
                         .setAudioMimeType(MimeTypes.AUDIO_AAC)
                         .setMuxerFactory(InAppFragmentedMp4Muxer.Factory())
                         .setLooper(thread.looper)
-                    // A remote origin needs its auth header on the phone-side input request only.
-                    if (!sourceHeaders.isNullOrEmpty()) {
-                        val dataSourceFactory = DefaultHttpDataSource.Factory().setDefaultRequestProperties(sourceHeaders)
-                        val assetLoaderFactory = ExoPlayerAssetLoader.Factory(
-                            appContext,
-                            DefaultDecoderFactory.Builder(appContext).build(),
-                            Clock.DEFAULT,
-                            DefaultMediaSourceFactory(dataSourceFactory),
-                        )
-                        builder.setAssetLoaderFactory(assetLoaderFactory)
-                    }
                     val transformer = builder
                         .addListener(object : Transformer.Listener {
                             override fun onCompleted(composition: Composition, result: ExportResult) {
@@ -301,15 +286,13 @@ class OnDeviceTranscoder(
     private fun codecLabel(codec: VideoCodec): String = when (codec) {
         VideoCodec.H264 -> "h264"
         VideoCodec.HEVC -> "hevc"
-        VideoCodec.VP9 -> "vp9"
-        VideoCodec.AV1 -> "av1"
+        VideoCodec.VP9, VideoCodec.AV1 -> error("unsupported by the on-device transcoder")
     }
 
     private fun videoMimeFor(codec: VideoCodec): String = when (codec) {
         VideoCodec.H264 -> MimeTypes.VIDEO_H264
         VideoCodec.HEVC -> MimeTypes.VIDEO_H265
-        VideoCodec.VP9 -> MimeTypes.VIDEO_VP9
-        VideoCodec.AV1 -> MimeTypes.VIDEO_AV1
+        VideoCodec.VP9, VideoCodec.AV1 -> error("unsupported by the on-device transcoder")
     }
 
     companion object {

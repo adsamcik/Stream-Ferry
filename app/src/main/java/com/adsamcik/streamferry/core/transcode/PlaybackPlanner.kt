@@ -15,12 +15,11 @@ enum class QualityBand(val label: String) {
     LOW("Low"),
 }
 
-/** Where a stream is produced. Priority order for a given band: DIRECT > SERVER > CLIENT_HW > CLIENT_CPU. */
+/** Where a stream is produced. Priority order for a given band: DIRECT > SERVER > CLIENT_HW. */
 enum class PlaybackEngineKind(val label: String) {
     DIRECT("Direct"),
     SERVER("Server transcode"),
     CLIENT_HW("On-device (hardware)"),
-    CLIENT_CPU("On-device (CPU)"),
 }
 
 /** The source's relevant properties for planning. */
@@ -37,7 +36,6 @@ data class PlannerSource(
 data class EngineAvailability(
     val server: Boolean,
     val clientHardware: Boolean,
-    val clientCpu: Boolean,
 )
 
 /** One concrete, ordered playback attempt the engine will try (and fall through on failure/stall). */
@@ -54,13 +52,13 @@ data class PlaybackAttempt(
     val rationale: String,
 ) {
     val isTranscode: Boolean get() = engine != PlaybackEngineKind.DIRECT
-    val isOnDevice: Boolean get() = engine == PlaybackEngineKind.CLIENT_HW || engine == PlaybackEngineKind.CLIENT_CPU
+    val isOnDevice: Boolean get() = engine == PlaybackEngineKind.CLIENT_HW
 }
 
 /**
  * Pure playback planner (§9). Produces an **ordered** list of [PlaybackAttempt]s that maximises viewing
  * quality: pick the best quality [QualityBand] the TV can play, preferring direct play, and satisfy it
- * with the best available engine (server > on-device HW > on-device CPU) and the most efficient codec the
+ * with the best available engine (server > on-device hardware) and the most efficient codec the
  * TV supports. The engine walks the list, advancing to the next attempt when one fails or can't keep up.
  *
  * Guarantees a universally-decodable H.264 floor (the STANDARD/LOW bands are H.264-only), mirroring the
@@ -91,7 +89,7 @@ class PlaybackPlanner {
             )
         }
 
-        // 2. Transcode bands, best quality first; within each, engine priority SERVER > CLIENT_HW > CLIENT_CPU.
+        // 2. Transcode bands, best quality first; within each, engine priority SERVER > CLIENT_HW.
         for (band in TRANSCODE_BANDS) {
             val spec = bandSpec(band, source, receiver)
             for (engine in TRANSCODE_ENGINES) {
@@ -164,7 +162,6 @@ class PlaybackPlanner {
             // engine falls through to the next one — so we optimistically allow all here.
             PlaybackEngineKind.SERVER -> true
             PlaybackEngineKind.CLIENT_HW -> device.canEncodeHardware(codec, tier)
-            PlaybackEngineKind.CLIENT_CPU -> device.canEncodeSoftware(codec, tier)
             PlaybackEngineKind.DIRECT -> false
         }
 
@@ -185,7 +182,6 @@ class PlaybackPlanner {
     private fun EngineAvailability.isAvailable(engine: PlaybackEngineKind) = when (engine) {
         PlaybackEngineKind.SERVER -> server
         PlaybackEngineKind.CLIENT_HW -> clientHardware
-        PlaybackEngineKind.CLIENT_CPU -> clientCpu
         PlaybackEngineKind.DIRECT -> true
     }
 
@@ -204,7 +200,7 @@ class PlaybackPlanner {
             QualityBand.MAX_TRANSCODE, QualityBand.VERY_HIGH, QualityBand.HIGH, QualityBand.STANDARD, QualityBand.LOW,
         )
         private val TRANSCODE_ENGINES = listOf(
-            PlaybackEngineKind.SERVER, PlaybackEngineKind.CLIENT_HW, PlaybackEngineKind.CLIENT_CPU,
+            PlaybackEngineKind.SERVER, PlaybackEngineKind.CLIENT_HW,
         )
         private const val MAX_BITRATE_BPS = 120_000_000L
         private const val MIN_BITRATE_BPS = 600_000L

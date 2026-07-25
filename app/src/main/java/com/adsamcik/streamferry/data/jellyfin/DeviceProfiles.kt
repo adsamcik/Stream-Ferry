@@ -62,11 +62,11 @@ object DeviceProfiles {
             if (caps.supportsHevc || tvHas("hevc", "h265")) add(transcodeProfile("hevc", caps.supportsHls))
             add(transcodeProfile("h264", caps.supportsHls))
         }.let { profiles ->
-            // A user-preferred codec (manual override) is moved to the FRONT so the server transcodes to it
-            // when a transcode is needed; the rest remain as ordered fallbacks. Ignored if the TV can't play it.
-            val pref = preferredVideoCodec?.lowercase()
-            if (pref == null) profiles
-            else profiles.sortedByDescending { it.contains("\"VideoCodec\":\"$pref\"") }
+            // A manual override is an output contract, not a preference: expose only the selected format.
+            // If Jellyfin cannot produce it, playback fails clearly instead of silently changing formats.
+            val selected = preferredVideoCodec?.lowercase()
+            if (selected == null) profiles
+            else profiles.filter { it.contains("\"VideoCodec\":\"$selected\"") }
         }
         val transcoding = "[${transcodeProfiles.joinToString(",")}]"
 
@@ -77,9 +77,11 @@ object DeviceProfiles {
             // for both Cast and DLNA. It forces a transcode, which is an accepted cost of enabling subtitles.
             """[{"Format":"srt","Method":"Encode"},{"Format":"subrip","Method":"Encode"},""" +
                 """{"Format":"vtt","Method":"Encode"},{"Format":"webvtt","Method":"Encode"},""" +
-                """{"Format":"ass","Method":"Encode"},{"Format":"ssa","Method":"Encode"},""" +
-                """{"Format":"pgssub","Method":"Encode"},{"Format":"dvdsub","Method":"Encode"},""" +
-                """{"Format":"dvbsub","Method":"Encode"}]"""
+                """{"Format":"ass","Method":"Encode"},{"Format":"ssa","Method":"Encode"},{"Format":"mov_text","Method":"Encode"},""" +
+                """{"Format":"pgssub","Method":"Encode"},{"Format":"hdmv_pgs_subtitle","Method":"Encode"},""" +
+                """{"Format":"dvdsub","Method":"Encode"},{"Format":"vobsub","Method":"Encode"},{"Format":"xsub","Method":"Encode"},""" +
+                """{"Format":"dvbsub","Method":"Encode"},{"Format":"eia_608","Method":"Encode"},""" +
+                """{"Format":"eia_708","Method":"Encode"}]"""
         } else {
             """[{"Format":"vtt","Method":"External"},{"Format":"srt","Method":"External"}]"""
         }

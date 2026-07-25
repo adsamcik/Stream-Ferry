@@ -2,6 +2,7 @@ package com.adsamcik.streamferry.ui
 
 import android.content.Intent
 import android.net.Uri
+import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.adsamcik.streamferry.app.AppContainer
@@ -9,6 +10,9 @@ import com.adsamcik.streamferry.core.redaction.LogRedactor
 import com.adsamcik.streamferry.core.language.LanguagePreferenceResolver
 import com.adsamcik.streamferry.core.language.SubtitleMemory
 import com.adsamcik.streamferry.core.stream.Protocol
+import com.adsamcik.streamferry.core.resume.SmartResumeRecord
+import com.adsamcik.streamferry.core.resume.SmartResumeSeed
+import com.adsamcik.streamferry.core.resume.SmartResumeSourceType
 import com.adsamcik.streamferry.core.stream.StreamPreferences
 import com.adsamcik.streamferry.data.download.DownloadEntry
 import com.adsamcik.streamferry.data.download.DownloadFormat
@@ -22,6 +26,7 @@ import com.adsamcik.streamferry.domain.MediaSource
 import com.adsamcik.streamferry.domain.MediaSourceIds
 import com.adsamcik.streamferry.permissions.AndroidNetworkPermissionManager
 import com.adsamcik.streamferry.playback.PlaybackStatus
+import com.adsamcik.streamferry.ui.navigation.NavigationStatePolicy
 import com.adsamcik.streamferry.ui.state.AppUiState
 import com.adsamcik.streamferry.ui.state.ConnectionState
 import com.adsamcik.streamferry.ui.state.DiagnosticsUiState
@@ -30,6 +35,7 @@ import com.adsamcik.streamferry.ui.state.NowPlayingDiagnostics
 import com.adsamcik.streamferry.ui.state.PlaybackUiState
 import com.adsamcik.streamferry.ui.state.QuickConnectUiState
 import com.adsamcik.streamferry.ui.state.Route
+import com.adsamcik.streamferry.ui.state.toUiState
 import com.adsamcik.streamferry.BuildConfig
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
@@ -50,9 +56,22 @@ import kotlin.coroutines.cancellation.CancellationException
  * methods; the ViewModel orchestrates domain services off the main thread. No business logic, URL
  * construction, token access or socket work happens in Composables (§19).
  */
-class MainViewModel(private val container: AppContainer) : ViewModel() {
+class MainViewModel(
+    private val container: AppContainer,
+    private val savedStateHandle: SavedStateHandle = SavedStateHandle(),
+) : ViewModel() {
 
-    private val _state = MutableStateFlow(AppUiState())
+    private val _state = MutableStateFlow(
+        AppUiState(
+            route = NavigationStatePolicy.restoreRoute(savedStateHandle[STATE_ROUTE]),
+            downloadsBackRoute = NavigationStatePolicy.restoreDownloadsOrigin(
+                savedStateHandle[STATE_DOWNLOADS_ORIGIN],
+            ),
+            activeSourceId = NavigationStatePolicy.restoreSource(savedStateHandle[STATE_SOURCE]),
+            searchQuery = savedStateHandle[STATE_SEARCH_QUERY] ?: "",
+            backgroundPlaybackUnrestricted = container.permissions.isBatteryOptimizationExempt(),
+        ),
+    )
     val state: StateFlow<AppUiState> = _state.asStateFlow()
 
     // Declared BEFORE init: the download/status collectors below run synchronously during construction
@@ -85,6 +104,7 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
             val title: String,
             val runtimeSeconds: Long?,
             override val target: DiscoveredTarget,
+            val smartResumeSeed: SmartResumeSeed?,
         ) : ReconnectContext
     }
 
@@ -93,8 +113,18 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
     @Volatile private var currentResumeKey: String? = null
     @Volatile private var currentDurationSeconds: Long? = null
     private var lastResumeSaveMs: Long = 0L
+    // Set only by the root Smart Resume card; consumed by the next selected-target play.
+    private var smartResumeOverrideSeconds: Long? = null
 
     init {
+        viewModelScope.launch {
+            state.collect { current ->
+                savedStateHandle[STATE_ROUTE] = NavigationStatePolicy.persistRoute(current.route)
+                savedStateHandle[STATE_DOWNLOADS_ORIGIN] = current.downloadsBackRoute.name
+                savedStateHandle[STATE_SOURCE] = current.activeSourceId
+                savedStateHandle[STATE_SEARCH_QUERY] = current.searchQuery
+            }
+        }
         onLocalNetworkPermissionResult(container.permissions.hasLocalNetworkAccess())
         // Runtime permission may be revoked outside this activity. Cancel work and remove cached targets
         // before a stale selection can trigger a reconnect or proxy start.
@@ -127,7 +157,12 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
         }
         viewModelScope.launch {
             container.authRepository.currentUser.collect { user ->
-                _state.update { it.copy(loggedIn = user != null) }
+                _state.update { it.copy(loggedIn = user != null, smartResume = container.smartResumeStore.current?.toUiState(user)) }
+            }
+        }
+        viewModelScope.launch {
+            container.smartResumeStore.record.collect { record ->
+                _state.update { it.copy(smartResume = record?.toUiState(container.authRepository.currentUser.value)) }
             }
         }
         // Autoplay the next episode when one finishes (Netflix-style). end-of-media fires only on a genuine
@@ -141,6 +176,14 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
             val restored = runCatching { container.authRepository.restoreSession() }.getOrNull()
             if (restored != null) {
                 _state.update { it.copy(loggedIn = true, connectionState = ConnectionState.CONNECTED) }
+            }
+            val shouldRestoreLibrary = _state.value.route == Route.GALLERY &&
+                (restored != null || _state.value.activeSourceId == MediaSourceIds.LOCAL)
+            if (shouldRestoreLibrary) {
+                val restoredQuery = _state.value.searchQuery
+                _state.update { it.copy(galleryLoading = true) }
+                loadRoots()
+                if (restoredQuery.isNotBlank()) onSearchQueryChanged(restoredQuery)
             }
         }
         // Offline downloads: completed set (persistent) + live progress.
@@ -199,10 +242,27 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
     }
 
     fun navigate(route: Route) {
-        val leavingTargetPicker = _state.value.route == Route.TARGET_PICKER && route != Route.TARGET_PICKER
-        _state.update { it.copy(route = route, errorMessage = null) }
+        val snapshot = _state.value
+        val safeRoute = when {
+            route == Route.MEDIA_DETAIL && snapshot.selectedItem == null -> Route.GALLERY
+            route == Route.TARGET_PICKER && snapshot.selectedItem == null && snapshot.selectedDownloadId == null -> Route.GALLERY
+            route == Route.PLAYBACK && snapshot.playback == null -> Route.GALLERY
+            else -> route
+        }
+        val leavingTargetPicker = snapshot.route == Route.TARGET_PICKER && safeRoute != Route.TARGET_PICKER
+        _state.update { it.copy(route = safeRoute, errorMessage = null) }
         if (leavingTargetPicker) stopTargetDiscovery()
+        if (safeRoute == Route.GALLERY && _state.value.libraries.isEmpty() && !_state.value.galleryLoading) {
+            val restoredQuery = _state.value.searchQuery
+            _state.update { it.copy(galleryLoading = true) }
+            viewModelScope.launch {
+                loadRoots()
+                if (restoredQuery.isNotBlank()) onSearchQueryChanged(restoredQuery)
+            }
+        }
     }
+
+    fun dismissError() = _state.update { it.copy(errorMessage = null) }
 
     fun onWelcomeContinue() {
         if (_state.value.loggedIn) openLibraries() else navigate(Route.SERVER_SETUP)
@@ -415,12 +475,12 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
     /** Runtime permission to request for the optional "all device videos" local gallery. */
     val readMediaVideoPermission: String = AndroidNetworkPermissionManager.PERMISSION_READ_MEDIA_VIDEO
 
-    /**
-     * Whether the app is exempt from battery optimization ("unrestricted"). When false, aggressive OEM
-     * power management can suspend the app's network with the screen off — screen-off casting then stalls
-     * until the display wakes. Surfaced in Settings so the user can allow unrestricted background playback.
-     */
-    fun isBackgroundPlaybackUnrestricted(): Boolean = container.permissions.isBatteryOptimizationExempt()
+    /** Re-reads the system setting after returning from the battery-optimization prompt. */
+    fun refreshBackgroundPlaybackStatus() {
+        _state.update {
+            it.copy(backgroundPlaybackUnrestricted = container.permissions.isBatteryOptimizationExempt())
+        }
+    }
 
     /** Intent that asks the system to allow unrestricted background playback (battery-opt exemption). */
     fun batteryOptimizationRequestIntent() = container.permissions.batteryOptimizationRequestIntent()
@@ -714,6 +774,7 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
         reconnectContext = null
         currentResumeKey = null
         currentDurationSeconds = null
+        val requestedSmartResumePosition = smartResumeOverrideSeconds
         val s = _state.value
         val target = s.selectedTarget ?: return@launch
         val controller = if (target.protocol == Protocol.CAST) container.castController else container.dlnaController
@@ -734,14 +795,15 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
                     title = entry.title,
                     runtimeSeconds = entry.runtimeSeconds,
                     allowClientTranscode = container.playbackPreferences.transcodeLocalOnDevice,
-                    resumePositionSeconds = container.resumeStore.resumePosition(resumeKey) ?: 0L,
+                    resumePositionSeconds = requestedSmartResumePosition ?: container.resumeStore.resumePosition(resumeKey) ?: 0L,
+                    smartResumeSeed = downloadedSmartResumeSeed(entry),
                     target = controller,
                     selectedTarget = target,
                     onForegrounded = goToPlayback,
                 )
                 currentResumeKey = resumeKey
                 currentDurationSeconds = entry.runtimeSeconds
-                reconnectContext = ReconnectContext.Local(file.absolutePath, entry.mimeType, entry.title, entry.runtimeSeconds, target)
+                reconnectContext = ReconnectContext.Local(file.absolutePath, entry.mimeType, entry.title, entry.runtimeSeconds, target, downloadedSmartResumeSeed(entry))
             } else {
                 val item = s.selectedItem ?: error("Nothing selected to play.")
                 if (item.sourceId == MediaSourceIds.LOCAL) {
@@ -754,14 +816,15 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
                         title = item.title,
                         runtimeSeconds = item.runtimeSeconds,
                         allowClientTranscode = container.playbackPreferences.transcodeLocalOnDevice,
-                        resumePositionSeconds = container.resumeStore.resumePosition(item.id) ?: 0L,
+                        resumePositionSeconds = requestedSmartResumePosition ?: container.resumeStore.resumePosition(item.id) ?: 0L,
+                        smartResumeSeed = localSmartResumeSeed(item),
                         target = controller,
                         selectedTarget = target,
                         onForegrounded = goToPlayback,
                     )
                     currentResumeKey = item.id
                     currentDurationSeconds = item.runtimeSeconds
-                    reconnectContext = ReconnectContext.Local(item.id, mime, item.title, item.runtimeSeconds, target)
+                    reconnectContext = ReconnectContext.Local(item.id, mime, item.title, item.runtimeSeconds, target, localSmartResumeSeed(item))
                 } else {
                     // Arm seamless autoplay-next: for an eligible series episode the engine holds the TV
                     // connection at end-of-media so the next episode loads without a reconnect.
@@ -771,12 +834,15 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
                         item, controller, target,
                         streamPreferences(),
                         autoAdvance = autoAdvance,
+                        smartResumeSeed = onlineSmartResumeSeed(item),
                         onForegrounded = goToPlayback,
                     )
                     // Enable auto-reconnect for this online session now that it has started.
                     reconnectContext = ReconnectContext.Online(item, target)
                 }
             }
+        }.onSuccess {
+            smartResumeOverrideSeconds = null
         }.onFailure { e ->
             if (isSessionExpired(e)) {
                 handleSessionExpired()
@@ -828,7 +894,7 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
                     // Prefer a SEAMLESS hand-off that reuses the live TV connection (the engine held it open
                     // at end-of-media). Fall back to a full play (reconnect) only if there's no live session.
                     val seamless = target != null && runCatching {
-                        container.playbackEngine.playNext(next, streamPreferences())
+                        container.playbackEngine.playNext(next, streamPreferences(), onlineSmartResumeSeed(next))
                     }.onFailure { e -> if (isSessionExpired(e)) handleSessionExpired() }.getOrDefault(false)
                     if (seamless && target != null) {
                         reconnectContext = ReconnectContext.Online(next, target)
@@ -846,6 +912,68 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
             }
         }
     }
+
+    /** Resume the app-wide renderer-confirmed checkpoint through the normal target picker. */
+    fun resumeSmartResume() = viewModelScope.launch {
+        val record = container.smartResumeStore.current ?: return@launch
+        val position = record.resumePositionSeconds() ?: return@launch
+        runCatching {
+            when (record.sourceType) {
+                SmartResumeSourceType.JELLYFIN -> {
+                    requireRecordOwner(record)
+                    beginSmartResumeTargetSelection(container.jellyfinMediaSource.item(record.mediaId).getOrThrow(), null, position)
+                }
+                SmartResumeSourceType.LOCAL -> {
+                    val uri = record.localContentUri ?: error("This local video is no longer available.")
+                    beginSmartResumeTargetSelection(container.localMediaSource.item(uri).getOrThrow(), null, position)
+                }
+                SmartResumeSourceType.DOWNLOADED -> {
+                    requireRecordOwner(record)
+                    val entry = container.downloadStore.get(record.mediaId) ?: error("The downloaded copy was deleted.")
+                    val file = container.downloadStore.fileFor(entry)
+                    check(file.isFile && file.canRead() && file.length() > 0L) { "The downloaded copy is unavailable." }
+                    beginSmartResumeTargetSelection(null, entry.itemId, position)
+                }
+            }
+        }.onFailure { error ->
+            _state.update { it.copy(errorMessage = error.message ?: "This Smart Resume item is unavailable.") }
+        }
+    }
+
+    fun dismissSmartResume() = container.smartResumeStore.clear()
+
+    private fun beginSmartResumeTargetSelection(item: MediaItem?, downloadId: String?, position: Long) {
+        smartResumeOverrideSeconds = position
+        _state.update {
+            it.copy(
+                selectedItem = item ?: it.selectedItem,
+                selectedDownloadId = downloadId,
+                activeSourceId = item?.sourceId ?: it.activeSourceId,
+                errorMessage = null,
+            )
+        }
+        scanTargets()
+    }
+
+    private fun requireRecordOwner(record: SmartResumeRecord) {
+        val current = container.authRepository.currentUser.value
+        check(current?.serverId == record.serverId && current?.userId == record.userId) {
+            "Sign in to the Jellyfin account that played this video to resume it."
+        }
+    }
+
+    private fun onlineSmartResumeSeed(item: MediaItem): SmartResumeSeed? =
+        container.authRepository.currentUser.value?.let { user ->
+            SmartResumeSeed(SmartResumeSourceType.JELLYFIN, item.id, item.title, item.subtitle, item.runtimeSeconds, user.serverId, user.userId)
+        }
+
+    private fun downloadedSmartResumeSeed(entry: DownloadEntry): SmartResumeSeed? =
+        container.authRepository.currentUser.value?.let { user ->
+            SmartResumeSeed(SmartResumeSourceType.DOWNLOADED, entry.itemId, entry.title, durationSeconds = entry.runtimeSeconds, serverId = user.serverId, userId = user.userId)
+        }
+
+    private fun localSmartResumeSeed(item: MediaItem): SmartResumeSeed =
+        SmartResumeSeed(SmartResumeSourceType.LOCAL, item.id, item.title, item.subtitle, item.runtimeSeconds, localContentUri = item.id)
 
     // ----- offline downloads -----
 
@@ -869,11 +997,20 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
     }
 
     fun openDownloads() = viewModelScope.launch {
+        val snapshot = _state.value
+        val origin = NavigationStatePolicy.captureDownloadsOrigin(
+            currentRoute = snapshot.route,
+            previousOrigin = snapshot.downloadsBackRoute,
+            availability = NavigationStatePolicy.Availability(
+                hasActivePlayback = snapshot.playback != null,
+                hasSelectedItem = snapshot.selectedItem != null,
+            ),
+        )
         refreshDownloadEntries()
         _state.update {
             it.copy(
                 route = Route.DOWNLOADS,
-                downloadsBackRoute = it.route,
+                downloadsBackRoute = origin,
                 errorMessage = null,
             )
         }
@@ -983,6 +1120,12 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
     }
 
     /** Pin the transcode video codec (e.g. "hevc"), or return to automatic (null). Re-resolves the stream. */
+    /** Override the stream resolution for this playback only; null returns to the saved automatic cap. */
+    fun selectMaxVideoHeight(height: Int?) = viewModelScope.launch {
+        runCatching { container.playbackEngine.selectMaxVideoHeight(height) }
+            .onFailure { e -> if (isSessionExpired(e)) handleSessionExpired() }
+    }
+
     fun selectPreferredCodec(codec: String?) = viewModelScope.launch {
         runCatching { container.playbackEngine.selectPreferredCodec(codec) }
             .onFailure { e -> if (isSessionExpired(e)) handleSessionExpired() }
@@ -1083,6 +1226,7 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
                                 ctx.item, controller, ctx.target,
                                 streamPreferences(),
                                 resumePositionOverrideSeconds = resumeAt,
+                                smartResumeSeed = onlineSmartResumeSeed(ctx.item),
                             )
                             is ReconnectContext.Local -> container.playbackEngine.playLocal(
                                 filePath = ctx.filePath,
@@ -1091,6 +1235,7 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
                                 runtimeSeconds = ctx.runtimeSeconds,
                                 allowClientTranscode = container.playbackPreferences.transcodeLocalOnDevice,
                                 resumePositionSeconds = resumeAt,
+                                smartResumeSeed = ctx.smartResumeSeed,
                                 target = controller,
                                 selectedTarget = ctx.target,
                             )
@@ -1186,14 +1331,6 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
     val maxVideoHeight: Int get() = container.playbackPreferences.maxVideoHeight
     fun setMaxVideoHeight(value: Int) { container.playbackPreferences.maxVideoHeight = value }
 
-    /** "Transcode online videos on this device" setting: opt-in on-device fallback for Jellyfin sources. */
-    val transcodeOnlineOnDevice: Boolean get() = container.playbackPreferences.transcodeOnlineOnDevice
-    fun setTranscodeOnlineOnDevice(value: Boolean) { container.playbackPreferences.transcodeOnlineOnDevice = value }
-
-    /** "Allow CPU (software) on-device transcode" setting: off => hardware-only on-device transcode. */
-    val onDeviceAllowCpu: Boolean get() = container.playbackPreferences.onDeviceAllowCpu
-    fun setOnDeviceAllowCpu(value: Boolean) { container.playbackPreferences.onDeviceAllowCpu = value }
-
     /** "Autoplay next episode" setting: play the next episode automatically when one finishes. */
     val autoPlayNextEpisode: Boolean get() = container.playbackPreferences.autoPlayNextEpisode
     fun setAutoPlayNextEpisode(value: Boolean) { container.playbackPreferences.autoPlayNextEpisode = value }
@@ -1244,8 +1381,6 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
         return StreamPreferences(
             preferDirectPlay = container.playbackPreferences.preferDirectPlay,
             maxVideoHeight = container.playbackPreferences.maxVideoHeight,
-            transcodeOnlineOnDevice = container.playbackPreferences.transcodeOnlineOnDevice,
-            onDeviceAllowCpu = container.playbackPreferences.onDeviceAllowCpu,
             autoSkipSegments = container.playbackPreferences.autoSkipSegments,
             preferredAudioLanguage = audioLanguage,
             preferredSubtitleLanguage = subtitleLanguage,
@@ -1432,6 +1567,8 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
         isManualQuality = isManualQuality,
         availableVideoCodecs = availableVideoCodecs,
         preferredVideoCodec = preferredVideoCodec,
+        maxVideoHeight = maxVideoHeight,
+        isManualMaxVideoHeight = isManualMaxVideoHeight,
         videoWidth = videoWidth,
         videoHeight = videoHeight,
         videoBitrateBps = videoBitrateBps,
@@ -1459,6 +1596,10 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
     }
 
     private companion object {
+        const val STATE_ROUTE = "navigation.route"
+        const val STATE_DOWNLOADS_ORIGIN = "navigation.downloads_origin"
+        const val STATE_SOURCE = "gallery.source"
+        const val STATE_SEARCH_QUERY = "gallery.search_query"
         const val DLNA_SCAN_MS = 4_000L
         const val QUICK_CONNECT_POLL_MS = 3_000L
         const val LIBRARY_ERROR = "Couldn't load your library. Check the connection and try again."

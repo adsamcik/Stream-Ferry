@@ -1,9 +1,9 @@
 package com.adsamcik.streamferry.data.proxy
 
 /**
- * A phone-hosted, on-device-transcoded HLS/CMAF origin for one playback session. The proxy serves the
- * playlist + segments produced here; the TV only ever sees the proxy URL. Methods are blocking (called
- * from the proxy's connection threads) and may transcode a segment on demand.
+ * A phone-hosted, on-device-transcoded HLS/CMAF origin for one local-file playback session. The proxy
+ * serves the playlist + segments produced here; the TV only ever sees the proxy URL. Methods are blocking
+ * (called from the proxy's connection threads) and may transcode a segment on demand.
  */
 interface ClientTranscodeSource {
     /**

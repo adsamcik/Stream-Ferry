@@ -95,13 +95,6 @@ data class StreamPreferences(
      */
     val maxVideoHeight: Int = 2160,
     /**
-     * Stored for compatibility with existing settings. Production currently safety-gates this remote
-     * phone-transcode path until its authenticated Media3 source is origin-pinned across redirects.
-     */
-    val transcodeOnlineOnDevice: Boolean = false,
-    /** Allow on-device transcoding to use a software (CPU) encoder when no hardware encoder fits. */
-    val onDeviceAllowCpu: Boolean = false,
-    /**
      * Auto-skip intro/outro/recap segments (Jellyfin Media Segments API). When true the engine seeks past
      * a segment the moment playback enters it (once per segment); the manual "Skip" button is unaffected.
      */

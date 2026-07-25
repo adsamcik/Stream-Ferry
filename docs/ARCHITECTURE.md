@@ -46,7 +46,7 @@ construction, or playback reporting. It depends only on the domain interfaces in
 | `data.local` | On-device video source: user-elective SAF folder/file grants (`LocalSourceStore`) + optional MediaStore, enumerated and exposed as a `MediaSource` (`LocalMediaSource`). |
 | `data.resume` | Local "continue where you left off" store (`ResumeStore`) for on-device files, which have no server-side resume point. |
 | `playback` | `PlaybackEngine` orchestrates select → proxy → renderer and runs adaptive bitrate; failure **recovery** is factored into pure, tested units — `PlaybackRecovery` (`decideRecovery`), `StartupWatchdog` (silent-failure/early-bail heuristics) and `RendererCapabilityStore` (learns per-renderer transcode needs). Also `MediaSessionController` (system playback controls) and `PlaybackServiceController`. |
-| `playback.streamselection` | Chooses a TV-compatible Jellyfin stream server-side. The remote Jellyfin → phone transcode fallback is safety-gated off until Media3 can enforce authenticated redirect/origin policy; the active phone path is limited to local files in `data.transcode`. |
+| `playback.streamselection` | Chooses a TV-compatible Jellyfin stream server-side. Online media is never transcoded on the phone; the separate `data.transcode` path is local-file-only. |
 | `playback.proxy` | `ProxyPlaybackService` foreground service (type `mediaPlayback`) hosting the MediaStyle controls notification. |
 | `playback.buffer` | Memory buffer policy (pass-through + rolling prebuffer). |
 | `playback.session` | `PlaybackSessionCoordinator` ties Jellyfin ↔ proxy ↔ Cast/DLNA sessions. |
@@ -54,6 +54,32 @@ construction, or playback reporting. It depends only on the domain interfaces in
 | `permissions` | Local-network / notification permission management. |
 | `diagnostics`, `logging` | Redacting logger, network info, compatibility runner. |
 | `core.*` | **Pure-JVM, dependency-free, unit-tested** building blocks (see below). |
+
+## Adaptive application shell
+
+The Compose shell separates durable destinations from contextual media work:
+
+- **Library**, **Downloads**, and **Settings** are the three top-level destinations. Compact-height
+  windows and windows at least 600 dp wide use a navigation rail; other compact windows use a bottom
+  navigation bar. Content is width-bounded instead of stretching phone layouts across a tablet.
+- Details, TV selection, Now Playing, Diagnostics, servers, and About remain contextual routes. Back
+  from Now Playing returns to Library while the TV session continues; Stop is an explicit playback
+  control. A persistent mini-player keeps the active target, state, progress, and play/pause action
+  available while browsing.
+- `MainViewModel` persists only stable route, source, search, and Downloads-origin values in
+  `SavedStateHandle`. Contextual routes are validated against their required selection/session state and
+  collapse to Library after process recreation instead of restoring a blank or looping screen.
+- Lazy grids/lists own their bounded scroll viewport. Simple forms and details own one vertical scroll;
+  the shell does not wrap lazy layouts in an unbounded parent scroller.
+
+The visual system uses stable Material 3 components with an expressive 8/12/20/28/36 dp shape scale,
+stronger display/title weights, complete teal light/dark fallback schemes, and Android's complete dynamic
+scheme when enabled. Production does not depend on the alpha Material 3 Expressive API line. Motion is
+reserved for state changes; playback no longer runs a perpetual decorative waveform animation.
+
+Accessibility-critical custom surfaces expose platform-equivalent actions: Quick Connect has an explicit
+sensitive clipboard button, the seek surface exposes progress and set-progress semantics, download state
+is consolidated, and the gallery alphabet rail provides 48 dp touch width plus named section actions.
 
 ## Verified pure-JVM core (`com.adsamcik.streamferry.core`)
 
@@ -110,8 +136,9 @@ state. Manual DI via `AppContainer` (no DI framework — §14).
 2. `PlaybackSessionCoordinator` creates a proxy session (256-bit id), starts the foreground service,
    binds the proxy to an ephemeral LAN port.
 3. The Cast/DLNA controller loads **only** the phone proxy URL.
-4. `JellyfinPlaybackReporter` reports start, then **progress every ~5 s** (position + paused state) and
-   stop — so Jellyfin's resume point, "Continue Watching", and played state stay in sync.
+4. `JellyfinPlaybackReporter` reports start, then **progress every ~5 s** (position + paused state),
+   immediate updates after pause/resume/seek, and stop — so Jellyfin's resume point, "Continue Watching",
+   and played state stay in sync.
 5. While playing, the `AdaptiveBitrateController` measures real proxy throughput over a rolling
    ≥ 30 s window (plus renderer rebuffer events) and, with hysteresis, may switch quality mid-stream
    by re-resolving PlaybackInfo at the current position and reloading the renderer with a new proxy

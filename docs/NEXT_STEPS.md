@@ -40,9 +40,11 @@ Ordered follow-ups to take the MVP scaffold to a fully verified product.
    Cast/Google TV + DLNA hardware and tune the ladder/thresholds from field data.
 10. **Add the compatibility runner UI + redacted diagnostics export** and the full VPN/LAN test
     automation ([VPN_LAN_DIAGNOSTICS.md](VPN_LAN_DIAGNOSTICS.md)).
-11. **Release hardening pass:** verify R8 keep rules against the real dependency set, confirm no debug
+11. **Validate the local hardware-transcode exception:** add explicit Media3 encoder/output-contract
+    checks, thermal admission, and Cast device coverage before treating it as broadly reliable.
+12. **Release hardening pass:** verify R8 keep rules against the real dependency set, confirm no debug
     trust anchors/endpoints ship, and complete the OSS license report.
-12. **Optional:** SBOM generation via a trusted plugin; per-server custom-CA UI; **dual-stack / IPv6
+13. **Optional:** SBOM generation via a trusted plugin; per-server custom-CA UI; **dual-stack / IPv6
     TV-facing proxy** bind +
     advertise (bracketed IPv6 URLs end-to-end), validated on a real IPv6-only LAN — today the proxy is
     IPv4-only ([KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) → Networking constraints).

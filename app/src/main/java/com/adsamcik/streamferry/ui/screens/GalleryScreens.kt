@@ -4,6 +4,8 @@ import android.content.res.Configuration
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
@@ -21,9 +23,9 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyGridState
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
-import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -53,11 +55,16 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.semantics.CustomAccessibilityAction
+import androidx.compose.ui.semantics.customActions
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
@@ -92,7 +99,12 @@ fun GalleryScreen(state: AppUiState, viewModel: MainViewModel) {
         else -> state.items
     }
 
-    val gridState = rememberLazyGridState()
+    val gridState = rememberSaveable(
+        state.activeSourceId,
+        state.currentFolder?.id,
+        state.searchQuery,
+        saver = LazyGridState.Saver,
+    ) { LazyGridState() }
     val scope = rememberCoroutineScope()
     // First grid index for each A–Z/# section, in display (server SortName) order.
     val firstIndexBySection = remember(entries) {
@@ -109,6 +121,9 @@ fun GalleryScreen(state: AppUiState, viewModel: MainViewModel) {
         val needsJellyfinLogin = !isLocalSource && !state.loggedIn
         if (!searchActive) {
             SourceSwitcher(viewModel.sources, state.activeSourceId, viewModel::selectSource)
+        }
+        if (atRoot && !searchActive) {
+            state.smartResume?.let { SmartResumeCard(it, viewModel::resumeSmartResume, viewModel::dismissSmartResume) }
         }
         if (isLocalSource && atRoot && !searchActive) {
             LocalAccessActions(viewModel)
@@ -183,7 +198,10 @@ private fun SourceSwitcher(sources: List<Pair<String, String>>, activeId: String
     if (sources.size < 2) return
     Row(
         horizontalArrangement = Arrangement.spacedBy(8.dp),
-        modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState())
+            .padding(bottom = 8.dp),
     ) {
         sources.forEach { (id, name) ->
             FilterChip(selected = id == activeId, onClick = { onSelect(id) }, label = { Text(name) })
@@ -207,16 +225,23 @@ private fun LocalAccessActions(viewModel: MainViewModel) {
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
         viewModel.onMediaPermissionResult(it)
     }
-    Row(
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    Column(
+        verticalArrangement = Arrangement.spacedBy(8.dp),
         modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
     ) {
-        OutlinedButton(onClick = { folderPicker.launch(null) }) { Text("Add folder") }
-        OutlinedButton(onClick = { filesPicker.launch(arrayOf("video/*")) }) { Text("Add files") }
+        OutlinedButton(
+            onClick = { folderPicker.launch(null) },
+            modifier = Modifier.fillMaxWidth(),
+        ) { Text("Add a folder") }
+        OutlinedButton(
+            onClick = { filesPicker.launch(arrayOf("video/*")) },
+            modifier = Modifier.fillMaxWidth(),
+        ) { Text("Add individual videos") }
         if (!viewModel.mediaPermissionGranted()) {
-            OutlinedButton(onClick = { permissionLauncher.launch(viewModel.readMediaVideoPermission) }) {
-                Text("Allow all videos")
-            }
+            OutlinedButton(
+                onClick = { permissionLauncher.launch(viewModel.readMediaVideoPermission) },
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("Allow access to all videos") }
         }
     }
 }
@@ -225,6 +250,7 @@ private fun LocalAccessActions(viewModel: MainViewModel) {
 @Composable
 private fun AlphabetIndexBar(sections: List<String>, onSection: (String) -> Unit) {
     if (sections.isEmpty()) return
+    val currentOnSection by rememberUpdatedState(onSection)
     fun sectionAt(y: Float, height: Int): String {
         if (height <= 0) return sections.first()
         val idx = ((y / height) * sections.size).toInt().coerceIn(0, sections.lastIndex)
@@ -233,12 +259,22 @@ private fun AlphabetIndexBar(sections: List<String>, onSection: (String) -> Unit
     Column(
         modifier = Modifier
             .fillMaxHeight()
-            .width(28.dp)
-            .pointerInput(sections) {
-                detectTapGestures { offset -> onSection(sectionAt(offset.y, size.height)) }
+            .width(48.dp)
+            .semantics {
+                customActions = sections.map { section ->
+                    CustomAccessibilityAction("Jump to $section") {
+                        currentOnSection(section)
+                        true
+                    }
+                }
             }
             .pointerInput(sections) {
-                detectVerticalDragGestures { change, _ -> onSection(sectionAt(change.position.y, size.height)) }
+                detectTapGestures { offset -> currentOnSection(sectionAt(offset.y, size.height)) }
+            }
+            .pointerInput(sections) {
+                detectVerticalDragGestures { change, _ ->
+                    currentOnSection(sectionAt(change.position.y, size.height))
+                }
             },
         verticalArrangement = Arrangement.SpaceEvenly,
         horizontalAlignment = Alignment.CenterHorizontally,

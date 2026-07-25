@@ -19,12 +19,15 @@ class PlaybackRecoveryTest {
         preferDirectPlay: Boolean = true,
         alreadyTranscoding: Boolean = false,
         alreadyRetried: Boolean = false,
-        onDeviceOnlineEnabled: Boolean = false,
-        onDeviceAlreadyAttempted: Boolean = false,
-        receiverSupportsHls: Boolean = true,
+        hasLowerResolutionFallback: Boolean = false,
     ) = decideRecovery(
-        failure, isReloading, isOnlineSession, preferDirectPlay, alreadyTranscoding, alreadyRetried,
-        onDeviceOnlineEnabled, onDeviceAlreadyAttempted, receiverSupportsHls,
+        failure = failure,
+        isReloading = isReloading,
+        isOnlineSession = isOnlineSession,
+        preferDirectPlay = preferDirectPlay,
+        alreadyTranscoding = alreadyTranscoding,
+        alreadyRetried = alreadyRetried,
+        hasLowerResolutionFallback = hasLowerResolutionFallback,
     )
 
     @Test fun formatFailureFallsBackToTranscode() =
@@ -48,6 +51,12 @@ class PlaybackRecoveryTest {
             decide(failure = PlaybackFailureKind.NETWORK, isReloading = true),
         )
 
+    @Test fun serverTranscodeFailureStepsDownResolutionBeforeGivingUp() =
+        assertEquals(
+            RecoveryAction.LOWER_RESOLUTION_FALLBACK,
+            decide(alreadyTranscoding = true, hasLowerResolutionFallback = true),
+        )
+
     @Test fun localFileFormatFailureSurfacesBecauseThereIsNoServer() =
         assertEquals(RecoveryAction.SURFACE, decide(failure = PlaybackFailureKind.FORMAT, isOnlineSession = false))
 
@@ -57,41 +66,4 @@ class PlaybackRecoveryTest {
     @Test fun directPlayDisabledSurfaces() =
         assertEquals(RecoveryAction.SURFACE, decide(preferDirectPlay = false))
 
-    @Test fun serverTranscodeExhaustedFallsBackToOnDeviceWhenEnabled() =
-        // Already server-transcoding + user opted into on-device online transcode -> try the phone.
-        assertEquals(
-            RecoveryAction.ONDEVICE_TRANSCODE_FALLBACK,
-            decide(alreadyTranscoding = true, onDeviceOnlineEnabled = true),
-        )
-
-    @Test fun onDeviceFallbackNotUsedWhenReceiverCannotPlayHls() =
-        // A DLNA renderer can't play the phone's HLS/CMAF on-device transcode, so surface instead of
-        // falling into an HLS-over-DLNA dead end (UPnP 701 / silent hang).
-        assertEquals(
-            RecoveryAction.SURFACE,
-            decide(alreadyTranscoding = true, onDeviceOnlineEnabled = true, receiverSupportsHls = false),
-        )
-
-    @Test fun onDeviceFallbackNotUsedWhenDisabled() =
-        assertEquals(RecoveryAction.SURFACE, decide(alreadyTranscoding = true, onDeviceOnlineEnabled = false))
-
-    @Test fun onDeviceFallbackNotRepeatedOnceAttempted() =
-        assertEquals(
-            RecoveryAction.SURFACE,
-            decide(alreadyTranscoding = true, onDeviceOnlineEnabled = true, onDeviceAlreadyAttempted = true),
-        )
-
-    @Test fun onDeviceFallbackNotUsedForLocalSession() =
-        // A local file has no server; server transcode isn't relevant and on-device is the primary path.
-        assertEquals(
-            RecoveryAction.SURFACE,
-            decide(isOnlineSession = false, onDeviceOnlineEnabled = true),
-        )
-
-    @Test fun serverTranscodePreferredBeforeOnDevice() =
-        // First FORMAT failure of a direct-play attempt still tries the SERVER transcode before on-device.
-        assertEquals(
-            RecoveryAction.TRANSCODE_FALLBACK,
-            decide(onDeviceOnlineEnabled = true),
-        )
 }

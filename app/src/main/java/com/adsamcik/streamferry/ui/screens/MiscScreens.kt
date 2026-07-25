@@ -6,12 +6,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
 import androidx.compose.material.icons.automirrored.rounded.Logout
 import androidx.compose.material.icons.rounded.BatteryStd
-import androidx.compose.material.icons.rounded.BugReport
 import androidx.compose.material.icons.rounded.DeleteForever
-import androidx.compose.material.icons.rounded.Dns
-import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.HighQuality
-import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.Restore
 import androidx.compose.material.icons.rounded.Subtitles
 import androidx.compose.material.icons.rounded.Translate
@@ -26,8 +22,10 @@ import android.content.ClipData
 import android.content.Intent
 import android.content.res.Configuration
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.annotation.DrawableRes
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -52,13 +50,17 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.ui.res.painterResource
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
+import com.adsamcik.streamferry.R
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.LocalClipboard
@@ -471,9 +473,9 @@ fun SettingsScreen(
         )
         SettingsToggleRow(
             icon = Icons.Rounded.HighQuality,
-            label = "Prefer original quality",
-            description = "Stream the original without transcoding when the TV can play it; falls back to a " +
-                "server transcode automatically if the TV (Cast or DLNA) can't.",
+            label = "Direct play first",
+            description = "Stream the original when the TV can play it. Turn this off to force a server " +
+                "transcode from the start; failed transcodes step down through lower resolutions automatically.",
             checked = preferDp,
             onCheckedChange = { preferDp = it; onPreferDirectPlayChange(it) },
         )
@@ -525,23 +527,6 @@ fun SettingsScreen(
             onCheckedChange = { transcodeLocal = it; onTranscodeLocalChange(it) },
         )
         SettingsToggleRow(
-            icon = Icons.Rounded.HighQuality,
-            label = "Online phone transcoding",
-            description = "Temporarily unavailable for authenticated Jellyfin media while redirect-safe " +
-                "phone-side source handling is completed. Server transcoding remains the safe fallback.",
-            checked = false,
-            enabled = false,
-            onCheckedChange = { /* Safety-gated until an origin-pinned Media3 source is available. */ },
-        )
-        SettingsToggleRow(
-            icon = Icons.Rounded.HighQuality,
-            label = "CPU on-device transcoding",
-            description = "Temporarily unavailable. The active local fallback uses hardware H.264/HEVC output only.",
-            checked = false,
-            enabled = false,
-            onCheckedChange = { /* The active pipeline intentionally has no CPU encoder path. */ },
-        )
-        SettingsToggleRow(
             icon = Icons.Rounded.BatteryStd,
             label = "Allow background playback (screen-off)",
             description = "Let the app run unrestricted so casting keeps working when the screen is off. " +
@@ -555,10 +540,10 @@ fun SettingsScreen(
             label = if (capsReset) "TV capabilities reset \u2713" else "Reset learned TV capabilities",
             onClick = { capsReset = true; onResetTvCapabilities() },
         )
-        SettingsRow(icon = Icons.Rounded.Dns, label = "Servers", onClick = onServers)
-        SettingsRow(icon = Icons.Rounded.Download, label = "Downloads", onClick = onDownloads)
-        SettingsRow(icon = Icons.Rounded.BugReport, label = "Diagnostics", onClick = onDiagnostics)
-        SettingsRow(icon = Icons.Rounded.Info, label = "About & open-source licenses", onClick = onAbout)
+        SettingsRow(iconRes = R.drawable.in_app_icon_servers, label = "Servers", onClick = onServers)
+        SettingsRow(iconRes = R.drawable.in_app_icon_downloads, label = "Downloads", onClick = onDownloads)
+        SettingsRow(iconRes = R.drawable.in_app_icon_diagnostics, label = "Diagnostics", onClick = onDiagnostics)
+        SettingsRow(iconRes = R.drawable.in_app_icon_about, label = "About & open-source licenses", onClick = onAbout)
         SettingsRow(icon = Icons.AutoMirrored.Rounded.Logout, label = "Log out", onClick = onLogout)
         SettingsRow(
             icon = Icons.Rounded.DeleteForever,
@@ -702,7 +687,8 @@ private fun SettingsToggleRow(
 
 @Composable
 private fun SettingsRow(
-    icon: ImageVector,
+    icon: ImageVector? = null,
+    @DrawableRes iconRes: Int? = null,
     label: String,
     onClick: () -> Unit,
     containerColor: androidx.compose.ui.graphics.Color = MaterialTheme.colorScheme.surfaceContainer,
@@ -718,7 +704,18 @@ private fun SettingsRow(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(14.dp),
         ) {
-            Icon(icon, contentDescription = null, tint = onContainerColor, modifier = Modifier.size(24.dp))
+            if (iconRes != null) {
+                Image(
+                    painter = painterResource(iconRes),
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .size(36.dp)
+                        .clip(RoundedCornerShape(10.dp)),
+                )
+            } else if (icon != null) {
+                Icon(icon, contentDescription = null, tint = onContainerColor, modifier = Modifier.size(24.dp))
+            }
             Text(
                 label,
                 style = MaterialTheme.typography.titleSmall,

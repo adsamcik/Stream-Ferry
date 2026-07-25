@@ -43,6 +43,7 @@ android {
 
     buildTypes {
         debug {
+            applicationIdSuffix = ".debug"
             isMinifyEnabled = false
             // Debug-only network_security_config enables a user trust anchor for LAN testing.
             // It must NEVER ship in release (see src/release manifest + docs/NETWORK_SECURITY.md).
@@ -102,6 +103,7 @@ dependencies {
     // --- AndroidX / Compose ---
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation(libs.androidx.lifecycle.runtime.compose)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.androidx.activity.compose)
 

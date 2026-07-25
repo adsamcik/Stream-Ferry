@@ -4,11 +4,14 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.createSavedStateHandle
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
 import com.adsamcik.streamferry.permissions.AndroidNetworkPermissionManager
 import com.adsamcik.streamferry.ui.AppRoot
 import com.adsamcik.streamferry.ui.MainViewModel
@@ -19,20 +22,24 @@ class MainActivity : ComponentActivity() {
     private val container by lazy { (application as StreamFerryApplication).container }
 
     private val viewModel: MainViewModel by viewModels {
-        object : ViewModelProvider.Factory {
-            @Suppress("UNCHECKED_CAST")
-            override fun <T : androidx.lifecycle.ViewModel> create(modelClass: Class<T>): T =
-                MainViewModel(container) as T
+        viewModelFactory {
+            initializer {
+                MainViewModel(
+                    container = container,
+                    savedStateHandle = createSavedStateHandle(),
+                )
+            }
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
         container.initializeCastContext()
         viewModel.onLocalNetworkPermissionResult(container.permissions.hasLocalNetworkAccess())
         setContent {
             StreamFerryTheme {
-                val state by viewModel.state.collectAsState()
+                val state by viewModel.state.collectAsStateWithLifecycle()
                 // Request the local-network (+ notifications) permissions before scanning/playing, then
                 // scan. Browsing the library never needs these; only TV playback does, so it is deferred.
                 val permissionLauncher = rememberLauncherForActivityResult(
@@ -63,6 +70,9 @@ class MainActivity : ComponentActivity() {
         container.initializeCastContext()
         // Covers settings-driven revocation without treating a denial as an empty device list.
         viewModel.onLocalNetworkPermissionResult(container.permissions.hasLocalNetworkAccess())
+        // The battery-optimization request is handled by a system activity. Re-read its result when
+        // control returns so the Settings toggle immediately reflects the user's choice.
+        viewModel.refreshBackgroundPlaybackStatus()
     }
 
     override fun onStop() {
@@ -70,5 +80,6 @@ class MainActivity : ComponentActivity() {
         // Persist the redacted event log when leaving the app, so a report shared later (after the
         // process is killed in the background) still contains this session's playback/TV events.
         runCatching { container.flushDiagnostics() }
+        container.checkpointSmartResume()
     }
 }

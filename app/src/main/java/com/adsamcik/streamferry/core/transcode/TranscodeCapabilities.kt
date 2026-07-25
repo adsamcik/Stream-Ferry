@@ -11,20 +11,14 @@ package com.adsamcik.streamferry.core.transcode
 data class DeviceEncodeCapabilities(
     val h264MaxResolution: ResolutionTier?,
     val hevcMaxResolution: ResolutionTier?,
-    val vp9MaxResolution: ResolutionTier? = null,
-    val av1MaxResolution: ResolutionTier? = null,
     /** HEVC Main10 (10-bit) hardware encode, requiring HEVCProfileMain10 + COLOR_FormatYUVP010. */
     val hevcMain10: Boolean = false,
     val maxFps: Int = 30,
-    /** Codecs the phone can encode in software (CPU band, opt-in). Slow — bounded to [softwareMaxResolution]. */
-    val softwareCodecs: Set<VideoCodec> = emptySet(),
-    val softwareMaxResolution: ResolutionTier = ResolutionTier.FHD_1080P,
 ) {
     private fun hwTier(codec: VideoCodec): ResolutionTier? = when (codec) {
         VideoCodec.H264 -> h264MaxResolution
         VideoCodec.HEVC -> hevcMaxResolution
-        VideoCodec.VP9 -> vp9MaxResolution
-        VideoCodec.AV1 -> av1MaxResolution
+        VideoCodec.VP9, VideoCodec.AV1 -> null
     }
 
     /** True if the phone can HARDWARE-encode [codec] at [tier] in realtime. */
@@ -32,10 +26,6 @@ data class DeviceEncodeCapabilities(
         val cap = hwTier(codec) ?: return false
         return tier.maxHeightPx <= cap.maxHeightPx
     }
-
-    /** True if the phone can SOFTWARE-encode [codec] at [tier] (CPU band; capped to [softwareMaxResolution]). */
-    fun canEncodeSoftware(codec: VideoCodec, tier: ResolutionTier): Boolean =
-        codec in softwareCodecs && tier.maxHeightPx <= softwareMaxResolution.maxHeightPx
 
     /** Backwards-compatible hardware-encode check (used by the legacy [TranscodeNegotiator]). */
     fun canEncode(codec: VideoCodec, tier: ResolutionTier): Boolean = canEncodeHardware(codec, tier)

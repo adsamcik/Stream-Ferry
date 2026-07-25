@@ -22,14 +22,12 @@ class PlaybackPlannerTest {
     // A TV that only plays H.264 up to 1080p (the conservative default).
     private val h264OnlyTv = ReceiverPlaybackCapabilities()
 
-    // A phone that HW-encodes H.264 + HEVC at 4K; can SW-encode H.264 up to 1080p.
+    // A phone that hardware-encodes H.264 + HEVC at 4K.
     private val device = DeviceEncodeCapabilities(
         h264MaxResolution = ResolutionTier.UHD_4K,
         hevcMaxResolution = ResolutionTier.UHD_4K,
-        softwareCodecs = setOf(VideoCodec.H264),
-        softwareMaxResolution = ResolutionTier.FHD_1080P,
     )
-    private val allEngines = EngineAvailability(server = true, clientHardware = true, clientCpu = true)
+    private val allEngines = EngineAvailability(server = true, clientHardware = true)
 
     private fun hevc4kSource(canDirectPlay: Boolean) = PlannerSource(
         codec = VideoCodec.HEVC, tier = ResolutionTier.UHD_4K, tenBit = true,
@@ -58,9 +56,9 @@ class PlaybackPlannerTest {
         val maxBand = plan.filter { it.band == QualityBand.MAX_TRANSCODE }
         // First engine tried for the top band is the server.
         assertEquals(PlaybackEngineKind.SERVER, maxBand.first().engine)
-        // Engine order within the band is server -> HW -> CPU.
+        // Engine order within the band is server -> hardware.
         val engineOrder = maxBand.map { it.engine }
-        assertEquals(engineOrder.sortedBy { listOf(PlaybackEngineKind.SERVER, PlaybackEngineKind.CLIENT_HW, PlaybackEngineKind.CLIENT_CPU).indexOf(it) }, engineOrder)
+        assertEquals(engineOrder.sortedBy { listOf(PlaybackEngineKind.SERVER, PlaybackEngineKind.CLIENT_HW).indexOf(it) }, engineOrder)
     }
 
     @Test fun bestCodecChosenForTopBand() {
@@ -78,7 +76,7 @@ class PlaybackPlannerTest {
     }
 
     @Test fun onlyAvailableEnginesAppear() {
-        val serverOnly = EngineAvailability(server = true, clientHardware = false, clientCpu = false)
+        val serverOnly = EngineAvailability(server = true, clientHardware = false)
         val plan = planner.plan(hevc4kSource(canDirectPlay = false), fullTv, device, serverOnly)
         assertTrue(plan.all { it.engine == PlaybackEngineKind.SERVER })
     }
@@ -86,19 +84,10 @@ class PlaybackPlannerTest {
     @Test fun clientHardwareGatedByDeviceEncodeSupport() {
         // Device with NO HEVC HW encoder: on-device HEVC must not appear (only H.264 HW).
         val h264HwOnly = DeviceEncodeCapabilities(h264MaxResolution = ResolutionTier.UHD_4K, hevcMaxResolution = null)
-        val noServer = EngineAvailability(server = false, clientHardware = true, clientCpu = false)
+        val noServer = EngineAvailability(server = false, clientHardware = true)
         val plan = planner.plan(hevc4kSource(canDirectPlay = false), fullTv, h264HwOnly, noServer)
         assertTrue(plan.all { it.engine == PlaybackEngineKind.CLIENT_HW })
         assertTrue(plan.all { it.codec == VideoCodec.H264 })
-    }
-
-    @Test fun cpuBandBoundedToSoftwareTierAndCodecs() {
-        // Only CPU engine, device SW-encodes H.264 up to 1080p: no 4K CPU attempt, H.264 only.
-        val cpuOnly = EngineAvailability(server = false, clientHardware = false, clientCpu = true)
-        val plan = planner.plan(hevc4kSource(canDirectPlay = false), fullTv, device, cpuOnly)
-        assertTrue(plan.all { it.engine == PlaybackEngineKind.CLIENT_CPU })
-        assertTrue(plan.all { it.codec == VideoCodec.H264 })
-        assertTrue(plan.all { it.tier.maxHeightPx <= ResolutionTier.FHD_1080P.maxHeightPx })
     }
 
     @Test fun h264OnlyTvGetsH264Ladder() {
@@ -124,7 +113,7 @@ class PlaybackPlannerTest {
     }
 
     @Test fun emptyWhenNothingPossible() {
-        val nothing = EngineAvailability(server = false, clientHardware = false, clientCpu = false)
+        val nothing = EngineAvailability(server = false, clientHardware = false)
         val plan = planner.plan(hevc4kSource(canDirectPlay = false), fullTv, device, nothing)
         assertTrue(plan.isEmpty())
     }

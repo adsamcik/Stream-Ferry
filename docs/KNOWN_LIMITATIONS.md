@@ -37,10 +37,8 @@ unmet item be stated with reasons.
   compatible Cast receivers only. There is no phone DASH or MPEG-TS muxer, no AV1/VP9 or CPU encoder
   path, and no Main10/HDR output or conversion contract. H.264/AAC is the compatibility floor; HEVC/AAC
   is hardware- and receiver-gated. DLNA does not receive an on-device HLS/fMP4 stream.
-- **Online phone fallback is safety-gated off.** The app will not send a Jellyfin Authorization header
-  through Media3's remote input until that input can enforce the same trusted-origin and redirect policy
-  as the authenticated Jellyfin proxy. An opt-in setting does not enable the fallback today; Jellyfin
-  server transcoding remains the supported online recovery path.
+- **Online phone transcoding is unsupported by design.** Jellyfin server transcoding is the supported
+  online conversion route; the phone transcodes only eligible local files for Cast.
 - **Rolling in-memory prebuffer** (Phase 9) policy + decisions are implemented and unit-tested; wiring
   it into the live streaming loop beyond pass-through is a follow-up.
 - **Jellyfin SDK vs HTTP API:** the playback path uses the documented Jellyfin **HTTP API** (OkHttp)

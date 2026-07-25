@@ -1,15 +1,16 @@
 # Stream Selection
 
-The phone **does not transcode**. It only proxies bytes. Therefore the app must ask Jellyfin for a
-stream the **target TV** can play, encoding the TV's capabilities (not the phone's) into the Jellyfin
-`DeviceProfile` / PlaybackInfo request and choosing among Jellyfin-provided media sources.
+The phone does not transcode **online Jellyfin streams**. It asks Jellyfin for a stream the **target
+TV** can play, encoding the TV's capabilities (not the phone's) into the Jellyfin `DeviceProfile` /
+PlaybackInfo request and choosing among Jellyfin-provided media sources. A separate experimental,
+hardware-only path may transcode incompatible local files for Cast.
 
 ## How transcoding is actually requested (implemented)
 
 The live path drives Jellyfin with an **accurate DeviceProfile built from the target's real
 capabilities** (`data.jellyfin.DeviceProfiles.forTarget`), then lets the server decide direct-play vs.
-transcode and returns the matching media source. The phone never transcodes; it only proxies the
-server's chosen stream.
+transcode and returns the matching media source. The phone proxies the server's chosen stream; it does
+not use its local-file transcoder for online media.
 
 - **DirectPlayProfiles** list only codecs/containers the target actually supports (so we never
   advertise a format the TV can't decode). HEVC/H.265 is dropped unless the target advertises it; a
@@ -75,6 +76,15 @@ double-fire. Finally, a successful fallback is **remembered per (renderer, sourc
 `RendererCapabilityStore`, so the next play of that format to that TV skips the doomed direct-play attempt
 entirely. The TV still only ever receives the phone proxy URL — the broad profile only affects the
 phone↔Jellyfin DeviceProfile.
+
+## In-playback Jellyfin overrides
+
+For an online session, the playback screen’s **Jellyfin overrides** card can set a quality cap,
+resolution cap, or output video format for that session only. Each override re-requests PlaybackInfo from
+the current position with direct play/direct stream disabled. A selected video format is advertised as the
+only server-transcode format, so Jellyfin either produces it within the requested caps or returns a clear
+failure; it is not silently substituted with another format. Choosing Auto removes that individual
+session override.
 
 ## Decision order (per target)
 

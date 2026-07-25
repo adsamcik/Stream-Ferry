@@ -31,6 +31,8 @@ import com.adsamcik.streamferry.data.language.ShowLanguageStore
 import com.adsamcik.streamferry.data.local.LocalMediaSource
 import com.adsamcik.streamferry.data.local.LocalSourceStore
 import com.adsamcik.streamferry.data.resume.ResumeStore
+import com.adsamcik.streamferry.data.resume.SmartResumeStore
+import com.adsamcik.streamferry.core.resume.SmartResumeSessionTracker
 import com.adsamcik.streamferry.data.transcode.MediaCodecCapabilityProbe
 import com.adsamcik.streamferry.data.transcode.OnDeviceTranscoder
 import com.adsamcik.streamferry.data.proxy.LocalProxyServer
@@ -183,6 +185,8 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
     // ----- media sources (multi-source gallery) -----
     val localSourceStore: LocalSourceStore by lazy { LocalSourceStore(appContext) }
     val resumeStore: ResumeStore by lazy { ResumeStore(appContext) }
+    val smartResumeStore: SmartResumeStore by lazy { SmartResumeStore(appContext) }
+    val smartResumeTracker: SmartResumeSessionTracker by lazy { SmartResumeSessionTracker(smartResumeStore) }
     val jellyfinMediaSource: MediaSource by lazy { JellyfinMediaSource(mediaRepository) }
     val localMediaSource: LocalMediaSource by lazy {
         LocalMediaSource(appContext, localSourceStore, logger, hasMediaPermission = { permissions.hasReadMediaVideo() })
@@ -289,6 +293,7 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
             onDeviceTranscoder = onDeviceTranscoder,
             deviceEncodeCapsProvider = { deviceEncodeCaps },
             rendererCaps = rendererCapabilityStore,
+            smartResume = smartResumeTracker,
             requireLocalNetworkAccess = localNetworkGate::requireAccess,
         )
     }
@@ -379,6 +384,11 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
         ioScope.launch { runCatching { diagnosticsEventLog.flush() } }
     }
 
+    /** Save renderer-confirmed Smart Resume progress as the app leaves the foreground. */
+    fun checkpointSmartResume() {
+        ioScope.launch { runCatching { playbackEngine.checkpointSmartResumeLifecycle() } }
+    }
+
     /**
      * Auto-recover downloads when connectivity returns. If a download exhausted its in-flight retries
      * while offline, re-enqueue it (resuming from its `.part` file) the moment a usable default network
@@ -423,6 +433,7 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
         libraryCache.clear()
         downloadStore.clear()
         runCatching { resumeStore.clear() }
+        runCatching { smartResumeStore.clear() }
         runCatching { crashReporter.clear() } // crash reports are app data too
         runCatching { diagnosticsEventLog.clear() } // persisted event log is app data too
         runCatching { diagnosticsPreferences.clear() }

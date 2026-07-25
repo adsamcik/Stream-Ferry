@@ -63,8 +63,15 @@ data class AppUiState(
     val selectedTarget: DiscoveredTarget? = null,
     val localNetworkPermissionGranted: Boolean = false,
 
+    // ----- background playback -----
+    /** Whether the app is exempt from battery optimization (needed for reliable screen-off casting). */
+    val backgroundPlaybackUnrestricted: Boolean = true,
+
     // ----- playback -----
     val playback: PlaybackUiState? = null,
+
+    /** Latest app-wide renderer-confirmed checkpoint, displayed at either gallery root. */
+    val smartResume: SmartResumeUiState? = null,
 
     // ----- offline downloads -----
     val downloads: List<DownloadUiItem> = emptyList(),
@@ -118,6 +125,10 @@ data class PlaybackUiState(
     val availableVideoCodecs: List<String> = emptyList(),
     /** Manually-chosen transcode codec (e.g. "hevc"), or null for automatic. */
     val preferredVideoCodec: String? = null,
+    /** Active server-stream resolution cap, or null when this is a local session. */
+    val maxVideoHeight: Int? = null,
+    /** True when the current session overrides the saved resolution cap. */
+    val isManualMaxVideoHeight: Boolean = false,
     val videoWidth: Int? = null,
     val videoHeight: Int? = null,
     val videoBitrateBps: Long? = null,

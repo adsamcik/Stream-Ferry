@@ -18,7 +18,7 @@ The phone path has a deliberately narrow contract:
   when both the phone's hardware encoder and the selected Cast receiver admit it.
 - **Encoder:** hardware only. There is no active CPU/software encoder fallback.
 - **Colour and profile:** output is 8-bit. There is no explicit Main10 or HDR conversion contract;
-  HDR/10-bit online fallback is rejected rather than silently changing colour treatment.
+  HDR/10-bit local sources are rejected rather than silently changing colour treatment.
 - **Not active in this path:** AV1 and VP9 encoding, DASH, MPEG-TS, CPU encoding, Main10, and HDR
   output. Types or planning code that model those choices are not a production phone-output promise.
 
@@ -26,16 +26,14 @@ The maximum resolution selected by negotiation is a capability-admission ceiling
 realtime 4K operation, a fixed frame rate, a fixed bitrate, or sustained performance. The server-side
 Jellyfin profile may have broader capabilities; do not infer them from this phone-output contract.
 
-## Online Jellyfin fallback is safety-gated
+## Online Jellyfin media is server-transcoded
 
-The optional idea of falling back from a Jellyfin server transcode to a phone transcode is **currently
-disabled**. Media3's remote input must enforce the same trusted-origin and authenticated-redirect policy
-as the Jellyfin proxy before the app can attach an Authorization header safely. Until that exists, the
-fallback stops with a clear error instead of fetching a remote original on the phone. A preference does
-not override this safety gate.
+Online Jellyfin media is never transcoded on the phone. The supported online recovery chain is direct
+play → Jellyfin server transcode → clear failure. This keeps authentication, redirect validation, and
+media conversion with the Jellyfin server rather than turning the phone into a remote media gateway.
 
-Consequently, the production online recovery chain is direct play → Jellyfin server transcode. The
-phone's local-file path is separate and never exposes a Jellyfin URL or token to the receiver.
+The local-file path is separate: it accepts only `content://` or `file://` sources and never exposes a
+Jellyfin URL or token to the receiver.
 
 ## Runtime flow
 
@@ -77,8 +75,7 @@ directly playable or played through a supported server-side route.
 
 - The receiver receives only `…/session/<id>/stream` URLs and opaque segment identifiers.
 - The local `content://` URI is opened by the phone and is never sent to the receiver.
-- The local path carries no Jellyfin credential. Remote Jellyfin phone fallback remains disabled until
-  authenticated redirects can be origin-pinned in the Media3 source.
+- The local path carries no Jellyfin credential and does not accept a remote source.
 
 ## Validation status and limits
 

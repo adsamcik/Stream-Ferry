@@ -2,11 +2,7 @@ package com.adsamcik.streamferry.ui.screens
 
 import android.content.res.Configuration
 import android.os.SystemClock
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
@@ -85,6 +81,16 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.ProgressBarRangeInfo
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.progressBarRangeInfo
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.setProgress
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -122,7 +128,7 @@ fun TargetPickerScreen(state: AppUiState, viewModel: MainViewModel, onRescan: ()
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
             OutlinedButton(onClick = onRescan, enabled = !state.isScanningTargets) {
                 Icon(Icons.Rounded.Refresh, contentDescription = null, modifier = Modifier.padding(end = 4.dp))
-                Text(if (state.isScanningTargets) "Scanning…" else "Scan for devices")
+                Text(if (state.isScanningTargets) "Searching…" else "Search for TVs")
             }
             if (state.isScanningTargets) {
                 CircularProgressIndicator(Modifier.padding(start = 12.dp).size(22.dp))
@@ -131,7 +137,7 @@ fun TargetPickerScreen(state: AppUiState, viewModel: MainViewModel, onRescan: ()
 
         if (!state.localNetworkPermissionGranted) {
             Text(
-                "Local-network access is required before a TV can fetch the phone-hosted stream.",
+                "Stream Ferry needs local-network access so this phone and your TV can communicate.",
                 style = MaterialTheme.typography.bodyMedium,
             )
             OutlinedButton(
@@ -144,26 +150,30 @@ fun TargetPickerScreen(state: AppUiState, viewModel: MainViewModel, onRescan: ()
         }
 
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("Cast (preferred)", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+            Text("Google Cast TVs", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
             if (state.castAvailable && state.localNetworkPermissionGranted) {
                 FrameworkCastRouteButton(onSelect = viewModel::selectTarget)
             }
         }
         if (!state.castAvailable) {
-            Text("Google Cast is unavailable on this device.")
+            Text("Google Cast is not available on this phone.")
         } else if (!state.localNetworkPermissionGranted) {
-            Text("Grant local-network access to choose a Cast device.", style = MaterialTheme.typography.bodyMedium)
+            Text("Allow local-network access to choose a TV.", style = MaterialTheme.typography.bodyMedium)
         } else {
             val selectedCast = state.selectedTarget?.takeIf { it.protocol == Protocol.CAST }
             if (selectedCast != null) {
-                Text("Selected Cast device: ${selectedCast.displayName}", style = MaterialTheme.typography.bodyMedium)
+                Text("Selected TV: ${selectedCast.displayName}", style = MaterialTheme.typography.bodyMedium)
             } else {
-                Text("Use the Cast button to choose a device.", style = MaterialTheme.typography.bodyMedium)
+                Text("Use the TV button to choose a Cast-enabled TV.", style = MaterialTheme.typography.bodyMedium)
             }
         }
 
-        Text("DLNA / Smart TV (best effort)", style = MaterialTheme.typography.titleMedium)
-        TargetGroup(state.dlnaTargets, state.selectedTarget, "No DLNA renderers found. Check Wi-Fi and local-network permission.") {
+        Text("Other smart TVs", style = MaterialTheme.typography.titleMedium)
+        TargetGroup(
+            state.dlnaTargets,
+            state.selectedTarget,
+            "No compatible smart TVs found. Check that the TV is on and connected to the same local network.",
+        ) {
             viewModel.selectTarget(it)
         }
 
@@ -175,7 +185,7 @@ fun TargetPickerScreen(state: AppUiState, viewModel: MainViewModel, onRescan: ()
             enabled = state.selectedTarget != null && state.localNetworkPermissionGranted,
             modifier = Modifier.padding(top = 8.dp),
         ) {
-            Text("Play to ${state.selectedTarget?.displayName ?: "selected TV"}")
+            Text("Play on ${state.selectedTarget?.displayName ?: "selected TV"}")
         }
     }
 }
@@ -247,7 +257,7 @@ private fun FrameworkCastRouteButton(
         factory = { viewContext ->
             MediaRouteButton(viewContext).also { button ->
                 CastButtonFactory.setUpMediaRouteButton(viewContext.applicationContext, viewContext.mainExecutor, button)
-                button.contentDescription = "Choose Cast device"
+                button.contentDescription = "Choose a Google Cast TV"
             }
         },
         modifier = Modifier.size(48.dp),
@@ -268,11 +278,18 @@ private fun TargetGroup(
     targets.forEach { target ->
         Card(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
             Row(
-                Modifier.fillMaxWidth().selectable(selected = target.id == selected?.id) { onSelect(target) }.padding(8.dp),
+                Modifier
+                    .fillMaxWidth()
+                    .selectable(
+                        selected = target.id == selected?.id,
+                        role = Role.RadioButton,
+                        onClick = { onSelect(target) },
+                    )
+                    .padding(8.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                RadioButton(selected = target.id == selected?.id, onClick = { onSelect(target) })
-                Column(Modifier.padding(start = 4.dp)) {
+                RadioButton(selected = target.id == selected?.id, onClick = null)
+                Column(Modifier.padding(start = 4.dp).weight(1f)) {
                     Text(target.displayName, style = MaterialTheme.typography.bodyLarge)
                     target.capabilities.modelName?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
                 }
@@ -326,6 +343,7 @@ fun PlaybackScreen(state: AppUiState, viewModel: MainViewModel) {
             p,
             onSelectQuality = { viewModel.selectQuality(it) },
             onSelectCodec = { viewModel.selectPreferredCodec(it) },
+            onSelectResolution = { viewModel.selectMaxVideoHeight(it) },
         )
         p.errorMessage?.let { msg ->
             Surface(
@@ -347,7 +365,7 @@ fun PlaybackScreen(state: AppUiState, viewModel: MainViewModel) {
             shape = RoundedCornerShape(18.dp),
         ) {
             Icon(Icons.Rounded.Stop, contentDescription = null, modifier = Modifier.size(22.dp))
-            Text("  Stop casting", style = MaterialTheme.typography.titleMedium)
+            Text("  Stop playing on TV", style = MaterialTheme.typography.titleMedium)
         }
         Text(
             "Tip: you can also control playback from the notification, lock screen, or your phone's volume keys.",
@@ -378,16 +396,22 @@ private fun ReconnectingBanner() {
         modifier = Modifier.fillMaxWidth(),
     ) {
         Row(
-            Modifier.fillMaxWidth().padding(16.dp),
+            Modifier
+                .fillMaxWidth()
+                .padding(16.dp)
+                .semantics(mergeDescendants = true) { liveRegion = LiveRegionMode.Polite },
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(14.dp),
         ) {
             CircularProgressIndicator(
-                Modifier.size(22.dp),
+                Modifier.size(22.dp).clearAndSetSemantics { },
                 strokeWidth = 2.dp,
                 color = MaterialTheme.colorScheme.onTertiaryContainer,
             )
-            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
                 Text(
                     "Reconnecting to the TV…",
                     style = MaterialTheme.typography.titleSmall,
@@ -430,16 +454,16 @@ private fun NowPlayingHero(p: PlaybackUiState, mediaTitle: String?) {
                     )
                 }
             }
-            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 Text(
-                    mediaTitle?.takeIf { it.isNotBlank() } ?: "Now casting",
+                    mediaTitle?.takeIf { it.isNotBlank() } ?: "Now playing",
                     style = MaterialTheme.typography.headlineSmall,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.onPrimaryContainer,
                     maxLines = 2,
                 )
                 Text(
-                    "${p.targetName} · ${p.protocol}",
+                    p.targetName,
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onPrimaryContainer,
                 )
@@ -493,6 +517,23 @@ private fun SeekScrubber(
             Box(
                 Modifier
                     .fillMaxSize()
+                    .semantics {
+                        contentDescription = "Playback position"
+                        stateDescription = if (duration != null) {
+                            "${formatClock(scrubSeconds)} of ${formatClock(duration)}"
+                        } else {
+                            "Live stream"
+                        }
+                        progressBarRangeInfo = duration?.let {
+                            ProgressBarRangeInfo(shown, 0f..1f)
+                        } ?: ProgressBarRangeInfo.Indeterminate
+                        if (duration != null) {
+                            setProgress { requested ->
+                                onSeek((requested.coerceIn(0f, 1f) * duration).toLong())
+                                true
+                            }
+                        }
+                    }
                     .then(
                         if (seekable) Modifier.pointerInput(duration) {
                             detectHorizontalDragGestures(
@@ -624,20 +665,16 @@ private fun SeekPreviewBubble(timeLabel: String, chapterName: String?, imageUrl:
 }
 
 /**
- * A custom Material 3 Expressive-style progress bar: the played portion is a travelling sine wave that
- * flattens smoothly when paused, the remaining portion a rounded track, with a thumb at the position.
+ * A custom Material 3 Expressive-style progress bar. Its sine silhouette communicates playback without
+ * continuous decorative motion; it flattens smoothly when paused and retains a clear position thumb.
  */
 @Composable
 private fun WaveBar(fraction: Float, playing: Boolean, indeterminate: Boolean, modifier: Modifier) {
     val activeColor = MaterialTheme.colorScheme.primary
     val trackColor = MaterialTheme.colorScheme.surfaceVariant
-    val transition = rememberInfiniteTransition(label = "wave")
-    val phase by transition.animateFloat(
-        initialValue = 0f,
-        targetValue = (2f * PI).toFloat(),
-        animationSpec = infiniteRepeatable(tween(1100, easing = LinearEasing)),
-        label = "phase",
-    )
+    // Keep a static phase to avoid perpetual decorative frame churn. Playback-state changes still
+    // animate briefly through amplitudeFraction, retaining useful motion without continuous motion.
+    val phase = 0f
     val amplitudeFraction by animateFloatAsState(
         targetValue = if (playing || indeterminate) 1f else 0f,
         animationSpec = tween(350),
@@ -809,7 +846,7 @@ private fun <T> PickerRow(
 }
 
 @Composable
-private fun AdaptiveCard(p: PlaybackUiState, onSelectQuality: (Long?) -> Unit, onSelectCodec: (String?) -> Unit) {
+private fun AdaptiveCard(p: PlaybackUiState, onSelectQuality: (Long?) -> Unit, onSelectCodec: (String?) -> Unit, onSelectResolution: (Int?) -> Unit) {
     Card(
         shape = RoundedCornerShape(22.dp),
         modifier = Modifier.fillMaxWidth(),
@@ -823,7 +860,7 @@ private fun AdaptiveCard(p: PlaybackUiState, onSelectQuality: (Long?) -> Unit, o
                     tint = MaterialTheme.colorScheme.onSecondaryContainer,
                 )
                 Text(
-                    "Quality",
+                    "Jellyfin overrides",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.onSecondaryContainer,
@@ -838,20 +875,33 @@ private fun AdaptiveCard(p: PlaybackUiState, onSelectQuality: (Long?) -> Unit, o
                 )
                 PickerRow(
                     icon = Icons.Rounded.Tune,
-                    label = "Quality",
+                    label = "Quality cap",
                     selectedLabel = menu.firstOrNull { it.isSelected }?.label ?: "Auto",
                     options = menu.map { it.bitrateBps to it.label },
                     onSelect = onSelectQuality,
                 )
             }
             // Manual codec picker — Auto (best codec the TV supports) plus each codec the TV can accept.
+            p.maxVideoHeight?.let { cap ->
+                val options = listOf<Pair<Int?, String>>(
+                    null to "Auto (${cap}p)", 2160 to "4K (2160p)", 1080 to "1080p", 720 to "720p", 480 to "480p",
+                )
+                PickerRow(
+                    icon = Icons.Rounded.Hd,
+                    label = "Resolution cap",
+                    selectedLabel = if (p.isManualMaxVideoHeight) "${cap}p" else "Auto (${cap}p)",
+                    options = options,
+                    onSelect = onSelectResolution,
+                )
+            }
+
             // Choosing one makes a server transcode use that codec.
             if (p.availableVideoCodecs.size > 1) {
                 val codecOptions = listOf<Pair<String?, String>>(null to "Auto") +
                     p.availableVideoCodecs.map { it to codecLabel(it) }
                 PickerRow(
                     icon = Icons.Rounded.Memory,
-                    label = "Codec",
+                    label = "Video format",
                     selectedLabel = p.preferredVideoCodec?.let { codecLabel(it) } ?: "Auto",
                     options = codecOptions,
                     onSelect = onSelectCodec,
@@ -980,7 +1030,7 @@ private fun PlaybackControlsPreview() {
                     previewUrlFor = { null },
                     onSeek = {},
                 )
-                AdaptiveCard(samplePlayback, onSelectQuality = {}, onSelectCodec = {})
+                AdaptiveCard(samplePlayback, onSelectQuality = {}, onSelectCodec = {}, onSelectResolution = {})
             }
         }
     }

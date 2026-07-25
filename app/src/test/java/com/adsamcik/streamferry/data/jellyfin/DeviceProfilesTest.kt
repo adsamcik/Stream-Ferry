@@ -108,6 +108,10 @@ class DeviceProfilesTest {
         assertTrue(json.contains("\"Format\":\"srt\",\"Method\":\"Encode\""))
         assertTrue(json.contains("\"Format\":\"vtt\",\"Method\":\"Encode\""))
         assertFalse(json.contains("\"Method\":\"External\"")) // nothing left external when burning in
+        assertTrue(json.contains("\"Format\":\"mov_text\",\"Method\":\"Encode\""))
+        assertTrue(json.contains("\"Format\":\"hdmv_pgs_subtitle\",\"Method\":\"Encode\""))
+        assertTrue(json.contains("\"Format\":\"vobsub\",\"Method\":\"Encode\""))
+        assertTrue(json.contains("\"Format\":\"eia_708\",\"Method\":\"Encode\""))
     }
 
     @Test fun noBurnInKeepsSubtitlesExternal() {
@@ -145,6 +149,20 @@ class DeviceProfilesTest {
         assertFalse(json.contains("\"VideoCodec\":\"av1\""))
         assertFalse(json.contains("\"VideoCodec\":\"vp9\""))
         assertTrue(json.contains("\"VideoCodec\":\"h264\""))
+    }
+
+    @Test fun manualFormatOverrideAdvertisesOnlyThatTranscodeFormat() {
+        val caps = castCaps.copy(
+            supportedVideoCodecs = setOf("h264", "hevc", "av1"), supportsHevc = true, supports10Bit = true,
+        )
+        val json = DeviceProfiles.forTarget(
+            caps, maxBitrateBps = 6_000_000, forceTranscode = true, allowSubtitleBurnIn = false,
+            preferredVideoCodec = "hevc",
+        )
+        assertTrue(json.contains("\"DirectPlayProfiles\":[]"))
+        assertTrue(json.contains("\"VideoCodec\":\"hevc\""))
+        assertFalse(json.contains("\"VideoCodec\":\"h264\""))
+        assertFalse(json.contains("\"VideoCodec\":\"av1\""))
     }
 
     @Test fun maxVideoHeightAddsCodecAgnosticHeightCap() {

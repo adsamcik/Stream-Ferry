@@ -1,10 +1,6 @@
 package com.adsamcik.streamferry.ui.screens
 
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.res.Configuration
-import android.widget.Toast
-import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -17,7 +13,6 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.Bolt
 import androidx.compose.material.icons.rounded.Cast
 import androidx.compose.material.icons.rounded.Dns
 import androidx.compose.material.icons.rounded.Lock
@@ -37,16 +32,17 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import com.adsamcik.streamferry.ui.MainViewModel
+import com.adsamcik.streamferry.ui.components.QuickConnectCodeCard
 import com.adsamcik.streamferry.ui.state.AppUiState
 import com.adsamcik.streamferry.ui.state.ConnectionState
 import com.adsamcik.streamferry.ui.state.Route
@@ -187,7 +183,7 @@ fun ServerSetupScreen(state: AppUiState, viewModel: MainViewModel) {
 
 @Composable
 fun LoginScreen(state: AppUiState, viewModel: MainViewModel) {
-    var username by remember { mutableStateOf("") }
+    var username by rememberSaveable { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
     val quickConnect = state.quickConnect
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -258,66 +254,23 @@ fun LoginScreen(state: AppUiState, viewModel: MainViewModel) {
 
 @Composable
 private fun QuickConnectPanel(code: String, onCancel: () -> Unit) {
-    val context = LocalContext.current
-    val clipboard = context.getSystemService(ClipboardManager::class.java)
-    Card(
+    Column(
         modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(24.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Column(
-            modifier = Modifier.fillMaxWidth().padding(24.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
+        QuickConnectCodeCard(code = code)
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            Icon(
-                Icons.Rounded.Bolt,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.onSecondaryContainer,
-                modifier = Modifier.size(32.dp),
-            )
-            Text(
-                "Quick Connect",
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.onSecondaryContainer,
-            )
-            Text(
-                "Enter this code on your Jellyfin server (Dashboard ▸ Quick Connect, or the prompt). Long press it to copy:",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSecondaryContainer,
-            )
-            Text(
-                code,
-                style = MaterialTheme.typography.displaySmall,
-                fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.onSecondaryContainer,
-                modifier = Modifier.combinedClickable(
-                    onClick = {},
-                    onLongClickLabel = "Copy Quick Connect code",
-                    onLongClick = {
-                        clipboard.setPrimaryClip(ClipData.newPlainText("Quick Connect code", code))
-                        Toast.makeText(context, "Quick Connect code copied", Toast.LENGTH_SHORT).show()
-                    },
-                ),
-            )
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                CircularProgressIndicator(Modifier.size(22.dp))
-                Text(
-                    "Waiting for approval…",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSecondaryContainer,
-                )
-            }
-            OutlinedButton(
-                onClick = onCancel,
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(18.dp),
-            ) { Text("Cancel") }
+            CircularProgressIndicator(Modifier.size(22.dp))
+            Text("Waiting for approval…", style = MaterialTheme.typography.bodyMedium)
         }
+        OutlinedButton(
+            onClick = onCancel,
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(18.dp),
+        ) { Text("Cancel Quick Connect") }
     }
 }
 
