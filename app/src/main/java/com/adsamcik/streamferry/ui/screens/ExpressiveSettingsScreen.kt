@@ -125,27 +125,6 @@ fun ExpressiveSettingsScreen(
         contentPadding = PaddingValues(bottom = 36.dp),
         verticalArrangement = Arrangement.spacedBy(20.dp),
     ) {
-        item(key = "stream-role") {
-            Surface(
-                modifier = Modifier.fillMaxWidth(),
-                shape = MaterialTheme.shapes.extraLarge,
-                color = MaterialTheme.colorScheme.primaryContainer,
-                contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
-            ) {
-                Column(
-                    modifier = Modifier.padding(horizontal = 24.dp, vertical = 22.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    Icon(Icons.Rounded.PlayCircle, contentDescription = null, modifier = Modifier.size(32.dp))
-                    Text("Your phone carries every stream", style = MaterialTheme.typography.headlineSmall)
-                    Text(
-                        "Keep this phone on the same local network as your TV while Stream Ferry is playing.",
-                        style = MaterialTheme.typography.bodyLarge,
-                    )
-                }
-            }
-        }
-
         item(key = "playback-heading") { SettingsHeading("Playback") }
         item(key = "playback-group") {
             SettingsGroup {
