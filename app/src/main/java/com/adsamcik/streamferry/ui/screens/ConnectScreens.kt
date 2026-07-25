@@ -1,6 +1,10 @@
 package com.adsamcik.streamferry.ui.screens
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.res.Configuration
+import android.widget.Toast
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -36,6 +40,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -253,6 +258,8 @@ fun LoginScreen(state: AppUiState, viewModel: MainViewModel) {
 
 @Composable
 private fun QuickConnectPanel(code: String, onCancel: () -> Unit) {
+    val context = LocalContext.current
+    val clipboard = context.getSystemService(ClipboardManager::class.java)
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(24.dp),
@@ -276,7 +283,7 @@ private fun QuickConnectPanel(code: String, onCancel: () -> Unit) {
                 color = MaterialTheme.colorScheme.onSecondaryContainer,
             )
             Text(
-                "Enter this code on your Jellyfin server (Dashboard ▸ Quick Connect, or the prompt):",
+                "Enter this code on your Jellyfin server (Dashboard ▸ Quick Connect, or the prompt). Long press it to copy:",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSecondaryContainer,
             )
@@ -285,6 +292,14 @@ private fun QuickConnectPanel(code: String, onCancel: () -> Unit) {
                 style = MaterialTheme.typography.displaySmall,
                 fontWeight = FontWeight.Bold,
                 color = MaterialTheme.colorScheme.onSecondaryContainer,
+                modifier = Modifier.combinedClickable(
+                    onClick = {},
+                    onLongClickLabel = "Copy Quick Connect code",
+                    onLongClick = {
+                        clipboard.setPrimaryClip(ClipData.newPlainText("Quick Connect code", code))
+                        Toast.makeText(context, "Quick Connect code copied", Toast.LENGTH_SHORT).show()
+                    },
+                ),
             )
             Row(
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
