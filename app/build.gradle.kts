@@ -10,16 +10,19 @@ plugins {
 }
 
 android {
-    namespace = "com.videobridge"
+    namespace = "com.adsamcik.streamferry"
     // compileSdk 37 = Android 17. Platform + build-tools 37 are installed on the build host.
     compileSdk = 37
 
     defaultConfig {
-        applicationId = "com.videobridge"
+        applicationId = "com.adsamcik.streamferry"
         minSdk = 34          // Android 14
         targetSdk = 37       // Android 17
-        versionCode = 34
-        versionName = "0.2.32"
+        // Local builds keep the checked-in version. The release workflow supplies both values
+        // from its validated v<major>.<minor>.<patch> tag so every Play upload gets a new,
+        // monotonically increasing versionCode.
+        versionCode = providers.gradleProperty("versionCode").orNull?.toIntOrNull() ?: 3000
+        versionName = providers.gradleProperty("versionName").orNull ?: "0.3.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
     }
@@ -51,10 +54,8 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
             )
-            // Sign with the real release key when a keystore.properties is supplied; otherwise fall
-            // back to the Android debug key so the release APK is still *signed* and therefore
-            // installable (an unsigned APK fails with "App not installed"). The debug key is not a
-            // production identity — supply a keystore for store distribution.
+            // A developer may build locally without a release keystore, but the public-release
+            // workflow always requires the real key. Debug fallback is intentionally local-only.
             signingConfig = if (rootProject.file("keystore.properties").exists()) {
                 signingConfigs.getByName("release")
             } else {

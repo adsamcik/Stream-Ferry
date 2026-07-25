@@ -1,5 +1,5 @@
 <resources>
-    <string name="app_name">Video Bridge</string>
+    <string name="app_name">Stream Ferry</string>
 
     <!-- Welcome -->
     <string name="welcome_title">Stream Jellyfin to your TV — safely</string>
@@ -25,7 +25,7 @@
     <string name="no_targets">No targets found. Check Wi-Fi and local-network permission.</string>
 
     <!-- Permissions -->
-    <string name="perm_local_network_rationale">Video Bridge needs local-network access so your TV can play video from this phone and to find Cast/DLNA devices. It is used only on your Wi-Fi/LAN.</string>
+    <string name="perm_local_network_rationale">Stream Ferry needs local-network access so your TV can play video from this phone and to find Cast/DLNA devices. It is used only on your Wi-Fi/LAN.</string>
     <string name="grant">Grant</string>
 
     <!-- Settings -->

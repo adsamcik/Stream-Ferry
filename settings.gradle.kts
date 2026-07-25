@@ -22,5 +22,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "VideoBridge"
+rootProject.name = "StreamFerry"
 include(":app")

@@ -1,6 +1,6 @@
 # Architecture
 
-Video Bridge streams Jellyfin video to a TV **exclusively** through an in-RAM proxy hosted on the
+Stream Ferry streams Jellyfin video to a TV **exclusively** through an in-RAM proxy hosted on the
 Android phone. The TV never talks to Jellyfin.
 
 ```
@@ -30,7 +30,7 @@ the TV.
 
 The UI layer never directly calls Jellyfin, Cast, DLNA, token storage, proxy sockets, URL
 construction, or playback reporting. It depends only on the domain interfaces in
-`com.videobridge.domain.Interfaces` and the `MainViewModel`.
+`com.adsamcik.streamferry.domain.Interfaces` and the `MainViewModel`.
 
 | Package | Responsibility |
 | --- | --- |
@@ -55,7 +55,7 @@ construction, or playback reporting. It depends only on the domain interfaces in
 | `diagnostics`, `logging` | Redacting logger, network info, compatibility runner. |
 | `core.*` | **Pure-JVM, dependency-free, unit-tested** building blocks (see below). |
 
-## Verified pure-JVM core (`com.videobridge.core`)
+## Verified pure-JVM core (`com.adsamcik.streamferry.core`)
 
 All security- and correctness-critical logic lives in framework-free Kotlin so it can be unit tested
 without an emulator. This is the only part runnable in the build sandbox and is covered by 215 passing

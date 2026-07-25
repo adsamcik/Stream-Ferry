@@ -1,13 +1,8 @@
-name: Release
+name: Public release
 
-# Release-APK publishing pipeline. Triggered when a version tag (e.g. v0.2.1) is
-# pushed: it builds the minified (R8) release APK and publishes it as an asset on
-# a GitHub Release for that tag. A production signing keystore is deliberately
-# never committed (see docs/BUILD.md); when none is present the build signs the
-# release APK with the standard Android *debug* key so the published artifact is
-# installable ("App not installed" happens with an unsigned APK). The debug key is
-# generated per run, so installing a newer build over an older one may require an
-# uninstall first; supply a real keystore for a stable signing identity.
+# A signed semantic-version tag produces both a direct-download APK on GitHub
+# and a signed AAB for Google Play. Production credentials live in the protected
+# google-play-production Environment, never in the repository.
 on:
   push:
     tags:
@@ -15,148 +10,184 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to build and publish the release APK for (e.g. v0.2.1)."
+        description: "Existing vMAJOR.MINOR.PATCH tag to release."
         required: true
+        type: string
+      play_track:
+        description: "Google Play track (use internal for first-upload validation)."
+        required: true
+        default: production
+        type: choice
+        options:
+          - production
+          - internal
+      play_status:
+        description: "Google Play release state."
+        required: true
+        default: completed
+        type: choice
+        options:
+          - completed
+          - draft
 
 permissions:
-  contents: write # needed to create the GitHub Release and upload assets.
+  contents: write
+
+concurrency:
+  group: public-release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
-  publish-release-apk:
+  publish:
     runs-on: ubuntu-latest
     timeout-minutes: 59
+    # Configure this Environment in GitHub with required reviewers and place
+    # GOOGLE_PLAY_SERVICE_ACCOUNT_JSON there. It protects all public releases.
+    environment: google-play-production
 
     env:
       ANDROID_HOME: /usr/local/lib/android/sdk
       ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - name: Checkout release tag
+        uses: actions/checkout@v7
         with:
-          # For manual dispatch, check out the requested tag; for tag pushes the
-          # default checkout already points at the tag.
           ref: ${{ github.event.inputs.tag || github.ref }}
 
-      - name: Resolve tag name
-        id: tag
+      - name: Validate tag and derive Android version
+        id: release
+        shell: bash
         run: |
-          raw="${{ github.event.inputs.tag || github.ref_name }}"
-          # Strip an optional refs/tags/ prefix so a manually-dispatched
-          # "refs/tags/v0.2.0" resolves to the bare tag name "v0.2.0".
-          echo "name=${raw#refs/tags/}" >> "$GITHUB_OUTPUT"
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          tag="${tag#refs/tags/}"
+          version="${tag#v}"
+          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Release tags must be vMAJOR.MINOR.PATCH without leading zeroes (received: $tag)."
+            exit 1
+          fi
+          IFS=. read -r major minor patch <<< "$version"
+          if (( 10#$minor > 999 || 10#$patch > 999 )); then
+            echo "::error::MINOR and PATCH must be below 1000 to derive an unambiguous versionCode."
+            exit 1
+          fi
+          version_code=$((10#$major * 1000000 + 10#$minor * 1000 + 10#$patch))
+          if (( version_code < 1 || version_code > 2100000000 )); then
+            echo "::error::Derived versionCode $version_code is outside Android's valid range."
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "version_code=$version_code" >> "$GITHUB_OUTPUT"
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
 
       - name: Set up Gradle (with dependency cache)
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
 
-      - name: Configure signing key
-        id: signing
+      - name: Configure required release signing key
         env:
           KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
         run: |
-          if [ -n "$KEYSTORE_BASE64" ]; then
-            # Stable release identity: decode the keystore from secrets and point the build at it via
-            # keystore.properties (read by app/build.gradle.kts). Updates install over each other.
-            ks="$RUNNER_TEMP/release.jks"
-            echo "$KEYSTORE_BASE64" | base64 -d > "$ks"
-            printf 'storeFile=%s\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
-              "$ks" "$KEYSTORE_PASSWORD" "$KEY_ALIAS" "$KEY_PASSWORD" > keystore.properties
-            echo "mode=release-key" >> "$GITHUB_OUTPUT"
-            echo "::notice::Signing the release APK with the configured release keystore."
-          else
-            # Fallback: per-run Android debug key (installable, but a different identity each release —
-            # add the RELEASE_KEYSTORE_* secrets for a stable signing identity; see docs/BUILD.md).
-            ks="$HOME/.android/debug.keystore"
-            if [ ! -f "$ks" ]; then
-              mkdir -p "$HOME/.android"
-              keytool -genkeypair -v -keystore "$ks" -storepass android -keypass android \
-                -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
-                -dname "CN=Android Debug,O=Android,C=US"
+          for required in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            if [[ -z "${!required}" ]]; then
+              echo "::error::A required release-signing secret is missing."
+              exit 1
             fi
-            echo "mode=debug-key" >> "$GITHUB_OUTPUT"
-            echo "::notice::No RELEASE_KEYSTORE_* secrets set — signing with a per-run Android debug key."
-          fi
+          done
+          keystore="$RUNNER_TEMP/stream-ferry-upload.jks"
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$keystore"
+          keytool -list -keystore "$keystore" -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null
+          printf 'storeFile=%s\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
+            "$keystore" "$KEYSTORE_PASSWORD" "$KEY_ALIAS" "$KEY_PASSWORD" > keystore.properties
 
-      - name: Build release APK (R8-minified)
+      - name: Build signed APK and AAB
         uses: ./.github/actions/gradle-retry
         with:
-          args: assembleRelease
+          args: >-
+            -PversionName=${{ steps.release.outputs.version }}
+            -PversionCode=${{ steps.release.outputs.version_code }}
+            assembleRelease bundleRelease
 
-      - name: Rename release APK with tag
-        id: apk
+      - name: Package release assets and signer identity
+        id: assets
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
         run: |
-          src=$(find app/build/outputs/apk/release -name '*.apk' | head -n 1)
-          if [ -z "$src" ]; then
-            echo "No release APK was produced." >&2
-            exit 1
-          fi
-          dst="video-bridge-${{ steps.tag.outputs.name }}-release.apk"
-          cp "$src" "$dst"
-          echo "path=$dst" >> "$GITHUB_OUTPUT"
+          apk_source="app/build/outputs/apk/release/app-release.apk"
+          aab_source="app/build/outputs/bundle/release/app-release.aab"
+          test -f "$apk_source"
+          test -f "$aab_source"
+          apk="stream-ferry-${TAG}.apk"
+          aab="stream-ferry-${TAG}.aab"
+          checksum="stream-ferry-${TAG}.sha256"
+          certificate="stream-ferry-${TAG}-signing-certificate.txt"
+          cp "$apk_source" "$apk"
+          cp "$aab_source" "$aab"
+          sha256sum "$apk" "$aab" > "$checksum"
+          keytool -printcert -jarfile "$apk" > "$certificate"
+          echo "apk=$apk" >> "$GITHUB_OUTPUT"
+          echo "aab=$aab" >> "$GITHUB_OUTPUT"
+          echo "checksum=$checksum" >> "$GITHUB_OUTPUT"
+          echo "certificate=$certificate" >> "$GITHUB_OUTPUT"
 
-      - name: Publish release APK to GitHub Release
+      - name: Create or update public GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.tag.outputs.name }}
-          APK: ${{ steps.apk.outputs.path }}
-          SIGN_MODE: ${{ steps.signing.outputs.mode }}
+          TAG: ${{ steps.release.outputs.tag }}
+          VERSION_CODE: ${{ steps.release.outputs.version_code }}
+          APK: ${{ steps.assets.outputs.apk }}
+          AAB: ${{ steps.assets.outputs.aab }}
+          CHECKSUM: ${{ steps.assets.outputs.checksum }}
+          CERTIFICATE: ${{ steps.assets.outputs.certificate }}
         run: |
-          # Build the release notes from CHANGELOG.md: extract the section for this tag's version
-          # (the "## [x.y.z]" heading becomes the release title, so only its body is used). Falls back to
-          # a generic note if the version has no changelog entry yet.
-          version="${TAG#v}"
           notes=release-notes.md
-          : > "$notes"
-          if [ -f CHANGELOG.md ]; then
+          version="${TAG#v}"
+          if [[ -f CHANGELOG.md ]]; then
             awk -v hdr="## [$version]" '
-              index($0, hdr) == 1 { grab = 1; next }
-              grab && index($0, "## [") == 1 { exit }
-              grab { print }
+              index($0, hdr) == 1 { capture = 1; next }
+              capture && index($0, "## [") == 1 { exit }
+              capture { print }
             ' CHANGELOG.md > "$notes"
           fi
-          sed -i '/./,$!d' "$notes" # strip leading blank lines
-          if [ ! -s "$notes" ]; then
-            echo "Automated release build for \`$TAG\` (R8-minified)." > "$notes"
+          sed -i '/./,$!d' "$notes" 2>/dev/null || true
+          if [[ ! -s "$notes" ]]; then
+            echo "Stream Ferry $TAG" > "$notes"
           fi
-          {
-            echo ""
-            echo "---"
-            if [ "$SIGN_MODE" = "release-key" ]; then
-              echo "R8-minified release APK, signed with the project release key. Full history: [CHANGELOG.md](CHANGELOG.md)."
-            else
-              echo "R8-minified release APK, signed with a per-run Android **debug** key — installing over an older build may require uninstalling it first (see [docs/BUILD.md](docs/BUILD.md)). Full history: [CHANGELOG.md](CHANGELOG.md)."
-            fi
-          } >> "$notes"
+          cat >> "$notes" <<EOF
 
-          # Idempotent + retried publish: create the release if needed, otherwise update its notes and
-          # (re)upload the APK, so a transient GitHub API hiccup or a job re-run recovers cleanly.
-          attempt=1
-          max=4
-          while true; do
-            if gh release view "$TAG" >/dev/null 2>&1; then
-              gh release edit "$TAG" --notes-file "$notes" >/dev/null 2>&1 || true
-              gh release upload "$TAG" "$APK" --clobber && exit 0
-            else
-              gh release create "$TAG" "$APK" --title "$TAG" --prerelease --notes-file "$notes" && exit 0
-            fi
-            status=$?
-            if [ "$attempt" -ge "$max" ]; then
-              echo "::error::Publishing the release failed after ${attempt} attempt(s)"
-              exit "$status"
-            fi
-            backoff=$((20 * attempt))
-            echo "::warning::Release publish failed (attempt ${attempt}/${max}); retrying in ${backoff}s"
-            attempt=$((attempt + 1))
-            sleep "$backoff"
-          done
+          ---
+          Direct APK: \`$APK\` (R8-minified, version code $VERSION_CODE).
 
+          Verify the APK with the attached SHA-256 checksum and signing-certificate report. The public
+          certificate is also committed as [docs/release-signing-certificate.pem](docs/release-signing-certificate.pem).
+          EOF
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "$TAG" --notes-file "$notes" --prerelease=false
+            gh release upload "$TAG" "$APK" "$AAB" "$CHECKSUM" "$CERTIFICATE" --clobber
+          else
+            gh release create "$TAG" "$APK" "$AAB" "$CHECKSUM" "$CERTIFICATE" \
+              --title "$TAG" --notes-file "$notes"
+          fi
 
+      - name: Upload AAB to Google Play
+        uses: r0adkll/upload-google-play@v1.1.5
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: com.adsamcik.streamferry
+          releaseFiles: app/build/outputs/bundle/release/app-release.aab
+          tracks: ${{ github.event.inputs.play_track || 'production' }}
+          status: ${{ github.event.inputs.play_status || 'completed' }}
+          releaseName: ${{ steps.release.outputs.tag }}
+          mappingFile: app/build/outputs/mapping/release/mapping.txt
+
+      - name: Remove temporary signing configuration
+        if: ${{ always() }}
+        run: rm -f keystore.properties

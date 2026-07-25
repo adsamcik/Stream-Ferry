@@ -18,7 +18,7 @@ targets API 37 directly.
 - Consequence: the Android Gradle Plugin, AndroidX, Compose, and the Google Cast SDK **cannot be
   resolved here**, so `./gradlew assembleDebug` / `lintDebug` / instrumented tests **cannot run in the
   sandbox**.
-- What was proven instead: the entire pure-JVM core (`com.videobridge.core`) compiles with
+- What was proven instead: the entire pure-JVM core (`com.adsamcik.streamferry.core`) compiles with
   `kotlinc` and **128 unit tests pass** (see [BUILD.md](BUILD.md)).
 
 ## Versions to re-verify at the first online build

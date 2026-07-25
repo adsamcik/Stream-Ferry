@@ -1,11 +1,11 @@
 # Local Media & Multi-Source Gallery
 
-Video Bridge browses and casts from multiple **sources** behind one gallery. Today there are two —
+Stream Ferry browses and casts from multiple **sources** behind one gallery. Today there are two —
 the **Jellyfin** server and **on-device local files** — and the design is extensible to more.
 
 ## The `MediaSource` abstraction
 
-`com.videobridge.domain.MediaSource` is the single browse contract the UI talks to:
+`com.adsamcik.streamferry.domain.MediaSource` is the single browse contract the UI talks to:
 
 ```
 roots() / children(parentId) / item(itemId) / search(query)  +  id, displayName, capabilities

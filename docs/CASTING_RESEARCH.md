@@ -1,7 +1,7 @@
-# Phone→TV casting research — condensed for Video Bridge
+# Phone→TV casting research — condensed for Stream Ferry
 
 Distilled from a 1256-line research dump (`paste-1782057501050.txt`), read line-by-line by
-20 agents and filtered to **only** what matters for Video Bridge's architecture: the
+20 agents and filtered to **only** what matters for Stream Ferry's architecture: the
 **phone is the sole media gateway and the TV only ever fetches a phone-hosted LAN URL**
 (`http://PHONE_LAN_IP:EPHEMERAL_PORT/session/<256-bit-id>/stream`). The TV never touches
 Jellyfin. Line cites `[Lnnn]` refer to the source dump.

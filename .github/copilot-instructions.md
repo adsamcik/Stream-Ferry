@@ -1,4 +1,4 @@
-# Copilot instructions — Video Bridge
+# Copilot instructions — Stream Ferry
 
 These are repository-wide instructions for GitHub Copilot (chat, code review, and the cloud
 coding agent). Read this before making changes. Keep changes small, surgical, and consistent
@@ -6,7 +6,7 @@ with the existing code and docs.
 
 ## What this project is
 
-Video Bridge is an Android app that streams Jellyfin video to a TV **through the phone**. The
+Stream Ferry is an Android app that streams Jellyfin video to a TV **through the phone**. The
 phone is the sole media gateway; **the TV never accesses Jellyfin directly**. The TV only ever
 receives an ephemeral, high-entropy, phone-hosted URL
 (`http://PHONE_LAN_IP:EPHEMERAL_PORT/session/<256-bit-id>/stream`). It must never receive the
@@ -20,12 +20,12 @@ URL. **This security invariant is the whole point of the project — never weake
 
 ## Repository layout
 
-- `app/src/main/java/com/jellyfinbridge/core/` — **pure-JVM, framework-free security/correctness
+- `app/src/main/java/com/adsamcik/streamferry/core/` — **pure-JVM, framework-free security/correctness
   core** (http/range, session, hls, buffer, redaction, stream selection, dlna xml). This is the
   part that can be compiled and tested without the Android toolchain.
-- `app/src/main/java/com/jellyfinbridge/{data,playback,ui,domain,diagnostics,permissions,logging}/`
+- `app/src/main/java/com/adsamcik/streamferry/{data,playback,ui,domain,diagnostics,permissions,logging}/`
   — the Android app (Compose UI, Cast, DLNA, Jellyfin HTTP, foreground proxy service).
-- `app/src/test/java/com/jellyfinbridge/core/` — JUnit 4 unit tests for the core.
+- `app/src/test/java/com/adsamcik/streamferry/core/` — JUnit 4 unit tests for the core.
 - `docs/` — design and policy docs. **When you change behavior, update the relevant doc.** Start
   with `docs/BUILD.md`, `docs/ARCHITECTURE.md`, and `docs/THREAT_MODEL.md`.
 - `gradle/libs.versions.toml` — the single source of truth for dependency versions (version
@@ -67,7 +67,7 @@ end-to-end: `./gradlew assembleDebug testDebugUnitTest lintDebug` all succeed (1
 
 ### Verifying the pure-JVM core offline (always works in the sandbox)
 
-The `com.videobridge.core` package is framework-free and can be compiled and tested with
+The `com.adsamcik.streamferry.core` package is framework-free and can be compiled and tested with
 `kotlinc` + JUnit 4 without the Android toolchain. The full, copy-pasteable recipe lives in
 [`docs/BUILD.md`](../docs/BUILD.md) ("What IS verified in the sandbox"). Use it to validate any
 change to the core (currently ~128 tests).

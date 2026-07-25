@@ -1,4 +1,4 @@
-# Video Bridge
+# Stream Ferry
 
 Stream Jellyfin video to a TV **through your Android phone**. The phone is the intentional, sole media
 gateway — **the TV never accesses Jellyfin directly**.

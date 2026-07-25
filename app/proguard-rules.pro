@@ -2,14 +2,14 @@
 # Keep documentation: minification + resource shrinking are enabled for release (app/build.gradle.kts).
 
 # --- Cast SDK: OptionsProvider is loaded reflectively from manifest meta-data. ---
--keep class com.videobridge.data.cast.CastOptionsProvider { *; }
+-keep class com.adsamcik.streamferry.data.cast.CastOptionsProvider { *; }
 -keep class com.google.android.gms.cast.framework.** { *; }
 
 # --- kotlinx.serialization: keep generated serializers. ---
 -keepattributes *Annotation*, InnerClasses
 -dontnote kotlinx.serialization.**
 -keepclassmembers class **$$serializer { *; }
--keepclasseswithmembers class com.videobridge.** {
+-keepclasseswithmembers class com.adsamcik.streamferry.** {
     kotlinx.serialization.KSerializer serializer(...);
 }
 

@@ -13,6 +13,6 @@
             android:launchMode="singleInstance"
             android:excludeFromRecents="true"
             android:taskAffinity=".crash"
-            android:theme="@style/Theme.JellyfinBridge" />
+            android:theme="@style/Theme.StreamFerry" />
     </application>
 </manifest>

@@ -21,6 +21,8 @@ gradle/gradle-daemon-jvm.properties
 keystore.properties
 *.jks
 *.keystore
+*.p12
+release-signing/
 
 # OS files
 .DS_Store

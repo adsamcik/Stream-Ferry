@@ -23,58 +23,16 @@
 
 ## Continuous integration (GitHub Actions)
 
-GitHub-hosted runners have full internet access, so Google Maven resolves there and the full Android
-build runs (unlike the local Copilot sandbox described below). Two workflows live in
-`.github/workflows`:
+GitHub-hosted runners assemble the Android app, run unit tests, and run lint:
 
-- **`ci.yml`** — runs on pushes to `main`, on pull requests targeting `main`, and on manual dispatch.
-  It assembles the debug APK (`assembleDebug`), runs the unit tests (`testDebugUnitTest`) and Android
-  lint (`lintDebug`), uploads the debug APK as a build artifact, and always uploads the test/lint
-  reports.
-- **`release.yml`** — publishes the **release** APK. It triggers when a version tag matching
-  `v*` (e.g. `v0.2.1`) is pushed, or via manual dispatch with a `tag` input. It builds the R8-minified
-  release APK (`assembleRelease`), renames it `video-bridge-<tag>-release.apk`, and attaches it to a
-  GitHub Release for that tag (marked as a pre-release). With no production `keystore.properties` present
-  the release build is signed with the standard Android **debug** key (the build falls back to the
-  `debug` signing config), so the published APK installs directly — an *unsigned* APK fails with
-  "App not installed". The debug key is generated per build, so updating over an older build may need an
-  uninstall first; supply a real keystore (see below) for a stable signing identity and store
-  distribution.
+- **`ci.yml`** runs on pushes and pull requests to `main` and uploads the debug APK and reports.
+- **`release.yml`** runs from a `vMAJOR.MINOR.PATCH` tag. It requires the stable release key,
+  builds the R8-minified APK and AAB, publishes the APK/AAB/checksum/signer report as a public
+  GitHub Release, and sends the AAB to Google Play.
 
-To cut a release, push a tag:
-
-```bash
-git tag v0.2.1
-git push origin v0.2.1
-```
-
-### Stable release signing (reuse the same certificate across cloud builds)
-
-By default each `release.yml` run generates a fresh Android debug key, so consecutive releases have a
-**different** signing identity (installing a newer build over an older one needs an uninstall first).
-To get a **stable** identity — updates install over each other, and it's required for Play distribution
-— add a keystore via repository secrets. The workflow decodes it and `app/build.gradle.kts` signs with
-it (via the `keystore.properties` it writes); when the secrets are absent it falls back to the per-run
-debug key.
-
-One-time setup (run locally; the private key never leaves your machine and is never committed):
-
-```powershell
-# 1) Generate a keystore (keep this .jks safe + backed up — losing it means you can't update the app).
-keytool -genkeypair -v -keystore video-bridge.jks -alias video-bridge `
-  -keyalg RSA -keysize 2048 -validity 10000 `
-  -dname "CN=Video Bridge, O=adamnova, C=US" -storepass <PW> -keypass <PW>
-
-# 2) Add the four GitHub Actions secrets (uses the gh CLI; base64 with no line wrapping).
-gh secret set RELEASE_KEYSTORE_BASE64    --body ([Convert]::ToBase64String([IO.File]::ReadAllBytes("video-bridge.jks")))
-gh secret set RELEASE_KEYSTORE_PASSWORD  --body "<PW>"
-gh secret set RELEASE_KEY_ALIAS          --body "video-bridge"
-gh secret set RELEASE_KEY_PASSWORD       --body "<PW>"
-```
-
-After that, every tagged release is signed with the same certificate. (The first build that switches
-from the debug key to your release key is a one-time uninstall-then-install on already-installed
-devices, because the certificate changed.)
+Release signing, the protected GitHub Environment, Play service-account access, public-certificate
+verification, and the exact tagging process are documented in [RELEASE.md](RELEASE.md). The release
+workflow never falls back to a debug key: a missing signing secret fails safely before building.
 
 ## Copilot sandbox limitation (why the local agent sandbox cannot assemble the APK)
 
@@ -101,7 +59,7 @@ With the allowlist configured, the full Gradle build has been **verified end-to-
 
 ## What IS verified in the sandbox: the pure-JVM core (128 tests)
 
-The security/correctness core (`com.videobridge.core`) is framework-free and is compiled & tested
+The security/correctness core (`com.adsamcik.streamferry.core`) is framework-free and is compiled & tested
 with `kotlinc` + JUnit 4. To reproduce:
 
 ```bash
@@ -110,13 +68,13 @@ LIBS=/tmp/verify/libs   # junit-4.13.2.jar + hamcrest-core-1.3.jar from Maven Ce
 mkdir -p /tmp/verify/out /tmp/verify/tests
 
 # 1. Compile main core + the DLNA AVTransport helper:
-MAIN=$(find app/src/main/java/com/jellyfinbridge/core -name '*.kt')
-MAIN="$MAIN app/src/main/java/com/jellyfinbridge/data/dlna/AVTransport.kt"
+MAIN=$(find app/src/main/java/com/adsamcik/streamferry/core -name '*.kt')
+MAIN="$MAIN app/src/main/java/com/adsamcik/streamferry/data/dlna/AVTransport.kt"
 kotlinc -cp "$KT/kotlin-stdlib.jar" $MAIN -d /tmp/verify/out
 
 # 2. Compile tests:
 CP="$KT/kotlin-test.jar:$KT/kotlin-test-junit.jar:$LIBS/junit-4.13.2.jar:$LIBS/hamcrest-core-1.3.jar:/tmp/verify/out"
-TESTS=$(find app/src/test/java/com/jellyfinbridge/core -name '*.kt')
+TESTS=$(find app/src/test/java/com/adsamcik/streamferry/core -name '*.kt')
 kotlinc -cp "$CP" $TESTS -d /tmp/verify/tests
 
 # 3. Run:
@@ -141,7 +99,7 @@ in `app/src/test`).
 
 ## Live end-to-end test against a Dockerized Jellyfin (no device needed)
 
-`app/src/test/java/com/jellyfinbridge/integration/JellyfinLiveIntegrationTest.kt` exercises the **real**
+`app/src/test/java/com/adsamcik/streamferry/integration/JellyfinLiveIntegrationTest.kt` exercises the **real**
 networking core — `JellyfinClient` (connect/validate/login/browse/playback-info), `HttpJellyfinRepository`,
 `DeviceProfiles`, and `LocalProxyServer` (incl. HLS playlist rewriting + segment proxying) — against a
 real Jellyfin server, and **simulates the TV** by fetching the phone proxy URL over HTTP. It asserts that
@@ -169,7 +127,7 @@ docker exec jf-it sh -lc "$FF -y -f lavfi -i testsrc=duration=15:size=640x360:ra
 #     {"LibraryOptions":{"PathInfos":[{"Path":"/media"}]}}) and wait for the two movies to scan.
 
 # 4. Run the live test (override host/creds with -Djellyfin.url / -Djellyfin.user / -Djellyfin.pass):
-./gradlew testDebugUnitTest --tests "com.videobridge.integration.JellyfinLiveIntegrationTest"
+./gradlew testDebugUnitTest --tests "com.adsamcik.streamferry.integration.JellyfinLiveIntegrationTest"
 
 # 5. Tear down
 docker rm -f jf-it && docker volume rm jf-it-config jf-it-media

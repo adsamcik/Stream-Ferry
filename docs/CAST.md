@@ -21,7 +21,7 @@ Receiver.
 Discovery/selection uses the AndroidX `MediaRouteButton` (Cast route picker). The app **explicitly
 requests `ACCESS_LOCAL_NETWORK`** for LAN discovery/control and the proxy-to-TV leg
 ([MANIFEST_PERMISSIONS.md](MANIFEST_PERMISSIONS.md)). Android's system **Output Switcher** can act as
-an in-app picker that is *exempt* from the local-network permission, but Video Bridge deliberately
+an in-app picker that is *exempt* from the local-network permission, but Stream Ferry deliberately
 keeps the explicit permission: the proxy leg needs LAN access regardless of how the target is picked,
 and an explicit request yields a clear rationale prompt plus a graceful denied/revoked fallback
 (Jellyfin browsing stays usable — [VPN_LAN_DIAGNOSTICS.md](VPN_LAN_DIAGNOSTICS.md)).
@@ -41,7 +41,7 @@ Connecting selects the device's `MediaRouter` route (briefly polling for a route
 absent) and awaits a Cast session start, bounded by a connect timeout. A session start can fail
 **transiently** — the SDK fires `onSessionStartFailed` quickly and a fresh attempt usually succeeds — so
 the controller retries automatically instead of surfacing a first-try hiccup to the user. The pure,
-unit-tested `com.videobridge.core.cast.ConnectRetryPolicy` decides:
+unit-tested `com.adsamcik.streamferry.core.cast.ConnectRetryPolicy` decides:
 
 - a fast **failure** is retried up to `MAX_ATTEMPTS` (default 3), dropping any half-open session and
   re-selecting the route between attempts (a short settle delay in between);

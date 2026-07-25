@@ -26,8 +26,9 @@ runs:
           # Intentional word-splitting of $GRADLE_ARGS so multiple tasks work.
           if ./gradlew --no-daemon $GRADLE_ARGS --console=plain; then
             exit 0
+          else
+            status=$?
           fi
-          status=$?
           if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
             echo "::error::gradle $GRADLE_ARGS failed after ${attempt} attempt(s)"
             exit "$status"

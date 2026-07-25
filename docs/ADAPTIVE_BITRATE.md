@@ -1,11 +1,11 @@
 # Adaptive bitrate (throughput-driven quality, ≥ 30 s window)
 
 During playback the phone proxies bytes from Jellyfin to the TV. If the phone→server link cannot
-sustain the current quality, the TV rebuffers. Video Bridge watches the link and **gradually,
+sustain the current quality, the TV rebuffers. Stream Ferry watches the link and **gradually,
 intelligently adjusts the requested quality** so playback stays smooth — without thrashing.
 
 The decision logic lives in the framework-free, deterministic, unit-tested
-`com.videobridge.core.adaptive.AdaptiveBitrateController` (with `BitrateLadder`). Like the rest of
+`com.adsamcik.streamferry.core.adaptive.AdaptiveBitrateController` (with `BitrateLadder`). Like the rest of
 the `core` package it holds **only numbers** (byte counts, bitrates, timestamps), so it is safe to log
 and never touches the Jellyfin URL, token, or the TV-facing proxy URL.
 
@@ -66,7 +66,7 @@ to avoid a spurious down-shift from the seek gap.
 ## Manual override (user-selected quality)
 
 Adaptation is the default (**Auto**), but the user can pin a specific quality from the playback
-screen's quality card. The picker is built by the pure `com.videobridge.core.adaptive.QualityMenu`
+screen's quality card. The picker is built by the pure `com.adsamcik.streamferry.core.adaptive.QualityMenu`
 (**Auto** plus each ladder rung, best-quality first, labelled in Mbps), so a manual pick is always one
 of the exact rungs the adaptive controller uses — never an invented bitrate.
 
@@ -84,7 +84,7 @@ source has no meaningful choice), and it is reset to Auto when playback stops.
 
 ## Verification
 
-`app/src/test/java/com/jellyfinbridge/core/AdaptiveBitrateControllerTest.kt` (pure-JVM, runs in the
+`app/src/test/java/com/adsamcik/streamferry/core/AdaptiveBitrateControllerTest.kt` (pure-JVM, runs in the
 sandbox) covers: warm-up hold before 30 s, average-throughput computation, step-down on starvation,
 step-down on rebuffering, cautious one-rung step-up, no step-up without headroom, the lowest-rung
 floor, window reset after a change, the switch cooldown, and source-capped ladders. Run them with the

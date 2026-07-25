@@ -10,7 +10,7 @@ WireGuard). Two realities make naïve relaying unreliable:
    OS exposes a tunnel interface (`wg0`/`tun0`) that often *also* carries a site-local address. Bind
    the TV-facing proxy there and the TV — which is only on the real Wi-Fi LAN — can never reach it.
 
-The recovery logic lives in the framework-free `com.videobridge.core` package so it is
+The recovery logic lives in the framework-free `com.adsamcik.streamferry.core` package so it is
 deterministic and exhaustively unit-tested (runs in the sandbox without the Android toolchain; see
 [BUILD.md](BUILD.md)). The Android layer (`data.proxy.LocalProxyServer`,
 `diagnostics.NetworkInfoProvider`) is thin wiring around it.

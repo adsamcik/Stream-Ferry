@@ -1,16 +1,26 @@
 # Changelog
 
-All notable changes to **Video Bridge** are documented here.
+All notable changes to **Stream Ferry** are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Video Bridge streams Jellyfin video to a TV **through the phone**: the phone is the sole media
+Stream Ferry streams Jellyfin video to a TV **through the phone**: the phone is the sole media
 gateway and the TV only ever receives an ephemeral, phone-hosted proxy URL — it never sees the
-Jellyfin server URL, token, or any real stream URL. Releases are R8-minified APKs published as GitHub
-pre-releases; there is **no telemetry** and nothing leaves the device unless you share a report.
+Jellyfin server URL, token, or any real stream URL. Releases are R8-minified APKs published on GitHub;
+there is **no telemetry** and nothing leaves the device unless you share a report.
 
 ## [Unreleased]
+
+## [0.3.0] - 2026-07-25
+
+### Added
++- Public-release automation now publishes a stable-signed APK, AAB, checksum, and signer report to
++  GitHub Releases and prepares the signed AAB for Google Play publishing.
++
++### Changed
+- Renamed the app from **Video Bridge** to **Stream Ferry** and changed its Android namespace and
+  application ID from `com.videobridge` to `com.adsamcik.streamferry`.
 
 ## [0.2.32] - 2026-07-08
 
