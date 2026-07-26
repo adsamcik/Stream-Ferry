@@ -7,6 +7,7 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -56,6 +57,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -271,13 +273,10 @@ private fun ScreenContent(
 
         if (state.route in selfScrollingRoutes) {
             Column(modifier = baseModifier.fillMaxWidth()) {
-                state.errorMessage?.let { message ->
-                    ErrorBanner(
-                        message = message,
-                        onDismiss = viewModel::dismissError,
-                        modifier = Modifier.padding(bottom = 12.dp),
-                    )
-                }
+                ErrorBannerHost(
+                    message = state.errorMessage,
+                    onDismiss = viewModel::dismissError,
+                )
                 Box(
                     modifier = Modifier
                         .weight(1f)
@@ -292,13 +291,10 @@ private fun ScreenContent(
                     .fillMaxWidth()
                     .verticalScroll(rememberScrollState()),
             ) {
-                state.errorMessage?.let { message ->
-                    ErrorBanner(
-                        message = message,
-                        onDismiss = viewModel::dismissError,
-                        modifier = Modifier.padding(bottom = 12.dp),
-                    )
-                }
+                ErrorBannerHost(
+                    message = state.errorMessage,
+                    onDismiss = viewModel::dismissError,
+                )
                 RouteContent(state, viewModel, onScanDevices, context, compact = !expanded)
             }
         }
@@ -417,6 +413,12 @@ private fun MiniPlayer(
     val title = state.selectedItem?.title?.takeIf(String::isNotBlank) ?: "Now playing"
     val duration = playback.durationSeconds?.takeIf { it > 0 }
     val progress = duration?.let { (playback.positionSeconds.toFloat() / it).coerceIn(0f, 1f) }
+    val animatedProgress by animateFloatAsState(
+        targetValue = progress ?: 0f,
+        animationSpec = MaterialTheme.motionScheme.defaultEffectsSpec(),
+        label = "mini player progress",
+    )
+    val effectsMotion = MaterialTheme.motionScheme.defaultEffectsSpec<Float>()
     val playbackState = when {
         playback.reconnecting -> "Reconnecting to ${playback.targetName}"
         playback.isBuffering -> "Buffering on ${playback.targetName}"
@@ -458,21 +460,54 @@ private fun MiniPlayer(
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
-                    Text(playbackState, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    AnimatedContent(
+                        targetState = playbackState,
+                        transitionSpec = { fadeIn(effectsMotion).togetherWith(fadeOut(effectsMotion)) },
+                        label = "mini player state",
+                    ) { status ->
+                        Text(status, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
                 }
                 FilledIconButton(
                     onClick = { viewModel.togglePlayPause() },
                     modifier = Modifier.size(if (compact) 40.dp else 48.dp),
                 ) {
-                    Icon(
-                        if (playback.isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
-                        contentDescription = if (playback.isPlaying) "Pause" else "Play",
-                    )
+                    AnimatedContent(
+                        targetState = playback.isPlaying,
+                        transitionSpec = { fadeIn(effectsMotion).togetherWith(fadeOut(effectsMotion)) },
+                        label = "mini player play state",
+                    ) { isPlaying ->
+                        Icon(
+                            if (isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
+                            contentDescription = if (isPlaying) "Pause" else "Play",
+                        )
+                    }
                 }
             }
             if (progress != null) {
-                LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth().clearAndSetSemantics {})
+                LinearProgressIndicator(progress = { animatedProgress }, modifier = Modifier.fillMaxWidth().clearAndSetSemantics {})
             }
+        }
+    }
+}
+
+@Composable
+private fun ErrorBannerHost(
+    message: String?,
+    onDismiss: () -> Unit,
+) {
+    val effectsMotion = MaterialTheme.motionScheme.defaultEffectsSpec<Float>()
+    AnimatedContent(
+        targetState = message,
+        transitionSpec = { fadeIn(effectsMotion).togetherWith(fadeOut(effectsMotion)) },
+        label = "error banner",
+    ) { currentMessage ->
+        if (currentMessage != null) {
+            ErrorBanner(
+                message = currentMessage,
+                onDismiss = onDismiss,
+                modifier = Modifier.padding(bottom = 12.dp),
+            )
         }
     }
 }
