@@ -2,7 +2,10 @@ package com.adsamcik.streamferry.ui.theme
 
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
+import androidx.compose.material3.MaterialExpressiveTheme
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.MotionScheme
 import androidx.compose.material3.Shapes
 import androidx.compose.material3.Typography
 import androidx.compose.material3.darkColorScheme
@@ -153,6 +156,7 @@ private val StreamFerryTypography = Typography(
  * complete teal schemes above are the deterministic light and dark fallbacks.
  */
 @Composable
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
 fun StreamFerryTheme(
     darkTheme: Boolean = isSystemInDarkTheme(),
     dynamicColor: Boolean = true,
@@ -167,10 +171,11 @@ fun StreamFerryTheme(
         else -> LightColors
     }
 
-    MaterialTheme(
+    MaterialExpressiveTheme(
         colorScheme = colorScheme,
         typography = StreamFerryTypography,
         shapes = StreamFerryShapes,
+        motionScheme = MotionScheme.expressive(),
         content = content,
     )
 }
