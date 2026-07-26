@@ -61,7 +61,6 @@ import androidx.compose.material.icons.rounded.VideoLibrary
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ElevatedCard
@@ -102,6 +101,7 @@ import com.adsamcik.streamferry.data.download.DownloadFormat
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.domain.MediaSourceIds
 import com.adsamcik.streamferry.ui.MainViewModel
+import com.adsamcik.streamferry.ui.components.ExpressiveLoadingIndicator
 import com.adsamcik.streamferry.ui.state.AppUiState
 import com.adsamcik.streamferry.ui.state.Route
 import com.adsamcik.streamferry.ui.theme.StreamFerryTheme
@@ -1852,7 +1852,7 @@ private const val CONTINUE_CARD_WIDTH = 132
 internal fun CenteredProgress(label: String) {
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            CircularProgressIndicator(Modifier.size(48.dp))
+            ExpressiveLoadingIndicator(Modifier.size(52.dp), description = label)
             Text(label, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }

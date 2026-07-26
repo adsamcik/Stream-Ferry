@@ -20,7 +20,6 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -42,6 +41,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import com.adsamcik.streamferry.ui.MainViewModel
+import com.adsamcik.streamferry.ui.components.ExpressiveLoadingIndicator
 import com.adsamcik.streamferry.ui.components.QuickConnectCodeCard
 import com.adsamcik.streamferry.ui.state.AppUiState
 import com.adsamcik.streamferry.ui.state.ConnectionState
@@ -174,7 +174,7 @@ fun ServerSetupScreen(state: AppUiState, viewModel: MainViewModel) {
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                CircularProgressIndicator(Modifier.size(24.dp))
+                ExpressiveLoadingIndicator(Modifier.size(32.dp), description = "Contacting server")
                 Text("Contacting server…", style = MaterialTheme.typography.bodyMedium)
             }
         }
@@ -245,7 +245,7 @@ fun LoginScreen(state: AppUiState, viewModel: MainViewModel) {
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                CircularProgressIndicator(Modifier.size(24.dp))
+                ExpressiveLoadingIndicator(Modifier.size(32.dp), description = "Signing in")
                 Text("Please wait…", style = MaterialTheme.typography.bodyMedium)
             }
         }
@@ -263,7 +263,7 @@ private fun QuickConnectPanel(code: String, onCancel: () -> Unit) {
             horizontalArrangement = Arrangement.spacedBy(10.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            CircularProgressIndicator(Modifier.size(22.dp))
+            ExpressiveLoadingIndicator(Modifier.size(32.dp), description = "Waiting for Quick Connect approval")
             Text("Waiting for approval…", style = MaterialTheme.typography.bodyMedium)
         }
         OutlinedButton(

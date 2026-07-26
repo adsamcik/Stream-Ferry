@@ -130,6 +130,7 @@ import com.adsamcik.streamferry.core.stream.TargetCapabilities
 import com.adsamcik.streamferry.domain.DiscoveredTarget
 import com.adsamcik.streamferry.domain.MediaChapter
 import com.adsamcik.streamferry.ui.MainViewModel
+import com.adsamcik.streamferry.ui.components.ExpressiveLoadingIndicator
 import com.adsamcik.streamferry.ui.state.AppUiState
 import com.adsamcik.streamferry.ui.state.PlaybackUiState
 import com.adsamcik.streamferry.ui.theme.StreamFerryTheme
@@ -730,7 +731,7 @@ fun PlaybackScreen(state: AppUiState, viewModel: MainViewModel) {
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
-                CircularProgressIndicator(Modifier.size(52.dp))
+                ExpressiveLoadingIndicator(Modifier.size(56.dp), description = "Preparing stream")
                 Text("Preparing stream…", style = MaterialTheme.typography.titleMedium)
             }
         }
