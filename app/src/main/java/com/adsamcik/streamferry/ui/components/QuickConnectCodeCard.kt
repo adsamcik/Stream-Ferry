@@ -4,12 +4,20 @@ import android.content.ClipData
 import android.content.ClipDescription
 import android.content.ClipboardManager
 import android.os.PersistableBundle
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
@@ -30,6 +38,7 @@ import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 
 /**
@@ -45,6 +54,8 @@ fun QuickConnectCodeCard(
 ) {
     val context = LocalContext.current
     var copied by rememberSaveable(code) { mutableStateOf(false) }
+    val effectsMotion = MaterialTheme.motionScheme.defaultEffectsSpec<Float>()
+    val spatialMotion = MaterialTheme.motionScheme.defaultSpatialSpec<IntSize>()
 
     fun copyCode() {
         val clipboard = context.getSystemService(ClipboardManager::class.java)
@@ -92,12 +103,38 @@ fun QuickConnectCodeCard(
                     .fillMaxWidth()
                     .testTag("quick-connect-copy"),
             ) {
-                Icon(Icons.Rounded.ContentCopy, contentDescription = null)
-                Text("Copy code", modifier = Modifier.padding(start = 8.dp))
+                AnimatedContent(
+                    targetState = copied,
+                    transitionSpec = {
+                        fadeIn(effectsMotion).togetherWith(fadeOut(effectsMotion))
+                    },
+                    label = "copy code action",
+                ) { isCopied ->
+                    Icon(
+                        if (isCopied) Icons.Rounded.Check else Icons.Rounded.ContentCopy,
+                        contentDescription = null,
+                    )
+                }
+                AnimatedContent(
+                    targetState = copied,
+                    transitionSpec = {
+                        fadeIn(effectsMotion).togetherWith(fadeOut(effectsMotion))
+                    },
+                    label = "copy code label",
+                ) { isCopied ->
+                    Text(
+                        if (isCopied) "Copied" else "Copy code",
+                        modifier = Modifier.padding(start = 8.dp),
+                    )
+                }
             }
-            if (copied) {
+            AnimatedVisibility(
+                visible = copied,
+                enter = fadeIn(effectsMotion) + expandVertically(spatialMotion),
+                exit = fadeOut(effectsMotion) + shrinkVertically(spatialMotion),
+            ) {
                 Text(
-                    text = "Code copied",
+                    text = "Code copied securely",
                     style = MaterialTheme.typography.labelLarge,
                     modifier = Modifier
                         .testTag("quick-connect-copy-feedback")
