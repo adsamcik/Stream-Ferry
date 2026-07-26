@@ -1,8 +1,15 @@
 package com.adsamcik.streamferry.ui.screens
 
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.animation.togetherWith
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.annotation.DrawableRes
 import androidx.compose.foundation.Image
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -13,14 +20,12 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.selection.toggleable
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
 import androidx.compose.material.icons.automirrored.rounded.Logout
 import androidx.compose.material.icons.rounded.BatteryStd
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.DeleteForever
-import androidx.compose.material.icons.rounded.ExpandLess
 import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.FastForward
 import androidx.compose.material.icons.rounded.HighQuality
@@ -54,11 +59,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
@@ -119,6 +124,11 @@ fun ExpressiveSettingsScreen(
     var advancedExpanded by rememberSaveable { mutableStateOf(false) }
     var capabilitiesReset by rememberSaveable { mutableStateOf(false) }
     var confirmDelete by rememberSaveable { mutableStateOf(false) }
+    val advancedIconRotation by animateFloatAsState(
+        targetValue = if (advancedExpanded) 180f else 0f,
+        animationSpec = MaterialTheme.motionScheme.defaultEffectsSpec(),
+        label = "advanced settings icon",
+    )
 
     LazyColumn(
         modifier = modifier.fillMaxSize(),
@@ -213,50 +223,61 @@ fun ExpressiveSettingsScreen(
         }
 
         item(key = "advanced-toggle") {
-            FilledTonalButton(
-                onClick = { advancedExpanded = !advancedExpanded },
-                modifier = Modifier.fillMaxWidth(),
-                shape = MaterialTheme.shapes.medium,
-            ) {
-                Icon(Icons.Rounded.Tune, contentDescription = null)
-                Text(
-                    "Advanced playback",
-                    modifier = Modifier.padding(start = 10.dp).weight(1f),
-                    style = MaterialTheme.typography.titleMedium,
-                )
-                Icon(
-                    if (advancedExpanded) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore,
-                    contentDescription = if (advancedExpanded) "Collapse advanced playback" else "Expand advanced playback",
-                )
-            }
-        }
-        if (advancedExpanded) {
-            item(key = "advanced-group") {
-                SettingsGroup {
-                    SettingsSwitchRow(
-                        icon = Icons.Rounded.HighQuality,
-                        title = "Transcode local videos on this device",
-                        supporting = "For compatible Cast receivers and 8-bit SDR files, use phone hardware to re-encode an incompatible format.",
-                        checked = transcodeLocal,
-                        onCheckedChange = {
-                            transcodeLocal = it
-                            onTranscodeLocalChange(it)
-                        },
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                FilledTonalButton(
+                    onClick = { advancedExpanded = !advancedExpanded },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = MaterialTheme.shapes.medium,
+                ) {
+                    Icon(Icons.Rounded.Tune, contentDescription = null)
+                    Text(
+                        "Advanced playback",
+                        modifier = Modifier.padding(start = 10.dp).weight(1f),
+                        style = MaterialTheme.typography.titleMedium,
                     )
-                    SettingsDivider()
-                    SettingsActionRow(
-                        icon = Icons.Rounded.Restore,
-                        title = if (capabilitiesReset) {
-                            "TV capabilities reset ✓"
+                    Icon(
+                        Icons.Rounded.ExpandMore,
+                        contentDescription = if (advancedExpanded) {
+                            "Collapse advanced playback"
                         } else {
-                            "Reset learned TV capabilities"
+                            "Expand advanced playback"
                         },
-                        supporting = "Try formats again after a TV or receiver update.",
-                        onClick = {
-                            capabilitiesReset = true
-                            onResetTvCapabilities()
-                        },
+                        modifier = Modifier.graphicsLayer { rotationZ = advancedIconRotation },
                     )
+                }
+                AnimatedVisibility(
+                    visible = advancedExpanded,
+                    enter = fadeIn(MaterialTheme.motionScheme.defaultEffectsSpec()) +
+                        expandVertically(MaterialTheme.motionScheme.defaultSpatialSpec()),
+                    exit = fadeOut(MaterialTheme.motionScheme.defaultEffectsSpec()) +
+                        shrinkVertically(MaterialTheme.motionScheme.defaultSpatialSpec()),
+                ) {
+                    SettingsGroup {
+                        SettingsSwitchRow(
+                            icon = Icons.Rounded.HighQuality,
+                            title = "Transcode local videos on this device",
+                            supporting = "For compatible Cast receivers and 8-bit SDR files, use phone hardware to re-encode an incompatible format.",
+                            checked = transcodeLocal,
+                            onCheckedChange = {
+                                transcodeLocal = it
+                                onTranscodeLocalChange(it)
+                            },
+                        )
+                        SettingsDivider()
+                        SettingsActionRow(
+                            icon = Icons.Rounded.Restore,
+                            title = if (capabilitiesReset) {
+                                "TV capabilities reset ✓"
+                            } else {
+                                "Reset learned TV capabilities"
+                            },
+                            supporting = "Try formats again after a TV or receiver update.",
+                            onClick = {
+                                capabilitiesReset = true
+                                onResetTvCapabilities()
+                            },
+                        )
+                    }
                 }
             }
         }
@@ -383,19 +404,16 @@ private fun SettingsSwitchRow(
     onCheckedChange: (Boolean) -> Unit,
 ) {
     ListItem(
-        headlineContent = { Text(title, style = MaterialTheme.typography.titleMedium) },
-        supportingContent = { Text(supporting) },
+        checked = checked,
+        onCheckedChange = onCheckedChange,
+        modifier = Modifier.fillMaxWidth(),
         leadingContent = { SettingsIcon(icon) },
         trailingContent = { Switch(checked = checked, onCheckedChange = null) },
+        supportingContent = { Text(supporting) },
         colors = ListItemDefaults.colors(containerColor = Color.Transparent),
-        modifier = Modifier
-            .fillMaxWidth()
-            .toggleable(
-                value = checked,
-                role = Role.Switch,
-                onValueChange = onCheckedChange,
-            ),
-    )
+    ) {
+        Text(title, style = MaterialTheme.typography.titleMedium)
+    }
 }
 
 @Composable
@@ -485,23 +503,34 @@ private fun SettingsValueRow(
     selectedValue: String,
     onClick: () -> Unit,
 ) {
+    val effectsMotion = MaterialTheme.motionScheme.defaultEffectsSpec<Float>()
     ListItem(
-        headlineContent = { Text(title, style = MaterialTheme.typography.titleMedium) },
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth(),
         supportingContent = {
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text(supporting)
-                Text(
-                    selectedValue,
-                    style = MaterialTheme.typography.labelLarge,
-                    color = MaterialTheme.colorScheme.primary,
-                )
+                AnimatedContent(
+                    targetState = selectedValue,
+                    transitionSpec = {
+                        fadeIn(effectsMotion).togetherWith(fadeOut(effectsMotion))
+                    },
+                    label = "selected setting value",
+                ) { value ->
+                    Text(
+                        value,
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
             }
         },
         leadingContent = { SettingsIcon(icon) },
         trailingContent = { Icon(Icons.Rounded.ExpandMore, contentDescription = null) },
         colors = ListItemDefaults.colors(containerColor = Color.Transparent),
-        modifier = Modifier.fillMaxWidth().clickable(role = Role.Button, onClick = onClick),
-    )
+    ) {
+        Text(title, style = MaterialTheme.typography.titleMedium)
+    }
 }
 
 @Composable
@@ -511,16 +540,27 @@ private fun SettingsActionRow(
     supporting: String,
     onClick: () -> Unit,
 ) {
+    val effectsMotion = MaterialTheme.motionScheme.defaultEffectsSpec<Float>()
     ListItem(
-        headlineContent = { Text(title, style = MaterialTheme.typography.titleMedium) },
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth(),
         supportingContent = { Text(supporting) },
         leadingContent = { SettingsIcon(icon) },
         trailingContent = {
             Icon(Icons.AutoMirrored.Rounded.KeyboardArrowRight, contentDescription = null)
         },
         colors = ListItemDefaults.colors(containerColor = Color.Transparent),
-        modifier = Modifier.fillMaxWidth().clickable(role = Role.Button, onClick = onClick),
-    )
+    ) {
+        AnimatedContent(
+                targetState = title,
+                transitionSpec = {
+                    fadeIn(effectsMotion).togetherWith(fadeOut(effectsMotion))
+                },
+                label = "setting action status",
+            ) { value ->
+                Text(value, style = MaterialTheme.typography.titleMedium)
+            }
+    }
 }
 
 @Composable
@@ -531,7 +571,8 @@ private fun SettingsLinkRow(
     onClick: () -> Unit,
 ) {
     ListItem(
-        headlineContent = { Text(title, style = MaterialTheme.typography.titleMedium) },
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth(),
         supportingContent = { Text(supporting) },
         leadingContent = {
             Image(
@@ -545,8 +586,9 @@ private fun SettingsLinkRow(
             Icon(Icons.AutoMirrored.Rounded.KeyboardArrowRight, contentDescription = null)
         },
         colors = ListItemDefaults.colors(containerColor = Color.Transparent),
-        modifier = Modifier.fillMaxWidth().clickable(role = Role.Button, onClick = onClick),
-    )
+    ) {
+        Text(title, style = MaterialTheme.typography.titleMedium)
+    }
 }
 
 @Composable
