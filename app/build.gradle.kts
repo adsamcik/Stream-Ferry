@@ -9,6 +9,33 @@ plugins {
     alias(libs.plugins.kotlin.serialization)
 }
 
+private val strictSemVer = Regex("""(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)""")
+
+private fun versionCodeFor(version: String): Int {
+    val match = strictSemVer.matchEntire(version)
+        ?: error("versionName must be MAJOR.MINOR.PATCH without leading zeroes (was: $version)")
+    val (majorText, minorText, patchText) = match.destructured
+    val major = majorText.toLong()
+    val minor = minorText.toLong()
+    val patch = patchText.toLong()
+    require(minor < 1_000 && patch < 1_000) {
+        "versionName minor and patch must be below 1000 (was: $version)"
+    }
+    val code = major * 1_000_000L + minor * 1_000L + patch
+    require(code in 1L..2_100_000_000L) {
+        "versionName produces an invalid Android versionCode (was: $version)"
+    }
+    return code.toInt()
+}
+
+val resolvedVersionName = providers.gradleProperty("versionName").orNull ?: "0.3.1"
+val resolvedVersionCode = providers.gradleProperty("versionCode").orNull?.let { suppliedCode ->
+    suppliedCode.toIntOrNull() ?: error("versionCode must be an integer (was: $suppliedCode)")
+} ?: versionCodeFor(resolvedVersionName)
+require(resolvedVersionCode in 1..2_100_000_000) {
+    "versionCode must be within Android's valid range (was: $resolvedVersionCode)"
+}
+
 android {
     namespace = "com.adsamcik.streamferry"
     // compileSdk 37 = Android 17. Platform + build-tools 37 are installed on the build host.
@@ -18,11 +45,10 @@ android {
         applicationId = "com.adsamcik.streamferry"
         minSdk = 34          // Android 14
         targetSdk = 37       // Android 17
-        // Local builds keep the checked-in version. The release workflow supplies both values
-        // from its validated v<major>.<minor>.<patch> tag so every Play upload gets a new,
-        // monotonically increasing versionCode.
-        versionCode = providers.gradleProperty("versionCode").orNull?.toIntOrNull() ?: 3001
-        versionName = providers.gradleProperty("versionName").orNull ?: "0.3.1"
+        // Android Studio derives the same monotonic code as CI from the checked-in versionName.
+        // CI may explicitly supply both values after validating its vMAJOR.MINOR.PATCH tag.
+        versionCode = resolvedVersionCode
+        versionName = resolvedVersionName
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
     }
