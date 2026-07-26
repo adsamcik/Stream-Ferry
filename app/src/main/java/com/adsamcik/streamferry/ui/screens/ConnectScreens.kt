@@ -1,5 +1,10 @@
 package com.adsamcik.streamferry.ui.screens
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import android.content.res.Configuration
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -129,7 +134,13 @@ fun ServerSetupScreen(state: AppUiState, viewModel: MainViewModel) {
             modifier = Modifier.fillMaxWidth(),
         )
 
-        if (state.needsHttpApproval) {
+        AnimatedVisibility(
+            visible = state.needsHttpApproval,
+            enter = fadeIn(MaterialTheme.motionScheme.defaultEffectsSpec()) +
+                expandVertically(MaterialTheme.motionScheme.defaultSpatialSpec()),
+            exit = fadeOut(MaterialTheme.motionScheme.defaultEffectsSpec()) +
+                shrinkVertically(MaterialTheme.motionScheme.defaultSpatialSpec()),
+        ) {
             Card(
                 shape = RoundedCornerShape(20.dp),
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
@@ -150,7 +161,13 @@ fun ServerSetupScreen(state: AppUiState, viewModel: MainViewModel) {
             }
         }
 
-        if (state.connectionState == ConnectionState.CONNECTED && state.serverName != null) {
+        AnimatedVisibility(
+            visible = state.connectionState == ConnectionState.CONNECTED && state.serverName != null,
+            enter = fadeIn(MaterialTheme.motionScheme.defaultEffectsSpec()) +
+                expandVertically(MaterialTheme.motionScheme.defaultSpatialSpec()),
+            exit = fadeOut(MaterialTheme.motionScheme.defaultEffectsSpec()) +
+                shrinkVertically(MaterialTheme.motionScheme.defaultSpatialSpec()),
+        ) {
             Text(
                 "Connected to ${state.serverName}",
                 color = MaterialTheme.colorScheme.primary,
@@ -169,7 +186,13 @@ fun ServerSetupScreen(state: AppUiState, viewModel: MainViewModel) {
             Icon(Icons.Rounded.Dns, contentDescription = null, modifier = Modifier.size(20.dp))
             Text("  Test connection & continue", style = MaterialTheme.typography.titleMedium)
         }
-        if (state.connectionState == ConnectionState.TESTING) {
+        AnimatedVisibility(
+            visible = state.connectionState == ConnectionState.TESTING,
+            enter = fadeIn(MaterialTheme.motionScheme.defaultEffectsSpec()) +
+                expandVertically(MaterialTheme.motionScheme.defaultSpatialSpec()),
+            exit = fadeOut(MaterialTheme.motionScheme.defaultEffectsSpec()) +
+                shrinkVertically(MaterialTheme.motionScheme.defaultSpatialSpec()),
+        ) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -186,67 +209,95 @@ fun LoginScreen(state: AppUiState, viewModel: MainViewModel) {
     var username by rememberSaveable { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
     val quickConnect = state.quickConnect
+
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         state.serverName?.let {
-            Text("Server: $it", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(
+                "Server: $it",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
-        if (quickConnect != null) {
-            QuickConnectPanel(code = quickConnect.code, onCancel = { viewModel.cancelQuickConnect() })
-            return@Column
-        }
-        Text(
-            "Your password is never stored; only an access token is kept, encrypted.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        OutlinedTextField(
-            value = username,
-            onValueChange = { username = it },
-            label = { Text("Username") },
-            singleLine = true,
-            shape = RoundedCornerShape(16.dp),
-            modifier = Modifier.fillMaxWidth(),
-        )
-        OutlinedTextField(
-            value = password,
-            onValueChange = { password = it },
-            label = { Text("Password") },
-            singleLine = true,
-            shape = RoundedCornerShape(16.dp),
-            visualTransformation = PasswordVisualTransformation(),
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-            modifier = Modifier.fillMaxWidth(),
-        )
-        Button(
-            onClick = { viewModel.login(username, password) },
-            enabled = username.isNotBlank() && !state.isBusy,
-            modifier = Modifier.fillMaxWidth().height(54.dp),
-            shape = RoundedCornerShape(18.dp),
+        AnimatedVisibility(
+            visible = quickConnect != null,
+            enter = fadeIn(MaterialTheme.motionScheme.defaultEffectsSpec()) +
+                expandVertically(MaterialTheme.motionScheme.defaultSpatialSpec()),
+            exit = fadeOut(MaterialTheme.motionScheme.defaultEffectsSpec()) +
+                shrinkVertically(MaterialTheme.motionScheme.defaultSpatialSpec()),
         ) {
-            Icon(Icons.Rounded.Lock, contentDescription = null, modifier = Modifier.size(20.dp))
-            Text("  Log in", style = MaterialTheme.typography.titleMedium)
+            quickConnect?.let {
+                QuickConnectPanel(code = it.code, onCancel = viewModel::cancelQuickConnect)
+            }
         }
-        OutlinedButton(
-            onClick = { viewModel.startQuickConnect() },
-            enabled = !state.isBusy,
-            modifier = Modifier.fillMaxWidth().height(54.dp),
-            shape = RoundedCornerShape(18.dp),
+        AnimatedVisibility(
+            visible = quickConnect == null,
+            enter = fadeIn(MaterialTheme.motionScheme.defaultEffectsSpec()) +
+                expandVertically(MaterialTheme.motionScheme.defaultSpatialSpec()),
+            exit = fadeOut(MaterialTheme.motionScheme.defaultEffectsSpec()) +
+                shrinkVertically(MaterialTheme.motionScheme.defaultSpatialSpec()),
         ) {
-            Text("Use Quick Connect", style = MaterialTheme.typography.titleMedium)
-        }
-        Text(
-            "Quick Connect lets you sign in without typing your password: enter the code below on a " +
-                "device already signed in to your Jellyfin server.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        if (state.isBusy) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                ExpressiveLoadingIndicator(Modifier.size(32.dp), description = "Signing in")
-                Text("Please wait…", style = MaterialTheme.typography.bodyMedium)
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(
+                    "Your password is never stored; only an access token is kept, encrypted.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                OutlinedTextField(
+                    value = username,
+                    onValueChange = { username = it },
+                    label = { Text("Username") },
+                    singleLine = true,
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = { password = it },
+                    label = { Text("Password") },
+                    singleLine = true,
+                    shape = RoundedCornerShape(16.dp),
+                    visualTransformation = PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Button(
+                    onClick = { viewModel.login(username, password) },
+                    enabled = username.isNotBlank() && !state.isBusy,
+                    modifier = Modifier.fillMaxWidth().height(54.dp),
+                    shape = RoundedCornerShape(18.dp),
+                ) {
+                    Icon(Icons.Rounded.Lock, contentDescription = null, modifier = Modifier.size(20.dp))
+                    Text("  Log in", style = MaterialTheme.typography.titleMedium)
+                }
+                OutlinedButton(
+                    onClick = viewModel::startQuickConnect,
+                    enabled = !state.isBusy,
+                    modifier = Modifier.fillMaxWidth().height(54.dp),
+                    shape = RoundedCornerShape(18.dp),
+                ) {
+                    Text("Use Quick Connect", style = MaterialTheme.typography.titleMedium)
+                }
+                Text(
+                    "Quick Connect lets you sign in without typing your password: enter the code below on a " +
+                        "device already signed in to your Jellyfin server.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                AnimatedVisibility(
+                    visible = state.isBusy,
+                    enter = fadeIn(MaterialTheme.motionScheme.defaultEffectsSpec()) +
+                        expandVertically(MaterialTheme.motionScheme.defaultSpatialSpec()),
+                    exit = fadeOut(MaterialTheme.motionScheme.defaultEffectsSpec()) +
+                        shrinkVertically(MaterialTheme.motionScheme.defaultSpatialSpec()),
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        ExpressiveLoadingIndicator(Modifier.size(32.dp), description = "Signing in")
+                        Text("Please wait…", style = MaterialTheme.typography.bodyMedium)
+                    }
+                }
             }
         }
     }
