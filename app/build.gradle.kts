@@ -29,12 +29,7 @@ private fun versionCodeFor(version: String): Int {
 }
 
 val resolvedVersionName = providers.gradleProperty("versionName").orNull ?: "0.3.1"
-val resolvedVersionCode = providers.gradleProperty("versionCode").orNull?.let { suppliedCode ->
-    suppliedCode.toIntOrNull() ?: error("versionCode must be an integer (was: $suppliedCode)")
-} ?: versionCodeFor(resolvedVersionName)
-require(resolvedVersionCode in 1..2_100_000_000) {
-    "versionCode must be within Android's valid range (was: $resolvedVersionCode)"
-}
+val resolvedVersionCode = versionCodeFor(resolvedVersionName)
 
 android {
     namespace = "com.adsamcik.streamferry"
@@ -45,8 +40,8 @@ android {
         applicationId = "com.adsamcik.streamferry"
         minSdk = 34          // Android 14
         targetSdk = 37       // Android 17
-        // Android Studio derives the same monotonic code as CI from the checked-in versionName.
-        // CI may explicitly supply both values after validating its vMAJOR.MINOR.PATCH tag.
+        // This is the sole version-code calculation, shared by Android Studio and CI.
+        // CI supplies only a validated vMAJOR.MINOR.PATCH versionName.
         versionCode = resolvedVersionCode
         versionName = resolvedVersionName
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"

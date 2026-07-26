@@ -47,7 +47,7 @@ No Google service account or Google Play credential is used by this repository.
 
 ## Cut a release
 
-1. Update the checked-in `versionName` fallback and `CHANGELOG.md`.
+1. Update the checked-in `versionName` and `CHANGELOG.md`.
 2. Commit and push the release commit to `main`.
 3. Create and push a strict semantic-version tag, for example:
 
@@ -56,8 +56,9 @@ No Google service account or Google Play credential is used by this repository.
    git push origin v0.3.0
    ```
 
-The release workflow verifies the tag has the form `vMAJOR.MINOR.PATCH`, derives a monotonic Android
-version code (`MAJOR * 1,000,000 + MINOR * 1,000 + PATCH`), requires the stable signing secrets, then
+The release workflow verifies the tag has the form `vMAJOR.MINOR.PATCH` and passes its version name to
+Gradle, which is the sole source of the monotonic Android version-code calculation
+(`MAJOR * 1,000,000 + MINOR * 1,000 + PATCH`). The workflow requires the stable signing secrets, then
 builds the APK and AAB. It creates or updates the public GitHub Release with the APK, AAB, checksum,
 and signer report. A manual dispatch can rebuild an already-published tag.
 
