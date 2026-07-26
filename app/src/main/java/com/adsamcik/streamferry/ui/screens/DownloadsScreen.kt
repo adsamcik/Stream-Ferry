@@ -1,5 +1,8 @@
 package com.adsamcik.streamferry.ui.screens
 
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -61,7 +64,7 @@ fun DownloadsScreen(state: AppUiState, viewModel: MainViewModel, onCast: () -> U
     ) {
         if (state.downloads.isEmpty()) {
             item(key = "empty-downloads") {
-                EmptyDownloadsSurface()
+                EmptyDownloadsSurface(Modifier.animateItem())
             }
         } else {
             item(key = "download-recovery") {
@@ -70,12 +73,13 @@ fun DownloadsScreen(state: AppUiState, viewModel: MainViewModel, onCast: () -> U
                         "If a download permanently fails, open its movie or episode and start it again.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(bottom = 4.dp),
+                    modifier = Modifier.animateItem().padding(bottom = 4.dp),
                 )
             }
             items(state.downloads, key = { it.itemId }) { item ->
                 DownloadRow(
                     item = item,
+                    modifier = Modifier.animateItem(),
                     onPlay = {
                         viewModel.prepareCastDownload(item.itemId)
                         onCast()
@@ -120,11 +124,11 @@ fun DownloadsScreen(state: AppUiState, viewModel: MainViewModel, onCast: () -> U
 }
 
 @Composable
-private fun EmptyDownloadsSurface() {
+private fun EmptyDownloadsSurface(modifier: Modifier = Modifier) {
     Surface(
         shape = MaterialTheme.shapes.extraLarge,
         color = MaterialTheme.colorScheme.surfaceContainerLow,
-        modifier = Modifier.fillMaxWidth(),
+        modifier = modifier.fillMaxWidth(),
     ) {
         Column(
             modifier = Modifier.fillMaxWidth().padding(28.dp),
@@ -157,22 +161,38 @@ private fun EmptyDownloadsSurface() {
 @Composable
 private fun DownloadRow(
     item: DownloadUiItem,
+    modifier: Modifier = Modifier,
     onPlay: () -> Unit,
     onCancel: () -> Unit,
     onDelete: () -> Unit,
     onDismissFailure: () -> Unit,
 ) {
     val progress = item.fraction?.coerceIn(0f, 1f)
-    val containerColor = when {
+    val targetContainerColor = when {
         item.failed -> MaterialTheme.colorScheme.errorContainer
         item.completed -> MaterialTheme.colorScheme.secondaryContainer
         else -> MaterialTheme.colorScheme.surfaceContainerLow
     }
-    val contentColor = when {
+    val targetContentColor = when {
         item.failed -> MaterialTheme.colorScheme.onErrorContainer
         item.completed -> MaterialTheme.colorScheme.onSecondaryContainer
         else -> MaterialTheme.colorScheme.onSurface
     }
+    val containerColor by animateColorAsState(
+        targetValue = targetContainerColor,
+        animationSpec = MaterialTheme.motionScheme.defaultEffectsSpec(),
+        label = "download container color",
+    )
+    val contentColor by animateColorAsState(
+        targetValue = targetContentColor,
+        animationSpec = MaterialTheme.motionScheme.defaultEffectsSpec(),
+        label = "download content color",
+    )
+    val animatedProgress by animateFloatAsState(
+        targetValue = progress ?: 0f,
+        animationSpec = MaterialTheme.motionScheme.defaultEffectsSpec(),
+        label = "download progress",
+    )
     val statusDescription = when {
         item.completed -> "Downloaded and available offline"
         item.failed -> "Download failed. ${item.statusText}"
@@ -181,7 +201,9 @@ private fun DownloadRow(
     }
 
     Surface(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = modifier
+            .fillMaxWidth()
+            .animateContentSize(animationSpec = MaterialTheme.motionScheme.defaultSpatialSpec()),
         shape = MaterialTheme.shapes.large,
         color = containerColor,
         contentColor = contentColor,
@@ -246,7 +268,7 @@ private fun DownloadRow(
                 if (!item.completed && !item.failed) {
                     if (progress != null) {
                         LinearProgressIndicator(
-                            progress = { progress },
+                            progress = { animatedProgress },
                             modifier = Modifier.fillMaxWidth().clearAndSetSemantics { },
                         )
                     } else {
