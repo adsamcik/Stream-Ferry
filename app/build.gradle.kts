@@ -21,7 +21,7 @@ android {
         // Local builds keep the checked-in version. The release workflow supplies both values
         // from its validated v<major>.<minor>.<patch> tag so every Play upload gets a new,
         // monotonically increasing versionCode.
-        versionCode = providers.gradleProperty("versionCode").orNull?.toIntOrNull() ?: 3000
+        versionCode = providers.gradleProperty("versionCode").orNull?.toIntOrNull() ?: 3001
         versionName = providers.gradleProperty("versionName").orNull ?: "0.3.1"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
