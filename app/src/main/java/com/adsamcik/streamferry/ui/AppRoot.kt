@@ -1,6 +1,12 @@
 package com.adsamcik.streamferry.ui
 
 import android.content.Intent
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -64,6 +70,7 @@ import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import com.adsamcik.streamferry.diagnostics.ReportShare
 import com.adsamcik.streamferry.ui.navigation.NavigationStatePolicy
@@ -132,6 +139,8 @@ fun AppRoot(state: AppUiState, viewModel: MainViewModel, onScanDevices: () -> Un
         )
         val showMiniPlayer = state.playback != null && state.route != Route.PLAYBACK
         val galleryOwnsPhoneHeader = !useNavigationRail && state.route == Route.GALLERY
+        val spatialMotion = MaterialTheme.motionScheme.defaultSpatialSpec<IntOffset>()
+        val effectsMotion = MaterialTheme.motionScheme.defaultEffectsSpec<Float>()
 
         Scaffold(
             containerColor = MaterialTheme.colorScheme.surfaceContainerLowest,
@@ -177,14 +186,33 @@ fun AppRoot(state: AppUiState, viewModel: MainViewModel, onScanDevices: () -> Un
                         .weight(1f)
                         .fillMaxHeight(),
                 ) {
-                    ScreenContent(
-                        state = state,
-                        viewModel = viewModel,
-                        onScanDevices = onScanDevices,
-                        context = context,
-                        expanded = useNavigationRail,
-                        reserveMiniPlayerSpace = useNavigationRail && showMiniPlayer,
-                    )
+                    AnimatedContent(
+                        targetState = state.route,
+                        modifier = Modifier.fillMaxSize(),
+                        transitionSpec = {
+                            val forward = routeDepth(targetState) >= routeDepth(initialState)
+                            val enterOffset: (Int) -> Int = { width ->
+                                if (forward) width / 10 else -width / 10
+                            }
+                            val exitOffset: (Int) -> Int = { width ->
+                                if (forward) -width / 14 else width / 14
+                            }
+                            (fadeIn(effectsMotion) + slideInHorizontally(spatialMotion, enterOffset))
+                                .togetherWith(
+                                    fadeOut(effectsMotion) + slideOutHorizontally(spatialMotion, exitOffset),
+                                )
+                        },
+                        label = "route transition",
+                    ) { route ->
+                        ScreenContent(
+                            state = state.copy(route = route),
+                            viewModel = viewModel,
+                            onScanDevices = onScanDevices,
+                            context = context,
+                            expanded = useNavigationRail,
+                            reserveMiniPlayerSpace = useNavigationRail && showMiniPlayer,
+                        )
+                    }
                     if (useNavigationRail && showMiniPlayer) {
                         MiniPlayer(
                             state = state,
@@ -568,6 +596,13 @@ private fun IconBack(onClick: () -> Unit) {
     IconButton(onClick = onClick) {
         Icon(Icons.AutoMirrored.Rounded.ArrowBack, contentDescription = "Back")
     }
+}
+
+private fun routeDepth(route: Route): Int = when (route) {
+    Route.WELCOME, Route.GALLERY, Route.SETTINGS -> 0
+    Route.SERVER_SETUP, Route.MEDIA_DETAIL, Route.DOWNLOADS, Route.DIAGNOSTICS, Route.SERVERS, Route.ABOUT -> 1
+    Route.LOGIN, Route.TARGET_PICKER -> 2
+    Route.PLAYBACK -> 3
 }
 
 private fun titleFor(route: Route): String = when (route) {
