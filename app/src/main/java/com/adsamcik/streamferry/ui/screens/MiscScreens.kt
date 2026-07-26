@@ -1,6 +1,12 @@
 package com.adsamcik.streamferry.ui.screens
 
-import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.animation.animateContentSize
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Code
+import androidx.compose.material.icons.rounded.Devices
+import androidx.compose.material.icons.rounded.PrivacyTip
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.Icon
@@ -19,6 +25,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -44,9 +51,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import com.adsamcik.streamferry.BuildConfig
 import com.adsamcik.streamferry.diagnostics.ReportShare
 import com.adsamcik.streamferry.logging.LogEntry
 import com.adsamcik.streamferry.logging.LogLevel
@@ -228,7 +238,7 @@ fun DiagnosticsScreen(
 
         // Crashes card
         item {
-            Card(modifier = Modifier.fillMaxWidth()) {
+            Card(modifier = Modifier.fillMaxWidth().animateContentSize(MaterialTheme.motionScheme.defaultSpatialSpec())) {
                 Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("Crash reports: ${d.crashCount}", style = MaterialTheme.typography.titleSmall)
                     if (d.crashCount > 0) {
@@ -274,13 +284,20 @@ fun DiagnosticsScreen(
 
         // Event log section
         item {
-            Text("Event log (redacted)", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "Event log (redacted)",
+                style = MaterialTheme.typography.headlineSmall,
+                modifier = Modifier.semantics { heading() },
+            )
         }
 
         // Filter chips
         item {
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                for (filter in DiagFilter.values()) {
+            Row(
+                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                for (filter in DiagFilter.entries) {
                     FilterChip(
                         selected = selectedFilter == filter,
                         onClick = { selectedFilter = filter },
@@ -336,6 +353,7 @@ fun DiagnosticsScreen(
         } else {
             items(filteredEntries) { entry ->
                 LogEntryRow(
+                    modifier = Modifier.animateItem(),
                     entry = entry,
                     fmt = timeFmt,
                     onCopy = {
@@ -352,8 +370,16 @@ fun DiagnosticsScreen(
 }
 
 @Composable
-private fun SnapshotCard(title: String, content: @Composable () -> Unit) {
-    Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp)) {
+private fun SnapshotCard(
+    title: String,
+    modifier: Modifier = Modifier,
+    content: @Composable () -> Unit,
+) {
+    Card(
+        modifier = modifier.fillMaxWidth().animateContentSize(MaterialTheme.motionScheme.defaultSpatialSpec()),
+        shape = MaterialTheme.shapes.extraLarge,
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow),
+    ) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(title, style = MaterialTheme.typography.titleSmall)
             HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
@@ -376,7 +402,12 @@ private fun LabelValue(label: String, value: String) {
 }
 
 @Composable
-private fun LogEntryRow(entry: LogEntry, fmt: SimpleDateFormat, onCopy: () -> Unit) {
+private fun LogEntryRow(
+    entry: LogEntry,
+    fmt: SimpleDateFormat,
+    onCopy: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
     val timeStr = remember(entry.timeMillis) { fmt.format(Date(entry.timeMillis)) }
     val levelColor = when (entry.level) {
         LogLevel.ERROR -> MaterialTheme.colorScheme.error
@@ -394,7 +425,7 @@ private fun LogEntryRow(entry: LogEntry, fmt: SimpleDateFormat, onCopy: () -> Un
         LogLevel.TRACE -> "TRC"
     }
     Row(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .clickable(onClick = onCopy)
             .padding(vertical = 2.dp),
@@ -411,29 +442,84 @@ private fun LogEntryRow(entry: LogEntry, fmt: SimpleDateFormat, onCopy: () -> Un
 
 @Composable
 fun AboutScreen() {
-    Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
         ElevatedCard(
-            shape = RoundedCornerShape(20.dp),
+            shape = MaterialTheme.shapes.extraLarge,
             modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
+            colors = CardDefaults.elevatedCardColors(
+                containerColor = MaterialTheme.colorScheme.primaryContainer,
+            ),
         ) {
-            Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(
                     "Stream Ferry",
-                    style = MaterialTheme.typography.titleLarge,
+                    style = MaterialTheme.typography.displaySmall,
                     fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                    modifier = Modifier.semantics { heading() },
                 )
                 Text(
-                    "Open-source licenses are listed in docs/LICENSES.md and bundled at build time.",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    "Version " + BuildConfig.VERSION_NAME,
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer,
                 )
                 Text(
-                    "No telemetry, analytics, ads, or tracking.",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    "A private bridge from your media library to the screen you already own.",
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer,
                 )
+            }
+        }
+
+        AboutFactCard(
+            icon = Icons.Rounded.PrivacyTip,
+            title = "Private by design",
+            body = "No telemetry, analytics, ads, or tracking. Credentials and playback history stay on this phone.",
+        )
+        AboutFactCard(
+            icon = Icons.Rounded.Devices,
+            title = "Built for your devices",
+            body = "Streams locally to compatible Cast and DLNA receivers, with explicit fallbacks when a format needs help.",
+        )
+        AboutFactCard(
+            icon = Icons.Rounded.Code,
+            title = "Open source",
+            body = "Open-source notices are bundled with the app and documented in docs/LICENSES.md.",
+        )
+    }
+}
+
+@Composable
+private fun AboutFactCard(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    title: String,
+    body: String,
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.large,
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow),
+    ) {
+        Row(
+            modifier = Modifier.padding(18.dp),
+            horizontalArrangement = Arrangement.spacedBy(16.dp),
+            verticalAlignment = Alignment.Top,
+        ) {
+            Surface(
+                shape = MaterialTheme.shapes.medium,
+                color = MaterialTheme.colorScheme.secondaryContainer,
+                contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+            ) {
+                Box(Modifier.size(48.dp), contentAlignment = Alignment.Center) {
+                    Icon(icon, contentDescription = null, modifier = Modifier.size(26.dp))
+                }
+            }
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                Text(body, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
     }
