@@ -79,6 +79,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -148,7 +149,7 @@ fun TargetPickerScreen(state: AppUiState, viewModel: MainViewModel, onRescan: ()
     val lifecycleOwner = LocalLifecycleOwner.current
     val latestRescan by rememberUpdatedState(onRescan)
     val latestScanning by rememberUpdatedState(state.isScanningTargets)
-    var secondsUntilRefresh by remember { mutableStateOf(TARGET_AUTO_REFRESH_SECONDS) }
+    var secondsUntilRefresh by remember { mutableIntStateOf(TARGET_AUTO_REFRESH_SECONDS) }
 
     // Refresh only while this picker is actually in the foreground. The ViewModel guards against
     // overlapping work and stops discovery when navigation leaves this route.
