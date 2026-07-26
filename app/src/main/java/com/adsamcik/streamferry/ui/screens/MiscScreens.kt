@@ -1,31 +1,16 @@
 package com.adsamcik.streamferry.ui.screens
 
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
-import androidx.compose.material.icons.automirrored.rounded.Logout
-import androidx.compose.material.icons.rounded.BatteryStd
-import androidx.compose.material.icons.rounded.DeleteForever
-import androidx.compose.material.icons.rounded.HighQuality
-import androidx.compose.material.icons.rounded.Restore
-import androidx.compose.material.icons.rounded.Subtitles
-import androidx.compose.material.icons.rounded.Translate
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.Icon
-import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import android.content.ClipData
 import android.content.Intent
 import android.content.res.Configuration
 import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.annotation.DrawableRes
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -37,7 +22,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -49,18 +33,13 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.ui.res.painterResource
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
-import com.adsamcik.streamferry.R
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.LocalClipboard
@@ -69,7 +48,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import com.adsamcik.streamferry.diagnostics.ReportShare
-import com.adsamcik.streamferry.core.language.Languages
 import com.adsamcik.streamferry.logging.LogEntry
 import com.adsamcik.streamferry.logging.LogLevel
 import com.adsamcik.streamferry.ui.state.AppUiState
@@ -430,307 +408,6 @@ private fun LogEntryRow(entry: LogEntry, fmt: SimpleDateFormat, onCopy: () -> Un
     }
 }
 
-@Composable
-fun SettingsScreen(
-    onLogout: () -> Unit,
-    onDeleteAll: () -> Unit,
-    onAbout: () -> Unit,
-    onDiagnostics: () -> Unit,
-    onDownloads: () -> Unit,
-    onServers: () -> Unit,
-    preferDirectPlay: Boolean,
-    onPreferDirectPlayChange: (Boolean) -> Unit,
-    transcodeLocalOnDevice: Boolean,
-    onTranscodeLocalChange: (Boolean) -> Unit,
-    maxVideoHeight: Int,
-    onMaxVideoHeightChange: (Int) -> Unit,
-    autoPlayNextEpisode: Boolean,
-    onAutoPlayNextChange: (Boolean) -> Unit,
-    autoSkipSegments: Boolean,
-    onAutoSkipSegmentsChange: (Boolean) -> Unit,
-    preferredAudioLanguage: String,
-    onPreferredAudioLanguageChange: (String) -> Unit,
-    preferredSubtitleLanguage: String,
-    onPreferredSubtitleLanguageChange: (String) -> Unit,
-    backgroundPlaybackUnrestricted: Boolean,
-    onAllowBackgroundPlayback: () -> Unit,
-    onResetTvCapabilities: () -> Unit,
-) {
-    var confirmDelete by remember { mutableStateOf(false) }
-    var preferDp by remember { mutableStateOf(preferDirectPlay) }
-    var transcodeLocal by remember { mutableStateOf(transcodeLocalOnDevice) }
-    var maxRes by remember { mutableStateOf(maxVideoHeight) }
-    var autoNext by remember { mutableStateOf(autoPlayNextEpisode) }
-    var autoSkip by remember { mutableStateOf(autoSkipSegments) }
-    var audioLang by remember { mutableStateOf(preferredAudioLanguage) }
-    var subtitleLang by remember { mutableStateOf(preferredSubtitleLanguage) }
-    var capsReset by remember { mutableStateOf(false) }
-    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Text(
-            "Manage your connection and app data.",
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        SettingsToggleRow(
-            icon = Icons.Rounded.HighQuality,
-            label = "Direct play first",
-            description = "Stream the original when the TV can play it. Turn this off to force a server " +
-                "transcode from the start; failed transcodes step down through lower resolutions automatically.",
-            checked = preferDp,
-            onCheckedChange = { preferDp = it; onPreferDirectPlayChange(it) },
-        )
-        SettingsMaxResolutionRow(
-            selected = maxRes,
-            onSelect = { maxRes = it; onMaxVideoHeightChange(it) },
-        )
-        SettingsToggleRow(
-            icon = Icons.Rounded.HighQuality,
-            label = "Autoplay next episode",
-            description = "When an episode finishes, automatically start the next one in the series on the " +
-                "same TV. On by default; applies to Jellyfin TV episodes.",
-            checked = autoNext,
-            onCheckedChange = { autoNext = it; onAutoPlayNextChange(it) },
-        )
-        SettingsToggleRow(
-            icon = Icons.Rounded.HighQuality,
-            label = "Auto-skip intro/recap",
-            description = "Automatically skip intro, recap and outro segments when your Jellyfin server " +
-                "provides them (10.10+ with the Intro Skipper plugin). A manual \u201CSkip\u201D button is " +
-                "always shown too. On by default.",
-            checked = autoSkip,
-            onCheckedChange = { autoSkip = it; onAutoSkipSegmentsChange(it) },
-        )
-        SettingsLanguageRow(
-            icon = Icons.Rounded.Translate,
-            label = "Preferred audio language",
-            description = "Auto-select this audio language when a video has it. Otherwise the server " +
-                "default is used. Your choice per show is remembered and overrides this.",
-            selectedCode = audioLang,
-            noneLabel = "No preference",
-            onSelect = { audioLang = it; onPreferredAudioLanguageChange(it) },
-        )
-        SettingsLanguageRow(
-            icon = Icons.Rounded.Subtitles,
-            label = "Preferred subtitle language",
-            description = "Auto-turn on subtitles in this language when a video has them (they're burned " +
-                "in). \u201CNo preference\u201D leaves subtitles off. Your choice per show overrides this.",
-            selectedCode = subtitleLang,
-            noneLabel = "No preference (off)",
-            onSelect = { subtitleLang = it; onPreferredSubtitleLanguageChange(it) },
-        )
-        SettingsToggleRow(
-            icon = Icons.Rounded.HighQuality,
-            label = "Transcode local videos on this device",
-            description = "For compatible Cast receivers and 8-bit SDR local files, re-encode an incompatible " +
-                "format on the phone (hardware) instead of just sending it. Directly-playable files stay as-is.",
-            checked = transcodeLocal,
-            onCheckedChange = { transcodeLocal = it; onTranscodeLocalChange(it) },
-        )
-        SettingsToggleRow(
-            icon = Icons.Rounded.BatteryStd,
-            label = "Allow background playback (screen-off)",
-            description = "Let the app run unrestricted so casting keeps working when the screen is off. " +
-                "Without it, some phones (notably Samsung) suspend the app in the background and playback " +
-                "stalls on \u201Cbuffering\u201D until you wake the screen. Opens a system prompt.",
-            checked = backgroundPlaybackUnrestricted,
-            onCheckedChange = { onAllowBackgroundPlayback() },
-        )
-        SettingsRow(
-            icon = Icons.Rounded.Restore,
-            label = if (capsReset) "TV capabilities reset \u2713" else "Reset learned TV capabilities",
-            onClick = { capsReset = true; onResetTvCapabilities() },
-        )
-        SettingsRow(iconRes = R.drawable.in_app_icon_servers, label = "Servers", onClick = onServers)
-        SettingsRow(iconRes = R.drawable.in_app_icon_downloads, label = "Downloads", onClick = onDownloads)
-        SettingsRow(iconRes = R.drawable.in_app_icon_diagnostics, label = "Diagnostics", onClick = onDiagnostics)
-        SettingsRow(iconRes = R.drawable.in_app_icon_about, label = "About & open-source licenses", onClick = onAbout)
-        SettingsRow(icon = Icons.AutoMirrored.Rounded.Logout, label = "Log out", onClick = onLogout)
-        SettingsRow(
-            icon = Icons.Rounded.DeleteForever,
-            label = "Delete all app data",
-            onClick = { confirmDelete = true },
-            containerColor = MaterialTheme.colorScheme.errorContainer,
-            onContainerColor = MaterialTheme.colorScheme.onErrorContainer,
-        )
-    }
-
-    if (confirmDelete) {
-        AlertDialog(
-            onDismissRequest = { confirmDelete = false },
-            title = { Text("Delete all app data?") },
-            text = { Text("This removes your server profile, saved login, and all local data. This cannot be undone.") },
-            confirmButton = {
-                TextButton(onClick = { confirmDelete = false; onDeleteAll() }) {
-                    Text("Delete", color = MaterialTheme.colorScheme.error)
-                }
-            },
-            dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text("Cancel") } },
-        )
-    }
-}
-
-@Composable
-private fun SettingsMaxResolutionRow(selected: Int, onSelect: (Int) -> Unit) {
-    val options = listOf(2160 to "4K (2160p)", 1080 to "1080p", 720 to "720p", 480 to "480p")
-    var expanded by remember { mutableStateOf(false) }
-    val selectedLabel = options.firstOrNull { it.first == selected }?.second ?: "4K (2160p)"
-    Card(
-        modifier = Modifier.fillMaxWidth().clickable { expanded = true },
-        shape = RoundedCornerShape(20.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(16.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(14.dp),
-        ) {
-            Icon(Icons.Rounded.HighQuality, contentDescription = null, tint = MaterialTheme.colorScheme.onSurface, modifier = Modifier.size(24.dp))
-            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text("Maximum resolution", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurface)
-                Text(
-                    "Cap the resolution streamed to the TV; taller sources are transcoded down. 4K also " +
-                        "passes HDR through to a capable TV (otherwise it falls back to 1080p SDR).",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-            Box {
-                OutlinedButton(onClick = { expanded = true }) { Text(selectedLabel) }
-                DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-                    options.forEach { (value, label) ->
-                        DropdownMenuItem(text = { Text(label) }, onClick = { expanded = false; onSelect(value) })
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun SettingsLanguageRow(
-    icon: ImageVector,
-    label: String,
-    description: String,
-    selectedCode: String,
-    noneLabel: String,
-    onSelect: (String) -> Unit,
-) {
-    var expanded by remember { mutableStateOf(false) }
-    val selectedName = Languages.nameFor(selectedCode) ?: noneLabel
-    Card(
-        modifier = Modifier.fillMaxWidth().clickable { expanded = true },
-        shape = RoundedCornerShape(20.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(16.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(14.dp),
-        ) {
-            Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.onSurface, modifier = Modifier.size(24.dp))
-            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text(label, style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurface)
-                Text(description, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-            Box {
-                OutlinedButton(onClick = { expanded = true }) { Text(selectedName) }
-                DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-                    DropdownMenuItem(text = { Text(noneLabel) }, onClick = { expanded = false; onSelect("") })
-                    Languages.COMMON.forEach { lang ->
-                        DropdownMenuItem(
-                            text = { Text(lang.name) },
-                            onClick = { expanded = false; onSelect(lang.code) },
-                        )
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun SettingsToggleRow(
-    icon: ImageVector,
-    label: String,
-    description: String,
-    checked: Boolean,
-    enabled: Boolean = true,
-    onCheckedChange: (Boolean) -> Unit,
-) {
-    Card(
-        modifier = Modifier.fillMaxWidth().clickable(enabled = enabled) { onCheckedChange(!checked) },
-        shape = RoundedCornerShape(20.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(16.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(14.dp),
-        ) {
-            Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.onSurface, modifier = Modifier.size(24.dp))
-            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text(label, style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurface)
-                Text(
-                    description,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-            Switch(
-                checked = checked,
-                onCheckedChange = if (enabled) onCheckedChange else null,
-                enabled = enabled,
-            )
-        }
-    }
-}
-
-@Composable
-private fun SettingsRow(
-    icon: ImageVector? = null,
-    @DrawableRes iconRes: Int? = null,
-    label: String,
-    onClick: () -> Unit,
-    containerColor: androidx.compose.ui.graphics.Color = MaterialTheme.colorScheme.surfaceContainer,
-    onContainerColor: androidx.compose.ui.graphics.Color = MaterialTheme.colorScheme.onSurface,
-) {
-    Card(
-        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
-        shape = RoundedCornerShape(20.dp),
-        colors = CardDefaults.cardColors(containerColor = containerColor),
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(16.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(14.dp),
-        ) {
-            if (iconRes != null) {
-                Image(
-                    painter = painterResource(iconRes),
-                    contentDescription = null,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier
-                        .size(36.dp)
-                        .clip(RoundedCornerShape(10.dp)),
-                )
-            } else if (icon != null) {
-                Icon(icon, contentDescription = null, tint = onContainerColor, modifier = Modifier.size(24.dp))
-            }
-            Text(
-                label,
-                style = MaterialTheme.typography.titleSmall,
-                color = onContainerColor,
-                modifier = Modifier.weight(1f),
-            )
-            Icon(
-                Icons.AutoMirrored.Rounded.KeyboardArrowRight,
-                contentDescription = null,
-                tint = onContainerColor,
-                modifier = Modifier.size(20.dp),
-            )
-        }
-    }
-}
 
 @Composable
 fun AboutScreen() {
@@ -777,26 +454,6 @@ private fun AboutScreenPreview() {
     }
 }
 
-@Preview(name = "Settings toggle", showBackground = true)
-@Preview(name = "Settings toggle · dark", showBackground = true, uiMode = Configuration.UI_MODE_NIGHT_YES)
-@Composable
-private fun SettingsToggleRowPreview() {
-    var checked by remember { mutableStateOf(true) }
-    StreamFerryTheme {
-        Surface(color = MaterialTheme.colorScheme.background) {
-            Box(Modifier.padding(16.dp)) {
-                SettingsToggleRow(
-                    icon = Icons.Rounded.HighQuality,
-                    label = "Prefer original quality",
-                    description = "Try the original file first and let the TV decode it; fall back to a " +
-                        "server transcode only if it can't.",
-                    checked = checked,
-                    onCheckedChange = { checked = it },
-                )
-            }
-        }
-    }
-}
 
 @Preview(name = "Log entries", showBackground = true)
 @Preview(name = "Log entries · dark", showBackground = true, uiMode = Configuration.UI_MODE_NIGHT_YES)
