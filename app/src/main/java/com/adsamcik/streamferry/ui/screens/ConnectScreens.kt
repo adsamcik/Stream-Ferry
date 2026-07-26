@@ -1,6 +1,8 @@
 package com.adsamcik.streamferry.ui.screens
 
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -18,7 +20,9 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Cast
+import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Dns
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material3.Button
@@ -40,6 +44,8 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -357,27 +363,113 @@ private fun QuickConnectPanelPreview() {
 
 @Composable
 fun ServersScreen(state: AppUiState, viewModel: MainViewModel) {
-    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Text("Your Jellyfin servers", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+    Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        Text(
+            "Your Jellyfin servers",
+            style = MaterialTheme.typography.headlineSmall,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.semantics { heading() },
+        )
+        Text(
+            "Choose where your library comes from. Server addresses stay private on this phone.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
         if (state.servers.isEmpty()) {
-            Text("No servers saved yet. Add one and it stays here even when offline.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = MaterialTheme.shapes.extraLarge,
+                color = MaterialTheme.colorScheme.surfaceContainerLow,
+            ) {
+                Text(
+                    "No servers saved yet. Add one and it stays available even when offline.",
+                    modifier = Modifier.padding(20.dp),
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
-        state.servers.forEach { s ->
-            Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(18.dp)) {
-                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text(s.name, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface)
-                    Text(s.baseUrlRedactedForUi, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    val status = if (s.active) "Active" else if (s.loggedIn) "Saved" else "Saved - not signed in"
-                    Text(status, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+        state.servers.forEach { server ->
+            val containerColor by animateColorAsState(
+                targetValue = if (server.active) {
+                    MaterialTheme.colorScheme.primaryContainer
+                } else {
+                    MaterialTheme.colorScheme.surfaceContainerLow
+                },
+                animationSpec = MaterialTheme.motionScheme.defaultEffectsSpec(),
+                label = "server card color",
+            )
+            val foreground = if (server.active) {
+                MaterialTheme.colorScheme.onPrimaryContainer
+            } else {
+                MaterialTheme.colorScheme.onSurface
+            }
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = MaterialTheme.shapes.extraLarge,
+                colors = CardDefaults.cardColors(containerColor = containerColor),
+            ) {
+                Column(
+                    Modifier.padding(18.dp).animateContentSize(MaterialTheme.motionScheme.defaultSpatialSpec()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            server.name,
+                            modifier = Modifier.weight(1f),
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.SemiBold,
+                            color = foreground,
+                        )
+                        if (server.active) {
+                            Surface(
+                                shape = MaterialTheme.shapes.large,
+                                color = MaterialTheme.colorScheme.primary,
+                                contentColor = MaterialTheme.colorScheme.onPrimary,
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Icon(Icons.Rounded.CheckCircle, contentDescription = null, modifier = Modifier.size(18.dp))
+                                    Text("Active", style = MaterialTheme.typography.labelLarge)
+                                }
+                            }
+                        }
+                    }
+                    Text(
+                        server.baseUrlRedactedForUi,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (server.active) foreground else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    if (!server.active) {
+                        Text(
+                            if (server.loggedIn) "Ready to use" else "Sign-in required",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                    }
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        if (!s.active) Button(onClick = { viewModel.switchServer(s.id) }, shape = RoundedCornerShape(16.dp)) { Text("Use") }
-                        OutlinedButton(onClick = { viewModel.forgetServer(s.id) }, shape = RoundedCornerShape(16.dp)) { Text("Forget") }
+                        if (!server.active) {
+                            Button(onClick = { viewModel.switchServer(server.id) }) { Text("Use server") }
+                        }
+                        OutlinedButton(onClick = { viewModel.forgetServer(server.id) }) { Text("Forget") }
                     }
                 }
             }
         }
-        Button(onClick = { viewModel.navigate(Route.SERVER_SETUP) }, modifier = Modifier.fillMaxWidth().height(50.dp), shape = RoundedCornerShape(16.dp)) {
-            Text("Add a server")
+        Button(
+            onClick = { viewModel.navigate(Route.SERVER_SETUP) },
+            modifier = Modifier.fillMaxWidth().height(54.dp),
+            shape = MaterialTheme.shapes.large,
+        ) {
+            Icon(Icons.Rounded.Add, contentDescription = null)
+            Text("Add a server", modifier = Modifier.padding(start = 8.dp))
         }
     }
 }
