@@ -24,7 +24,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
-import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
@@ -89,13 +88,22 @@ import kotlinx.coroutines.withContext
 
 private val compactNavigationBreakpoint = 600.dp
 private val compactHeightBreakpoint = 480.dp
-private val selfScrollingRoutes = setOf(Route.GALLERY, Route.DOWNLOADS, Route.DIAGNOSTICS, Route.SETTINGS)
+private val selfScrollingRoutes = setOf(
+    Route.GALLERY,
+    Route.MEDIA_DETAIL,
+    Route.TARGET_PICKER,
+    Route.PLAYBACK,
+    Route.DOWNLOADS,
+    Route.DIAGNOSTICS,
+    Route.SETTINGS,
+)
 private val upNavigationRoutes = setOf(
     Route.SERVER_SETUP,
     Route.LOGIN,
     Route.MEDIA_DETAIL,
     Route.TARGET_PICKER,
     Route.PLAYBACK,
+    Route.DOWNLOADS,
     Route.DIAGNOSTICS,
     Route.ABOUT,
     Route.SERVERS,
@@ -116,26 +124,41 @@ fun AppRoot(state: AppUiState, viewModel: MainViewModel, onScanDevices: () -> Un
 
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val useNavigationRail = maxWidth >= compactNavigationBreakpoint || maxHeight < compactHeightBreakpoint
-        val showTopLevelNavigation = state.route !in setOf(Route.WELCOME, Route.SERVER_SETUP, Route.LOGIN)
+        val showTopLevelNavigation = state.route !in setOf(
+            Route.WELCOME,
+            Route.SERVER_SETUP,
+            Route.LOGIN,
+            Route.PLAYBACK,
+        )
         val showMiniPlayer = state.playback != null && state.route != Route.PLAYBACK
+        val galleryOwnsPhoneHeader = !useNavigationRail && state.route == Route.GALLERY
 
         Scaffold(
             containerColor = MaterialTheme.colorScheme.surfaceContainerLowest,
             contentWindowInsets = WindowInsets.safeDrawing,
             topBar = {
-                TopAppBar(
-                    title = { Text(titleFor(state.route), fontWeight = FontWeight.Bold, maxLines = 1) },
-                    navigationIcon = { if (showUpNavigation && back != null) IconBack(back) },
-                    colors = TopAppBarDefaults.topAppBarColors(
-                        containerColor = MaterialTheme.colorScheme.surfaceContainer,
-                        titleContentColor = MaterialTheme.colorScheme.onSurface,
-                    ),
-                )
+                if (!galleryOwnsPhoneHeader) {
+                    TopAppBar(
+                        title = { Text(titleFor(state.route), fontWeight = FontWeight.Bold, maxLines = 1) },
+                        navigationIcon = { if (showUpNavigation && back != null) IconBack(back) },
+                        colors = TopAppBarDefaults.topAppBarColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceContainer,
+                            titleContentColor = MaterialTheme.colorScheme.onSurface,
+                        ),
+                    )
+                }
             },
             bottomBar = {
                 if (!useNavigationRail && showTopLevelNavigation) {
                     Column {
-                        if (showMiniPlayer) MiniPlayer(state, viewModel)
+                        if (showMiniPlayer) {
+                            MiniPlayer(
+                                state = state,
+                                viewModel = viewModel,
+                                compact = true,
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                            )
+                        }
                         CompactNavigation(state, viewModel)
                     }
                 }
@@ -200,7 +223,12 @@ private fun ScreenContent(
         Route.PLAYBACK -> 1_120.dp
         else -> 960.dp
     }
-    val outerPadding = if (expanded) 24.dp else 16.dp
+    val outerPadding = when {
+        expanded -> 24.dp
+        state.route == Route.GALLERY -> 12.dp
+        else -> 16.dp
+    }
+    val topPadding = if (!expanded && state.route == Route.GALLERY) 8.dp else 12.dp
     val bottomPadding = if (reserveMiniPlayerSpace) 104.dp else 12.dp
 
     Box(
@@ -210,7 +238,7 @@ private fun ScreenContent(
         val baseModifier = Modifier
             .fillMaxHeight()
             .widthIn(max = maxContentWidth)
-            .padding(start = outerPadding, end = outerPadding, top = 12.dp, bottom = bottomPadding)
+            .padding(start = outerPadding, end = outerPadding, top = topPadding, bottom = bottomPadding)
             .imePadding()
 
         if (state.route in selfScrollingRoutes) {
@@ -227,7 +255,7 @@ private fun ScreenContent(
                         .weight(1f)
                         .fillMaxWidth(),
                 ) {
-                    RouteContent(state, viewModel, onScanDevices, context)
+                    RouteContent(state, viewModel, onScanDevices, context, compact = !expanded)
                 }
             }
         } else {
@@ -243,7 +271,7 @@ private fun ScreenContent(
                         modifier = Modifier.padding(bottom = 12.dp),
                     )
                 }
-                RouteContent(state, viewModel, onScanDevices, context)
+                RouteContent(state, viewModel, onScanDevices, context, compact = !expanded)
             }
         }
     }
@@ -255,6 +283,7 @@ private fun RouteContent(
     viewModel: MainViewModel,
     onScanDevices: () -> Unit,
     context: android.content.Context,
+    compact: Boolean,
 ) {
     when (state.route) {
         Route.WELCOME -> WelcomeScreen(
@@ -264,8 +293,8 @@ private fun RouteContent(
         )
         Route.SERVER_SETUP -> ServerSetupScreen(state, viewModel)
         Route.LOGIN -> LoginScreen(state, viewModel)
-        Route.GALLERY -> GalleryScreen(state, viewModel)
-        Route.MEDIA_DETAIL -> MediaDetailScreen(state, viewModel, onChooseTv = onScanDevices)
+        Route.GALLERY -> GalleryScreen(state, viewModel, compact = compact)
+        Route.MEDIA_DETAIL -> MediaDetailScreen(state, viewModel, onChooseTv = onScanDevices, compact = compact)
         Route.TARGET_PICKER -> TargetPickerScreen(state, viewModel, onRescan = onScanDevices)
         Route.PLAYBACK -> PlaybackScreen(state, viewModel)
         Route.DOWNLOADS -> DownloadsScreen(state, viewModel, onCast = onScanDevices)
@@ -320,12 +349,6 @@ private fun CompactNavigation(state: AppUiState, viewModel: MainViewModel) {
             label = { Text("Library") },
         )
         NavigationBarItem(
-            selected = selected == TopLevelDestination.DOWNLOADS,
-            onClick = { viewModel.openDownloads() },
-            icon = { Icon(Icons.Rounded.Download, contentDescription = null) },
-            label = { Text("Downloads") },
-        )
-        NavigationBarItem(
             selected = selected == TopLevelDestination.SETTINGS,
             onClick = { viewModel.navigate(Route.SETTINGS) },
             icon = { Icon(Icons.Rounded.Settings, contentDescription = null) },
@@ -346,13 +369,6 @@ private fun WideNavigation(state: AppUiState, viewModel: MainViewModel) {
             alwaysShowLabel = true,
         )
         NavigationRailItem(
-            selected = selected == TopLevelDestination.DOWNLOADS,
-            onClick = { viewModel.openDownloads() },
-            icon = { Icon(Icons.Rounded.Download, contentDescription = null) },
-            label = { Text("Downloads") },
-            alwaysShowLabel = true,
-        )
-        NavigationRailItem(
             selected = selected == TopLevelDestination.SETTINGS,
             onClick = { viewModel.navigate(Route.SETTINGS) },
             icon = { Icon(Icons.Rounded.Settings, contentDescription = null) },
@@ -367,6 +383,7 @@ private fun MiniPlayer(
     state: AppUiState,
     viewModel: MainViewModel,
     modifier: Modifier = Modifier,
+    compact: Boolean = false,
 ) {
     val playback = state.playback ?: return
     val title = state.selectedItem?.title?.takeIf(String::isNotBlank) ?: "Now playing"
@@ -382,7 +399,7 @@ private fun MiniPlayer(
     Surface(
         modifier = modifier
             .fillMaxWidth()
-            .heightIn(min = 76.dp)
+            .heightIn(min = if (compact) 64.dp else 76.dp)
             .semantics {
                 stateDescription = playbackState
                 progress?.let { progressBarRangeInfo = ProgressBarRangeInfo(it, 0f..1f) }
@@ -401,18 +418,23 @@ private fun MiniPlayer(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                    .padding(horizontal = if (compact) 12.dp else 16.dp, vertical = if (compact) 6.dp else 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 Icon(Icons.Rounded.Tv, contentDescription = null)
                 Column(Modifier.weight(1f)) {
-                    Text(title, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(
+                        title,
+                        style = if (compact) MaterialTheme.typography.titleSmall else MaterialTheme.typography.titleMedium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
                     Text(playbackState, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
                 FilledIconButton(
                     onClick = { viewModel.togglePlayPause() },
-                    modifier = Modifier.size(48.dp),
+                    modifier = Modifier.size(if (compact) 40.dp else 48.dp),
                 ) {
                     Icon(
                         if (playback.isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,

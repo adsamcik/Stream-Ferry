@@ -2,14 +2,14 @@
 # Verified locally: Kotlin 2.4.0 (kotlinc on the build host), Android SDK Platform 37 / build-tools 37.0.0 present.
 # AGP 9.2.1 supports compileSdk 37 (developer.android.com AGP 9.2 release notes); requires Gradle >= 9.4.1 (wrapper pins 9.5.1).
 agp = "9.2.1"
-kotlin = "2.4.0"
+kotlin = "2.4.10"
 
 # AndroidX / Compose. Compose BOM + Cast versions must be re-verified at first online build
 # (this sandbox blocks dl.google.com, so they could not be resolved here — see docs/BUILD.md).
-coreKtx = "1.15.0"
-lifecycle = "2.9.0"
-activityCompose = "1.9.3"
-composeBom = "2026.06.00"
+coreKtx = "1.19.0"
+lifecycle = "2.11.0"
+activityCompose = "1.13.0"
+composeBom = "2026.06.01"
 
 # Google Cast Sender SDK (Google Play services).
 castFramework = "22.3.1"
@@ -18,9 +18,9 @@ castFramework = "22.3.1"
 jellyfinSdk = "1.8.11"
 
 # Networking / serialization (Maven Central).
-okhttp = "4.12.0"
-coroutines = "1.9.0"
-serialization = "1.7.3"
+okhttp = "5.4.0"
+coroutines = "1.11.0"
+serialization = "1.11.0"
 
 # Image loading for in-app posters/thumbnails (Maven Central). Coil shares the app OkHttp client so the
 # Jellyfin token is sent only as a header (never in the image URL), and is configured memory-cache-only.
@@ -33,8 +33,8 @@ media3 = "1.10.1"
 junit = "4.13.2"
 androidxTestJunit = "1.3.0"
 espresso = "3.7.0"
-robolectric = "4.14.1"
-mockk = "1.13.13"
+robolectric = "4.16.1"
+mockk = "1.14.11"
 
 [libraries]
 androidx-core-ktx = { module = "androidx.core:core-ktx", version.ref = "coreKtx" }

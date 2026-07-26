@@ -77,7 +77,7 @@ class NavigationStatePolicyTest {
     @Test
     fun `top level grouping follows the durable information architecture`() {
         assertEquals(TopLevelDestination.LIBRARY, NavigationStatePolicy.topLevelFor(Route.MEDIA_DETAIL))
-        assertEquals(TopLevelDestination.DOWNLOADS, NavigationStatePolicy.topLevelFor(Route.DOWNLOADS))
+        assertEquals(TopLevelDestination.SETTINGS, NavigationStatePolicy.topLevelFor(Route.DOWNLOADS))
         assertEquals(TopLevelDestination.SETTINGS, NavigationStatePolicy.topLevelFor(Route.DIAGNOSTICS))
     }
 }

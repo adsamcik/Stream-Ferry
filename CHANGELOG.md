@@ -12,6 +12,8 @@ there is **no telemetry** and nothing leaves the device unless you share a repor
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-26
+
 ### Changed
 - Reworked the Compose UI around three durable destinations (Library, Downloads, and Settings),
   adaptive bottom/rail navigation, bounded large-screen content, stable expressive colour/shape/type

@@ -6,9 +6,12 @@ import okhttp3.Dns
 import okhttp3.OkHttpClient
 import java.net.Inet4Address
 import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.net.URI
 import java.net.UnknownHostException
 import java.util.concurrent.TimeUnit
+import javax.net.SocketFactory
 
 /**
  * Trust policy for URLs learned from SSDP/device descriptions. It is deliberately distinct from the
@@ -22,6 +25,7 @@ class RendererEndpointPolicy(private val networkInfo: NetworkInfoProvider) {
         val host: String,
         val addresses: List<InetAddress>,
         val network: Network,
+        val localAddress: InetAddress,
     )
 
     /** Validate LOCATION and require it to resolve to the exact source that sent the SSDP reply. */
@@ -33,14 +37,16 @@ class RendererEndpointPolicy(private val networkInfo: NetworkInfoProvider) {
         resolve(rawUrl, requiredSource = null, expectedNetwork = location.network, expectedAddresses = location.addresses)
 
     /**
-     * Every request uses the selected physical LAN Network plus a DNS implementation that returns only
-     * the addresses validated at discovery time. This prevents default-route fallback and DNS rebinding.
+     * Every request is bound to the selected physical LAN address plus a DNS implementation that returns
+     * only addresses validated at discovery time. Direct address binding is important on Android 16
+     * vendor kernels that reject `Network.socketFactory` with EPERM while a VPN is active; it still keeps
+     * renderer traffic off the VPN because the socket's source is the verified Wi-Fi/Ethernet address.
      */
     fun client(base: OkHttpClient, endpoint: Endpoint, timeoutMillis: Long): OkHttpClient = base.newBuilder()
         .followRedirects(false)
         .followSslRedirects(false)
         .callTimeout(timeoutMillis.coerceAtLeast(1), TimeUnit.MILLISECONDS)
-        .socketFactory(endpoint.network.socketFactory)
+        .socketFactory(LocalAddressSocketFactory(endpoint.localAddress))
         .dns(object : Dns {
             override fun lookup(hostname: String): List<InetAddress> {
                 if (!hostname.equals(endpoint.host, ignoreCase = true)) {
@@ -68,16 +74,26 @@ class RendererEndpointPolicy(private val networkInfo: NetworkInfoProvider) {
 
         val selectedNetwork = expectedNetwork ?: networkInfo.lanNetwork() ?: return null
         if (expectedNetwork != null && networkInfo.lanNetwork() != expectedNetwork) return null
-        val addresses = runCatching { selectedNetwork.getAllByName(host).toList() }.getOrNull()?.distinct().orEmpty()
+        // Literal renderer addresses need no DNS. Avoiding Network.getAllByName here also sidesteps
+        // Samsung/VPN resolver stalls after SSDP has already proved the peer's exact source address.
+        val addresses = runCatching {
+            if (isIpv4Literal(host)) listOf(InetAddress.getByName(host))
+            else selectedNetwork.getAllByName(host).toList()
+        }.getOrNull()?.distinct().orEmpty()
         if (addresses.isEmpty() || addresses.any { !isApprovedRendererAddress(it) }) return null
         if (requiredSource != null && addresses.none { it == requiredSource }) return null
         if (expectedAddresses != null && addresses.any { it !in expectedAddresses }) return null
+        val localAddress = networkInfo.lanIpv4()
+            ?.let { runCatching { InetAddress.getByName(it) }.getOrNull() as? Inet4Address }
+            ?.takeIf { it.isSiteLocalAddress }
+            ?: return null
 
         return Endpoint(
             url = uri.normalize().toString(),
             host = host,
             addresses = addresses,
             network = selectedNetwork,
+            localAddress = localAddress,
         )
     }
 
@@ -91,5 +107,36 @@ class RendererEndpointPolicy(private val networkInfo: NetworkInfoProvider) {
 
     private fun isIpv4Literal(host: String): Boolean = host.split('.').let { parts ->
         parts.size == 4 && parts.all { part -> part.toIntOrNull()?.let { it in 0..255 } == true }
+    }
+
+    /** SocketFactory equivalent of binding a UDP socket to the physical LAN interface/address. */
+    private class LocalAddressSocketFactory(private val localAddress: InetAddress) : SocketFactory() {
+        private fun unconnected(): Socket = Socket().apply {
+            reuseAddress = true
+            bind(InetSocketAddress(localAddress, 0))
+        }
+
+        override fun createSocket(): Socket = unconnected()
+
+        override fun createSocket(host: String, port: Int): Socket =
+            unconnected().apply { connect(InetSocketAddress(host, port)) }
+
+        override fun createSocket(host: String, port: Int, localHost: InetAddress, localPort: Int): Socket =
+            unconnected().apply { connect(InetSocketAddress(host, port)) }
+
+        override fun createSocket(host: InetAddress, port: Int): Socket =
+            unconnected().apply { connect(InetSocketAddress(host, port)) }
+
+        override fun createSocket(
+            address: InetAddress,
+            port: Int,
+            localAddress: InetAddress,
+            localPort: Int,
+        ): Socket = unconnected().apply { connect(InetSocketAddress(address, port)) }
+
+        override fun equals(other: Any?): Boolean =
+            other is LocalAddressSocketFactory && other.localAddress == localAddress
+
+        override fun hashCode(): Int = localAddress.hashCode()
     }
 }

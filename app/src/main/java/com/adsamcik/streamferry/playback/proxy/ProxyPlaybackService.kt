@@ -1,8 +1,6 @@
 package com.adsamcik.streamferry.playback.proxy
 
 import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -11,11 +9,11 @@ import android.net.wifi.WifiManager
 import android.os.IBinder
 import android.os.PowerManager
 import android.os.SystemClock
-import com.adsamcik.streamferry.R
 import com.adsamcik.streamferry.app.StreamFerryApplication
 import com.adsamcik.streamferry.app.startForegroundCompat
 import com.adsamcik.streamferry.logging.DiagnosticsLogger
 import com.adsamcik.streamferry.playback.MediaSessionController
+import com.adsamcik.streamferry.playback.PlaybackNotificationFactory
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.withTimeoutOrNull
@@ -65,14 +63,14 @@ class ProxyPlaybackService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START -> startForegroundPlayback(
-                intent?.getLongExtra(EXTRA_FOREGROUND_LATCH_TOKEN, NO_FOREGROUND_LATCH_TOKEN) ?: NO_FOREGROUND_LATCH_TOKEN,
+                intent.getLongExtra(EXTRA_FOREGROUND_LATCH_TOKEN, NO_FOREGROUND_LATCH_TOKEN),
             )
             ACTION_STOP -> stopSelfSafely()
-            MediaSessionController.ACTION_PLAY,
-            MediaSessionController.ACTION_PAUSE,
-            MediaSessionController.ACTION_STOP,
-            MediaSessionController.ACTION_FFWD,
-            MediaSessionController.ACTION_RWND,
+            PlaybackNotificationFactory.ACTION_PLAY,
+            PlaybackNotificationFactory.ACTION_PAUSE,
+            PlaybackNotificationFactory.ACTION_STOP,
+            PlaybackNotificationFactory.ACTION_FFWD,
+            PlaybackNotificationFactory.ACTION_RWND,
             -> controller?.dispatch(intent.action)
             else -> {
                 // Any other delivery (a null/unknown action, or a redelivered startForegroundService()
@@ -123,7 +121,11 @@ class ProxyPlaybackService : Service() {
         notification: Notification,
         foregroundLatchToken: Long = NO_FOREGROUND_LATCH_TOKEN,
     ) {
-        startForegroundCompat(MediaSessionController.NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+        startForegroundCompat(
+            PlaybackNotificationFactory.NOTIFICATION_ID,
+            notification,
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
+        )
         // Release the playback engine, which armed this latch and is deliberately blocked BEFORE the
         // (main-thread-saturating) renderer handshake until the startForegroundService() obligation is met.
         if (foregroundLatchToken != NO_FOREGROUND_LATCH_TOKEN) {
@@ -132,20 +134,7 @@ class ProxyPlaybackService : Service() {
     }
 
     /** Cheap, dependency-free notification used to enter the foreground within the deadline (then upgraded). */
-    private fun fallbackNotification(): Notification {
-        val nm = getSystemService(NotificationManager::class.java)
-        if (nm.getNotificationChannel(MediaSessionController.CHANNEL_ID) == null) {
-            nm.createNotificationChannel(
-                NotificationChannel(MediaSessionController.CHANNEL_ID, getString(R.string.notif_channel_playback), NotificationManager.IMPORTANCE_LOW),
-            )
-        }
-        return Notification.Builder(this, MediaSessionController.CHANNEL_ID)
-            .setContentTitle(getString(R.string.app_name))
-            .setContentText(getString(R.string.notif_playing))
-            .setSmallIcon(android.R.drawable.stat_sys_upload)
-            .setOngoing(true)
-            .build()
-    }
+    private fun fallbackNotification(): Notification = PlaybackNotificationFactory.fallback(this)
 
     private fun stopSelfSafely() {
         // The PlaybackSessionCoordinator owns proxy.stop(); here we release our wake/Wi-Fi locks and

@@ -22,7 +22,7 @@ android {
         // from its validated v<major>.<minor>.<patch> tag so every Play upload gets a new,
         // monotonically increasing versionCode.
         versionCode = providers.gradleProperty("versionCode").orNull?.toIntOrNull() ?: 3000
-        versionName = providers.gradleProperty("versionName").orNull ?: "0.3.0"
+        versionName = providers.gradleProperty("versionName").orNull ?: "0.3.1"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
     }

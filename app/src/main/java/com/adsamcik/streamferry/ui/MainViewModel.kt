@@ -38,6 +38,8 @@ import com.adsamcik.streamferry.ui.state.Route
 import com.adsamcik.streamferry.ui.state.toUiState
 import com.adsamcik.streamferry.BuildConfig
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
@@ -691,12 +693,11 @@ class MainViewModel(
             onLocalNetworkPermissionDenied()
             return
         }
-        // The framework MediaRouteButton owns live Cast discovery/route updates. This transaction is for
-        // the adjacent DLNA list only, so it never keeps a second active Cast scan alive in the picker.
+        // Enumerate both protocols. The framework chooser remains available, but the app-level Cast scan
+        // is what makes Cast TVs visible alongside DLNA results without requiring an extra dialog tap.
         scanJob?.cancel()
         scanJob = viewModelScope.launch {
             try {
-                container.castController.stopDiscovery()
                 _state.update {
                     it.copy(
                         route = Route.TARGET_PICKER,
@@ -706,27 +707,52 @@ class MainViewModel(
                         localNetworkPermissionGranted = true,
                     )
                 }
-                // Cast module initialization is activity-owned and asynchronous. Its result controls the
-                // framework button; discovery itself is owned by that button rather than this snapshot.
                 val castReady = container.awaitCastContext() != null
-                val dlnaResult = try {
-                    Result.success(container.dlnaController.discover(DLNA_SCAN_MS))
-                } catch (c: CancellationException) {
-                    throw c
-                } catch (e: Exception) {
-                    Result.failure(e)
+                val (castResult, dlnaResult) = coroutineScope {
+                    val cast = async {
+                        if (!castReady) {
+                            Result.success(emptyList<DiscoveredTarget>())
+                        } else {
+                            try {
+                                Result.success(container.castController.discover(CAST_SCAN_MS))
+                            } catch (c: CancellationException) {
+                                throw c
+                            } catch (e: Exception) {
+                                Result.failure(e)
+                            }
+                        }
+                    }
+                    val dlna = async {
+                        try {
+                            Result.success(container.dlnaController.discover(DLNA_SCAN_MS))
+                        } catch (c: CancellationException) {
+                            throw c
+                        } catch (e: Exception) {
+                            Result.failure(e)
+                        }
+                    }
+                    cast.await() to dlna.await()
                 }
+                castResult.exceptionOrNull()?.let { container.logger.w("discovery", "Cast discovery failed", it) }
                 dlnaResult.exceptionOrNull()?.let { container.logger.w("discovery", "DLNA discovery failed", it) }
+                val cast = castResult.getOrDefault(emptyList())
                 val dlna = dlnaResult.getOrDefault(emptyList())
-                val scanError = if (dlnaResult.isFailure) {
-                    "Couldn't scan for DLNA devices. You can still select a Cast device."
-                } else null
+                val scanError = when {
+                    castResult.isFailure && dlnaResult.isFailure ->
+                        "Couldn't scan for TVs. Check the local network and try again."
+                    castResult.isFailure ->
+                        "Couldn't scan for Cast devices. Other smart TVs may still appear."
+                    dlnaResult.isFailure ->
+                        "Couldn't scan for other smart TVs. Cast devices may still appear."
+                    else -> null
+                }
                 _state.update { current ->
                     current.copy(
                         castAvailable = castReady,
-                        castTargets = emptyList(),
+                        castTargets = cast,
                         dlnaTargets = dlna,
-                        // Cast selection is framework-owned. Only invalidate a vanished DLNA snapshot.
+                        // A framework-selected Cast route may be temporarily absent from an enumeration;
+                        // retain it. DLNA selections are tied to the current descriptor snapshot.
                         selectedTarget = current.selectedTarget?.takeIf { selected ->
                             selected.protocol == Protocol.CAST ||
                                 dlna.any { it.protocol == selected.protocol && it.id == selected.id }
@@ -1600,7 +1626,8 @@ class MainViewModel(
         const val STATE_DOWNLOADS_ORIGIN = "navigation.downloads_origin"
         const val STATE_SOURCE = "gallery.source"
         const val STATE_SEARCH_QUERY = "gallery.search_query"
-        const val DLNA_SCAN_MS = 4_000L
+        const val CAST_SCAN_MS = 4_000L
+        const val DLNA_SCAN_MS = 6_000L
         const val QUICK_CONNECT_POLL_MS = 3_000L
         const val LIBRARY_ERROR = "Couldn't load your library. Check the connection and try again."
         const val SEARCH_DEBOUNCE_MS = 350L

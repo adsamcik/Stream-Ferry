@@ -6,7 +6,7 @@ import com.adsamcik.streamferry.ui.state.Route
 /** Pure route policy shared by the app shell, saved-state restoration, and JVM tests. */
 internal object NavigationStatePolicy {
 
-    enum class TopLevelDestination { LIBRARY, DOWNLOADS, SETTINGS }
+    enum class TopLevelDestination { LIBRARY, SETTINGS }
 
     data class Availability(
         val hasActivePlayback: Boolean = false,
@@ -26,8 +26,8 @@ internal object NavigationStatePolicy {
     )
 
     fun topLevelFor(route: Route): TopLevelDestination = when (route) {
-        Route.DOWNLOADS -> TopLevelDestination.DOWNLOADS
-        Route.SETTINGS, Route.SERVERS, Route.DIAGNOSTICS, Route.ABOUT -> TopLevelDestination.SETTINGS
+        Route.DOWNLOADS, Route.SETTINGS, Route.SERVERS, Route.DIAGNOSTICS, Route.ABOUT ->
+            TopLevelDestination.SETTINGS
         else -> TopLevelDestination.LIBRARY
     }
 

@@ -45,6 +45,7 @@ import java.net.DatagramPacket
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.MulticastSocket
+import java.net.NetworkInterface
 import java.net.SocketTimeoutException
 
 /**
@@ -124,11 +125,7 @@ class DlnaTargetController(
         val descriptionJobs = mutableListOf<Deferred<DiscoveredTarget?>>()
         val limiter = SsdpDiscoveryLimiter()
         val semaphore = Semaphore(MAX_CONCURRENT_DESCRIPTIONS)
-        val socket = MulticastSocket()
-        if (!bindSsdpToLan(socket)) {
-            runCatching { socket.close() }
-            return@coroutineScope emptyList()
-        }
+        val socket = openSsdpSocket() ?: return@coroutineScope emptyList()
         socket.use { s ->
             val msearch = (
                 "M-SEARCH * HTTP/1.1\r\n" +
@@ -203,22 +200,52 @@ class DlnaTargetController(
         targets
     }
 
-    /** Pin outgoing SSDP multicast to the selected physical LAN and reject any default-route fallback. */
-    private fun bindSsdpToLan(socket: MulticastSocket): Boolean {
+    /**
+     * Open SSDP on the selected physical LAN. The socket starts unbound so Android can attach it to
+     * the Wi-Fi [android.net.Network] before a local port is allocated. Some Android 16 vendor kernels
+     * reject `Network.bindSocket` for an already-bound UDP socket with EPERM while a VPN is active.
+     *
+     * If the platform still rejects network attachment, bind explicitly to the same LAN address and
+     * network interface. That fallback remains pinned to Wi-Fi/Ethernet and cannot silently use the VPN.
+     */
+    private fun openSsdpSocket(): MulticastSocket? {
         val lanNetwork = network.lanNetwork() ?: run {
             logger.trace(TAG, "No selected physical LAN network for SSDP discovery")
-            return false
+            return null
         }
-        if (network.lanIpv4() == null) {
+        val lanAddress = network.lanIpv4()?.let { runCatching { InetAddress.getByName(it) }.getOrNull() } ?: run {
             logger.trace(TAG, "No LAN IPv4 address for SSDP discovery")
-            return false
+            return null
         }
+        val lanInterface = runCatching { NetworkInterface.getByInetAddress(lanAddress) }.getOrNull()
+
+        val networkBound = MulticastSocket(null)
+        runCatching {
+            networkBound.reuseAddress = true
+            lanNetwork.bindSocket(networkBound)
+            networkBound.bind(InetSocketAddress(lanAddress, 0))
+            lanInterface?.let { networkBound.networkInterface = it }
+            return networkBound
+        }.onFailure { error ->
+            runCatching { networkBound.close() }
+            logger.trace(
+                TAG,
+                "Android rejected SSDP Network binding; trying the physical LAN interface " +
+                    "(${error.javaClass.simpleName}: ${error.message ?: "no detail"})",
+            )
+        }
+
+        val interfaceBound = MulticastSocket(null)
         return runCatching {
-            lanNetwork.bindSocket(socket)
-            true
+            interfaceBound.reuseAddress = true
+            lanInterface?.let { interfaceBound.networkInterface = it }
+            interfaceBound.bind(InetSocketAddress(lanAddress, 0))
+            logger.trace(TAG, "SSDP socket pinned directly to the physical LAN interface")
+            interfaceBound
         }.onFailure {
-            logger.w(TAG, "Couldn't bind SSDP to the selected LAN; discovery skipped", it)
-        }.getOrDefault(false)
+            runCatching { interfaceBound.close() }
+            logger.w(TAG, "Couldn't bind SSDP to the physical LAN; discovery skipped", it)
+        }.getOrNull()
     }
 
     private fun describe(

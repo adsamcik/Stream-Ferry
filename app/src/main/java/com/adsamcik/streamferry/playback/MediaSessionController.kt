@@ -1,21 +1,18 @@
 package com.adsamcik.streamferry.playback
 
 import android.app.Notification
-import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
-import android.content.Intent
-import android.graphics.drawable.Icon
 import android.media.MediaMetadata
 import android.media.VolumeProvider
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import com.adsamcik.streamferry.R
 import com.adsamcik.streamferry.core.metadata.MetadataSanitizer
-import com.adsamcik.streamferry.playback.proxy.ProxyPlaybackService
 
 /**
  * Bridges the [PlaybackEngine] to the Android media framework so the user gets real **playback
@@ -57,16 +54,24 @@ class MediaSessionController(
                 override fun onSeekTo(pos: Long) = transport.onSeekTo(pos / 1000)
                 override fun onFastForward() = transport.onSkip(SKIP_SECONDS)
                 override fun onRewind() = transport.onSkip(-SKIP_SECONDS)
+                override fun onCustomAction(action: String, extras: android.os.Bundle?) = dispatch(action)
             },
             Handler(Looper.getMainLooper()),
         )
+        contentIntent?.let(::setSessionActivity)
         setPlaybackToRemote(volumeProvider())
     }
 
     val token: MediaSession.Token get() = session.sessionToken
 
+    private val notificationFactory = PlaybackNotificationFactory(appContext, session.sessionToken, contentIntent)
+
     @Volatile
-    private var lastNotification: Notification = buildNotification("Stream Ferry", "Preparing…", playing = false)
+    private var lastNotification: Notification = notificationFactory.build(
+        title = appContext.getString(R.string.app_name),
+        targetName = null,
+        phase = PlaybackNotificationFactory.Phase.PREPARING,
+    )
 
     private fun volumeProvider(): VolumeProvider =
         object : VolumeProvider(VOLUME_CONTROL_RELATIVE, MAX_VOLUME, MAX_VOLUME) {
@@ -87,44 +92,55 @@ class MediaSessionController(
             session.isActive = false
             return
         }
-        ensureChannel()
         session.isActive = true
         val title = MetadataSanitizer.receiverTitle(status.title)
-        session.setMetadata(
-            MediaMetadata.Builder()
-                .putString(MediaMetadata.METADATA_KEY_TITLE, title)
-                .putString(MediaMetadata.METADATA_KEY_ARTIST, "${status.targetName} · ${status.protocolName}")
-                .putLong(MediaMetadata.METADATA_KEY_DURATION, (status.durationSeconds ?: 0L) * 1000)
-                .build(),
-        )
+        val targetName = MetadataSanitizer.normalize(status.targetName, MAX_DEVICE_NAME_UTF8_BYTES)
+            .ifBlank { appContext.getString(R.string.notif_your_tv) }
+        val metadata = MediaMetadata.Builder()
+            .putString(MediaMetadata.METADATA_KEY_TITLE, title)
+            .putString(MediaMetadata.METADATA_KEY_DISPLAY_TITLE, title)
+            .putString(MediaMetadata.METADATA_KEY_ARTIST, targetName)
+            .putString(MediaMetadata.METADATA_KEY_DISPLAY_SUBTITLE, targetName)
+            .apply {
+                status.durationSeconds
+                    ?.takeIf { it > 0L }
+                    ?.let { putLong(MediaMetadata.METADATA_KEY_DURATION, it * 1000) }
+            }
+            .build()
+        session.setMetadata(metadata)
         val playerState = when {
             status.isBuffering -> PlaybackState.STATE_BUFFERING
             status.isPlaying -> PlaybackState.STATE_PLAYING
             else -> PlaybackState.STATE_PAUSED
         }
         session.setPlaybackState(stateOf(playerState, status.positionSeconds * 1000, status.isPlaying))
-        lastNotification = buildNotification(
+        val phase = when {
+            status.isBuffering -> PlaybackNotificationFactory.Phase.BUFFERING
+            status.isPlaying -> PlaybackNotificationFactory.Phase.PLAYING
+            else -> PlaybackNotificationFactory.Phase.PAUSED
+        }
+        lastNotification = notificationFactory.build(
             title = title,
-            text = "${status.targetName} · ${if (status.isBuffering) "buffering" else if (status.isPlaying) "playing" else "paused"}",
-            playing = status.isPlaying,
+            targetName = targetName,
+            phase = phase,
         )
-        runCatching { notificationManager.notify(NOTIF_ID, lastNotification) }
+        runCatching { notificationManager.notify(PlaybackNotificationFactory.NOTIFICATION_ID, lastNotification) }
     }
 
     /** The current notification (the foreground service uses it for `startForeground`). */
     fun currentNotification(): Notification {
-        ensureChannel()
+        PlaybackNotificationFactory.ensureChannel(appContext)
         return lastNotification
     }
 
     /** Route a notification/media action (sent to the service) to the engine. */
     fun dispatch(action: String?) {
         when (action) {
-            ACTION_PLAY -> transport.onPlay()
-            ACTION_PAUSE -> transport.onPause()
-            ACTION_STOP -> transport.onStop()
-            ACTION_FFWD -> transport.onSkip(SKIP_SECONDS)
-            ACTION_RWND -> transport.onSkip(-SKIP_SECONDS)
+            PlaybackNotificationFactory.ACTION_PLAY -> transport.onPlay()
+            PlaybackNotificationFactory.ACTION_PAUSE -> transport.onPause()
+            PlaybackNotificationFactory.ACTION_STOP -> transport.onStop()
+            PlaybackNotificationFactory.ACTION_FFWD -> transport.onSkip(SKIP_SECONDS)
+            PlaybackNotificationFactory.ACTION_RWND -> transport.onSkip(-SKIP_SECONDS)
         }
     }
 
@@ -134,67 +150,24 @@ class MediaSessionController(
     }
 
     private fun stateOf(state: Int, positionMs: Long, playing: Boolean): PlaybackState =
-        PlaybackState.Builder()
-            .setState(state, positionMs, if (playing) 1f else 0f)
-            .setActions(
-                PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE or PlaybackState.ACTION_PLAY_PAUSE or
-                    PlaybackState.ACTION_STOP or PlaybackState.ACTION_SEEK_TO or
-                    PlaybackState.ACTION_FAST_FORWARD or PlaybackState.ACTION_REWIND,
-            )
-            .build()
-
-    private fun buildNotification(title: String, text: String, playing: Boolean): Notification {
-        val playPause = if (playing) {
-            action(android.R.drawable.ic_media_pause, "Pause", ACTION_PAUSE)
-        } else {
-            action(android.R.drawable.ic_media_play, "Play", ACTION_PLAY)
-        }
-        val style = Notification.MediaStyle()
-            .setMediaSession(session.sessionToken)
-            .setShowActionsInCompactView(0, 1, 2)
-        val builder = Notification.Builder(appContext, CHANNEL_ID)
-            .setContentTitle(title)
-            .setContentText(text)
-            .setSmallIcon(android.R.drawable.stat_sys_upload)
-            .setOngoing(playing)
-            // Keep server-provided title metadata off a locked device while preserving transport controls.
-            .setVisibility(Notification.VISIBILITY_PRIVATE)
-            .setStyle(style)
-            .addAction(action(android.R.drawable.ic_media_rew, "Rewind", ACTION_RWND))
-            .addAction(playPause)
-            .addAction(action(android.R.drawable.ic_media_ff, "Forward", ACTION_FFWD))
-            .addAction(action(android.R.drawable.ic_menu_close_clear_cancel, "Stop", ACTION_STOP))
-        contentIntent?.let { builder.setContentIntent(it) }
-        return builder.build()
-    }
-
-    private fun action(iconRes: Int, title: String, action: String): Notification.Action {
-        val intent = Intent(appContext, ProxyPlaybackService::class.java).setAction(action)
-        val pi = PendingIntent.getService(
-            appContext, action.hashCode(), intent,
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-        )
-        return Notification.Action.Builder(Icon.createWithResource(appContext, iconRes), title, pi).build()
-    }
-
-    private fun ensureChannel() {
-        if (notificationManager.getNotificationChannel(CHANNEL_ID) == null) {
-            notificationManager.createNotificationChannel(
-                NotificationChannel(CHANNEL_ID, appContext.getString(R.string.notif_channel_playback), NotificationManager.IMPORTANCE_LOW),
-            )
-        }
-    }
+        notificationFactory.addSystemControls(
+            PlaybackState.Builder()
+                .setState(
+                    state,
+                    positionMs.coerceAtLeast(0L),
+                    if (playing) 1f else 0f,
+                    SystemClock.elapsedRealtime(),
+                )
+                .setActions(
+                    PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE or PlaybackState.ACTION_PLAY_PAUSE or
+                        PlaybackState.ACTION_STOP or PlaybackState.ACTION_SEEK_TO or
+                        PlaybackState.ACTION_FAST_FORWARD or PlaybackState.ACTION_REWIND,
+                ),
+        ).build()
 
     companion object {
-        const val CHANNEL_ID = "playback"
-        const val NOTIF_ID = 1001
         private const val MAX_VOLUME = 20
         private const val SKIP_SECONDS = 30L
-
-        const val ACTION_PLAY = "com.adsamcik.streamferry.media.PLAY"
-        const val ACTION_PAUSE = "com.adsamcik.streamferry.media.PAUSE"
-        const val ACTION_STOP = "com.adsamcik.streamferry.media.STOP"
-        const val ACTION_FFWD = "com.adsamcik.streamferry.media.FFWD"
-        const val ACTION_RWND = "com.adsamcik.streamferry.media.RWND"
+        private const val MAX_DEVICE_NAME_UTF8_BYTES = 160
     }
 }

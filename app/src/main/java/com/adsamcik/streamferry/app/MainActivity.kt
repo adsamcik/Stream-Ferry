@@ -1,7 +1,6 @@
 package com.adsamcik.streamferry.app
 
 import android.os.Bundle
-import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -12,12 +11,17 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.createSavedStateHandle
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
+import androidx.fragment.app.FragmentActivity
 import com.adsamcik.streamferry.permissions.AndroidNetworkPermissionManager
 import com.adsamcik.streamferry.ui.AppRoot
 import com.adsamcik.streamferry.ui.MainViewModel
 import com.adsamcik.streamferry.ui.theme.StreamFerryTheme
 
-class MainActivity : ComponentActivity() {
+/**
+ * The AndroidX media-route chooser is implemented with DialogFragments, so the app's host must expose
+ * a FragmentManager. FragmentActivity remains a ComponentActivity and is fully compatible with Compose.
+ */
+class MainActivity : FragmentActivity() {
 
     private val container by lazy { (application as StreamFerryApplication).container }
 
