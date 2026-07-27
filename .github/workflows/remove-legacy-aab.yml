@@ -1,0 +1,20 @@
+name: Remove legacy release AAB
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/remove-legacy-aab.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  remove:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove the legacy v0.3.2 AAB asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release delete-asset v0.3.2 stream-ferry-v0.3.2.aab --yes
