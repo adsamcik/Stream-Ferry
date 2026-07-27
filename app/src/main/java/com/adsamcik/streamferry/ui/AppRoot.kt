@@ -337,6 +337,8 @@ private fun RouteContent(
             onDiagnostics = { viewModel.navigate(Route.DIAGNOSTICS); viewModel.refreshDiagnostics() },
             onDownloads = { viewModel.openDownloads() },
             onServers = { viewModel.openServers() },
+            themeMode = state.themeMode,
+            onThemeModeChange = { viewModel.setThemeMode(it) },
             preferDirectPlay = viewModel.preferDirectPlay,
             onPreferDirectPlayChange = { viewModel.setPreferDirectPlay(it) },
             transcodeLocalOnDevice = viewModel.transcodeLocalOnDevice,

@@ -56,6 +56,7 @@ import com.adsamcik.streamferry.playback.PersistentRendererCapabilityStore
 import com.adsamcik.streamferry.playback.RendererCapabilityStore
 import com.adsamcik.streamferry.playback.reporting.DefaultJellyfinPlaybackReporter
 import com.adsamcik.streamferry.playback.session.DefaultPlaybackSessionCoordinator
+import com.adsamcik.streamferry.ui.theme.AppearancePreferences
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -97,6 +98,7 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
     }
     val diagnosticsPreferences: DiagnosticsPreferences by lazy { DiagnosticsPreferences(appContext) }
     val playbackPreferences: PlaybackPreferences by lazy { PlaybackPreferences(appContext) }
+    val appearancePreferences: AppearancePreferences by lazy { AppearancePreferences(appContext) }
     val showLanguageStore: ShowLanguageStore by lazy { ShowLanguageStore(appContext) }
 
     /**
@@ -438,6 +440,7 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
         runCatching { diagnosticsEventLog.clear() } // persisted event log is app data too
         runCatching { diagnosticsPreferences.clear() }
         runCatching { playbackPreferences.clear() }
+        runCatching { appearancePreferences.clear() }
         runCatching { rendererCapabilityStore.clear() }
         runCatching { showLanguageStore.clear() }
         logger.traceEnabled = false

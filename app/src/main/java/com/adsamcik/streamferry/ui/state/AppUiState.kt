@@ -6,6 +6,7 @@ import com.adsamcik.streamferry.domain.MediaSourceIds
 import com.adsamcik.streamferry.domain.MediaTrack
 import com.adsamcik.streamferry.domain.ServerProfile
 import com.adsamcik.streamferry.logging.LogEntry
+import com.adsamcik.streamferry.ui.theme.ThemeMode
 
 /** Navigation routes (§18 screens). */
 enum class Route {
@@ -66,6 +67,9 @@ data class AppUiState(
     // ----- background playback -----
     /** Whether the app is exempt from battery optimization (needed for reliable screen-off casting). */
     val backgroundPlaybackUnrestricted: Boolean = true,
+
+    // ----- appearance -----
+    val themeMode: ThemeMode = ThemeMode.SYSTEM,
 
     // ----- playback -----
     val playback: PlaybackUiState? = null,

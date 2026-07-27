@@ -1551,7 +1551,7 @@ private fun WatchStateAction(item: MediaItem, onToggle: () -> Unit) {
         shape = RoundedCornerShape(24.dp),
         colors = CardDefaults.cardColors(
             containerColor = if (item.played) {
-                MaterialTheme.colorScheme.tertiaryContainer
+                MaterialTheme.colorScheme.surfaceContainerHigh
             } else {
                 MaterialTheme.colorScheme.surfaceContainer
             },

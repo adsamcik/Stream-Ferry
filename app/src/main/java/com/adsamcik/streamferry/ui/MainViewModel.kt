@@ -36,6 +36,7 @@ import com.adsamcik.streamferry.ui.state.PlaybackUiState
 import com.adsamcik.streamferry.ui.state.QuickConnectUiState
 import com.adsamcik.streamferry.ui.state.Route
 import com.adsamcik.streamferry.ui.state.toUiState
+import com.adsamcik.streamferry.ui.theme.ThemeMode
 import com.adsamcik.streamferry.BuildConfig
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
@@ -71,6 +72,7 @@ class MainViewModel(
             ),
             activeSourceId = NavigationStatePolicy.restoreSource(savedStateHandle[STATE_SOURCE]),
             searchQuery = savedStateHandle[STATE_SEARCH_QUERY] ?: "",
+            themeMode = container.appearancePreferences.themeMode,
             backgroundPlaybackUnrestricted = container.permissions.isBatteryOptimizationExempt(),
         ),
     )
@@ -1348,6 +1350,11 @@ class MainViewModel(
     /** "Prefer original quality (direct play)" setting: Cast tries the original first, transcode fallback. */
     val preferDirectPlay: Boolean get() = container.playbackPreferences.preferDirectPlay
     fun setPreferDirectPlay(value: Boolean) { container.playbackPreferences.preferDirectPlay = value }
+
+    fun setThemeMode(value: ThemeMode) {
+        container.appearancePreferences.themeMode = value
+        _state.update { it.copy(themeMode = value) }
+    }
 
     /** "Transcode local videos on this device" setting: off (default) => always direct-play local files. */
     val transcodeLocalOnDevice: Boolean get() = container.playbackPreferences.transcodeLocalOnDevice

@@ -148,6 +148,13 @@ private val StreamFerryTypography = Typography(
     labelMedium = DefaultTypography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
 )
 
+/** The user's preferred appearance. System is the default and follows Android's current mode. */
+enum class ThemeMode(val label: String) {
+    SYSTEM("System default"),
+    LIGHT("Light"),
+    DARK("Dark"),
+}
+
 /**
  * Stream Ferry's stable Material 3 theme.
  *
@@ -158,10 +165,15 @@ private val StreamFerryTypography = Typography(
 @Composable
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 fun StreamFerryTheme(
-    darkTheme: Boolean = isSystemInDarkTheme(),
+    themeMode: ThemeMode = ThemeMode.SYSTEM,
     dynamicColor: Boolean = true,
     content: @Composable () -> Unit,
 ) {
+    val darkTheme = when (themeMode) {
+        ThemeMode.SYSTEM -> isSystemInDarkTheme()
+        ThemeMode.LIGHT -> false
+        ThemeMode.DARK -> true
+    }
     val context = LocalContext.current
     val colorScheme = when {
         dynamicColor -> {

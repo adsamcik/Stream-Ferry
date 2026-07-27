@@ -26,6 +26,7 @@ import androidx.compose.material.icons.automirrored.rounded.Logout
 import androidx.compose.material.icons.rounded.BatteryStd
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.DeleteForever
+import androidx.compose.material.icons.rounded.DarkMode
 import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.FastForward
 import androidx.compose.material.icons.rounded.HighQuality
@@ -69,6 +70,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import com.adsamcik.streamferry.R
 import com.adsamcik.streamferry.core.language.Languages
+import com.adsamcik.streamferry.ui.theme.ThemeMode
 
 private data class ResolutionChoice(val height: Int, val label: String)
 
@@ -91,6 +93,8 @@ fun ExpressiveSettingsScreen(
     onDiagnostics: () -> Unit,
     onDownloads: () -> Unit,
     onServers: () -> Unit,
+    themeMode: ThemeMode,
+    onThemeModeChange: (ThemeMode) -> Unit,
     preferDirectPlay: Boolean,
     onPreferDirectPlayChange: (Boolean) -> Unit,
     transcodeLocalOnDevice: Boolean,
@@ -135,6 +139,16 @@ fun ExpressiveSettingsScreen(
         contentPadding = PaddingValues(bottom = 36.dp),
         verticalArrangement = Arrangement.spacedBy(20.dp),
     ) {
+        item(key = "appearance-heading") { SettingsHeading("Appearance") }
+        item(key = "appearance-group") {
+            SettingsGroup {
+                SettingsThemeModeRow(
+                    selected = themeMode,
+                    onSelect = onThemeModeChange,
+                )
+            }
+        }
+
         item(key = "playback-heading") { SettingsHeading("Playback") }
         item(key = "playback-group") {
             SettingsGroup {
@@ -488,6 +502,35 @@ private fun SettingsLanguageRow(
                     onClick = {
                         expanded = false
                         onSelect(language.code)
+                    },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingsThemeModeRow(selected: ThemeMode, onSelect: (ThemeMode) -> Unit) {
+    var expanded by remember { mutableStateOf(false) }
+
+    Box {
+        SettingsValueRow(
+            icon = Icons.Rounded.DarkMode,
+            title = "Theme",
+            supporting = "Choose light, dark, or follow your device setting.",
+            selectedValue = selected.label,
+            onClick = { expanded = true },
+        )
+        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            ThemeMode.entries.forEach { mode ->
+                DropdownMenuItem(
+                    text = { Text(mode.label) },
+                    trailingIcon = {
+                        if (mode == selected) Icon(Icons.Rounded.Check, contentDescription = null)
+                    },
+                    onClick = {
+                        expanded = false
+                        onSelect(mode)
                     },
                 )
             }

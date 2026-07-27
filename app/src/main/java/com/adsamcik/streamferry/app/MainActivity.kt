@@ -42,8 +42,8 @@ class MainActivity : FragmentActivity() {
         container.initializeCastContext()
         viewModel.onLocalNetworkPermissionResult(container.permissions.hasLocalNetworkAccess())
         setContent {
-            StreamFerryTheme {
-                val state by viewModel.state.collectAsStateWithLifecycle()
+            val state by viewModel.state.collectAsStateWithLifecycle()
+            StreamFerryTheme(themeMode = state.themeMode) {
                 // Request the local-network (+ notifications) permissions before scanning/playing, then
                 // scan. Browsing the library never needs these; only TV playback does, so it is deferred.
                 val permissionLauncher = rememberLauncherForActivityResult(
