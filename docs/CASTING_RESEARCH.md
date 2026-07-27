@@ -131,7 +131,6 @@ interruptions. [L279, L586, L699-L700, L718-L720]
   permission — prefer it for Cast device selection. [L28, L791]
 - **Foreground services.** Android 12+ restricts starting an FGS from the background; Android 14+
   requires declaring the appropriate **FGS type** for ongoing work (relay + any capture). [L352, L1031]
-- Play Store policy (FGS, local-network, capture, privacy disclosures) can affect distribution. [L599, L1240]
 
 ---
 

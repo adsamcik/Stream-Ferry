@@ -3,11 +3,10 @@
 Every release is built from a signed Git tag and published on GitHub with:
 
 - a directly installable, R8-minified APK;
-- an AAB for an optional **manual** upload through Play Console;
 - a SHA-256 checksum and signer-certificate report.
 
-The workflow never contacts Google Play. GitHub users can install an update over an earlier GitHub
-APK because every release uses the same long-lived signing identity.
+GitHub users can install an update over an earlier GitHub APK because every release uses the same
+long-lived signing identity.
 
 ## Signing identity — create once, back up forever
 
@@ -43,8 +42,6 @@ Add the following **repository Actions secrets**, exactly as written in
 - `RELEASE_KEY_ALIAS`
 - `RELEASE_KEY_PASSWORD`
 
-No Google service account or Google Play credential is used by this repository.
-
 ## Cut a release
 
 1. Update the checked-in `versionName` and `CHANGELOG.md`.
@@ -59,8 +56,8 @@ No Google service account or Google Play credential is used by this repository.
 The release workflow verifies the tag has the form `vMAJOR.MINOR.PATCH` and passes its version name to
 Gradle, which is the sole source of the monotonic Android version-code calculation
 (`MAJOR * 1,000,000 + MINOR * 1,000 + PATCH`). The workflow requires the stable signing secrets, then
-builds the APK and AAB. It creates or updates the public GitHub Release with the APK, AAB, checksum,
-and signer report. A manual dispatch can rebuild an already-published tag.
+builds the APK. It creates or updates the public GitHub Release with the APK, checksum, and signer
+report. A manual dispatch can rebuild an already-published tag.
 
 ### Verify a GitHub APK
 
@@ -78,9 +75,3 @@ inspected locally with:
 ```bash
 keytool -printcert -file docs/release-signing-certificate.pem
 ```
-
-## Manual Google Play upload
-
-If you choose to distribute through Google Play, download the signed `.aab` from the corresponding
-GitHub Release and upload it in Play Console yourself. Enable Play App Signing if desired and keep the
-same upload key backed up; no Google credential is stored in this repository or exposed to CI.

@@ -42,10 +42,10 @@ there is **no telemetry** and nothing leaves the device unless you share a repor
 ## [0.3.0] - 2026-07-25
 
 ### Added
-+- Public-release automation now publishes a stable-signed APK, AAB, checksum, and signer report to
-+  GitHub Releases and attaches a signed AAB for optional manual Google Play upload.
-+
-+### Changed
+- Public-release automation now publishes a stable-signed APK, checksum, and signer report to GitHub
+  Releases.
+
+### Changed
 - Renamed the app from **Video Bridge** to **Stream Ferry** and changed its Android namespace and
   application ID from `com.videobridge` to `com.adsamcik.streamferry`.
 

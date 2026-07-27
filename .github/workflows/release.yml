@@ -1,8 +1,7 @@
 name: Public release
 
-# A signed semantic-version tag creates a public GitHub Release with a directly
-# installable APK, an AAB for optional manual Play Console upload, checksums, and
-# a signer report. This workflow never contacts Google Play.
+# A signed semantic-version tag creates a public GitHub Release with a directly installable APK,
+# checksum, and signer report.
 on:
   push:
     tags:
@@ -77,12 +76,12 @@ jobs:
           printf 'storeFile=%s\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
             "$keystore" "$KEYSTORE_PASSWORD" "$KEY_ALIAS" "$KEY_PASSWORD" > keystore.properties
 
-      - name: Build signed APK and AAB
+      - name: Build signed APK
         uses: ./.github/actions/gradle-retry
         with:
           args: >-
             -PversionName=${{ steps.release.outputs.version }}
-            assembleRelease bundleRelease
+            assembleRelease
 
       - name: Package release assets and signer identity
         id: assets
@@ -90,13 +89,10 @@ jobs:
           TAG: ${{ steps.release.outputs.tag }}
         run: |
           apk_source="app/build/outputs/apk/release/app-release.apk"
-          aab_source="app/build/outputs/bundle/release/app-release.aab"
           metadata_source="app/build/outputs/apk/release/output-metadata.json"
           test -f "$metadata_source"
           test -f "$apk_source"
-          test -f "$aab_source"
           apk="stream-ferry-${TAG}.apk"
-          aab="stream-ferry-${TAG}.aab"
           checksum="stream-ferry-${TAG}.sha256"
           certificate="stream-ferry-${TAG}-signing-certificate.txt"
           version_code="$(python3 -c "import json, sys; print(json.load(open(sys.argv[1]))['elements'][0]['versionCode'])" "$metadata_source")"
@@ -105,11 +101,9 @@ jobs:
             exit 1
           fi
           cp "$apk_source" "$apk"
-          cp "$aab_source" "$aab"
-          sha256sum "$apk" "$aab" > "$checksum"
+          sha256sum "$apk" > "$checksum"
           keytool -printcert -jarfile "$apk" > "$certificate"
           echo "apk=$apk" >> "$GITHUB_OUTPUT"
-          echo "aab=$aab" >> "$GITHUB_OUTPUT"
           echo "version_code=$version_code" >> "$GITHUB_OUTPUT"
           echo "checksum=$checksum" >> "$GITHUB_OUTPUT"
           echo "certificate=$certificate" >> "$GITHUB_OUTPUT"
@@ -120,7 +114,6 @@ jobs:
           TAG: ${{ steps.release.outputs.tag }}
           VERSION_CODE: ${{ steps.assets.outputs.version_code }}
           APK: ${{ steps.assets.outputs.apk }}
-          AAB: ${{ steps.assets.outputs.aab }}
           CHECKSUM: ${{ steps.assets.outputs.checksum }}
           CERTIFICATE: ${{ steps.assets.outputs.certificate }}
         run: |
@@ -147,9 +140,9 @@ jobs:
           EOF
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release edit "$TAG" --title "$TAG" --notes-file "$notes" --prerelease=false
-            gh release upload "$TAG" "$APK" "$AAB" "$CHECKSUM" "$CERTIFICATE" --clobber
+            gh release upload "$TAG" "$APK" "$CHECKSUM" "$CERTIFICATE" --clobber
           else
-            gh release create "$TAG" "$APK" "$AAB" "$CHECKSUM" "$CERTIFICATE" \
+            gh release create "$TAG" "$APK" "$CHECKSUM" "$CERTIFICATE" \
               --title "$TAG" --notes-file "$notes"
           fi
 

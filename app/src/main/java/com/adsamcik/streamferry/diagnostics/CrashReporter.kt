@@ -16,7 +16,7 @@ import kotlin.system.exitProcess
 /**
  * Captures uncaught exceptions on any thread, writes a **redacted** crash report to app-private
  * storage (`filesDir/crashes/`), then delegates to the previously-installed handler so the process
- * still terminates normally (the system crash dialog still shows; Play Console still records it).
+ * still terminates normally and the system crash dialog still shows.
  *
  * Reports are sandboxed app-private files (excluded from backup like all app data) and are removed by
  * "Delete all app data". The report text comes from the pure-JVM [CrashReportFormatter] (redacts
