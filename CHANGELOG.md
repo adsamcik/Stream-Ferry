@@ -12,6 +12,18 @@ there is **no telemetry** and nothing leaves the device unless you share a repor
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-07-27
+
+### Added
+- Added an appearance-theme selector and expressive feedback for server selection, Quick Connect
+  and authentication, downloads, diagnostics, settings disclosures, and gallery navigation.
+
+### Changed
+- Extended the expressive Material 3 motion system through navigation, playback, errors, resume and
+  copy feedback, while keeping reduced-motion behaviour appropriate for playback.
+- Simplified playback state handling and the Settings implementation, avoiding unnecessary refresh
+  allocations and obsolete UI code.
+
 ## [0.3.1] - 2026-07-26
 
 ### Changed
