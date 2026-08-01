@@ -82,4 +82,23 @@ class NightVolumeSchedulerTest {
 
         assertEquals(.6f, result.commandVolume!!, .001f)
     }
+
+    @Test fun dstOverlapUsesTheEarlierOffsetDeterministically() {
+        val policy = NightVolumePolicy.Gradual(LocalTime.of(1, 0), LocalTime.of(4, 0), .4f)
+        val start = ZonedDateTime.of(2026, 10, 25, 1, 0, 0, 0, zone).toInstant()
+        val overlap = ZonedDateTime.of(2026, 10, 25, 2, 30, 0, 0, zone).toInstant()
+        val started = NightVolumeScheduler.evaluate(policy, input(start))
+        val result = NightVolumeScheduler.evaluate(policy, input(overlap), started.session)
+
+        assertEquals(.65f, result.commandVolume!!, .001f)
+    }
+
+    @Test fun inactiveOrUnsupportedPlaybackNeverReceivesACommand() {
+        val policy = NightVolumePolicy.Hard(LocalTime.of(22, 0), .4f)
+        val after = instant(1, 22, 1)
+        val session = NightVolumeSession(startedAt = instant(1, 21), startingVolume = .8f)
+
+        assertNull(NightVolumeScheduler.evaluate(policy, input(after).copy(activePlayback = false), session).commandVolume)
+        assertNull(NightVolumeScheduler.evaluate(policy, input(after).copy(volumeSupported = false), session).commandVolume)
+    }
 }

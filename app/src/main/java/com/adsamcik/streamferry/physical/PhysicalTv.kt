@@ -99,6 +99,28 @@ object PhysicalTvEndpointSelector {
     }
 }
 
+/**
+ * Smart Resume may automatically reuse a screen only from an exact persisted stable identity. The
+ * display reference is intentionally absent from this API so a room/name match cannot become control
+ * authority by accident.
+ */
+object PhysicalTvResumeMatcher {
+    fun findConfident(
+        physicalTvs: Collection<PhysicalTv>,
+        physicalStableId: String?,
+        endpointStorageToken: String?,
+    ): PhysicalTv? {
+        physicalStableId?.let { id ->
+            physicalTvs.singleOrNull { it.id == id }?.let { return it }
+        }
+        val endpointToken = endpointStorageToken ?: return null
+        return physicalTvs.singleOrNull { tv ->
+            tv.availableEndpoints.mapNotNull(PhysicalEndpointKey::from)
+                .any { it.storageToken == endpointToken }
+        }
+    }
+}
+
 /** Pure, deterministic, deliberately conservative cross-protocol matching policy. */
 object PhysicalTvMatcher {
     fun match(

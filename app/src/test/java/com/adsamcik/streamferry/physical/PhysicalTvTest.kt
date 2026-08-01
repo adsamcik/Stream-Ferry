@@ -84,6 +84,16 @@ class PhysicalTvTest {
         assertEquals(cast, tv.copy(selectionPreference = EndpointSelectionPreference(Protocol.CAST, Protocol.DLNA)).selectEndpoint())
     }
 
+    @Test fun resumeMatcherUsesOnlyExactStableIdentity() {
+        val first = PhysicalTvAggregator.aggregate(listOf(cast(id = "cast-a", name = "Living Room"))).physicalTvs.single()
+        val second = PhysicalTvAggregator.aggregate(listOf(cast(id = "cast-b", name = "Living Room"))).physicalTvs.single()
+        val token = requireNotNull(PhysicalEndpointKey.from(second.castEndpoint!!)).storageToken
+
+        assertEquals(second, PhysicalTvResumeMatcher.findConfident(listOf(first, second), null, token))
+        assertEquals(first, PhysicalTvResumeMatcher.findConfident(listOf(first, second), first.id, null))
+        assertNull(PhysicalTvResumeMatcher.findConfident(listOf(first, second), "Living Room", null))
+    }
+
     private fun cast(id: String = "cast-id", name: String = "TV", host: String? = null, model: String? = null) = target(
         id, name, Protocol.CAST,
         TargetDiscoveryMetadata(castDeviceId = id, validatedSourceHost = host, modelName = model, volumeControlAvailable = true),

@@ -30,6 +30,7 @@ import com.adsamcik.streamferry.permissions.AndroidNetworkPermissionManager
 import com.adsamcik.streamferry.physical.PhysicalEndpointKey
 import com.adsamcik.streamferry.physical.PhysicalTv
 import com.adsamcik.streamferry.physical.PhysicalTvAggregator
+import com.adsamcik.streamferry.physical.PhysicalTvResumeMatcher
 import com.adsamcik.streamferry.playback.PlaybackStatus
 import com.adsamcik.streamferry.playback.PlaybackFailureCause
 import com.adsamcik.streamferry.playback.PlaybackFailureStage
@@ -772,7 +773,13 @@ class MainViewModel(
                     container.physicalTvAssociations,
                 ).physicalTvs
                 val resumeDevice = pendingResumeDeviceContext
-                val resumeTv = resumeDevice?.let { findConfidentResumeTv(physical, it) }
+                val resumeTv = resumeDevice?.let { context ->
+                    PhysicalTvResumeMatcher.findConfident(
+                        physical,
+                        context.physicalDeviceStableId,
+                        context.stableEndpointIdentity,
+                    )
+                }
                 val resumeEndpoint = resumeTv?.let { tv ->
                     resumeDevice.lastSuccessfulProtocol
                         ?.let { protocol -> tv.availableEndpoints.firstOrNull { it.protocol == protocol } }
@@ -1480,21 +1487,6 @@ class MainViewModel(
             lastSuccessfulProtocol = endpoint.protocol,
             stableEndpointIdentity = endpointKey?.storageToken,
         )
-    }
-
-    /** Exact stable physical or endpoint identity only; display names never authorize automatic reuse. */
-    private fun findConfidentResumeTv(
-        physicalTvs: List<PhysicalTv>,
-        context: SmartResumeDeviceContext,
-    ): PhysicalTv? {
-        context.physicalDeviceStableId?.let { stableId ->
-            physicalTvs.singleOrNull { it.id == stableId }?.let { return it }
-        }
-        val endpointToken = context.stableEndpointIdentity ?: return null
-        return physicalTvs.singleOrNull { tv ->
-            tv.availableEndpoints.mapNotNull(PhysicalEndpointKey::from)
-                .any { it.storageToken == endpointToken }
-        }
     }
 
     /** Persist only evidence that reached renderer-confirmed PLAYING, never a mere discovery/load. */
