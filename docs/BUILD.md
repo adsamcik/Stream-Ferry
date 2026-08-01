@@ -4,8 +4,9 @@
 
 - JDK 17+.
 - Android SDK Platform 37 + build-tools 37.0.0 (installed on the build host).
-- Gradle wrapper pins **9.5.1**; AGP **9.2.1** (requires Gradle ≥ 9.4.1).
-- **Network access to `google()` / `maven.google.com`** — see the sandbox limitation below.
+- Gradle wrapper and Android Gradle Plugin versions are pinned in the repository; use the wrapper.
+- **Network access to `google()` / `maven.google.com`**, or a complete warm dependency cache — see
+  Android dependency availability below.
 
 ## Standard commands (run on a machine with Google Maven access)
 
@@ -33,33 +34,18 @@ Release signing, the protected GitHub Environment, public-certificate
 verification, and the exact tagging process are documented in [RELEASE.md](RELEASE.md). The release
 workflow never falls back to a debug key: a missing signing secret fails safely before building.
 
-## Copilot sandbox limitation (why the local agent sandbox cannot assemble the APK)
+## Android dependency availability
 
-> This limitation applies to the Copilot/local build sandbox only. The GitHub Actions CI described
-> above runs on hosted runners with full Google Maven access and **does** assemble the APK.
+The full Android gates require SDK Platform 37 and resolved artifacts from `google()` / Maven Central.
+A host with a warm Gradle cache may run them offline; a cold host without repository access cannot.
+Report that situation as an environment limitation, not as a passing build. GitHub Actions remains the
+authoritative connected build described above.
 
-By **default** the Copilot cloud-agent firewall **blocks** `dl.google.com` / `maven.google.com`
-(HTTP 000), while `mavenCentral()` and the Gradle services are reachable. With that default, the
-Android Gradle Plugin, AndroidX, Compose, and the Google Cast SDK cannot be resolved, so
-`assembleDebug` / `lintDebug` / instrumented & Compose UI tests **cannot run**. This is an
-environment constraint, not a project defect. See [API37_MIGRATION.md](API37_MIGRATION.md).
+## Pure-JVM fallback
 
-Two ways to get a working in-session build:
-
-1. `.github/workflows/copilot-setup-steps.yml` pre-warms the Gradle cache from Google Maven while
-   the setup runner still has full internet (see
-   [`.github/copilot-instructions.md`](../.github/copilot-instructions.md)).
-2. **Preferred:** a repository admin adds `dl.google.com` and `maven.google.com` to the Copilot
-   coding agent custom firewall allowlist (repository **Settings → Copilot → Coding agent**). The
-   allowlist is applied at session start, so it takes effect on the **next** agent session.
-
-With the allowlist configured, the full Gradle build has been **verified end-to-end in-session**:
-`./gradlew assembleDebug testDebugUnitTest lintDebug` all succeed (128 unit tests pass).
-
-## What IS verified in the sandbox: the pure-JVM core (128 tests)
-
-The security/correctness core (`com.adsamcik.streamferry.core`) is framework-free and is compiled & tested
-with `kotlinc` + JUnit 4. To reproduce:
+The framework-free `com.adsamcik.streamferry.core` subset can be compiled and tested with `kotlinc` +
+JUnit 4 when Android dependencies are unavailable. This is useful diagnostics, but it is not a
+substitute for `testDebugUnitTest`, `assembleDebug`, and `lintDebug`:
 
 ```bash
 KT=/usr/share/kotlinc/lib
@@ -80,7 +66,7 @@ kotlinc -cp "$CP" $TESTS -d /tmp/verify/tests
 CLASSES=$(cd /tmp/verify/tests && find . -name '*Test.class' | sed 's#^\./##;s#/#.#g;s#\.class$##' | grep -v '\$')
 java -cp "$CP:/tmp/verify/tests:$KT/kotlin-stdlib.jar:$KT/annotations-13.0.jar" \
      org.junit.runner.JUnitCore $CLASSES
-# => OK (128 tests)
+# => OK (current core-only test suite)
 ```
 
 These same tests run under Gradle as `./gradlew testDebugUnitTest` on a connected machine (they live

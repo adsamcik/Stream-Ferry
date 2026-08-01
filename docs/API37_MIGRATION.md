@@ -11,27 +11,18 @@
 So the API-37 fallback scaffold described in §2 is **not** required for SDK constants — the project
 targets API 37 directly.
 
-## The actual blocker: Google Maven unreachable in the build sandbox
+## Android dependency requirement
 
-- `dl.google.com` / `maven.google.com` return HTTP 000 (blocked) in this environment. `mavenCentral()`,
-  `services.gradle.org`, and `plugins.gradle.org` are reachable.
-- Consequence: the Android Gradle Plugin, AndroidX, Compose, and the Google Cast SDK **cannot be
-  resolved here**, so `./gradlew assembleDebug` / `lintDebug` / instrumented tests **cannot run in the
-  sandbox**.
-- What was proven instead: the entire pure-JVM core (`com.adsamcik.streamferry.core`) compiles with
-  `kotlinc` and **128 unit tests pass** (see [BUILD.md](BUILD.md)).
+The Android Gradle Plugin, AndroidX, Compose, and Google Cast SDK must be available from the Gradle
+cache or their configured repositories. A cold restricted environment without Google Maven access
+cannot run `assembleDebug` or `lintDebug`; a connected or pre-warmed environment can. Record the exact
+gate results for each change instead of carrying a sandbox-specific passing/failing claim here.
 
-## Versions to re-verify at the first online build
+## Dependency version verification
 
-These were resolved from official release notes / web search but **could not be downloaded** to
-confirm here:
-
-- Compose BOM `2026.06.00`
-- `play-services-cast-framework 22.3.1`
-- AndroidX `core-ktx`, `lifecycle`, `activity-compose`
-
-Confirmed against Maven Central directly: AGP `9.2.1`, Kotlin `2.4.0`, Jellyfin SDK `1.8.11`
-(LGPL-3.0).
+`gradle/libs.versions.toml` is the authoritative pin set. CI should resolve that exact set before a
+release, and dependency/license changes should be reviewed through [DEPENDENCY_RISK.md](DEPENDENCY_RISK.md)
+and [LICENSES.md](LICENSES.md). Do not infer current compatibility from an old web-search result.
 
 ## Exact migration / build steps on a connected machine
 
@@ -56,5 +47,5 @@ Confirmed against Maven Central directly: AGP `9.2.1`, Kotlin `2.4.0`, Jellyfin 
 ## Do-not-fake commitments
 
 - No invented API-37 constants/permissions are used.
-- No claim of "API 37 readiness" beyond what is verified: SDK present + core tests pass; full Android
-  assembly is pending an environment with Google Maven access.
+- No claim of "API 37 readiness" beyond the exact unit, assembly, lint, and device results recorded for
+  the current change. Unit/compile success is not physical Cast/DLNA validation.

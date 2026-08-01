@@ -16,12 +16,11 @@ token, Authorization header, playlist/segment/subtitle/poster URLs.
 
 ## Status
 
-The **pure-JVM security/correctness core compiles and passes 128 unit tests**, and the full Android
-app (manual server connect + validate, full show/movie gallery, Cast/DLNA device picker, adaptive
-playback, foreground proxy service) builds with `./gradlew assembleDebug testDebugUnitTest lintDebug`
-on any host with Google Maven access. In the Copilot cloud-agent sandbox this requires
-`dl.google.com` / `maven.google.com` on the firewall allowlist (otherwise Google Maven is blocked) —
-see [docs/BUILD.md](docs/BUILD.md) and [docs/API37_MIGRATION.md](docs/API37_MIGRATION.md).
+The Android app and its unit suite are verified with `assembleDebug`, `testDebugUnitTest`, and
+`lintDebug` on a host with Android SDK 37 and the resolved Gradle dependencies. Test totals evolve with
+the code, so release/change reports should record the exact command result instead of relying on a
+fixed count. See [docs/BUILD.md](docs/BUILD.md) and
+[docs/API37_MIGRATION.md](docs/API37_MIGRATION.md).
 
 Implemented end-to-end:
 
@@ -34,7 +33,9 @@ Implemented end-to-end:
   check, an **unwatched-episode count** on series/seasons, and an in-progress **progress bar**; a
   **Continue Watching** row surfaces resumable items. From an item's detail you can **mark it watched or
   unwatched** (a series/season cascades to its episodes), written back via Jellyfin's `UserData` API.
-- **Device picker** — live Cast (MediaRouter) + DLNA (SSDP) discovery and selection.
+- **Physical-TV picker** — live Cast (MediaRouter) + DLNA (SSDP) discoveries are conservatively
+  aggregated into one TV row only when stable evidence is confident. Tapping the TV starts playback;
+  Cast versus DLNA is normally an internal choice.
 - **Adaptive bitrate** — during playback the proxy measures real throughput over a rolling **≥ 30 s**
   window and, with hysteresis, steps quality down/up intelligently (also reacting to renderer
   rebuffering). See [docs/ADAPTIVE_BITRATE.md](docs/ADAPTIVE_BITRATE.md).
@@ -53,9 +54,15 @@ Implemented end-to-end:
 - **System playback controls** — a media-style notification, lock-screen controls, hardware
   media-button support, and phone volume keys all control the TV via a `MediaSession` (plus in-app
   play/pause/seek/volume on the Now Playing screen).
-- **Reliable & recoverable** — Jellyfin API calls self-recover from transient network/5xx blips with
-  bounded retry + backoff; an expired token (401) routes the user back to login; interrupted downloads
-  resume from where they left off. See [docs/RESILIENCE.md](docs/RESILIENCE.md).
+- **Durable Now Playing + bounded recovery** — connection, preparation, buffering, same-stream retry,
+  compatible server fallback, and an eligible alternate endpoint of the same physical TV stay on one
+  Now Playing screen. Attempt generations reject stale callbacks, Stop cancels recovery, and exhaustion
+  leaves Retry / Change TV / Stop available. Jellyfin API and download retries remain bounded too. See
+  [docs/PHYSICAL_TV_PLAYBACK.md](docs/PHYSICAL_TV_PLAYBACK.md) and
+  [docs/RESILIENCE.md](docs/RESILIENCE.md).
+- **Smart Resume + optional night volume** — app-private resume records retain renderer-confirmed
+  progress and stable previous-TV identity without persisting live sessions or proxy URLs. Night volume
+  is off by default, reduction-only, sparse, and stops adjusting after a manual phone-side change.
 - **On-device crash reports** — an uncaught-exception handler writes a **redacted** crash report
   (stack trace + app/device info, secrets stripped) to app-private storage; view, share or clear them
   from **Settings → Diagnostics**. Sharing includes only reports from the **latest build** (crashes from
@@ -69,8 +76,9 @@ Implemented end-to-end:
 
 - Kotlin · Jetpack Compose · Material 3 · ViewModel/coroutines/Flow.
 - `minSdk 34` (Android 14) · `targetSdk 37` / `compileSdk 37` (Android 17 — SDK verified present).
-- Modes: **Proxy Cast** (preferred) and **Proxy DLNA** (Samsung/LG and other renderers). No direct
-  Jellyfin-to-TV path.
+- Modes: phone-proxied **Cast** and **DLNA** (Samsung/LG and other renderers); when one confidently
+  identified TV exposes both, endpoint preference and fallback are internal. No direct Jellyfin-to-TV
+  path.
 
 ## Documentation
 
@@ -81,6 +89,7 @@ Implemented end-to-end:
 | [PROXY_DESIGN.md](docs/PROXY_DESIGN.md) | HTTP/Range semantics, session security, FGS-type decision. |
 | [MEMORY_BUFFER_POLICY.md](docs/MEMORY_BUFFER_POLICY.md) | RAM-only buffering, limits, pressure, seek. |
 | [STREAM_SELECTION.md](docs/STREAM_SELECTION.md) | Choosing a TV-compatible Jellyfin stream. |
+| [PHYSICAL_TV_PLAYBACK.md](docs/PHYSICAL_TV_PLAYBACK.md) | Physical-TV matching, bounded recovery, Smart Resume, night volume, and hardware checklist. |
 | [ADAPTIVE_BITRATE.md](docs/ADAPTIVE_BITRATE.md) | Throughput-driven adaptive quality (≥ 30 s window). |
 | [DOWNLOADS.md](docs/DOWNLOADS.md) | Optional offline downloads + library metadata cache. |
 | [CAST.md](docs/CAST.md) · [DLNA.md](docs/DLNA.md) | Cast Sender SDK / manual UPnP integration. |
@@ -101,7 +110,7 @@ See [docs/BUILD.md](docs/BUILD.md). On a host with Google Maven access:
 ./gradlew clean assembleDebug testDebugUnitTest lintDebug
 ```
 
-The pure-JVM core can also be verified directly with `kotlinc` (procedure in docs/BUILD.md).
+The pure-JVM core subset can also be verified directly with `kotlinc` (procedure in docs/BUILD.md).
 
 ## Privacy
 
