@@ -120,5 +120,19 @@ class PlaybackRecoverySessionTest {
         assertEquals(2, continued.usage.automaticAttempts)
         assertEquals(original.attempts, continued.attempts)
         assertTrue(continued.generation > original.generation)
+        assertTrue(continued.alternateProtocolReserved)
+        assertNull(continued.reserveAlternateProtocol(
+            ProtocolSwitchInput(
+                isLocalSession = false,
+                isOnlineSession = true,
+                hasAlternateProtocol = true,
+                hasAlreadySwitchedProtocol = false,
+                sameEndpointRecoveryExhausted = true,
+                failureStage = PlaybackFailureStage.ENDPOINT_DISCONNECT,
+                failureCause = PlaybackFailureCause.ENDPOINT_UNAVAILABLE,
+                budget = continued.budget,
+                usage = continued.usage,
+            ),
+        ))
     }
 }

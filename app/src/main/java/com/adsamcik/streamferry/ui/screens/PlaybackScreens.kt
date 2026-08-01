@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -71,6 +72,7 @@ import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.SheetValue
 import androidx.compose.material3.rememberBottomSheetState
 import androidx.compose.runtime.Composable
@@ -131,6 +133,9 @@ import com.adsamcik.streamferry.core.stream.Protocol
 import com.adsamcik.streamferry.core.stream.TargetCapabilities
 import com.adsamcik.streamferry.domain.DiscoveredTarget
 import com.adsamcik.streamferry.domain.MediaChapter
+import com.adsamcik.streamferry.physical.PhysicalTv
+import com.adsamcik.streamferry.playback.PlaybackAttemptDescriptor
+import com.adsamcik.streamferry.playback.PlaybackPhase
 import com.adsamcik.streamferry.ui.MainViewModel
 import com.adsamcik.streamferry.ui.components.ExpressiveLoadingIndicator
 import com.adsamcik.streamferry.ui.state.AppUiState
@@ -200,59 +205,149 @@ fun TargetPickerScreen(state: AppUiState, viewModel: MainViewModel, onRescan: ()
                 }
             }
 
-            item(key = "target-cast") {
-                CastTargetCard(
-                    castAvailable = state.castAvailable,
-                    permissionGranted = state.localNetworkPermissionGranted,
-                    selected = state.selectedTarget?.takeIf { it.protocol == Protocol.CAST },
-                    onSelect = viewModel::selectTarget,
-                )
-            }
-            if (state.castTargets.isNotEmpty()) {
-                item(key = "target-cast-results") {
-                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text(
-                            "Nearby Cast screens",
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.Bold,
-                        )
-                        TargetGroup(
-                            targets = state.castTargets,
-                            selected = state.selectedTarget,
-                            empty = "No Cast screens found yet.",
-                            scanning = state.isScanningTargets,
-                            onSelect = viewModel::selectTarget,
-                        )
-                    }
-                }
-            }
-
-            item(key = "target-dlna-heading") {
+            item(key = "target-tv-heading") {
                 Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    Text("Other smart TVs", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                    Text("Nearby TVs", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                     Text(
-                        "Nearby DLNA screens on the same network",
+                        "Choose the screen itself. Stream Ferry will pick the best available connection.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
             }
-            item(key = "target-dlna-list") {
-                TargetGroup(
-                    targets = state.dlnaTargets,
-                    selected = state.selectedTarget,
-                    empty = "No compatible smart TVs yet. Make sure the TV is on and connected to this network.",
+            state.previousPhysicalTvName?.let { previousName ->
+                item(key = "target-previous-tv") {
+                    Text(
+                        "Previously used: $previousName. If it isn't available, choose another TV; your resume point is safe.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 4.dp),
+                    )
+                }
+            }
+            item(key = "target-tv-list") {
+                PhysicalTvGroup(
+                    targets = state.physicalTvs,
+                    selected = state.selectedPhysicalTv,
+                    empty = "No compatible TVs yet. Make sure the TV is on and connected to this network.",
                     scanning = state.isScanningTargets,
-                    onSelect = viewModel::selectTarget,
+                    onSelect = viewModel::selectPhysicalTv,
+                    onUnlink = viewModel::unlinkPhysicalTv,
                 )
             }
         }
+    }
+}
 
-        TargetPlayDock(
-            selected = state.selectedTarget,
-            enabled = state.selectedTarget != null && state.localNetworkPermissionGranted,
-            onPlay = viewModel::play,
-        )
+@Composable
+private fun PhysicalTvGroup(
+    targets: List<PhysicalTv>,
+    selected: PhysicalTv?,
+    empty: String,
+    scanning: Boolean,
+    onSelect: (PhysicalTv) -> Unit,
+    onUnlink: (PhysicalTv) -> Unit,
+) {
+    if (targets.isEmpty()) {
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(26.dp),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
+        ) {
+            Column(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Box(Modifier.size(56.dp), contentAlignment = Alignment.Center) {
+                    Surface(
+                        modifier = Modifier.size(48.dp),
+                        shape = CircleShape,
+                        color = MaterialTheme.colorScheme.secondaryContainer,
+                        contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(Icons.Rounded.Tv, contentDescription = null, modifier = Modifier.size(26.dp))
+                        }
+                    }
+                    if (scanning) CircularProgressIndicator(Modifier.fillMaxSize(), strokeWidth = 2.dp)
+                }
+                Text(
+                    if (scanning) "Still looking…" else "No TVs found yet",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                )
+                Text(
+                    empty,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                )
+            }
+        }
+        return
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        targets.forEach { target ->
+            val isSelected = target.id == selected?.id
+            Card(
+                onClick = { onSelect(target) },
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(if (isSelected) 28.dp else 22.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = if (isSelected) MaterialTheme.colorScheme.primaryContainer
+                    else MaterialTheme.colorScheme.surfaceContainerHigh,
+                ),
+                border = BorderStroke(
+                    if (isSelected) 2.dp else 1.dp,
+                    if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant,
+                ),
+            ) {
+                Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        Surface(
+                            modifier = Modifier.size(48.dp),
+                            shape = CircleShape,
+                            color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondaryContainer,
+                            contentColor = if (isSelected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSecondaryContainer,
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(Icons.Rounded.Tv, contentDescription = null, modifier = Modifier.size(26.dp))
+                            }
+                        }
+                        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            Text(
+                                target.displayName,
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            val models = target.availableEndpoints.mapNotNull { it.capabilities.modelName }
+                                .map(String::trim).filter(String::isNotEmpty).distinct()
+                            Text(
+                                models.firstOrNull() ?: "Available now",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                        RadioButton(selected = isSelected, onClick = null)
+                    }
+                    if (target.castEndpoint != null && target.dlnaEndpoint != null) {
+                        TextButton(
+                            onClick = { onUnlink(target) },
+                            modifier = Modifier.align(Alignment.End).heightIn(min = 48.dp),
+                        ) { Text("These are separate devices") }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -765,8 +860,16 @@ fun PlaybackScreen(state: AppUiState, viewModel: MainViewModel) {
                     modifier = Modifier.weight(0.43f).fillMaxHeight(),
                     verticalArrangement = Arrangement.spacedBy(if (compactHeight) 8.dp else 12.dp),
                 ) {
-                    NowPlayingHero(p, mediaTitle = title, compact = compactHeight)
-                    p.errorMessage?.let {
+                    NowPlayingHero(p, mediaTitle = title ?: p.mediaTitle, compact = compactHeight)
+                    if (p.isTerminal) {
+                        TerminalPlaybackCard(
+                            message = p.errorMessage ?: "Stream Ferry ran out of safe automatic options.",
+                            onRetry = viewModel::retryPlayback,
+                            onChangeTv = viewModel::changeTv,
+                            onStop = viewModel::stopPlayback,
+                            compact = compactHeight,
+                        )
+                    } else p.errorMessage?.let {
                         PlaybackIssueBanner(it, onOpenOptions = { showOptions = true }, compact = compactHeight)
                     }
                     Spacer(Modifier.weight(1f))
@@ -793,7 +896,7 @@ fun PlaybackScreen(state: AppUiState, viewModel: MainViewModel) {
                         SkipSegmentButton(label, onSkip = viewModel::skipSegment, compact = compactHeight)
                     }
                     TransportControls(p, positionProvider, viewModel, compact = compactHeight)
-                    VolumeControl(p, viewModel, compact = true)
+                    if (p.volumeSupported) VolumeControl(p, viewModel, compact = true)
                     Spacer(Modifier.weight(1f))
                 }
             }
@@ -802,8 +905,16 @@ fun PlaybackScreen(state: AppUiState, viewModel: MainViewModel) {
                 modifier = Modifier.fillMaxSize(),
                 verticalArrangement = Arrangement.spacedBy(if (compactHeight) 6.dp else 10.dp),
             ) {
-                NowPlayingHero(p, mediaTitle = title, compact = true)
-                p.errorMessage?.let {
+                NowPlayingHero(p, mediaTitle = title ?: p.mediaTitle, compact = true)
+                if (p.isTerminal) {
+                    TerminalPlaybackCard(
+                        message = p.errorMessage ?: "Stream Ferry ran out of safe automatic options.",
+                        onRetry = viewModel::retryPlayback,
+                        onChangeTv = viewModel::changeTv,
+                        onStop = viewModel::stopPlayback,
+                        compact = true,
+                    )
+                } else p.errorMessage?.let {
                     PlaybackIssueBanner(it, onOpenOptions = { showOptions = true }, compact = true)
                 }
                 Spacer(Modifier.weight(1f))
@@ -818,7 +929,7 @@ fun PlaybackScreen(state: AppUiState, viewModel: MainViewModel) {
                     SkipSegmentButton(label, onSkip = viewModel::skipSegment, compact = compactHeight)
                 }
                 TransportControls(p, positionProvider, viewModel, compact = compactHeight)
-                VolumeControl(p, viewModel, compact = true)
+                if (p.volumeSupported) VolumeControl(p, viewModel, compact = true)
                 PlaybackQuickActions(
                     p = p,
                     viewModel = viewModel,
@@ -867,6 +978,48 @@ private fun PlaybackIssueBanner(message: String, onOpenOptions: () -> Unit, comp
                 fontWeight = FontWeight.Bold,
                 color = MaterialTheme.colorScheme.onErrorContainer,
             )
+        }
+    }
+}
+
+@Composable
+private fun TerminalPlaybackCard(
+    message: String,
+    onRetry: () -> Unit,
+    onChangeTv: () -> Unit,
+    onStop: () -> Unit,
+    compact: Boolean,
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth().semantics { liveRegion = LiveRegionMode.Assertive },
+        shape = RoundedCornerShape(if (compact) 18.dp else 22.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text(
+                message,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onErrorContainer,
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Button(onClick = onRetry, modifier = Modifier.weight(1f).heightIn(min = 48.dp)) {
+                    Icon(Icons.Rounded.Refresh, contentDescription = null)
+                    Text("Retry")
+                }
+                OutlinedButton(onClick = onChangeTv, modifier = Modifier.weight(1f).heightIn(min = 48.dp)) {
+                    Icon(Icons.Rounded.Tv, contentDescription = null)
+                    Text("Change TV")
+                }
+                OutlinedButton(onClick = onStop, modifier = Modifier.heightIn(min = 48.dp)) {
+                    Icon(Icons.Rounded.Stop, contentDescription = "Stop")
+                }
+            }
         }
     }
 }
@@ -1052,9 +1205,51 @@ private fun PlaybackOptionsSheet(
                     onSelectResolution = viewModel::selectMaxVideoHeight,
                 )
             }
+            if (p.attemptHistory.isNotEmpty()) {
+                item(key = "playback-options-attempts") {
+                    PlaybackAttemptHistory(p.attemptHistory)
+                }
+            }
         }
     }
 }
+
+@Composable
+private fun PlaybackAttemptHistory(attempts: List<PlaybackAttemptDescriptor>) {
+    var expanded by rememberSaveable { mutableStateOf(false) }
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+    ) {
+        Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            TextButton(onClick = { expanded = !expanded }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
+                Text("Technical attempt details", modifier = Modifier.weight(1f), textAlign = TextAlign.Start)
+                Text(if (expanded) "Hide" else "Show")
+            }
+            AnimatedVisibility(visible = expanded) {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    attempts.forEachIndexed { index, attempt ->
+                        Text(
+                            "${index + 1}. ${attempt.toUiSummary()}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun PlaybackAttemptDescriptor.toUiSummary(): String = buildList {
+    protocol?.takeIf(String::isNotBlank)?.let(::add)
+    route?.name?.lowercase()?.replace('_', ' ')?.let(::add)
+    codec?.takeIf(String::isNotBlank)?.let(::add)
+    startPositionSeconds?.let { add("from ${formatPlaybackTime(it)}") }
+    failureStage?.name?.lowercase()?.replace('_', ' ')?.let { add("failed at $it") }
+    reason?.takeIf(String::isNotBlank)?.let(::add)
+}.joinToString(" · ").ifBlank { "Playback attempt" }
 
 @Composable
 private fun SkipSegmentButton(label: String, onSkip: () -> Unit, compact: Boolean = false) {
@@ -1111,11 +1306,20 @@ private fun ReconnectingBanner() {
 
 @Composable
 private fun NowPlayingHero(p: PlaybackUiState, mediaTitle: String?, compact: Boolean = false) {
-    val statusLabel = when {
-        p.reconnecting -> "Reconnecting"
-        p.isBuffering -> "Buffering"
-        p.isPlaying -> "Playing"
-        else -> "Paused"
+    val statusLabel = when (p.phase) {
+        PlaybackPhase.CONNECTING -> "Connecting"
+        PlaybackPhase.PREPARING -> "Preparing"
+        PlaybackPhase.LOADING -> "Loading"
+        PlaybackPhase.WAITING_FOR_PLAYBACK -> "Starting"
+        PlaybackPhase.PLAYING -> "Playing"
+        PlaybackPhase.PAUSED -> "Paused"
+        PlaybackPhase.BUFFERING -> "Buffering"
+        PlaybackPhase.RECONNECTING -> "Reconnecting"
+        PlaybackPhase.CHANGING_STREAM -> "Changing stream"
+        PlaybackPhase.CHANGING_PROTOCOL -> "Trying another connection"
+        PlaybackPhase.STOPPED -> "Stopped"
+        PlaybackPhase.COMPLETED -> "Completed"
+        PlaybackPhase.FAILED -> "Needs attention"
     }
     ElevatedCard(
         shape = RoundedCornerShape(if (compact) 24.dp else 28.dp),
@@ -1169,7 +1373,17 @@ private fun NowPlayingHero(p: PlaybackUiState, mediaTitle: String?, compact: Boo
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(5.dp),
                         ) {
-                            if (p.isBuffering || p.reconnecting) {
+                            if (p.phase in setOf(
+                                    PlaybackPhase.CONNECTING,
+                                    PlaybackPhase.PREPARING,
+                                    PlaybackPhase.LOADING,
+                                    PlaybackPhase.WAITING_FOR_PLAYBACK,
+                                    PlaybackPhase.BUFFERING,
+                                    PlaybackPhase.RECONNECTING,
+                                    PlaybackPhase.CHANGING_STREAM,
+                                    PlaybackPhase.CHANGING_PROTOCOL,
+                                )
+                            ) {
                                 CircularProgressIndicator(Modifier.size(12.dp), strokeWidth = 2.dp)
                             }
                             Text(statusLabel, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
@@ -1678,6 +1892,15 @@ private fun StatRow(icon: ImageVector, label: String, value: String) {
 
 private fun formatMbps(bps: Long): String = "%.1f".format(bps / 1_000_000.0)
 
+private fun formatPlaybackTime(seconds: Long): String {
+    val safe = seconds.coerceAtLeast(0)
+    val hours = safe / 3_600
+    val minutes = (safe % 3_600) / 60
+    val remainingSeconds = safe % 60
+    return if (hours > 0) "%d:%02d:%02d".format(hours, minutes, remainingSeconds)
+    else "%d:%02d".format(minutes, remainingSeconds)
+}
+
 /** Friendly label for a codec id used in the manual codec picker. */
 private fun codecLabel(codec: String): String = when (codec.lowercase()) {
     "h264", "avc" -> "H.264"
@@ -1726,6 +1949,7 @@ private val samplePlayback = PlaybackUiState(
     targetName = "Living Room TV",
     protocol = "CAST",
     isPlaying = true,
+    phase = PlaybackPhase.PLAYING,
     positionSeconds = 1_325,
     durationSeconds = 3_600,
     streamMode = "Direct play · H.264 / AAC",

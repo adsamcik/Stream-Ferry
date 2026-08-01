@@ -49,6 +49,8 @@ import com.adsamcik.streamferry.domain.SecureTokenStore
 import com.adsamcik.streamferry.logging.DiagnosticsLogger
 import com.adsamcik.streamferry.permissions.AndroidNetworkPermissionManager
 import com.adsamcik.streamferry.permissions.LocalNetworkAccessGate
+import com.adsamcik.streamferry.physical.PersistentPhysicalTvAssociationStore
+import com.adsamcik.streamferry.physical.PhysicalTvAssociationStore
 import com.adsamcik.streamferry.playback.AndroidPlaybackServiceController
 import com.adsamcik.streamferry.playback.MediaSessionController
 import com.adsamcik.streamferry.playback.PlaybackEngine
@@ -102,6 +104,9 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
     val appearancePreferences: AppearancePreferences by lazy { AppearancePreferences(appContext) }
     val showLanguageStore: ShowLanguageStore by lazy { ShowLanguageStore(appContext) }
     val nightVolumeSettingsStore: NightVolumeSettingsStore by lazy { NightVolumeSettingsStore(appContext) }
+    val physicalTvAssociations: PhysicalTvAssociationStore by lazy {
+        PersistentPhysicalTvAssociationStore(appContext)
+    }
 
     /**
      * Persists the redacted event log to disk so a shared diagnostics report survives app restarts (the
@@ -298,6 +303,7 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
             deviceEncodeCapsProvider = { deviceEncodeCaps },
             rendererCaps = rendererCapabilityStore,
             smartResume = smartResumeTracker,
+            nightVolumePolicyProvider = { nightVolumeSettingsStore.load() },
             requireLocalNetworkAccess = localNetworkGate::requireAccess,
         )
     }
@@ -446,6 +452,7 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
         runCatching { rendererCapabilityStore.clear() }
         runCatching { showLanguageStore.clear() }
         runCatching { nightVolumeSettingsStore.clear() }
+        runCatching { physicalTvAssociations.clear() }
         logger.traceEnabled = false
         logger.clear()
     }

@@ -47,6 +47,9 @@ enum class PlaybackAttemptRoute { DIRECT, SERVER_TRANSCODE, ON_DEVICE_TRANSCODE 
 /** The bounded classes of automatic work. Explicit user changes do not consume this budget. */
 enum class RecoveryAttemptKind { SAME_STREAM_NETWORK, FORMAT_COMPATIBILITY, LOWER_RESOLUTION, ALTERNATE_PROTOCOL }
 
+/** A source/phone-gateway preparation failure that changing the TV protocol cannot repair. */
+class PlaybackPreparationException(message: String, cause: Throwable? = null) : Exception(message, cause)
+
 /**
  * A concise attempt record. It intentionally has no title, media id, URL, token, IP, or raw exception.
  * [endpoint] is always a label created by [redactPlaybackEndpoint], never a connectable address.
@@ -158,6 +161,8 @@ data class PlaybackRecoverySession(
     val attempts: List<PlaybackAttemptDescriptor> = emptyList(),
     val budget: RecoveryBudget = RecoveryBudget(),
     val usage: RecoveryBudgetUsage = RecoveryBudgetUsage(),
+    /** Claimed atomically at reservation time, even if cancellation happens before renderer load. */
+    val alternateProtocolReserved: Boolean = false,
 ) {
     val budgetStatus: RecoveryBudgetStatus get() = budget.status(usage)
 
@@ -167,6 +172,7 @@ data class PlaybackRecoverySession(
         generation = generation + 1,
         attempts = emptyList(),
         usage = RecoveryBudgetUsage(),
+        alternateProtocolReserved = false,
     )
     /** Continue a reserved automatic recovery across the engine stop/start boundary. */
     fun continueFrom(continuation: PlaybackRecoveryContinuation): PlaybackRecoverySession = copy(
@@ -175,6 +181,7 @@ data class PlaybackRecoverySession(
         attempts = continuation.session.attempts,
         budget = continuation.session.budget,
         usage = continuation.session.usage,
+        alternateProtocolReserved = continuation.session.alternateProtocolReserved,
     )
 
     /** Records every renderer load attempt. The ring is deliberately short and already redacted. */
@@ -202,10 +209,14 @@ data class PlaybackRecoverySession(
     }
     /** Reserve the single alternate-protocol continuation before the coordinator launches it. */
     fun reserveAlternateProtocol(input: ProtocolSwitchInput): PlaybackRecoveryContinuation? {
+        if (alternateProtocolReserved) return null
         if (!isAlternateProtocolEligible(input)) return null
         val reserved = reserveRecovery(RecoveryAttemptKind.ALTERNATE_PROTOCOL, PlaybackPhase.CHANGING_PROTOCOL)
             ?: return null
-        return PlaybackRecoveryContinuation(reserved, RecoveryAttemptKind.ALTERNATE_PROTOCOL)
+        return PlaybackRecoveryContinuation(
+            reserved.copy(alternateProtocolReserved = true),
+            RecoveryAttemptKind.ALTERNATE_PROTOCOL,
+        )
     }
 
 
@@ -213,7 +224,9 @@ data class PlaybackRecoverySession(
     fun recordFailure(stage: PlaybackFailureStage, cause: PlaybackFailureCause): PlaybackRecoverySession = copy(
         attempts = if (attempts.isEmpty()) attempts else attempts.dropLast(1) +
             attempts.last().copy(failureStage = stage, failureCause = cause),
-    )    fun transition(next: PlaybackPhase): PlaybackRecoverySession = copy(phase = next)
+    )
+
+    fun transition(next: PlaybackPhase): PlaybackRecoverySession = copy(phase = next)
 
     /** A stopped session invalidates queued watchdog/recovery work as well as renderer callbacks. */
     fun stop(): PlaybackRecoverySession = copy(phase = PlaybackPhase.STOPPED, generation = generation + 1)

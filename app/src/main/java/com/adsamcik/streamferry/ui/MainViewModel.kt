@@ -10,6 +10,8 @@ import com.adsamcik.streamferry.core.redaction.LogRedactor
 import com.adsamcik.streamferry.core.language.LanguagePreferenceResolver
 import com.adsamcik.streamferry.core.language.SubtitleMemory
 import com.adsamcik.streamferry.core.stream.Protocol
+import com.adsamcik.streamferry.core.resume.SmartResumeDeviceContext
+import com.adsamcik.streamferry.core.resume.SmartResumePositionReconciler
 import com.adsamcik.streamferry.core.resume.SmartResumeRecord
 import com.adsamcik.streamferry.core.resume.SmartResumeSeed
 import com.adsamcik.streamferry.core.resume.SmartResumeSourceType
@@ -25,7 +27,15 @@ import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.domain.MediaSource
 import com.adsamcik.streamferry.domain.MediaSourceIds
 import com.adsamcik.streamferry.permissions.AndroidNetworkPermissionManager
+import com.adsamcik.streamferry.physical.PhysicalEndpointKey
+import com.adsamcik.streamferry.physical.PhysicalTv
+import com.adsamcik.streamferry.physical.PhysicalTvAggregator
 import com.adsamcik.streamferry.playback.PlaybackStatus
+import com.adsamcik.streamferry.playback.PlaybackFailureCause
+import com.adsamcik.streamferry.playback.PlaybackFailureStage
+import com.adsamcik.streamferry.playback.PlaybackPhase
+import com.adsamcik.streamferry.playback.PlaybackPreparationException
+import com.adsamcik.streamferry.playback.PlaybackRecoveryContinuation
 import com.adsamcik.streamferry.ui.navigation.NavigationStatePolicy
 import com.adsamcik.streamferry.ui.state.AppUiState
 import com.adsamcik.streamferry.ui.state.ConnectionState
@@ -87,10 +97,12 @@ class MainViewModel(
 
     // ----- auto-reconnect after an unexpected renderer disconnect -----
     private var reconnectJob: Job? = null
+    private var reconnectGeneration = 0L
     // The in-flight device scan, so a play tap can cancel it (its progress spinner is an infinite Compose
     // animation that would otherwise keep posting main-thread frames during the FGS start window).
     private var scanJob: Job? = null
     @Volatile private var reconnecting = false
+    @Volatile private var playbackStarting = false
     // True while we're auto-advancing to the next episode (end-of-media -> resolve next -> play). Guards
     // the status->null "ended" branch so it doesn't bounce to the gallery during the hand-off.
     @Volatile private var autoAdvancing = false
@@ -98,16 +110,25 @@ class MainViewModel(
     // What to re-play on reconnect (Jellyfin online OR an on-device / downloaded local file). Set after a
     // successful play()/playLocal(), cleared on stop / a new play.
     private var reconnectContext: ReconnectContext? = null
+    private var pendingResumeDeviceContext: SmartResumeDeviceContext? = null
+    private var lastRecordedPhysicalAttemptGeneration = -1L
 
     private sealed interface ReconnectContext {
-        val target: DiscoveredTarget
-        data class Online(val item: MediaItem, override val target: DiscoveredTarget) : ReconnectContext
+        val physicalTv: PhysicalTv
+        val endpoint: DiscoveredTarget
+        data class Online(
+            val item: MediaItem,
+            override val physicalTv: PhysicalTv,
+            override val endpoint: DiscoveredTarget,
+        ) : ReconnectContext
         data class Local(
             val filePath: String,
             val contentType: String,
             val title: String,
             val runtimeSeconds: Long?,
-            override val target: DiscoveredTarget,
+            override val physicalTv: PhysicalTv,
+            override val endpoint: DiscoveredTarget,
+            val downloadId: String?,
             val smartResumeSeed: SmartResumeSeed?,
         ) : ReconnectContext
     }
@@ -143,15 +164,22 @@ class MainViewModel(
                 if (status != null) {
                     lastPlaybackPositionSeconds = status.positionSeconds
                     saveResumeThrottled(status.positionSeconds)
+                    recordSuccessfulPhysicalEndpoint(status)
                 }
                 // An unexpected renderer drop -> kick off auto-reconnect + resume (idempotent).
-                if (status?.connectionLost == true) startReconnect()
+                if (status?.connectionLost == true) {
+                    startReconnect()
+                } else if (status?.isTerminal == true) {
+                    startTerminalProtocolFallback(status)
+                }
                 _state.update { cur ->
                     // While reconnecting OR auto-advancing to the next episode, a transient null status
                     // must NOT bounce the user to the gallery — keep the playback screen for the hand-off.
-                    val ended = status == null && cur.route == Route.PLAYBACK && !reconnecting && !autoAdvancing
+                    val ended = status == null && cur.route == Route.PLAYBACK &&
+                        !playbackStarting && !reconnecting && !autoAdvancing
                     val ui = status?.toUi()?.copy(reconnecting = reconnecting)
-                        ?: cur.playback?.takeIf { reconnecting }?.copy(reconnecting = true)
+                        ?: cur.playback?.takeIf { playbackStarting || reconnecting }
+                            ?.copy(reconnecting = reconnecting)
                     cur.copy(
                         playback = ui,
                         route = if (ended) Route.GALLERY else cur.route,
@@ -739,6 +767,17 @@ class MainViewModel(
                 dlnaResult.exceptionOrNull()?.let { container.logger.w("discovery", "DLNA discovery failed", it) }
                 val cast = castResult.getOrDefault(emptyList())
                 val dlna = dlnaResult.getOrDefault(emptyList())
+                val physical = PhysicalTvAggregator.aggregate(
+                    cast + dlna,
+                    container.physicalTvAssociations,
+                ).physicalTvs
+                val resumeDevice = pendingResumeDeviceContext
+                val resumeTv = resumeDevice?.let { findConfidentResumeTv(physical, it) }
+                val resumeEndpoint = resumeTv?.let { tv ->
+                    resumeDevice.lastSuccessfulProtocol
+                        ?.let { protocol -> tv.availableEndpoints.firstOrNull { it.protocol == protocol } }
+                        ?: tv.selectEndpoint()
+                }
                 val scanError = when {
                     castResult.isFailure && dlnaResult.isFailure ->
                         "Couldn't scan for TVs. Check the local network and try again."
@@ -749,19 +788,39 @@ class MainViewModel(
                     else -> null
                 }
                 _state.update { current ->
+                    val refreshedSelection = resumeTv ?: current.selectedPhysicalTv?.let { selected ->
+                        physical.firstOrNull { it.id == selected.id }
+                    }
                     current.copy(
                         castAvailable = castReady,
                         castTargets = cast,
                         dlnaTargets = dlna,
-                        // A framework-selected Cast route may be temporarily absent from an enumeration;
-                        // retain it. DLNA selections are tied to the current descriptor snapshot.
-                        selectedTarget = current.selectedTarget?.takeIf { selected ->
-                            selected.protocol == Protocol.CAST ||
-                                dlna.any { it.protocol == selected.protocol && it.id == selected.id }
+                        physicalTvs = physical,
+                        selectedPhysicalTv = refreshedSelection,
+                        selectedTarget = resumeEndpoint ?: refreshedSelection?.selectEndpoint(),
+                        previousPhysicalTvName = when {
+                            resumeTv != null -> null
+                            resumeDevice != null -> resumeDevice.physicalDeviceReference
+                            else -> current.previousPhysicalTvName
                         },
                         isScanningTargets = false,
                         errorMessage = scanError,
                     )
+                }
+                // Smart Resume gets one bounded discovery window. Exact stable identity can auto-reuse
+                // the TV; a miss leaves the record intact and the picker visible with a display-only hint.
+                if (resumeDevice != null) {
+                    pendingResumeDeviceContext = null
+                    if (resumeTv != null && resumeEndpoint != null) {
+                        viewModelScope.launch {
+                            delay(1)
+                            if (_state.value.route == Route.TARGET_PICKER &&
+                                _state.value.selectedPhysicalTv?.id == resumeTv.id
+                            ) {
+                                play().join()
+                            }
+                        }
+                    }
                 }
             } catch (c: CancellationException) {
                 throw c
@@ -777,7 +836,41 @@ class MainViewModel(
         }
     }
 
-    fun selectTarget(target: DiscoveredTarget) = _state.update { it.copy(selectedTarget = target) }
+    fun selectTarget(target: DiscoveredTarget) {
+        val physical = PhysicalTvAggregator.aggregate(
+            _state.value.castTargets + _state.value.dlnaTargets + target,
+            container.physicalTvAssociations,
+        ).physicalTvs.firstOrNull { tv -> tv.availableEndpoints.any { it.protocol == target.protocol && it.id == target.id } }
+        _state.update { it.copy(selectedPhysicalTv = physical, selectedTarget = target) }
+    }
+
+    /** One picker action chooses the physical screen; protocol selection stays internal. */
+    fun selectPhysicalTv(target: PhysicalTv) {
+        pendingResumeDeviceContext = null
+        _state.update {
+            it.copy(
+                selectedPhysicalTv = target,
+                selectedTarget = target.selectEndpoint(),
+                previousPhysicalTvName = null,
+            )
+        }
+        play()
+    }
+
+    /** Advanced correction for a false-positive association; the negative pair survives later scans. */
+    fun unlinkPhysicalTv(target: PhysicalTv) {
+        val cast = target.castEndpoint?.let(PhysicalEndpointKey::from) ?: return
+        val dlna = target.dlnaEndpoint?.let(PhysicalEndpointKey::from) ?: return
+        container.physicalTvAssociations.unlink(cast, dlna)
+        val physical = PhysicalTvAggregator.aggregate(
+            _state.value.castTargets + _state.value.dlnaTargets,
+            container.physicalTvAssociations,
+        ).physicalTvs
+        _state.update {
+            it.copy(physicalTvs = physical, selectedPhysicalTv = null, selectedTarget = null)
+        }
+        container.logger.event("discovery", "A saved TV endpoint association was unlinked")
+    }
 
     fun play() = viewModelScope.launch {
         if (!container.permissions.hasLocalNetworkAccess()) {
@@ -804,19 +897,44 @@ class MainViewModel(
         currentDurationSeconds = null
         val requestedSmartResumePosition = smartResumeOverrideSeconds
         val s = _state.value
-        val target = s.selectedTarget ?: return@launch
+        val physicalTv = s.selectedPhysicalTv ?: return@launch
+        val target = physicalTv.selectEndpoint() ?: return@launch
+        val resumeDeviceContext = smartResumeDeviceContext(physicalTv, target)
+        _state.update { it.copy(selectedTarget = target) }
         val controller = if (target.protocol == Protocol.CAST) container.castController else container.dlnaController
         val downloadId = s.selectedDownloadId
         // Navigate to the playback screen only AFTER the proxy service enters the foreground (via the
         // onForegrounded callback below), so the screen's recomposition can't queue ahead of onStartCommand
         // on the main thread and blow the startForegroundService() deadline
         // (ForegroundServiceDidNotStartInTimeException on a Galaxy S24 / Android 16). See PlaybackEngine.
-        val goToPlayback = { _state.update { it.copy(route = Route.PLAYBACK, errorMessage = null) } }
+        val pendingPlayback = PlaybackUiState(
+            targetName = physicalTv.displayName,
+            protocol = target.protocol.name,
+            mediaTitle = s.selectedItem?.title ?: downloadId?.let(downloadTitles::get).orEmpty(),
+            durationSeconds = s.selectedItem?.runtimeSeconds,
+            phase = PlaybackPhase.CONNECTING,
+            adaptiveNote = "Connecting to the TV…",
+            volumeSupported = target.discoveryMetadata.volumeControlAvailable,
+        )
+        val goToPlayback = {
+            _state.update {
+                it.copy(
+                    route = Route.PLAYBACK,
+                    playback = it.playback ?: pendingPlayback,
+                    errorMessage = null,
+                )
+            }
+        }
+        playbackStarting = true
         runCatching {
             if (downloadId != null) {
                 val entry = container.downloadStore.get(downloadId) ?: error("Download no longer available.")
                 val file = container.downloadStore.fileFor(entry)
                 val resumeKey = "dl:$downloadId"
+                reconnectContext = ReconnectContext.Local(
+                    file.absolutePath, entry.mimeType, entry.title, entry.runtimeSeconds,
+                    physicalTv, target, downloadId, downloadedSmartResumeSeed(entry),
+                )
                 container.playbackEngine.playLocal(
                     filePath = file.absolutePath,
                     contentType = entry.mimeType,
@@ -825,19 +943,23 @@ class MainViewModel(
                     allowClientTranscode = container.playbackPreferences.transcodeLocalOnDevice,
                     resumePositionSeconds = requestedSmartResumePosition ?: container.resumeStore.resumePosition(resumeKey) ?: 0L,
                     smartResumeSeed = downloadedSmartResumeSeed(entry),
+                    smartResumeDeviceContext = resumeDeviceContext,
                     target = controller,
                     selectedTarget = target,
                     onForegrounded = goToPlayback,
                 )
                 currentResumeKey = resumeKey
                 currentDurationSeconds = entry.runtimeSeconds
-                reconnectContext = ReconnectContext.Local(file.absolutePath, entry.mimeType, entry.title, entry.runtimeSeconds, target, downloadedSmartResumeSeed(entry))
             } else {
                 val item = s.selectedItem ?: error("Nothing selected to play.")
                 if (item.sourceId == MediaSourceIds.LOCAL) {
                     // On-device file: served via the proxy from a content:// fd. Resumes where you left
                     // off and auto-reconnects, the same as an online session.
                     val mime = container.localMediaSource.mimeTypeFor(item.id)
+                    reconnectContext = ReconnectContext.Local(
+                        item.id, mime, item.title, item.runtimeSeconds,
+                        physicalTv, target, null, localSmartResumeSeed(item),
+                    )
                     container.playbackEngine.playLocal(
                         filePath = item.id,
                         contentType = mime,
@@ -846,33 +968,35 @@ class MainViewModel(
                         allowClientTranscode = container.playbackPreferences.transcodeLocalOnDevice,
                         resumePositionSeconds = requestedSmartResumePosition ?: container.resumeStore.resumePosition(item.id) ?: 0L,
                         smartResumeSeed = localSmartResumeSeed(item),
+                        smartResumeDeviceContext = resumeDeviceContext,
                         target = controller,
                         selectedTarget = target,
                         onForegrounded = goToPlayback,
                     )
                     currentResumeKey = item.id
                     currentDurationSeconds = item.runtimeSeconds
-                    reconnectContext = ReconnectContext.Local(item.id, mime, item.title, item.runtimeSeconds, target, localSmartResumeSeed(item))
                 } else {
                     // Arm seamless autoplay-next: for an eligible series episode the engine holds the TV
                     // connection at end-of-media so the next episode loads without a reconnect.
                     val autoAdvance = container.playbackPreferences.autoPlayNextEpisode &&
                         item.type.equals("Episode", ignoreCase = true) && item.seriesId != null
+                    reconnectContext = ReconnectContext.Online(item, physicalTv, target)
                     container.playbackEngine.play(
                         item, controller, target,
                         streamPreferences(),
                         autoAdvance = autoAdvance,
                         smartResumeSeed = onlineSmartResumeSeed(item),
+                        smartResumeDeviceContext = resumeDeviceContext,
                         onForegrounded = goToPlayback,
                     )
-                    // Enable auto-reconnect for this online session now that it has started.
-                    reconnectContext = ReconnectContext.Online(item, target)
                 }
             }
         }.onSuccess {
             smartResumeOverrideSeconds = null
         }.onFailure { e ->
-            if (isSessionExpired(e)) {
+            if (e is CancellationException) {
+                throw e
+            } else if (isSessionExpired(e)) {
                 handleSessionExpired()
             } else {
                 // Surface the ACTUAL cause (redacted) instead of a misleading "same Wi-Fi" message.
@@ -880,17 +1004,66 @@ class MainViewModel(
                 // (JellyfinClient.exec); only log here for non-HTTP failures (Cast/DLNA/proxy) so the
                 // diagnostics export doesn't carry the same error twice.
                 val reason = LogRedactor.redact(bestFailureReason(e)).take(180)
-                if (generateSequence(e) { it.cause }.none { it is JellyfinHttpException }) {
+                val latestFailureCause = container.playbackEngine.recoverySnapshot().attempts.lastOrNull()?.failureCause
+                val upstreamFailure = latestFailureCause == PlaybackFailureCause.UPSTREAM_OR_SERVER_UNAVAILABLE ||
+                    generateSequence(e) { it.cause }.any {
+                        it is JellyfinHttpException || it is PlaybackPreparationException
+                    }
+                if (!upstreamFailure) {
                     container.logger.w("Playback", "Couldn't start playback", e)
                 }
-                _state.update {
-                    it.copy(
-                        route = Route.TARGET_PICKER,
-                        errorMessage = "Couldn't start playback: $reason",
+                val context = reconnectContext
+                var switched = false
+                if (context != null && !upstreamFailure) {
+                    val generation = ++reconnectGeneration
+                    reconnecting = true
+                    _state.update { current ->
+                        current.copy(
+                            route = Route.PLAYBACK,
+                            playback = (current.playback ?: pendingPlayback).copy(
+                                phase = PlaybackPhase.CHANGING_PROTOCOL,
+                                adaptiveNote = "Trying another connection to the same TV…",
+                                reconnecting = true,
+                            ),
+                            errorMessage = null,
+                        )
+                    }
+                    val latest = container.playbackEngine.recoverySnapshot().attempts.lastOrNull()
+                    switched = tryAlternateProtocol(
+                        context,
+                        failureStage = latest?.failureStage ?: PlaybackFailureStage.UNKNOWN,
+                        failureCause = latest?.failureCause ?: PlaybackFailureCause.UNKNOWN,
+                        generation = generation,
                     )
+                    if (generation != reconnectGeneration) return@onFailure
+                    reconnecting = false
+                    _state.update { current ->
+                        current.copy(playback = current.playback?.copy(reconnecting = false))
+                    }
+                }
+                if (switched) {
+                    smartResumeOverrideSeconds = null
+                    container.logger.event("playback", "Initial playback recovered through the TV's alternate protocol")
+                } else if (context != null) {
+                    // Keep raw/redacted transport detail in diagnostics; the main UI stays concise.
+                    container.logger.event("playback", "Initial playback exhausted: $reason")
+                    surfaceTerminalPlaybackFailure(context, "Couldn't start playback on this TV.")
+                } else {
+                    _state.update { current ->
+                        current.copy(
+                            route = Route.PLAYBACK,
+                            playback = (current.playback ?: pendingPlayback).copy(
+                                phase = PlaybackPhase.FAILED,
+                                isTerminal = true,
+                                errorMessage = "Couldn't start playback on this TV.",
+                            ),
+                            errorMessage = null,
+                        )
+                    }
                 }
             }
         }
+        playbackStarting = false
         _state.update { it.copy(selectedDownloadId = null) }
     }
 
@@ -919,13 +1092,14 @@ class MainViewModel(
                     container.logger.event("playback", "Autoplaying next episode")
                     _state.update { it.copy(selectedItem = next) }
                     val target = _state.value.selectedTarget
+                    val previousContext = reconnectContext
                     // Prefer a SEAMLESS hand-off that reuses the live TV connection (the engine held it open
                     // at end-of-media). Fall back to a full play (reconnect) only if there's no live session.
                     val seamless = target != null && runCatching {
                         container.playbackEngine.playNext(next, streamPreferences(), onlineSmartResumeSeed(next))
                     }.onFailure { e -> if (isSessionExpired(e)) handleSessionExpired() }.getOrDefault(false)
-                    if (seamless && target != null) {
-                        reconnectContext = ReconnectContext.Online(next, target)
+                    if (seamless && target != null && previousContext != null) {
+                        reconnectContext = ReconnectContext.Online(next, previousContext.physicalTv, target)
                     } else {
                         play().join() // no live session to reuse — full (re)connect
                     }
@@ -944,23 +1118,39 @@ class MainViewModel(
     /** Resume the app-wide renderer-confirmed checkpoint through the normal target picker. */
     fun resumeSmartResume() = viewModelScope.launch {
         val record = container.smartResumeStore.current ?: return@launch
-        val position = record.resumePositionSeconds() ?: return@launch
         runCatching {
             when (record.sourceType) {
                 SmartResumeSourceType.JELLYFIN -> {
                     requireRecordOwner(record)
-                    beginSmartResumeTargetSelection(container.jellyfinMediaSource.item(record.mediaId).getOrThrow(), null, position)
+                    val item = container.jellyfinMediaSource.item(record.mediaId).getOrThrow()
+                    val position = SmartResumePositionReconciler.reconcile(
+                        record,
+                        rendererConfirmedSeconds = null,
+                        jellyfinResumeSeconds = item.resumePositionSeconds,
+                    ) ?: error("This playback is already complete.")
+                    beginSmartResumeTargetSelection(item, null, position, record.deviceContext())
                 }
                 SmartResumeSourceType.LOCAL -> {
                     val uri = record.localContentUri ?: error("This local video is no longer available.")
-                    beginSmartResumeTargetSelection(container.localMediaSource.item(uri).getOrThrow(), null, position)
+                    val item = container.localMediaSource.item(uri).getOrThrow()
+                    val position = SmartResumePositionReconciler.reconcile(
+                        record,
+                        rendererConfirmedSeconds = container.resumeStore.resumePosition(uri),
+                        jellyfinResumeSeconds = null,
+                    ) ?: error("This playback is already complete.")
+                    beginSmartResumeTargetSelection(item, null, position, record.deviceContext())
                 }
                 SmartResumeSourceType.DOWNLOADED -> {
                     requireRecordOwner(record)
                     val entry = container.downloadStore.get(record.mediaId) ?: error("The downloaded copy was deleted.")
                     val file = container.downloadStore.fileFor(entry)
                     check(file.isFile && file.canRead() && file.length() > 0L) { "The downloaded copy is unavailable." }
-                    beginSmartResumeTargetSelection(null, entry.itemId, position)
+                    val position = SmartResumePositionReconciler.reconcile(
+                        record,
+                        rendererConfirmedSeconds = container.resumeStore.resumePosition("dl:${entry.itemId}"),
+                        jellyfinResumeSeconds = null,
+                    ) ?: error("This playback is already complete.")
+                    beginSmartResumeTargetSelection(null, entry.itemId, position, record.deviceContext())
                 }
             }
         }.onFailure { error ->
@@ -970,14 +1160,21 @@ class MainViewModel(
 
     fun dismissSmartResume() = container.smartResumeStore.clear()
 
-    private fun beginSmartResumeTargetSelection(item: MediaItem?, downloadId: String?, position: Long) {
+    private fun beginSmartResumeTargetSelection(
+        item: MediaItem?,
+        downloadId: String?,
+        position: Long,
+        deviceContext: SmartResumeDeviceContext,
+    ) {
         smartResumeOverrideSeconds = position
+        pendingResumeDeviceContext = deviceContext
         _state.update {
             it.copy(
                 selectedItem = item ?: it.selectedItem,
                 selectedDownloadId = downloadId,
                 activeSourceId = item?.sourceId ?: it.activeSourceId,
                 errorMessage = null,
+                previousPhysicalTvName = deviceContext.physicalDeviceReference,
             )
         }
         scanTargets()
@@ -1206,9 +1403,166 @@ class MainViewModel(
         unplayedItemCount = if (played) 0 else unplayedItemCount,
     )
 
+    /** Explicit retry starts a fresh bounded recovery budget but keeps the same physical TV and checkpoint. */
+    fun retryPlayback() {
+        val ctx = reconnectContext ?: return
+        cancelReconnect()
+        viewModelScope.launch {
+            playbackStarting = true
+            _state.update { current ->
+                current.copy(
+                    route = Route.PLAYBACK,
+                    playback = current.playback?.copy(
+                        phase = PlaybackPhase.CONNECTING,
+                        isTerminal = false,
+                        errorMessage = null,
+                        reconnecting = false,
+                    ),
+                    errorMessage = null,
+                )
+            }
+            try {
+                playContext(ctx, ctx.endpoint, lastPlaybackPositionSeconds)
+            } catch (c: CancellationException) {
+                throw c
+            } catch (error: Exception) {
+                val reason = LogRedactor.redact(bestFailureReason(error)).take(180)
+                container.logger.w("playback", "Explicit playback retry failed", error)
+                _state.update { current ->
+                    current.copy(
+                        route = Route.PLAYBACK,
+                        playback = current.playback?.copy(
+                            phase = PlaybackPhase.FAILED,
+                            isTerminal = true,
+                            errorMessage = "Couldn't start playback: $reason",
+                        ),
+                    )
+                }
+            } finally {
+                playbackStarting = false
+            }
+        }
+    }
+
+    /** User-requested device change leaves recovery intentionally and returns to one physical-TV picker. */
+    fun changeTv() = viewModelScope.launch {
+        val ctx = reconnectContext
+        cancelReconnect()
+        smartResumeOverrideSeconds = lastPlaybackPositionSeconds
+        if (ctx is ReconnectContext.Local && ctx.downloadId != null) {
+            _state.update { it.copy(selectedDownloadId = ctx.downloadId) }
+        }
+        _state.update {
+            it.copy(
+                route = Route.TARGET_PICKER,
+                playback = null,
+                selectedPhysicalTv = null,
+                selectedTarget = null,
+                errorMessage = null,
+            )
+        }
+        runCatching { container.playbackEngine.stop() }
+        scanTargets()
+    }
+
+    private fun controllerFor(target: DiscoveredTarget) =
+        if (target.protocol == Protocol.CAST) container.castController else container.dlnaController
+
+    private fun smartResumeDeviceContext(
+        physicalTv: PhysicalTv,
+        endpoint: DiscoveredTarget,
+    ): SmartResumeDeviceContext {
+        val endpointKey = PhysicalEndpointKey.from(endpoint)
+        val hasStablePhysicalIdentity = physicalTv.availableEndpoints.any { PhysicalEndpointKey.from(it) != null }
+        return SmartResumeDeviceContext(
+            physicalDeviceStableId = physicalTv.id.takeIf { hasStablePhysicalIdentity },
+            physicalDeviceReference = physicalTv.displayName,
+            lastSuccessfulProtocol = endpoint.protocol,
+            stableEndpointIdentity = endpointKey?.storageToken,
+        )
+    }
+
+    /** Exact stable physical or endpoint identity only; display names never authorize automatic reuse. */
+    private fun findConfidentResumeTv(
+        physicalTvs: List<PhysicalTv>,
+        context: SmartResumeDeviceContext,
+    ): PhysicalTv? {
+        context.physicalDeviceStableId?.let { stableId ->
+            physicalTvs.singleOrNull { it.id == stableId }?.let { return it }
+        }
+        val endpointToken = context.stableEndpointIdentity ?: return null
+        return physicalTvs.singleOrNull { tv ->
+            tv.availableEndpoints.mapNotNull(PhysicalEndpointKey::from)
+                .any { it.storageToken == endpointToken }
+        }
+    }
+
+    /** Persist only evidence that reached renderer-confirmed PLAYING, never a mere discovery/load. */
+    private fun recordSuccessfulPhysicalEndpoint(status: PlaybackStatus) {
+        if (status.phase != PlaybackPhase.PLAYING || status.attemptGeneration == lastRecordedPhysicalAttemptGeneration) return
+        val context = reconnectContext ?: return
+        if (status.protocolName != context.endpoint.protocol.name) return
+        val store = container.physicalTvAssociations
+        val keys = context.physicalTv.availableEndpoints.mapNotNull(PhysicalEndpointKey::from).distinct()
+        val cast = keys.singleOrNull { it.protocol == Protocol.CAST }
+        val dlna = keys.singleOrNull { it.protocol == Protocol.DLNA }
+        if (cast != null && dlna != null && !store.isBlocked(cast, dlna) && !store.isLinked(cast, dlna)) {
+            // A two-endpoint PhysicalTv exists only after the conservative matcher found a mutual,
+            // one-to-one confident pair. Renderer-confirmed playback makes that pairing durable.
+            store.link(cast, dlna)
+        }
+        val preferenceScope = (keys + keys.mapNotNull(store::linkedPeer)).distinct()
+        if (preferenceScope.isNotEmpty()) {
+            store.recordLastSuccessful(preferenceScope, context.endpoint.protocol)
+        }
+        lastRecordedPhysicalAttemptGeneration = status.attemptGeneration
+    }
+
+    private fun ReconnectContext.withEndpoint(endpoint: DiscoveredTarget): ReconnectContext = when (this) {
+        is ReconnectContext.Online -> copy(endpoint = endpoint)
+        is ReconnectContext.Local -> copy(endpoint = endpoint)
+    }
+
+    private suspend fun playContext(
+        context: ReconnectContext,
+        endpoint: DiscoveredTarget,
+        resumeAtSeconds: Long,
+        recoveryContinuation: PlaybackRecoveryContinuation? = null,
+    ) {
+        val deviceContext = smartResumeDeviceContext(context.physicalTv, endpoint)
+        when (context) {
+            is ReconnectContext.Online -> container.playbackEngine.play(
+                context.item,
+                controllerFor(endpoint),
+                endpoint,
+                streamPreferences(),
+                resumePositionOverrideSeconds = resumeAtSeconds,
+                autoAdvance = container.playbackPreferences.autoPlayNextEpisode &&
+                    context.item.type.equals("Episode", ignoreCase = true) && context.item.seriesId != null,
+                smartResumeSeed = onlineSmartResumeSeed(context.item),
+                smartResumeDeviceContext = deviceContext,
+                recoveryContinuation = recoveryContinuation,
+            )
+            is ReconnectContext.Local -> container.playbackEngine.playLocal(
+                filePath = context.filePath,
+                contentType = context.contentType,
+                title = context.title,
+                runtimeSeconds = context.runtimeSeconds,
+                allowClientTranscode = container.playbackPreferences.transcodeLocalOnDevice,
+                resumePositionSeconds = resumeAtSeconds,
+                smartResumeSeed = context.smartResumeSeed,
+                smartResumeDeviceContext = deviceContext,
+                target = controllerFor(endpoint),
+                selectedTarget = endpoint,
+                recoveryContinuation = recoveryContinuation,
+            )
+        }
+    }
+
     fun stopPlayback() = viewModelScope.launch {
         cancelReconnect()
         reconnectContext = null
+        pendingResumeDeviceContext = null
         saveResumeNow()
         runCatching { container.playbackEngine.stop() }
         _state.update { it.copy(route = Route.GALLERY) }
@@ -1221,78 +1575,174 @@ class MainViewModel(
 
     // ----- auto-reconnect after an unexpected renderer disconnect -----
 
-    /**
-     * Re-establish a dropped online session: retry the same item on the same TV — resuming at the last
-     * reported position — a few times with linear backoff, surfaced as a "reconnecting" overlay. A
-     * network blip recovers as later attempts succeed; a permanent drop (TV off) gives up with a clear
-     * message. Idempotent; superseded/cancelled by [stopPlayback]/[play] via [cancelReconnect].
-     */
-    private fun startReconnect() {
+    /** One same-endpoint retry, then at most one alternate endpoint belonging to the same physical TV. */
+    private fun startReconnect() = startBoundedDeviceRecovery(retrySameEndpoint = true)
+
+    /** Internal stream/format recovery is exhausted; only a qualified physical-TV protocol handoff remains. */
+    private fun startTerminalProtocolFallback(status: PlaybackStatus) = startBoundedDeviceRecovery(
+        retrySameEndpoint = false,
+        initialStage = status.attemptHistory.lastOrNull()?.failureStage,
+        initialCause = status.attemptHistory.lastOrNull()?.failureCause,
+    )
+
+    private fun startBoundedDeviceRecovery(
+        retrySameEndpoint: Boolean,
+        initialStage: PlaybackFailureStage? = null,
+        initialCause: PlaybackFailureCause? = null,
+    ) {
         if (!container.permissions.hasLocalNetworkAccess()) {
             onLocalNetworkPermissionDenied()
             return
         }
-        val ctx = reconnectContext ?: return
+        val originalContext = reconnectContext ?: return
         if (reconnectJob?.isActive == true) return
+        val generation = ++reconnectGeneration
         reconnecting = true
-        val resumeAt = lastPlaybackPositionSeconds
         reconnectJob = viewModelScope.launch {
             try {
-                for (attempt in 1..MAX_RECONNECT_ATTEMPTS) {
-                    if (!container.permissions.hasLocalNetworkAccess()) {
-                        onLocalNetworkPermissionDenied()
-                        return@launch
-                    }
-                    _state.update { it.copy(playback = it.playback?.copy(reconnecting = true)) }
-                    container.logger.event("playback", "Connection lost; reconnecting (attempt $attempt of $MAX_RECONNECT_ATTEMPTS)")
-                    delay(minOf(RECONNECT_BASE_DELAY_MS * attempt, RECONNECT_MAX_DELAY_MS))
-                    val controller = if (ctx.target.protocol == Protocol.CAST) container.castController
-                        else container.dlnaController
-                    val ok = runCatching {
-                        when (ctx) {
-                            is ReconnectContext.Online -> container.playbackEngine.play(
-                                ctx.item, controller, ctx.target,
-                                streamPreferences(),
-                                resumePositionOverrideSeconds = resumeAt,
-                                smartResumeSeed = onlineSmartResumeSeed(ctx.item),
-                            )
-                            is ReconnectContext.Local -> container.playbackEngine.playLocal(
-                                filePath = ctx.filePath,
-                                contentType = ctx.contentType,
-                                title = ctx.title,
-                                runtimeSeconds = ctx.runtimeSeconds,
-                                allowClientTranscode = container.playbackPreferences.transcodeLocalOnDevice,
-                                resumePositionSeconds = resumeAt,
-                                smartResumeSeed = ctx.smartResumeSeed,
-                                target = controller,
-                                selectedTarget = ctx.target,
-                            )
-                        }
-                    }.onFailure { if (it is CancellationException) throw it }.isSuccess
-                    if (ok) {
-                        reconnecting = false
-                        _state.update { it.copy(playback = it.playback?.copy(reconnecting = false)) }
-                        container.logger.event("playback", "Reconnected and resumed playback")
-                        return@launch
-                    }
-                }
-                // Exhausted every attempt — give up cleanly and tell the user.
-                runCatching { container.playbackEngine.stop() }
-                reconnectContext = null
-                _state.update {
-                    it.copy(
-                        route = if (it.route == Route.PLAYBACK) Route.GALLERY else it.route,
-                        playback = null,
-                        errorMessage = "Lost the connection to the TV and couldn't reconnect. Please try again.",
+                _state.update { current ->
+                    current.copy(
+                        route = Route.PLAYBACK,
+                        playback = current.playback?.copy(
+                            reconnecting = true,
+                            phase = if (retrySameEndpoint) PlaybackPhase.RECONNECTING else PlaybackPhase.CHANGING_PROTOCOL,
+                            errorMessage = null,
+                            isTerminal = false,
+                        ),
                     )
                 }
+                if (retrySameEndpoint) {
+                    container.logger.event("playback", "Connection lost; trying the same TV endpoint once")
+                    delay(RECONNECT_DELAY_MS)
+                    if (generation != reconnectGeneration) return@launch
+                    if (container.playbackEngine.retrySameEndpointAfterDisconnect()) {
+                        container.logger.event("playback", "Reconnected and resumed on the same endpoint")
+                        return@launch
+                    }
+                }
+                if (generation != reconnectGeneration) return@launch
+                val latest = container.playbackEngine.recoverySnapshot().attempts.lastOrNull()
+                val switched = tryAlternateProtocol(
+                    originalContext,
+                    failureStage = latest?.failureStage ?: initialStage ?: PlaybackFailureStage.UNKNOWN,
+                    failureCause = latest?.failureCause ?: initialCause ?: PlaybackFailureCause.UNKNOWN,
+                    generation = generation,
+                )
+                if (generation != reconnectGeneration) return@launch
+                if (switched) {
+                    container.logger.event("playback", "Playback resumed through the TV's alternate protocol")
+                    return@launch
+                }
+                surfaceTerminalPlaybackFailure(
+                    originalContext,
+                    if (retrySameEndpoint) {
+                        "The connection to the TV couldn't be restored automatically."
+                    } else {
+                        "Stream Ferry tried the available compatible playback options."
+                    },
+                )
+            } catch (c: CancellationException) {
+                throw c
+            } catch (error: Exception) {
+                if (generation != reconnectGeneration) return@launch
+                container.logger.w("playback", "Automatic playback recovery failed", error)
+                surfaceTerminalPlaybackFailure(originalContext, "Playback couldn't be restored automatically.")
             } finally {
-                reconnecting = false
+                if (generation == reconnectGeneration) {
+                    reconnecting = false
+                    reconnectJob = null
+                    _state.update { current ->
+                        current.copy(playback = current.playback?.copy(reconnecting = false))
+                    }
+                }
             }
         }
     }
 
+    private suspend fun tryAlternateProtocol(
+        context: ReconnectContext,
+        failureStage: PlaybackFailureStage,
+        failureCause: PlaybackFailureCause,
+        generation: Long,
+    ): Boolean {
+        val alternate = when (context.endpoint.protocol) {
+            Protocol.CAST -> context.physicalTv.dlnaEndpoint
+            Protocol.DLNA -> context.physicalTv.castEndpoint
+        } ?: return false
+        val continuation = container.playbackEngine.reserveAlternateProtocolContinuation(
+            hasAlternateProtocol = true,
+            failureStage = failureStage,
+            failureCause = failureCause,
+            sameEndpointRecoveryExhausted = true,
+            isLocalSessionHint = context is ReconnectContext.Local,
+            isOnlineSessionHint = context is ReconnectContext.Online,
+        ) ?: return false
+        if (generation != reconnectGeneration) return false
+        _state.update { current ->
+            current.copy(
+                selectedTarget = alternate,
+                playback = current.playback?.copy(
+                    protocol = alternate.protocol.name,
+                    phase = PlaybackPhase.CHANGING_PROTOCOL,
+                    adaptiveNote = "Trying another connection to the same TV…",
+                    reconnecting = true,
+                ),
+            )
+        }
+        return try {
+            playContext(context, alternate, lastPlaybackPositionSeconds, continuation)
+            if (generation != reconnectGeneration) return false
+            reconnectContext = context.withEndpoint(alternate)
+            _state.update {
+                it.copy(
+                    selectedPhysicalTv = context.physicalTv,
+                    selectedTarget = alternate,
+                )
+            }
+            true
+        } catch (c: CancellationException) {
+            throw c
+        } catch (error: Exception) {
+            container.logger.w("playback", "Alternate TV protocol failed", error)
+            false
+        }
+    }
+
+    /** Release renderer/proxy resources while retaining a stable, actionable Now Playing error card. */
+    private suspend fun surfaceTerminalPlaybackFailure(context: ReconnectContext, message: String) {
+        val snapshot = container.playbackEngine.recoverySnapshot()
+        try {
+            container.playbackEngine.stop()
+        } catch (c: CancellationException) {
+            throw c
+        } catch (error: Exception) {
+            container.logger.w("playback", "Terminal playback cleanup failed", error)
+        }
+        _state.update { current ->
+            val prior = current.playback ?: PlaybackUiState(
+                targetName = context.physicalTv.displayName,
+                protocol = context.endpoint.protocol.name,
+                durationSeconds = currentDurationSeconds,
+                volumeSupported = context.endpoint.discoveryMetadata.volumeControlAvailable,
+            )
+            current.copy(
+                route = Route.PLAYBACK,
+                playback = prior.copy(
+                    phase = PlaybackPhase.FAILED,
+                    isTerminal = true,
+                    reconnecting = false,
+                    errorMessage = message,
+                    attemptGeneration = snapshot.generation,
+                    attemptHistory = snapshot.attempts,
+                    recoveryBudget = snapshot.budgetStatus,
+                ),
+                errorMessage = null,
+            )
+        }
+    }
+
     private fun cancelReconnect() {
+        reconnectGeneration++
         reconnectJob?.cancel()
         reconnectJob = null
         reconnecting = false
@@ -1442,6 +1892,7 @@ class MainViewModel(
         stopTargetDiscovery()
         cancelReconnect()
         reconnectContext = null
+        pendingResumeDeviceContext = null
         saveResumeNow()
         _state.update { current ->
             current.copy(
@@ -1449,6 +1900,8 @@ class MainViewModel(
                 localNetworkPermissionGranted = false,
                 castTargets = emptyList(),
                 dlnaTargets = emptyList(),
+                physicalTvs = emptyList(),
+                selectedPhysicalTv = null,
                 selectedTarget = null,
                 playback = null,
                 isScanningTargets = false,
@@ -1588,6 +2041,7 @@ class MainViewModel(
     private fun PlaybackStatus.toUi() = PlaybackUiState(
         targetName = targetName,
         protocol = protocolName,
+        mediaTitle = title,
         isPlaying = isPlaying,
         isBuffering = isBuffering,
         positionSeconds = positionSeconds,
@@ -1608,7 +2062,13 @@ class MainViewModel(
         sourceFormat = sourceFormat,
         outputFormat = outputFormat,
         volume = volume,
+        volumeSupported = volumeSupported,
         errorMessage = errorMessage,
+        phase = phase,
+        attemptGeneration = attemptGeneration,
+        attemptHistory = attemptHistory,
+        recoveryBudget = recoveryBudget,
+        isTerminal = isTerminal,
         audioTracks = audioTracks,
         subtitleTracks = subtitleTracks,
         currentAudioIndex = currentAudioIndex,
@@ -1638,9 +2098,7 @@ class MainViewModel(
         const val QUICK_CONNECT_POLL_MS = 3_000L
         const val LIBRARY_ERROR = "Couldn't load your library. Check the connection and try again."
         const val SEARCH_DEBOUNCE_MS = 350L
-        const val MAX_RECONNECT_ATTEMPTS = 12
-        const val RECONNECT_BASE_DELAY_MS = 2_000L
-        const val RECONNECT_MAX_DELAY_MS = 15_000L
+        const val RECONNECT_DELAY_MS = 2_000L
         const val RESUME_SAVE_INTERVAL_MS = 10_000L
     }
 }
