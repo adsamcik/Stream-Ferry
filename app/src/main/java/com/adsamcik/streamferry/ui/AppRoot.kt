@@ -58,6 +58,9 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -74,6 +77,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import com.adsamcik.streamferry.app.StreamFerryApplication
+import com.adsamcik.streamferry.core.volume.NightVolumePolicy
 import com.adsamcik.streamferry.diagnostics.ReportShare
 import com.adsamcik.streamferry.ui.navigation.NavigationStatePolicy
 import com.adsamcik.streamferry.ui.navigation.NavigationStatePolicy.TopLevelDestination
@@ -127,6 +132,10 @@ private val upNavigationRoutes = setOf(
 fun AppRoot(state: AppUiState, viewModel: MainViewModel, onScanDevices: () -> Unit) {
     val back = backActionFor(state, viewModel)
     val context = LocalContext.current
+    val nightVolumeSettings = remember(context.applicationContext) {
+        (context.applicationContext as StreamFerryApplication).container.nightVolumeSettingsStore
+    }
+    var nightVolumePolicy by remember { mutableStateOf(nightVolumeSettings.load()) }
     val showUpNavigation = state.route in upNavigationRoutes
 
     BackHandler(enabled = back != null) { back?.invoke() }
@@ -211,6 +220,11 @@ fun AppRoot(state: AppUiState, viewModel: MainViewModel, onScanDevices: () -> Un
                             viewModel = viewModel,
                             onScanDevices = onScanDevices,
                             context = context,
+                            nightVolumePolicy = nightVolumePolicy,
+                            onNightVolumePolicyChange = { policy ->
+                                nightVolumePolicy = policy
+                                nightVolumeSettings.save(policy)
+                            },
                             expanded = useNavigationRail,
                             reserveMiniPlayerSpace = useNavigationRail && showMiniPlayer,
                         )
@@ -245,6 +259,8 @@ private fun ScreenContent(
     viewModel: MainViewModel,
     onScanDevices: () -> Unit,
     context: android.content.Context,
+    nightVolumePolicy: NightVolumePolicy,
+    onNightVolumePolicyChange: (NightVolumePolicy) -> Unit,
     expanded: Boolean,
     reserveMiniPlayerSpace: Boolean,
 ) {
@@ -282,7 +298,7 @@ private fun ScreenContent(
                         .weight(1f)
                         .fillMaxWidth(),
                 ) {
-                    RouteContent(state, viewModel, onScanDevices, context, compact = !expanded)
+                    RouteContent(state, viewModel, onScanDevices, context, nightVolumePolicy, onNightVolumePolicyChange, compact = !expanded)
                 }
             }
         } else {
@@ -295,7 +311,7 @@ private fun ScreenContent(
                     message = state.errorMessage,
                     onDismiss = viewModel::dismissError,
                 )
-                RouteContent(state, viewModel, onScanDevices, context, compact = !expanded)
+                RouteContent(state, viewModel, onScanDevices, context, nightVolumePolicy, onNightVolumePolicyChange, compact = !expanded)
             }
         }
     }
@@ -307,6 +323,8 @@ private fun RouteContent(
     viewModel: MainViewModel,
     onScanDevices: () -> Unit,
     context: android.content.Context,
+    nightVolumePolicy: NightVolumePolicy,
+    onNightVolumePolicyChange: (NightVolumePolicy) -> Unit,
     compact: Boolean,
 ) {
     when (state.route) {
@@ -358,6 +376,8 @@ private fun RouteContent(
                 runCatching { context.startActivity(viewModel.batteryOptimizationRequestIntent()) }
             },
             onResetTvCapabilities = { viewModel.resetLearnedTvCapabilities() },
+            nightVolumePolicy = nightVolumePolicy,
+            onNightVolumePolicyChange = onNightVolumePolicyChange,
         )
         Route.ABOUT -> AboutScreen()
         Route.SERVERS -> ServersScreen(state, viewModel)
