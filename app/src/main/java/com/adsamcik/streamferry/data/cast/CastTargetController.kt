@@ -25,6 +25,7 @@ import com.adsamcik.streamferry.core.metadata.MetadataSanitizer
 import com.adsamcik.streamferry.core.stream.Protocol
 import com.adsamcik.streamferry.core.stream.TargetCapabilities
 import com.adsamcik.streamferry.domain.DiscoveredTarget
+import com.adsamcik.streamferry.domain.TargetDiscoveryMetadata
 import com.adsamcik.streamferry.domain.HlsSegmentFormat
 import com.adsamcik.streamferry.domain.PlaybackFailureKind
 import com.adsamcik.streamferry.domain.PlaybackTargetController
@@ -148,12 +149,23 @@ class CastTargetController(
             val results = router.routes
                 .filter { it.matchesSelector(selector) && !it.isDefault }
                 .map { route ->
+                    // CastDevice identity comes only from documented route extras. A MediaRouter route
+                    // ID is ephemeral, so it is never used as a stable physical-device identifier.
+                    val device = route.extras?.let { CastDevice.getFromBundle(it) }
+                    val deviceId = device?.deviceId?.takeIf { it.isNotBlank() }
+                    val modelName = device?.modelName?.takeIf { it.isNotBlank() }
                     DiscoveredTarget(
                         id = route.id,
                         displayName = route.name,
                         protocol = Protocol.CAST,
-                        capabilities = CAST_BASELINE.copy(modelName = route.description),
+                        capabilities = CAST_BASELINE.copy(modelName = modelName ?: route.description),
                         lastTestedStatus = null,
+                        discoveryMetadata = TargetDiscoveryMetadata(
+                            castDeviceId = deviceId,
+                            validatedSourceHost = device?.inetAddress?.hostAddress,
+                            modelName = modelName,
+                            volumeControlAvailable = true,
+                        ),
                     )
                 }
             logger.event("discovery", "Cast scan: ${results.size} route(s)")
