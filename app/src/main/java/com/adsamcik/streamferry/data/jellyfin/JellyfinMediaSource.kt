@@ -17,7 +17,15 @@ class JellyfinMediaSource(
     override val id: String = MediaSourceIds.JELLYFIN
     override val displayName: String = "Jellyfin"
     override val capabilities: SourceCapabilities =
-        SourceCapabilities(canServerTranscode = true, isSeekable = true)
+        SourceCapabilities(
+            canServerTranscode = true,
+            isSeekable = true,
+            isReopenable = true,
+            // The current phone transcoder accepts local URI/file inputs. A remote authenticated,
+            // reopenable segment input is deliberately not claimed until seeking/thermal/receiver
+            // validation exists; Jellyfin's server transcode remains the supported online fallback.
+            canStreamToClientTranscoder = false,
+        )
 
     override suspend fun roots(): Result<List<MediaItem>> = library.videoLibraries()
     override suspend fun children(parentId: String): Result<List<MediaItem>> = library.children(parentId)

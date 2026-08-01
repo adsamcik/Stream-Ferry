@@ -258,6 +258,33 @@ data class DiscoveredTarget(
     val protocol: Protocol,
     val capabilities: TargetCapabilities,
     val lastTestedStatus: String?,
+    /**
+     * Ephemeral identity evidence collected during this discovery scan. It is intentionally separate
+     * from [id]: a Cast route ID is not a Cast device ID, and a DLNA USN is not necessarily a UDN.
+     * Network hosts are discovery-only evidence and must never be persisted.
+     */
+    val discoveryMetadata: TargetDiscoveryMetadata = TargetDiscoveryMetadata(),
+)
+
+/**
+ * Protocol-independent identity evidence used only to decide whether two discovered endpoints could
+ * be the same physical screen. Values come from documented Cast and DLNA discovery surfaces.
+ */
+data class TargetDiscoveryMetadata(
+    /** Public CastDevice.deviceId, when this is a Cast endpoint. */
+    val castDeviceId: String? = null,
+    /** UDN from the selected DLNA MediaRenderer device node. */
+    val dlnaUdn: String? = null,
+    /** SSDP USN from the response that was used to describe this renderer. */
+    val dlnaUsn: String? = null,
+    /** Host that sent and was validated against the DLNA description, or the Cast device host. */
+    val validatedSourceHost: String? = null,
+    /** Validated DLNA description host. This is transient matching evidence, never persisted. */
+    val validatedDescriptionHost: String? = null,
+    val manufacturer: String? = null,
+    val modelName: String? = null,
+    /** True only when discovery resolved a protocol endpoint with renderer-volume support. */
+    val volumeControlAvailable: Boolean = false,
 )
 
 sealed interface PlaybackTargetEvent {

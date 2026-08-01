@@ -12,8 +12,18 @@ class PlaybackRouterTest {
 
     private val router = PlaybackRouter()
 
-    private val jellyfin = SourceCapabilities(canServerTranscode = true, isSeekable = true)
-    private val localFile = SourceCapabilities(canServerTranscode = false, isSeekable = true)
+    private val jellyfin = SourceCapabilities(
+        canServerTranscode = true,
+        isSeekable = true,
+        isReopenable = true,
+        canStreamToClientTranscoder = false,
+    )
+    private val localFile = SourceCapabilities(
+        canServerTranscode = false,
+        isSeekable = true,
+        isReopenable = true,
+        canStreamToClientTranscoder = true,
+    )
 
     private fun decision(method: PlayMethod) =
         StreamDecision(method, burnInSubtitles = false, maxBitrateBps = null, producesHls = method == PlayMethod.HLS_TRANSCODE, rationale = "test")
@@ -28,9 +38,9 @@ class PlaybackRouterTest {
         assertEquals(RouteKind.SERVER_TRANSCODE, router.route(decision(PlayMethod.AUDIO_TRANSCODE), jellyfin).kind)
     }
 
-    @Test fun jellyfinTranscodeCanPreferClient() {
+    @Test fun jellyfinClientPreferenceFallsBackToServerUntilRemoteInputProviderExists() {
         val route = router.route(decision(PlayMethod.HLS_TRANSCODE), jellyfin, preferClientTranscode = true)
-        assertEquals(RouteKind.CLIENT_TRANSCODE, route.kind)
+        assertEquals(RouteKind.SERVER_TRANSCODE, route.kind)
     }
 
     @Test fun localFileTranscodeUsesClient() {
@@ -44,9 +54,22 @@ class PlaybackRouterTest {
         assertEquals(RouteKind.SERVER_TRANSCODE, route.kind)
     }
 
-    @Test fun noServerAndNotSeekableStillAttemptsClient() {
-        val nonSeekableLocal = SourceCapabilities(canServerTranscode = false, isSeekable = false)
+    @Test fun noServerAndIneligibleInputIsUnsupported() {
+        val nonSeekableLocal = SourceCapabilities(
+            canServerTranscode = false,
+            isSeekable = false,
+            isReopenable = true,
+            canStreamToClientTranscoder = true,
+        )
         val route = router.route(decision(PlayMethod.HLS_TRANSCODE), nonSeekableLocal)
-        assertEquals(RouteKind.CLIENT_TRANSCODE, route.kind)
+        assertEquals(RouteKind.UNSUPPORTED, route.kind)
+    }
+
+    @Test fun clientTranscodeRequiresReopenableAndStreamableInput() {
+        val notReopenable = localFile.copy(isReopenable = false)
+        val noInputAdapter = localFile.copy(canStreamToClientTranscoder = false)
+
+        assertEquals(RouteKind.UNSUPPORTED, router.route(decision(PlayMethod.HLS_TRANSCODE), notReopenable).kind)
+        assertEquals(RouteKind.UNSUPPORTED, router.route(decision(PlayMethod.HLS_TRANSCODE), noInputAdapter).kind)
     }
 }

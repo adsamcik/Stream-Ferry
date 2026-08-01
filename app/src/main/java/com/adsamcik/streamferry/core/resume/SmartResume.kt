@@ -1,5 +1,6 @@
 package com.adsamcik.streamferry.core.resume
 
+import com.adsamcik.streamferry.core.stream.Protocol
 import java.util.UUID
 import kotlin.math.abs
 
@@ -32,6 +33,21 @@ data class SmartResumeSeed(
     }
 }
 
+/**
+ * A deliberately small, secret-free hint for reconnecting a saved playback session to a device.
+ * These are stable identities only. Callers must never put a proxy URL, host/port, token, session id,
+ * or transport address here.
+ */
+data class SmartResumeDeviceContext(
+    val physicalDeviceStableId: String? = null,
+    val physicalDeviceReference: String? = null,
+    val lastSuccessfulProtocol: Protocol? = null,
+    val stableEndpointIdentity: String? = null,
+) {
+    fun isStructurallyValid(): Boolean =
+        listOfNotNull(physicalDeviceStableId, physicalDeviceReference, stableEndpointIdentity).all { it.isNotBlank() }
+}
+
 data class SmartResumeRecord(
     val version: Int = CURRENT_VERSION,
     val sourceType: SmartResumeSourceType,
@@ -48,16 +64,23 @@ data class SmartResumeRecord(
     val generation: Long,
     val sequence: Long,
     val state: SmartResumeRecordState,
+    val physicalDeviceStableId: String? = null,
+    val physicalDeviceReference: String? = null,
+    val lastSuccessfulProtocol: Protocol? = null,
+    val stableEndpointIdentity: String? = null,
 ) {
     fun seed() = SmartResumeSeed(sourceType, mediaId, displayTitle, displaySubtitle, durationSeconds, serverId, userId, localContentUri)
     fun identityKey() = seed().identityKey()
+    fun deviceContext() = SmartResumeDeviceContext(
+        physicalDeviceStableId, physicalDeviceReference, lastSuccessfulProtocol, stableEndpointIdentity,
+    )
     fun resumePositionSeconds(): Long? = if (state == SmartResumeRecordState.IN_PROGRESS) {
         ResumePolicy.resumePosition(confirmedPositionSeconds, durationSeconds)
     } else null
-    fun isStructurallyValid() = version == CURRENT_VERSION && seed().isStructurallyValid() &&
+    fun isStructurallyValid() = version == CURRENT_VERSION && seed().isStructurallyValid() && deviceContext().isStructurallyValid() &&
         confirmedPositionSeconds >= 0 && updatedAtMillis >= 0 && sessionId.isNotBlank() && generation > 0 && sequence > 0
 
-    companion object { const val CURRENT_VERSION = 1 }
+    companion object { const val CURRENT_VERSION = 2 }
 }
 
 data class SmartResumeCheckpoint(
@@ -69,17 +92,38 @@ data class SmartResumeCheckpoint(
     val durationSeconds: Long?,
     val updatedAtMillis: Long,
     val kind: SmartResumeCheckpointKind,
+    val deviceContext: SmartResumeDeviceContext? = null,
 )
+
+/**
+ * Reconciles independently-confirmed renderer and Jellyfin positions without letting a stale server
+ * checkpoint move this device backwards. Finished records remain finished even if late telemetry arrives.
+ */
+object SmartResumePositionReconciler {
+    fun reconcile(
+        record: SmartResumeRecord?,
+        rendererConfirmedSeconds: Long?,
+        jellyfinResumeSeconds: Long?,
+    ): Long? {
+        if (record?.state == SmartResumeRecordState.FINISHED) return null
+        val position = listOfNotNull(record?.confirmedPositionSeconds, rendererConfirmedSeconds, jellyfinResumeSeconds)
+            .filter { it >= 0 }
+            .maxOrNull() ?: return null
+        return ResumePolicy.resumePosition(position, record?.durationSeconds)
+    }
+}
 
 /** Pure stale-write and position-regression guard. */
 object SmartResumeReducer {
     fun reduce(current: SmartResumeRecord?, update: SmartResumeCheckpoint): SmartResumeRecord? {
-        if (!update.seed.isStructurallyValid() || update.sequence <= 0 || update.confirmedPositionSeconds < 0) return current
+        if (!update.seed.isStructurallyValid() || update.generation <= 0 || update.sequence <= 0 || update.confirmedPositionSeconds < 0 ||
+            update.deviceContext?.isStructurallyValid() == false) return current
         if (current == null) return if (update.kind == SmartResumeCheckpointKind.STARTED) create(update) else null
         if (current.sessionId != update.sessionId) {
             return if (update.kind == SmartResumeCheckpointKind.STARTED && update.generation > current.generation) create(update) else current
         }
-        if (current.identityKey() != update.seed.identityKey() || update.sequence <= current.sequence || current.state == SmartResumeRecordState.FINISHED) return current
+        if (update.generation != current.generation || current.identityKey() != update.seed.identityKey() ||
+            update.sequence <= current.sequence || current.state == SmartResumeRecordState.FINISHED) return current
         val completed = update.kind == SmartResumeCheckpointKind.COMPLETED
         val regressionAllowed = completed || update.kind == SmartResumeCheckpointKind.SEEK_CONFIRMED
         if (!regressionAllowed && update.confirmedPositionSeconds < current.confirmedPositionSeconds) return current
@@ -91,6 +135,10 @@ object SmartResumeReducer {
             updatedAtMillis = maxOf(current.updatedAtMillis, update.updatedAtMillis),
             sequence = update.sequence,
             state = if (completed) SmartResumeRecordState.FINISHED else SmartResumeRecordState.IN_PROGRESS,
+            physicalDeviceStableId = update.deviceContext?.physicalDeviceStableId ?: current.physicalDeviceStableId,
+            physicalDeviceReference = update.deviceContext?.physicalDeviceReference ?: current.physicalDeviceReference,
+            lastSuccessfulProtocol = update.deviceContext?.lastSuccessfulProtocol ?: current.lastSuccessfulProtocol,
+            stableEndpointIdentity = update.deviceContext?.stableEndpointIdentity ?: current.stableEndpointIdentity,
         )
     }
 
@@ -109,6 +157,10 @@ object SmartResumeReducer {
         generation = update.generation,
         sequence = update.sequence,
         state = if (update.kind == SmartResumeCheckpointKind.COMPLETED) SmartResumeRecordState.FINISHED else SmartResumeRecordState.IN_PROGRESS,
+        physicalDeviceStableId = update.deviceContext?.physicalDeviceStableId,
+        physicalDeviceReference = update.deviceContext?.physicalDeviceReference,
+        lastSuccessfulProtocol = update.deviceContext?.lastSuccessfulProtocol,
+        stableEndpointIdentity = update.deviceContext?.stableEndpointIdentity,
     )
 }
 
@@ -145,19 +197,35 @@ class SmartResumeSessionTracker(
         var lastWriteMillis: Long = 0,
         var lastPersistedPosition: Long = 0,
         var pendingSeekSeconds: Long? = null,
+        var deviceContext: SmartResumeDeviceContext? = null,
     )
     private var session: Session? = null
 
-    @Synchronized fun prepare(seed: SmartResumeSeed?) {
+    @Synchronized fun prepare(seed: SmartResumeSeed?, deviceContext: SmartResumeDeviceContext? = null) {
         if (seed == null || !seed.isStructurallyValid()) { session = null; return }
         val current = store.current
-        session = Session(seed, newSessionId(), (current?.generation ?: 0) + 1, sequence = 0L)
+        session = Session(
+            seed, newSessionId(), (current?.generation ?: 0) + 1, sequence = 0L,
+            deviceContext = deviceContext?.takeIf { it.isStructurallyValid() },
+        )
+    }
+
+    /** Supplies or refreshes safe device identities after preparation, once a renderer has connected. */
+    @Synchronized fun updateDeviceContext(deviceContext: SmartResumeDeviceContext?) {
+        if (deviceContext?.isStructurallyValid() == true) session?.deviceContext = deviceContext
     }
 
     @Synchronized fun noteSeekRequested(positionSeconds: Long) { session?.pendingSeekSeconds = positionSeconds.coerceAtLeast(0) }
 
-    @Synchronized fun onRendererStatus(positionSeconds: Long, durationSeconds: Long?, isPlaying: Boolean) {
+    /** A confirmed renderer status can also atomically persist the safe endpoint that succeeded. */
+    @Synchronized fun onRendererStatus(
+        positionSeconds: Long,
+        durationSeconds: Long?,
+        isPlaying: Boolean,
+        deviceContext: SmartResumeDeviceContext? = null,
+    ) {
         val s = session ?: return
+        if (deviceContext?.isStructurallyValid() == true) s.deviceContext = deviceContext
         val position = positionSeconds.coerceAtLeast(0)
         if (durationSeconds != null && durationSeconds > 0) s.durationSeconds = durationSeconds
         if (!s.active) {
@@ -180,19 +248,30 @@ class SmartResumeSessionTracker(
         if (crossedThreshold || clock() - s.lastWriteMillis >= writeIntervalMillis) persist(s, SmartResumeCheckpointKind.PROGRESS)
     }
 
-    @Synchronized fun checkpoint(kind: SmartResumeCheckpointKind) {
+    @Synchronized fun checkpoint(kind: SmartResumeCheckpointKind, deviceContext: SmartResumeDeviceContext? = null) {
         val s = session ?: return
         if (!s.active || kind == SmartResumeCheckpointKind.COMPLETED) return
+        if (deviceContext?.isStructurallyValid() == true) s.deviceContext = deviceContext
         persist(s, kind)
     }
 
-    @Synchronized fun complete() { session?.takeIf { it.active }?.let { persist(it, SmartResumeCheckpointKind.COMPLETED) } }
+    @Synchronized fun complete(deviceContext: SmartResumeDeviceContext? = null) {
+        session?.takeIf { it.active }?.let {
+            if (deviceContext?.isStructurallyValid() == true) it.deviceContext = deviceContext
+            persist(it, SmartResumeCheckpointKind.COMPLETED)
+        }
+    }
     @Synchronized fun detach() { session = null }
 
     private fun persist(s: Session, kind: SmartResumeCheckpointKind) {
         val now = clock()
         val persisted = runCatching {
-            store.apply(SmartResumeCheckpoint(s.seed.copy(durationSeconds = s.durationSeconds ?: s.seed.durationSeconds), s.id, s.generation, ++s.sequence, s.positionSeconds, s.durationSeconds, now, kind))
+            store.apply(
+                SmartResumeCheckpoint(
+                    s.seed.copy(durationSeconds = s.durationSeconds ?: s.seed.durationSeconds), s.id,
+                    s.generation, ++s.sequence, s.positionSeconds, s.durationSeconds, now, kind, s.deviceContext,
+                ),
+            )
         }.getOrNull() ?: return
         s.lastWriteMillis = now
         s.lastPersistedPosition = persisted.confirmedPositionSeconds
