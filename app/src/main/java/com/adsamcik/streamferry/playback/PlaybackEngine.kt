@@ -1565,7 +1565,15 @@ class PlaybackEngine(
             return null
         }
         val decision = streamSelection.select(target.capabilities, profile, StreamPreferences())
-        val route = playbackRouter.route(decision, SourceCapabilities(canServerTranscode = false, isSeekable = true))
+        val route = playbackRouter.route(
+            decision,
+            SourceCapabilities(
+                canServerTranscode = false,
+                isSeekable = true,
+                isReopenable = true,
+                canStreamToClientTranscoder = true,
+            ),
+        )
         if (route.kind != RouteKind.CLIENT_TRANSCODE) {
             logger.event("transcode", "Local ${profile.videoCodec}/$container is direct-playable to this TV (${route.kind}); no on-device transcode")
             return null

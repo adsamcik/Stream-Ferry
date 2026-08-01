@@ -9,6 +9,10 @@ data class SourceCapabilities(
     val canServerTranscode: Boolean,
     /** True if the source supports random access (range/seek) — required for a seekable client transcode. */
     val isSeekable: Boolean,
+    /** True when the input can be opened again for later segments or recovery after a seek. */
+    val isReopenable: Boolean = isSeekable,
+    /** True only when this source has an implemented, authenticated input adapter for the phone transcoder. */
+    val canStreamToClientTranscoder: Boolean = false,
 )
 
 enum class RouteKind {
@@ -20,6 +24,9 @@ enum class RouteKind {
 
     /** Transcode on the phone (HW MediaCodec) into a seekable phone-hosted HLS/CMAF origin. */
     CLIENT_TRANSCODE,
+
+    /** No current provider can safely execute the requested conversion. */
+    UNSUPPORTED,
 }
 
 data class PlaybackRoute(val kind: RouteKind, val rationale: String)
@@ -46,7 +53,7 @@ class PlaybackRouter {
 
         // A remux/transcode is needed (DIRECT_STREAM_REMUX / AUDIO_TRANSCODE / HLS_TRANSCODE).
         val serverPossible = source.canServerTranscode
-        val clientPossible = source.isSeekable // a seekable source is required for full-seek client transcode
+        val clientPossible = source.isSeekable && source.isReopenable && source.canStreamToClientTranscoder
         return when {
             serverPossible && !preferClientTranscode ->
                 PlaybackRoute(
@@ -68,8 +75,8 @@ class PlaybackRouter {
 
             else ->
                 PlaybackRoute(
-                    RouteKind.CLIENT_TRANSCODE,
-                    "No server transcode and source not seekable; attempting on-device transcode (seek limited).",
+                    RouteKind.UNSUPPORTED,
+                    "No eligible server or reopenable, seekable phone-transcode input provider.",
                 )
         }
     }

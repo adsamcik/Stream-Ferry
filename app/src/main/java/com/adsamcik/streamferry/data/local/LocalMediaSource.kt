@@ -42,7 +42,12 @@ class LocalMediaSource(
     override val id: String = MediaSourceIds.LOCAL
     override val displayName: String = "On this device"
     override val capabilities: SourceCapabilities =
-        SourceCapabilities(canServerTranscode = false, isSeekable = true)
+        SourceCapabilities(
+            canServerTranscode = false,
+            isSeekable = true,
+            isReopenable = true,
+            canStreamToClientTranscoder = true,
+        )
 
     /** True when the user has granted any local access (folders, files, or the media permission). */
     fun hasAnyAccess(): Boolean =
