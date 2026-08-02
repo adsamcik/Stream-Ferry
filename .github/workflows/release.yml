@@ -108,7 +108,10 @@ jobs:
             exit 1
           fi
           "$apksigner" verify --verbose --print-certs "$apk" > "$certificate" 2>&1
-          grep -q '^Signer #1 certificate SHA-256 digest:' "$certificate"
+          if [[ ! -s "$certificate" ]]; then
+            echo "::error::apksigner completed without producing a signing-certificate report."
+            exit 1
+          fi
           echo "apk=$apk" >> "$GITHUB_OUTPUT"
           echo "version_code=$version_code" >> "$GITHUB_OUTPUT"
           echo "checksum=$checksum" >> "$GITHUB_OUTPUT"
