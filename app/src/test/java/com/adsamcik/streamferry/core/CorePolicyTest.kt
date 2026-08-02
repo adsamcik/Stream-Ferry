@@ -113,6 +113,13 @@ class CorePolicyTest {
         assertFalse(SsdpParser.isAcceptableLocation(null))
     }
 
+    @Test fun rejectsAmbiguousOrNonRoutableHttpLocation() {
+        assertFalse(SsdpParser.isAcceptableLocation("http://user@10.0.0.2/desc.xml"))
+        assertFalse(SsdpParser.isAcceptableLocation("http://10.0.0.2/desc.xml#other"))
+        assertFalse(SsdpParser.isAcceptableLocation("http://10.0.0.2:0/desc.xml"))
+        assertFalse(SsdpParser.isAcceptableLocation("http://localhost/desc.xml"))
+    }
+
     @Test fun rejectsRemoteLocationToPreventSsrf() {
         // A hostile LAN device must not lure the control point into fetching a remote description.
         assertFalse(SsdpParser.isAcceptableLocation("http://evil.example.com/desc.xml"))
@@ -120,6 +127,8 @@ class CorePolicyTest {
         // Legitimate LAN renderers are still accepted.
         assertTrue(SsdpParser.isAcceptableLocation("http://192.168.1.5:7676/desc.xml"))
         assertTrue(SsdpParser.isAcceptableLocation("http://10.0.0.9:2870/dmr.xml"))
+        assertTrue(SsdpParser.isAcceptableLocation("http://living-room-tv/desc.xml"))
+        assertTrue(SsdpParser.isAcceptableLocation("http://living-room-tv.local/desc.xml"))
     }
 
     @Test fun ssdpBoundsOversized() {

@@ -1,6 +1,7 @@
 package com.adsamcik.streamferry.data.dlna
 
 import android.net.Network
+import com.adsamcik.streamferry.core.net.ServerUrlValidator
 import com.adsamcik.streamferry.diagnostics.NetworkInfoProvider
 import okhttp3.Dns
 import okhttp3.OkHttpClient
@@ -16,7 +17,7 @@ import javax.net.SocketFactory
 /**
  * Trust policy for URLs learned from SSDP/device descriptions. It is deliberately distinct from the
  * user-entered Jellyfin URL policy: renderer endpoints must be private IPv4 peers on one selected
- * physical LAN, resolved through that Network and pinned for the lifetime of the renderer descriptor.
+ * physical LAN and are pinned to the SSDP response source for the renderer descriptor's lifetime.
  */
 class RendererEndpointPolicy(private val networkInfo: NetworkInfoProvider) {
 
@@ -28,11 +29,20 @@ class RendererEndpointPolicy(private val networkInfo: NetworkInfoProvider) {
         val localAddress: InetAddress,
     )
 
-    /** Validate LOCATION and require it to resolve to the exact source that sent the SSDP reply. */
-    fun location(rawUrl: String, source: InetAddress?): Endpoint? =
-        resolve(rawUrl, requiredSource = source, expectedNetwork = null, expectedAddresses = null)
+    /**
+     * Validate LOCATION and pin it to the exact source that sent the SSDP reply. Host names do not
+     * need a second DNS lookup: the unicast reply already proves the renderer's reachable address,
+     * and pinning avoids slow/broken vendor DNS while ensuring the fetch cannot leave that peer.
+     */
+    fun location(rawUrl: String, source: InetAddress?): Endpoint? {
+        source ?: return null
+        return resolve(rawUrl, requiredSource = source, expectedNetwork = null, expectedAddresses = null)
+    }
 
-    /** Service URLs may change spelling/host name, but must stay on the discovered renderer addresses. */
+    /**
+     * Service URLs may change spelling/host name, but their client remains pinned to the addresses
+     * proven by the SSDP reply. An absolute IPv4 literal must name one of those exact addresses.
+     */
     fun service(rawUrl: String, location: Endpoint): Endpoint? =
         resolve(rawUrl, requiredSource = null, expectedNetwork = location.network, expectedAddresses = location.addresses)
 
@@ -69,20 +79,31 @@ class RendererEndpointPolicy(private val networkInfo: NetworkInfoProvider) {
         if (uri.rawUserInfo != null || uri.rawFragment != null) return null
         val host = uri.host?.trim()?.takeIf { it.isNotEmpty() } ?: return null
         if (host.equals("localhost", ignoreCase = true) || host.contains('%')) return null
-        if (uri.port !in -1..65535) return null
-        if (!isIpv4Literal(host) && !host.contains('.')) return null // no single-label/overlay DNS names
+        if (uri.port == 0 || uri.port !in -1..65535) return null
+        val literalHost = isIpv4Literal(host)
+        if (!literalHost && !ServerUrlValidator.isPrivateHost(host)) return null
 
         val selectedNetwork = expectedNetwork ?: networkInfo.lanNetwork() ?: return null
         if (expectedNetwork != null && networkInfo.lanNetwork() != expectedNetwork) return null
-        // Literal renderer addresses need no DNS. Avoiding Network.getAllByName here also sidesteps
-        // Samsung/VPN resolver stalls after SSDP has already proved the peer's exact source address.
-        val addresses = runCatching {
-            if (isIpv4Literal(host)) listOf(InetAddress.getByName(host))
-            else selectedNetwork.getAllByName(host).toList()
-        }.getOrNull()?.distinct().orEmpty()
-        if (addresses.isEmpty() || addresses.any { !isApprovedRendererAddress(it) }) return null
-        if (requiredSource != null && addresses.none { it == requiredSource }) return null
-        if (expectedAddresses != null && addresses.any { it !in expectedAddresses }) return null
+        val addresses = when {
+            requiredSource != null -> {
+                if (!isApprovedRendererAddress(requiredSource)) return null
+                if (literalHost) {
+                    val advertised = ipv4Literal(host) ?: return null
+                    if (advertised != requiredSource) return null
+                }
+                listOf(requiredSource)
+            }
+            expectedAddresses != null -> {
+                if (expectedAddresses.isEmpty() || expectedAddresses.any { !isApprovedRendererAddress(it) }) return null
+                if (literalHost) {
+                    val advertised = ipv4Literal(host) ?: return null
+                    if (advertised !in expectedAddresses) return null
+                }
+                expectedAddresses
+            }
+            else -> return null
+        }
         val localAddress = networkInfo.lanIpv4()
             ?.let { runCatching { InetAddress.getByName(it) }.getOrNull() as? Inet4Address }
             ?.takeIf { it.isSiteLocalAddress }
@@ -106,8 +127,14 @@ class RendererEndpointPolicy(private val networkInfo: NetworkInfoProvider) {
     }
 
     private fun isIpv4Literal(host: String): Boolean = host.split('.').let { parts ->
-        parts.size == 4 && parts.all { part -> part.toIntOrNull()?.let { it in 0..255 } == true }
+        parts.size == 4 && parts.all { part ->
+            part.toIntOrNull()?.let { it in 0..255 } == true &&
+                (part.length == 1 || !part.startsWith('0'))
+        }
     }
+
+    private fun ipv4Literal(host: String): Inet4Address? =
+        runCatching { InetAddress.getByName(host) }.getOrNull() as? Inet4Address
 
     /** SocketFactory equivalent of binding a UDP socket to the physical LAN interface/address. */
     private class LocalAddressSocketFactory(private val localAddress: InetAddress) : SocketFactory() {

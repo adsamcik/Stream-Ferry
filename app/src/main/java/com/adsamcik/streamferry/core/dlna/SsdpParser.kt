@@ -77,6 +77,11 @@ object SsdpParser {
             val host = u.host
             (scheme == "http" || scheme == "https") &&
                 !host.isNullOrBlank() &&
+                !host.equals("localhost", ignoreCase = true) &&
+                u.rawUserInfo == null &&
+                u.rawFragment == null &&
+                u.port != 0 &&
+                u.port in -1..65535 &&
                 ServerUrlValidator.isPrivateHost(host)
         } catch (_: Exception) {
             false
