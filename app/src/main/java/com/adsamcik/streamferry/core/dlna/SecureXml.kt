@@ -1,6 +1,7 @@
 package com.adsamcik.streamferry.core.dlna
 
 import org.xml.sax.InputSource
+import java.io.ByteArrayInputStream
 import java.io.StringReader
 import javax.xml.parsers.DocumentBuilderFactory
 
@@ -61,8 +62,47 @@ object SecureXml {
         if (xml.toByteArray(Charsets.UTF_8).size > MAX_XML_BYTES) {
             throw XmlTooLargeException("XML exceeds ${MAX_XML_BYTES} bytes")
         }
-        val builder = hardenedFactory().newDocumentBuilder()
-        builder.setEntityResolver { _, _ -> InputSource(StringReader("")) }
-        return builder.parse(InputSource(StringReader(xml)))
+        return newBuilder().parse(InputSource(StringReader(xml)))
     }
+
+    /**
+     * Parse raw XML bytes so the XML declaration or BOM controls character decoding. Device
+     * descriptions are not guaranteed to be UTF-8, and the raw byte limit remains the network bound.
+     */
+    fun parse(xml: ByteArray): org.w3c.dom.Document {
+        if (xml.size > MAX_XML_BYTES) {
+            throw XmlTooLargeException("XML exceeds $MAX_XML_BYTES bytes")
+        }
+        if (containsDoctype(xml)) {
+            throw SecurityException("DOCTYPE is not allowed in renderer XML")
+        }
+        return newBuilder().parse(ByteArrayInputStream(xml))
+    }
+
+    private fun newBuilder() = hardenedFactory().newDocumentBuilder().apply {
+        setEntityResolver { _, _ -> InputSource(StringReader("")) }
+    }
+
+    /**
+     * XML markup keywords are ASCII in UPnP encodings. Ignoring NUL bytes catches both UTF-16 byte
+     * orders as well as ASCII-compatible encodings before trusting the declared document encoding.
+     */
+    private fun containsDoctype(xml: ByteArray): Boolean {
+        var matched = 0
+        for (byte in xml) {
+            val value = byte.toInt() and 0xff
+            if (value == 0) continue
+            val actual = if (value in 'a'.code..'z'.code) value - ('a'.code - 'A'.code) else value
+            val expected = DOCTYPE_MARKER[matched].code
+            matched = when {
+                actual == expected -> matched + 1
+                actual == DOCTYPE_MARKER[0].code -> 1
+                else -> 0
+            }
+            if (matched == DOCTYPE_MARKER.length) return true
+        }
+        return false
+    }
+
+    private const val DOCTYPE_MARKER = "<!DOCTYPE"
 }

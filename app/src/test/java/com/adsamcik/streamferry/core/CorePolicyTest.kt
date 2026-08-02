@@ -5,6 +5,7 @@ import com.adsamcik.streamferry.core.dlna.DidlLite
 import com.adsamcik.streamferry.core.dlna.SecureXml
 import com.adsamcik.streamferry.core.dlna.SsdpParser
 import com.adsamcik.streamferry.core.hls.HlsRewriter
+import java.nio.charset.StandardCharsets
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -149,8 +150,26 @@ class CorePolicyTest {
         assertEquals("root", doc.documentElement.nodeName)
     }
 
+    @Test fun secureXmlBytesHonorDeclaredDocumentEncoding() {
+        val xml = """<?xml version="1.0" encoding="ISO-8859-1"?><root><name>café</name></root>"""
+            .toByteArray(StandardCharsets.ISO_8859_1)
+        val doc = SecureXml.parse(xml)
+
+        assertEquals("café", doc.getElementsByTagName("name").item(0).textContent)
+    }
+
+    @Test fun secureXmlBytesBlockUtf16Doctype() {
+        val malicious = """<?xml version="1.0" encoding="UTF-16"?><!DOCTYPE root><root/>"""
+            .toByteArray(StandardCharsets.UTF_16LE)
+
+        assertFailsWith<SecurityException> { SecureXml.parse(malicious) }
+    }
+
     @Test fun secureXmlRejectsOversized() {
         val big = "<root>" + "a".repeat(SecureXml.MAX_XML_BYTES) + "</root>"
         assertFailsWith<SecureXml.XmlTooLargeException> { SecureXml.parse(big) }
+        assertFailsWith<SecureXml.XmlTooLargeException> {
+            SecureXml.parse(ByteArray(SecureXml.MAX_XML_BYTES + 1))
+        }
     }
 }

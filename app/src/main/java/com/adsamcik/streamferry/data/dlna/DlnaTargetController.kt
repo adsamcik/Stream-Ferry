@@ -259,12 +259,12 @@ class DlnaTargetController(
             logger.trace(TAG, "Rejected SSDP LOCATION outside the selected renderer network")
             return null
         }
-        val xml = fetch(locationEndpoint, remainingMillis)
-        if (xml == null) {
+        val xmlBytes = fetch(locationEndpoint, remainingMillis)
+        if (xmlBytes == null) {
             logger.w("dlna", "Device description fetch failed on the approved LAN route")
             return null
         }
-        val doc = runCatching { SecureXml.parse(xml) }.getOrElse {
+        val doc = runCatching { SecureXml.parse(xmlBytes) }.getOrElse {
             logger.w("dlna", "Device description XML parse failed: ${it.javaClass.simpleName}")
             return null
         }
@@ -573,8 +573,9 @@ class DlnaTargetController(
         httpClient.newCall(request).execute().use { resp ->
             // Read max+1 and reject overflow. peekBody silently truncates, which can turn a malformed
             // SOAP fault into a misleading successful parse.
-            val bytes = resp.body?.byteStream()?.let { BoundedBody.readAtMost(it, MAX_SOAP_BYTES + 1) }
-            if (bytes == null || bytes.size > MAX_SOAP_BYTES) {
+            val bytes = BoundedBody.readAtMost(resp.body.byteStream(), MAX_SOAP_BYTES + 1)
+                ?: throw IOException("Renderer SOAP body exceeds the size limit")
+            if (bytes.size > MAX_SOAP_BYTES) {
                 throw IOException("Renderer SOAP body exceeds the size limit")
             }
             val text = bytes.toString(Charsets.UTF_8)
@@ -596,24 +597,28 @@ class DlnaTargetController(
      * wall-clock budget. There is deliberately no fallback to the system default route: a VPN/default
      * route must not receive a renderer control request or the phone proxy URL later carried by SOAP.
      */
-    private fun fetch(endpoint: RendererEndpointPolicy.Endpoint, remainingMillis: Long): String? {
+    private fun fetch(endpoint: RendererEndpointPolicy.Endpoint, remainingMillis: Long): ByteArray? {
         requireLocalNetworkAccess()
         if (remainingMillis <= 0) return null
         return fetchViaOkHttp(endpointPolicy.client(httpClient, endpoint, remainingMillis), endpoint.url, remainingMillis)
     }
 
-    private fun fetchViaOkHttp(c: OkHttpClient, url: String, remainingMillis: Long): String? = runCatching {
+    private fun fetchViaOkHttp(c: OkHttpClient, url: String, remainingMillis: Long): ByteArray? = runCatching {
         val call = c.newCall(Request.Builder().url(url).build())
         call.timeout().timeout(remainingMillis, java.util.concurrent.TimeUnit.MILLISECONDS)
         call.execute().use { resp ->
             val bytes = if (resp.isSuccessful) {
-                resp.body?.byteStream()?.let { BoundedBody.readAtMost(it, MAX_DESCRIPTION_BYTES + 1) }
+                BoundedBody.readAtMost(resp.body.byteStream(), MAX_DESCRIPTION_BYTES + 1)
             } else {
                 null
             }
-            val body = bytes?.takeIf { it.size <= MAX_DESCRIPTION_BYTES }?.toString(Charsets.UTF_8)
-            logger.trace(TAG, "describe fetch via selected LAN: HTTP ${resp.code}, ${body?.length ?: 0} bytes from $url")
-            body?.takeIf { it.isNotBlank() }
+            val body = bytes?.takeIf { it.size <= MAX_DESCRIPTION_BYTES }
+            logger.trace(
+                TAG,
+                "describe fetch via selected LAN: HTTP " + resp.code + ", " +
+                    (body?.size ?: 0) + " bytes from " + url,
+            )
+            body?.takeIf { it.isNotEmpty() }
         }
     }.onFailure {
         logger.trace(TAG, "describe fetch via selected LAN failed for $url: ${it.javaClass.simpleName} ${it.message ?: ""}")
