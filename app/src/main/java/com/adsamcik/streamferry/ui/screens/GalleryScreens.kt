@@ -97,6 +97,7 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import com.adsamcik.streamferry.core.resume.ResumePolicy
+import com.adsamcik.streamferry.core.resume.SmartResumeSourceType
 import com.adsamcik.streamferry.data.download.DownloadFormat
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.domain.MediaSourceIds
@@ -494,6 +495,11 @@ private fun LibraryHome(
     onOpenSearch: () -> Unit,
     onCloseSearch: () -> Unit,
 ) {
+    val smartResumeMediaId = state.smartResume
+        ?.takeIf { it.sourceType == SmartResumeSourceType.JELLYFIN }
+        ?.mediaId
+    val visibleContinueWatching = state.continueWatching.filterNot { it.id == smartResumeMediaId }
+
     LazyVerticalGrid(
         columns = if (compact) GridCells.Fixed(2) else GridCells.Adaptive(minSize = 150.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -577,10 +583,10 @@ private fun LibraryHome(
                 )
             }
         }
-        if (state.continueWatching.isNotEmpty()) {
+        if (visibleContinueWatching.isNotEmpty()) {
             item(key = "continue-watching", span = { GridItemSpan(maxLineSpan) }) {
                 ContinueWatchingRow(
-                    items = state.continueWatching,
+                    items = visibleContinueWatching,
                     posterUrlFor = { viewModel.posterUrl(it, POSTER_CARD_WIDTH_PX) },
                     onClick = { viewModel.onItemClicked(it) },
                 )

@@ -6,6 +6,8 @@ import com.adsamcik.streamferry.core.resume.SmartResumeSourceType
 import com.adsamcik.streamferry.domain.UserSession
 
 data class SmartResumeUiState(
+    val mediaId: String,
+    val sourceType: SmartResumeSourceType,
     val title: String,
     val subtitle: String?,
     val sourceLabel: String,
@@ -22,6 +24,8 @@ fun SmartResumeRecord.toUiState(currentUser: UserSession?): SmartResumeUiState? 
         (currentUser.serverId != serverId || currentUser.userId != userId)
     ) return null
     return SmartResumeUiState(
+        mediaId = mediaId,
+        sourceType = sourceType,
         title = displayTitle,
         subtitle = displaySubtitle,
         sourceLabel = when (sourceType) {
