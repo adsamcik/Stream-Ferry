@@ -10,6 +10,8 @@ import androidx.compose.animation.togetherWith
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.annotation.DrawableRes
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -22,6 +24,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
 import androidx.compose.material.icons.automirrored.rounded.Logout
@@ -70,6 +73,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.adsamcik.streamferry.R
 import com.adsamcik.streamferry.core.language.Languages
@@ -207,7 +211,7 @@ fun ExpressiveSettingsScreen(
             }
         }
 
-        item(key = "night-volume-heading") { SettingsHeading("Night volume") }
+        item(key = "night-volume-heading") { SettingsHeading("Volume automation") }
         item(key = "night-volume-group") {
             SettingsGroup {
                 SettingsNightVolumeRow(policy = nightVolumePolicy, onSave = onNightVolumePolicyChange)
@@ -236,16 +240,15 @@ fun ExpressiveSettingsScreen(
                     },
                 )
                 SettingsDivider()
-                SettingsSwitchRow(
+                SettingsActionRow(
                     icon = Icons.Rounded.BatteryStd,
-                    title = "Allow background playback (screen-off)",
+                    title = "Background playback",
                     supporting = if (backgroundPlaybackUnrestricted) {
-                        "Background playback is unrestricted on this phone."
+                        "Unrestricted on this phone. Tap to review Android's battery setting."
                     } else {
-                        "Review Android battery restrictions so playback does not stall when the screen is off."
+                        "Allow unrestricted battery use so playback is less likely to stall with the screen off."
                     },
-                    checked = backgroundPlaybackUnrestricted,
-                    onCheckedChange = { onAllowBackgroundPlayback() },
+                    onClick = onAllowBackgroundPlayback,
                 )
             }
         }
@@ -420,23 +423,54 @@ private fun SettingsNightVolumeRow(policy: NightVolumePolicy, onSave: (NightVolu
         onDismissRequest = { showDialog = false },
         title = { Text("Night volume") },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Column(
+                modifier = Modifier.heightIn(max = 440.dp).verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
                 Text("Times use this phone's local time. Automatic changes only reduce volume during active playback.")
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                    NightVolumeModeButton("Off", mode == NightVolumeMode.OFF, Modifier.weight(1f)) { mode = NightVolumeMode.OFF }
-                    NightVolumeModeButton("Gradual", mode == NightVolumeMode.GRADUAL, Modifier.weight(1f)) { mode = NightVolumeMode.GRADUAL }
-                    NightVolumeModeButton("Hard", mode == NightVolumeMode.HARD, Modifier.weight(1f)) { mode = NightVolumeMode.HARD }
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
+                    NightVolumeModeButton("Off", mode == NightVolumeMode.OFF, Modifier.fillMaxWidth()) {
+                        mode = NightVolumeMode.OFF
+                        error = null
+                    }
+                    NightVolumeModeButton("Gradual reduction", mode == NightVolumeMode.GRADUAL, Modifier.fillMaxWidth()) {
+                        mode = NightVolumeMode.GRADUAL
+                        error = null
+                    }
+                    NightVolumeModeButton("Hard reduction", mode == NightVolumeMode.HARD, Modifier.fillMaxWidth()) {
+                        mode = NightVolumeMode.HARD
+                        error = null
+                    }
                 }
                 when (mode) {
                     NightVolumeMode.OFF -> Text("No automatic volume changes.")
                     NightVolumeMode.GRADUAL -> {
-                        OutlinedTextField(value = startText, onValueChange = { startText = it; error = null }, label = { Text("Start time (HH:mm)") }, singleLine = true, isError = error != null, modifier = Modifier.fillMaxWidth())
-                        OutlinedTextField(value = endText, onValueChange = { endText = it; error = null }, label = { Text("End time (HH:mm)") }, singleLine = true, isError = error != null, modifier = Modifier.fillMaxWidth())
+                        NightVolumeTimeField(startText, "Start time (HH:mm)", error != null) {
+                            startText = it
+                            error = null
+                        }
+                        NightVolumeTimeField(endText, "End time (HH:mm)", error != null) {
+                            endText = it
+                            error = null
+                        }
                     }
-                    NightVolumeMode.HARD -> OutlinedTextField(value = timeText, onValueChange = { timeText = it; error = null }, label = { Text("Time (HH:mm)") }, singleLine = true, isError = error != null, modifier = Modifier.fillMaxWidth())
+                    NightVolumeMode.HARD -> {
+                        NightVolumeTimeField(timeText, "Time (HH:mm)", error != null) {
+                            timeText = it
+                            error = null
+                        }
+                    }
                 }
                 if (mode != NightVolumeMode.OFF) {
-                    OutlinedTextField(value = targetPercent, onValueChange = { targetPercent = it; error = null }, label = { Text("Target volume (0–100%)") }, singleLine = true, isError = error != null, modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(
+                        value = targetPercent,
+                        onValueChange = { targetPercent = it.filter(Char::isDigit).take(3); error = null },
+                        label = { Text("Target volume (0–100%)") },
+                        singleLine = true,
+                        isError = error != null,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
                 }
                 error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
             }
@@ -447,8 +481,15 @@ private fun SettingsNightVolumeRow(policy: NightVolumePolicy, onSave: (NightVolu
                     val saved = runCatching {
                         when (mode) {
                             NightVolumeMode.OFF -> NightVolumePolicy.Off
-                            NightVolumeMode.GRADUAL -> NightVolumePolicy.Gradual(LocalTime.parse(startText), LocalTime.parse(endText), targetPercent.toFloat().div(100f).also { require(it in 0f..1f) })
-                            NightVolumeMode.HARD -> NightVolumePolicy.Hard(LocalTime.parse(timeText), targetPercent.toFloat().div(100f).also { require(it in 0f..1f) })
+                            NightVolumeMode.GRADUAL -> NightVolumePolicy.Gradual(
+                                LocalTime.parse(startText),
+                                LocalTime.parse(endText),
+                                parseNightVolumeTarget(targetPercent),
+                            )
+                            NightVolumeMode.HARD -> NightVolumePolicy.Hard(
+                                LocalTime.parse(timeText),
+                                parseNightVolumeTarget(targetPercent),
+                            )
                         }
                     }.getOrElse { error = "Use HH:mm times and a target from 0 to 100%."; null }
                     if (saved != null) { onSave(saved); showDialog = false }
@@ -459,6 +500,29 @@ private fun SettingsNightVolumeRow(policy: NightVolumePolicy, onSave: (NightVolu
         dismissButton = { TextButton(onClick = { showDialog = false }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Cancel") } },
     )
 }
+
+@Composable
+private fun NightVolumeTimeField(
+    value: String,
+    label: String,
+    isError: Boolean,
+    onValueChange: (String) -> Unit,
+) {
+    OutlinedTextField(
+        value = value,
+        onValueChange = { input ->
+            onValueChange(input.filter { it.isDigit() || it == ':' }.take(5))
+        },
+        label = { Text(label) },
+        singleLine = true,
+        isError = isError,
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
+        modifier = Modifier.fillMaxWidth(),
+    )
+}
+
+private fun parseNightVolumeTarget(value: String): Float =
+    value.toFloat().div(100f).also { require(it in 0f..1f) }
 
 @Composable
 private fun NightVolumeModeButton(label: String, selected: Boolean, modifier: Modifier, onClick: () -> Unit) {
