@@ -2061,6 +2061,7 @@ class MainViewModel(
         isManualQuality = isManualQuality,
         availableVideoCodecs = availableVideoCodecs,
         preferredVideoCodec = preferredVideoCodec,
+        automaticMaxVideoHeight = automaticMaxVideoHeight,
         maxVideoHeight = maxVideoHeight,
         isManualMaxVideoHeight = isManualMaxVideoHeight,
         videoWidth = videoWidth,

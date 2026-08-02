@@ -165,6 +165,27 @@ class DeviceProfilesTest {
         assertFalse(json.contains("\"VideoCodec\":\"av1\""))
     }
 
+    @Test fun formatAndResolutionOverridesComposeInOneTranscodeProfile() {
+        val caps = castCaps.copy(
+            supportedVideoCodecs = setOf("h264", "hevc"),
+            supportsHevc = true,
+            supports10Bit = true,
+        )
+        val json = DeviceProfiles.forTarget(
+            caps,
+            maxBitrateBps = null,
+            forceTranscode = true,
+            allowSubtitleBurnIn = false,
+            preferredVideoCodec = "hevc",
+            maxVideoHeight = 720,
+        )
+
+        assertTrue(json.contains("\"DirectPlayProfiles\":[]"))
+        assertTrue(json.contains("\"VideoCodec\":\"hevc\""))
+        assertFalse(json.contains("\"VideoCodec\":\"h264\""))
+        assertTrue(json.contains("\"Property\":\"Height\",\"Value\":\"720\""))
+    }
+
     @Test fun maxVideoHeightAddsCodecAgnosticHeightCap() {
         // A 1080p max caps EVERY codec's Height so the server downscales a 4K source.
         val json = DeviceProfiles.forTarget(

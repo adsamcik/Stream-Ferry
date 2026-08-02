@@ -92,6 +92,8 @@ data class PlaybackStatus(
     val availableVideoCodecs: List<String> = emptyList(),
     /** Manually-chosen transcode codec (e.g. "hevc"), or null for automatic best-codec. */
     val preferredVideoCodec: String? = null,
+    /** Saved automatic resolution cap, retained while a playback-only override is active. */
+    val automaticMaxVideoHeight: Int? = null,
     /** Active server-stream resolution cap, or null when this is a local session. */
     val maxVideoHeight: Int? = null,
     /** True when the current session overrides the saved resolution cap. */
@@ -1031,9 +1033,15 @@ class PlaybackEngine(
                 }
             return@withLock
         }
-        if (currentInfo == null || preferredCodec == codec) return@withLock
-        preferredCodec = codec
-        logger.event("quality", "Preferred codec -> ${codec ?: "auto"}; re-resolving")
+        if (currentInfo == null) return@withLock
+        val requested = codec?.let { parseVideoCodec(it)?.name?.lowercase() ?: return@withLock }
+        if (requested != null && requested !in tvVideoCodecs(selectedTarget?.capabilities ?: return@withLock)) {
+            logger.w("quality", "Ignoring unsupported TV output format: $requested")
+            return@withLock
+        }
+        if (preferredCodec == requested) return@withLock
+        preferredCodec = requested
+        logger.event("quality", "Preferred codec -> ${requested ?: "auto"}; re-resolving")
         reloadStreamPreservingPosition("codec change")
     }
 
@@ -2190,6 +2198,7 @@ class PlaybackEngine(
                 else -> emptyList()
             },
             preferredVideoCodec = if (currentInfo != null) preferredCodec else forcedLocalCodec?.name?.lowercase(),
+            automaticMaxVideoHeight = currentInfo?.let { prefs.maxVideoHeight },
             maxVideoHeight = currentInfo?.let { effectiveMaxVideoHeight() },
             isManualMaxVideoHeight = manualMaxVideoHeight != null,
             videoWidth = srcProfile?.widthPx,

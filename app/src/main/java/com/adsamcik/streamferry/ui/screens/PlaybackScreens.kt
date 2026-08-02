@@ -122,6 +122,7 @@ import com.adsamcik.streamferry.core.adaptive.QualityMenu
 import com.adsamcik.streamferry.core.chapter.chapterIndexForPosition
 import com.adsamcik.streamferry.core.stream.Protocol
 import com.adsamcik.streamferry.core.stream.TargetCapabilities
+import com.adsamcik.streamferry.core.stream.TvOutputMenu
 import com.adsamcik.streamferry.domain.DiscoveredTarget
 import com.adsamcik.streamferry.domain.MediaChapter
 import com.adsamcik.streamferry.physical.PhysicalTv
@@ -864,7 +865,7 @@ private fun PlaybackOptionsSheet(
                 }
             }
             item(key = "playback-options-adaptive") {
-                AdaptiveCard(
+                TvOutputCard(
                     p = p,
                     onSelectQuality = viewModel::selectQuality,
                     onSelectCodec = viewModel::selectPreferredCodec,
@@ -1418,7 +1419,7 @@ private fun <T> PickerRow(
 }
 
 @Composable
-private fun AdaptiveCard(p: PlaybackUiState, onSelectQuality: (Long?) -> Unit, onSelectCodec: (String?) -> Unit, onSelectResolution: (Int?) -> Unit) {
+private fun TvOutputCard(p: PlaybackUiState, onSelectQuality: (Long?) -> Unit, onSelectCodec: (String?) -> Unit, onSelectResolution: (Int?) -> Unit) {
     Card(
         shape = RoundedCornerShape(22.dp),
         modifier = Modifier.fillMaxWidth(),
@@ -1427,15 +1428,46 @@ private fun AdaptiveCard(p: PlaybackUiState, onSelectQuality: (Long?) -> Unit, o
         Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Icon(
-                    Icons.Rounded.GraphicEq,
+                    Icons.Rounded.Tv,
                     contentDescription = null,
                     tint = MaterialTheme.colorScheme.onSecondaryContainer,
                 )
                 Text(
-                    "Jellyfin overrides",
+                    "TV output",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.onSecondaryContainer,
+                )
+            }
+            Text(
+                "Override automatic playback when the TV needs a specific format or resolution.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSecondaryContainer,
+            )
+            val formatMenu = TvOutputMenu.formatOptions(
+                availableVideoCodecs = p.availableVideoCodecs,
+                preferredVideoCodec = p.preferredVideoCodec,
+            )
+            if (formatMenu.size > 1) {
+                PickerRow(
+                    icon = Icons.Rounded.Memory,
+                    label = "Output format",
+                    selectedLabel = formatMenu.firstOrNull { it.isSelected }?.label ?: "Auto",
+                    options = formatMenu.map { it.codec to it.label },
+                    onSelect = onSelectCodec,
+                )
+            }
+            p.automaticMaxVideoHeight?.let { automaticCap ->
+                val resolutionMenu = TvOutputMenu.resolutionOptions(
+                    automaticMaxHeightPx = automaticCap,
+                    manualMaxHeightPx = p.maxVideoHeight.takeIf { p.isManualMaxVideoHeight },
+                )
+                PickerRow(
+                    icon = Icons.Rounded.Hd,
+                    label = "Output resolution",
+                    selectedLabel = resolutionMenu.firstOrNull { it.isSelected }?.label ?: "Auto",
+                    options = resolutionMenu.map { it.heightPx to it.label },
+                    onSelect = onSelectResolution,
                 )
             }
             // Manual quality picker — Auto (adaptive) plus each bitrate rung. Shown only when there's a real
@@ -1451,32 +1483,6 @@ private fun AdaptiveCard(p: PlaybackUiState, onSelectQuality: (Long?) -> Unit, o
                     selectedLabel = menu.firstOrNull { it.isSelected }?.label ?: "Auto",
                     options = menu.map { it.bitrateBps to it.label },
                     onSelect = onSelectQuality,
-                )
-            }
-            // Manual codec picker — Auto (best codec the TV supports) plus each codec the TV can accept.
-            p.maxVideoHeight?.let { cap ->
-                val options = listOf<Pair<Int?, String>>(
-                    null to "Auto (${cap}p)", 2160 to "4K (2160p)", 1080 to "1080p", 720 to "720p", 480 to "480p",
-                )
-                PickerRow(
-                    icon = Icons.Rounded.Hd,
-                    label = "Resolution cap",
-                    selectedLabel = if (p.isManualMaxVideoHeight) "${cap}p" else "Auto (${cap}p)",
-                    options = options,
-                    onSelect = onSelectResolution,
-                )
-            }
-
-            // Choosing one makes a server transcode use that codec.
-            if (p.availableVideoCodecs.size > 1) {
-                val codecOptions = listOf<Pair<String?, String>>(null to "Auto") +
-                    p.availableVideoCodecs.map { it to codecLabel(it) }
-                PickerRow(
-                    icon = Icons.Rounded.Memory,
-                    label = "Video format",
-                    selectedLabel = p.preferredVideoCodec?.let { codecLabel(it) } ?: "Auto",
-                    options = codecOptions,
-                    onSelect = onSelectCodec,
                 )
             }
             StatRow(Icons.Rounded.Tv, "Stream", p.streamMode.ifBlank { "—" })
@@ -1530,15 +1536,6 @@ private fun formatPlaybackTime(seconds: Long): String {
     else "%d:%02d".format(minutes, remainingSeconds)
 }
 
-/** Friendly label for a codec id used in the manual codec picker. */
-private fun codecLabel(codec: String): String = when (codec.lowercase()) {
-    "h264", "avc" -> "H.264"
-    "hevc", "h265" -> "HEVC"
-    "vp9" -> "VP9"
-    "av1" -> "AV1"
-    else -> codec.uppercase()
-}
-
 /** A friendly tag for high resolutions ("4K"/"8K"); lower ones are already clear from the WxH dimensions. */
 private fun resolutionLabel(heightPx: Int): String = when {
     heightPx >= 4320 -> " (8K)"
@@ -1587,6 +1584,8 @@ private val samplePlayback = PlaybackUiState(
     adaptiveNote = "Streaming the original at full quality.",
     availableBitratesBps = listOf(1_500_000, 3_000_000, 6_000_000, 12_000_000, 20_000_000),
     availableVideoCodecs = listOf("hevc", "h264"),
+    automaticMaxVideoHeight = 2160,
+    maxVideoHeight = 2160,
     volume = 0.7f,
 )
 
@@ -1612,7 +1611,7 @@ private fun PlaybackControlsPreview() {
                     previewUrlFor = { null },
                     onSeek = {},
                 )
-                AdaptiveCard(samplePlayback, onSelectQuality = {}, onSelectCodec = {}, onSelectResolution = {})
+                TvOutputCard(samplePlayback, onSelectQuality = {}, onSelectCodec = {}, onSelectResolution = {})
             }
         }
     }
