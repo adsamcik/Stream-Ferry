@@ -1,7 +1,7 @@
 [versions]
 # Verified locally: Kotlin 2.4.0 (kotlinc on the build host), Android SDK Platform 37 / build-tools 37.0.0 present.
 # AGP 9.2.1 supports compileSdk 37 (developer.android.com AGP 9.2 release notes); requires Gradle >= 9.4.1 (wrapper pins 9.5.1).
-agp = "9.2.1"
+agp = "9.3.1"
 kotlin = "2.4.10"
 
 # AndroidX / Compose. Compose BOM + Cast versions must be re-verified at first online build
@@ -12,13 +12,13 @@ activityCompose = "1.13.0"
 # The alpha BOM is required for the official Material 3 Expressive theme, motion scheme, and
 # morphing loading indicator. Keep the whole Compose stack aligned instead of pinning Material 3
 # independently against an older Compose runtime.
-composeBom = "2026.07.00"
+composeBom = "2026.07.01"
 
 # Google Cast Sender SDK (Google Play services).
 castFramework = "22.3.1"
 
 # Jellyfin official Kotlin SDK — VERIFIED on Maven Central: org.jellyfin.sdk:jellyfin-core:1.8.11, LGPL-3.0.
-jellyfinSdk = "1.8.11"
+jellyfinSdk = "1.8.12"
 
 # Networking / serialization (Maven Central).
 okhttp = "5.4.0"
