@@ -17,6 +17,9 @@ data class SsdpMessage(
     val usn: String? get() = headers["USN"]
     val server: String? get() = headers["SERVER"]
 
+    /** True only for a successful HTTP-style M-SEARCH response status line. */
+    fun isSuccessfulSearchResponse(): Boolean = SsdpParser.isSuccessfulSearchResponse(startLine)
+
     /** True if this looks like a UPnP MediaRenderer advertisement. */
     fun isMediaRenderer(): Boolean {
         val t = (st ?: "") + (usn ?: "")
@@ -28,6 +31,19 @@ object SsdpParser {
     const val MAX_HEADERS = 64
     const val MAX_LINE_LEN = 2048
     const val MAX_MESSAGE_LEN = 16 * 1024
+
+    private val SUCCESSFUL_SEARCH_RESPONSE = Regex(
+        """^HTTP/1\.[01][\t ]+200(?:[\t ]+[^\r\n]*)?$""",
+        RegexOption.IGNORE_CASE,
+    )
+
+    /**
+     * Validate the complete SSDP response status line. A normal response includes a reason phrase
+     * (`HTTP/1.1 200 OK`), while a few renderers omit it; both forms are valid. Keeping this beside
+     * parsing avoids subtle call-site mistakes between prefix matching and whole-string matching.
+     */
+    fun isSuccessfulSearchResponse(startLine: String): Boolean =
+        SUCCESSFUL_SEARCH_RESPONSE.matches(startLine)
 
     fun parse(raw: String): SsdpMessage? {
         if (raw.length > MAX_MESSAGE_LEN) return null

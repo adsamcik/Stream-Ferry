@@ -90,8 +90,22 @@ class CorePolicyTest {
         val msg = SsdpParser.parse(raw)
         assertNotNull(msg)
         assertEquals("http://192.168.1.5:7676/desc.xml", msg.location)
+        assertTrue(msg.isSuccessfulSearchResponse())
         assertTrue(msg.isMediaRenderer())
         assertTrue(SsdpParser.isAcceptableLocation(msg.location))
+    }
+
+    @Test fun acceptsSuccessfulSsdpStatusLineWithOrWithoutReasonPhrase() {
+        assertTrue(SsdpParser.isSuccessfulSearchResponse("HTTP/1.1 200 OK"))
+        assertTrue(SsdpParser.isSuccessfulSearchResponse("HTTP/1.0  200"))
+        assertTrue(SsdpParser.isSuccessfulSearchResponse("http/1.1\t200\tOK"))
+    }
+
+    @Test fun rejectsNonSuccessfulOrMalformedSsdpStartLine() {
+        assertFalse(SsdpParser.isSuccessfulSearchResponse("HTTP/1.1 404 Not Found"))
+        assertFalse(SsdpParser.isSuccessfulSearchResponse("HTTP/2 200 OK"))
+        assertFalse(SsdpParser.isSuccessfulSearchResponse("NOTIFY * HTTP/1.1"))
+        assertFalse(SsdpParser.isSuccessfulSearchResponse("HTTP/1.1 200 OK\r\nLOCATION: http://10.0.0.2/"))
     }
 
     @Test fun rejectsNonHttpLocation() {

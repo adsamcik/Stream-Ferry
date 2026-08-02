@@ -168,7 +168,7 @@ class DlnaTargetController(
                 if (tracedUsns.add(msg.usn ?: msg.location ?: "?")) {
                     logger.trace(TAG, "SSDP <- mediaRenderer=${msg.isMediaRenderer()} usn=${msg.usn} loc=${msg.location}")
                 }
-                if (!SSDP_RESPONSE_STATUS.matches(msg.startLine) ||
+                if (!msg.isSuccessfulSearchResponse() ||
                     msg.usn.isNullOrBlank() ||
                     msg.st.isNullOrBlank() ||
                     msg.location.isNullOrBlank() ||
@@ -626,10 +626,6 @@ class DlnaTargetController(
         private const val SSDP_PROBES = 3
         private const val SSDP_PROBE_SPACING_MS = 150L
         private const val SSDP_RECEIVE_SLICE_MS = 250L
-        private val SSDP_RESPONSE_STATUS = Regex(
-            """^HTTP/1\.[01]\s+200(?:\s|$)""",
-            RegexOption.IGNORE_CASE,
-        )
         private const val MAX_CONCURRENT_DESCRIPTIONS = 4
         private const val NANOS_PER_MILLISECOND = 1_000_000L
         private const val FETCH_TIMEOUT_MS = 5000
