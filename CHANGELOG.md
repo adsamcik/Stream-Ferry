@@ -12,6 +12,31 @@ there is **no telemetry** and nothing leaves the device unless you share a repor
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-02
+
+### Added
+- Added a unified physical-TV picker that conservatively combines confidently matched Cast and DLNA
+  endpoints, remembers successful routes, and lets you keep endpoints separate when appropriate.
+- Added bounded, redacted playback recovery: one transient retry, compatible stream fallbacks, and a
+  single alternate-protocol handoff when the selected physical TV supports it.
+- Added device-aware Smart Resume v2, which reconciles the latest confirmed position and can reuse an
+  exact previously selected TV after an app restart.
+- Added optional Night volume settings for gradual or one-time, reduction-only volume changes during
+  playback, including overnight schedules and manual-override protection.
+- Added TV-output overrides on Now Playing, giving you direct control of the selected output route.
+
+### Changed
+- Reworked playback around one stable Now Playing flow for connection, buffering, recovery, stream
+  changes, and failures, with actionable Retry, Change TV, and Stop actions.
+- Limited phone-side transcoding to eligible local Cast playback and improved its selection policy;
+  Jellyfin server transcoding remains the online compatibility path.
+- Refined the compact picker, Settings, Smart Resume, and Now Playing interactions and updated the
+  Android/Gradle dependency set.
+
+### Fixed
+- Improved DLNA discovery and control reliability through stricter SSDP admission, safe description
+  XML handling, endpoint validation/pinning, and clearer diagnostics.
+- Recover active playback more reliably when a Cast receiver or TV restarts.
 ## [0.3.2] - 2026-07-27
 
 ### Added
