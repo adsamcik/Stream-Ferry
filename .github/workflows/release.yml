@@ -107,7 +107,7 @@ jobs:
             echo "::error::Android apksigner was not found in $ANDROID_HOME/build-tools."
             exit 1
           fi
-          "$apksigner" verify --verbose --print-certs "$apk" > "$certificate"
+          "$apksigner" verify --verbose --print-certs "$apk" > "$certificate" 2>&1
           grep -q '^Signer #1 certificate SHA-256 digest:' "$certificate"
           echo "apk=$apk" >> "$GITHUB_OUTPUT"
           echo "version_code=$version_code" >> "$GITHUB_OUTPUT"

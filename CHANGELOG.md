@@ -12,6 +12,12 @@ there is **no telemetry** and nothing leaves the device unless you share a repor
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-08-02
+
+### Fixed
+- Capture Android `apksigner` verification output from both streams so the GitHub Release always
+  includes a complete signing-certificate report.
+
 ## [0.4.1] - 2026-08-02
 
 ### Fixed
