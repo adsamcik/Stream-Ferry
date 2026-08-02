@@ -12,6 +12,12 @@ there is **no telemetry** and nothing leaves the device unless you share a repor
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-08-02
+
+### Fixed
+- Generate the GitHub Release signing-certificate report with Android's `apksigner`, verifying the
+  APK's modern signature schemes and publishing the actual signer certificate fingerprints.
+
 ## [0.4.0] - 2026-08-02
 
 ### Added

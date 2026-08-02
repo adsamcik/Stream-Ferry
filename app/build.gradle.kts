@@ -28,7 +28,7 @@ private fun versionCodeFor(version: String): Int {
     return code.toInt()
 }
 
-val resolvedVersionName = providers.gradleProperty("versionName").orNull ?: "0.4.0"
+val resolvedVersionName = providers.gradleProperty("versionName").orNull ?: "0.4.1"
 val resolvedVersionCode = versionCodeFor(resolvedVersionName)
 
 android {

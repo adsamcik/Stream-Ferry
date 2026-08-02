@@ -65,7 +65,7 @@ Download the APK and its `.sha256` asset and run:
 
 ```bash
 sha256sum --check stream-ferry-vX.Y.Z.sha256
-keytool -printcert -jarfile stream-ferry-vX.Y.Z.apk
+apksigner verify --verbose --print-certs stream-ferry-vX.Y.Z.apk
 ```
 
 Compare the displayed SHA-256 certificate fingerprint with the `signing-certificate.txt` release

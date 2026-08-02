@@ -102,7 +102,13 @@ jobs:
           fi
           cp "$apk_source" "$apk"
           sha256sum "$apk" > "$checksum"
-          keytool -printcert -jarfile "$apk" > "$certificate"
+          apksigner="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner -print | sort -V | tail -n 1)"
+          if [[ -z "$apksigner" || ! -x "$apksigner" ]]; then
+            echo "::error::Android apksigner was not found in $ANDROID_HOME/build-tools."
+            exit 1
+          fi
+          "$apksigner" verify --verbose --print-certs "$apk" > "$certificate"
+          grep -q '^Signer #1 certificate SHA-256 digest:' "$certificate"
           echo "apk=$apk" >> "$GITHUB_OUTPUT"
           echo "version_code=$version_code" >> "$GITHUB_OUTPUT"
           echo "checksum=$checksum" >> "$GITHUB_OUTPUT"
