@@ -12,6 +12,7 @@ import com.adsamcik.streamferry.core.stream.Protocol
 import com.adsamcik.streamferry.core.stream.TargetCapabilities
 import com.adsamcik.streamferry.diagnostics.NetworkInfoProvider
 import com.adsamcik.streamferry.domain.DiscoveredTarget
+import com.adsamcik.streamferry.domain.TargetDiscoveryMetadata
 import com.adsamcik.streamferry.domain.PlaybackFailureKind
 import com.adsamcik.streamferry.domain.PlaybackTargetController
 import com.adsamcik.streamferry.domain.PlaybackTargetEvent
@@ -294,6 +295,17 @@ class DlnaTargetController(
             protocol = Protocol.DLNA,
             capabilities = DLNA_BASELINE.copy(modelName = (description.modelName ?: friendly).take(64)),
             lastTestedStatus = null,
+            discoveryMetadata = TargetDiscoveryMetadata(
+                dlnaUdn = description.udn,
+                dlnaUsn = usn,
+                // location() proved LOCATION resolves to this SSDP source on the selected LAN.
+                validatedSourceHost = sourceAddress.hostAddress,
+                validatedDescriptionHost = locationEndpoint.host,
+                manufacturer = description.manufacturer,
+                modelName = description.modelName,
+                // Advertise volume only after its separately validated control URL resolved.
+                volumeControlAvailable = renderingService != null && renderingRoute != null,
+            ),
         )
     }
 

@@ -15,7 +15,9 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -46,6 +48,7 @@ import androidx.compose.material3.ListItem
 import androidx.compose.material3.ListItemDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -70,7 +73,9 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import com.adsamcik.streamferry.R
 import com.adsamcik.streamferry.core.language.Languages
+import com.adsamcik.streamferry.core.volume.NightVolumePolicy
 import com.adsamcik.streamferry.ui.theme.ThemeMode
+import java.time.LocalTime
 
 private data class ResolutionChoice(val height: Int, val label: String)
 
@@ -112,6 +117,8 @@ fun ExpressiveSettingsScreen(
     backgroundPlaybackUnrestricted: Boolean,
     onAllowBackgroundPlayback: () -> Unit,
     onResetTvCapabilities: () -> Unit,
+    nightVolumePolicy: NightVolumePolicy,
+    onNightVolumePolicyChange: (NightVolumePolicy) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     // These preferences are backed by synchronous stores rather than observable Compose state. Keep
@@ -197,6 +204,13 @@ fun ExpressiveSettingsScreen(
                         onPreferredSubtitleLanguageChange(it)
                     },
                 )
+            }
+        }
+
+        item(key = "night-volume-heading") { SettingsHeading("Night volume") }
+        item(key = "night-volume-group") {
+            SettingsGroup {
+                SettingsNightVolumeRow(policy = nightVolumePolicy, onSave = onNightVolumePolicyChange)
             }
         }
 
@@ -381,6 +395,94 @@ fun ExpressiveSettingsScreen(
     }
 }
 
+private enum class NightVolumeMode { OFF, GRADUAL, HARD }
+
+@Composable
+private fun SettingsNightVolumeRow(policy: NightVolumePolicy, onSave: (NightVolumePolicy) -> Unit) {
+    var showDialog by remember { mutableStateOf(false) }
+    SettingsValueRow(
+        icon = Icons.Rounded.Tune,
+        title = "Night volume",
+        supporting = "Optionally lower supported TV volume on this phone's local schedule.",
+        selectedValue = policy.summary(),
+        onClick = { showDialog = true },
+    )
+    if (!showDialog) return
+
+    var mode by remember(policy) { mutableStateOf(policy.toMode()) }
+    var startText by remember(policy) { mutableStateOf((policy as? NightVolumePolicy.Gradual)?.start?.toString() ?: "22:00") }
+    var endText by remember(policy) { mutableStateOf((policy as? NightVolumePolicy.Gradual)?.end?.toString() ?: "06:00") }
+    var timeText by remember(policy) { mutableStateOf((policy as? NightVolumePolicy.Hard)?.time?.toString() ?: "22:00") }
+    var targetPercent by remember(policy) { mutableStateOf(policy.targetPercentText()) }
+    var error by remember { mutableStateOf<String?>(null) }
+
+    AlertDialog(
+        onDismissRequest = { showDialog = false },
+        title = { Text("Night volume") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Times use this phone's local time. Automatic changes only reduce volume during active playback.")
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                    NightVolumeModeButton("Off", mode == NightVolumeMode.OFF, Modifier.weight(1f)) { mode = NightVolumeMode.OFF }
+                    NightVolumeModeButton("Gradual", mode == NightVolumeMode.GRADUAL, Modifier.weight(1f)) { mode = NightVolumeMode.GRADUAL }
+                    NightVolumeModeButton("Hard", mode == NightVolumeMode.HARD, Modifier.weight(1f)) { mode = NightVolumeMode.HARD }
+                }
+                when (mode) {
+                    NightVolumeMode.OFF -> Text("No automatic volume changes.")
+                    NightVolumeMode.GRADUAL -> {
+                        OutlinedTextField(value = startText, onValueChange = { startText = it; error = null }, label = { Text("Start time (HH:mm)") }, singleLine = true, isError = error != null, modifier = Modifier.fillMaxWidth())
+                        OutlinedTextField(value = endText, onValueChange = { endText = it; error = null }, label = { Text("End time (HH:mm)") }, singleLine = true, isError = error != null, modifier = Modifier.fillMaxWidth())
+                    }
+                    NightVolumeMode.HARD -> OutlinedTextField(value = timeText, onValueChange = { timeText = it; error = null }, label = { Text("Time (HH:mm)") }, singleLine = true, isError = error != null, modifier = Modifier.fillMaxWidth())
+                }
+                if (mode != NightVolumeMode.OFF) {
+                    OutlinedTextField(value = targetPercent, onValueChange = { targetPercent = it; error = null }, label = { Text("Target volume (0–100%)") }, singleLine = true, isError = error != null, modifier = Modifier.fillMaxWidth())
+                }
+                error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    val saved = runCatching {
+                        when (mode) {
+                            NightVolumeMode.OFF -> NightVolumePolicy.Off
+                            NightVolumeMode.GRADUAL -> NightVolumePolicy.Gradual(LocalTime.parse(startText), LocalTime.parse(endText), targetPercent.toFloat().div(100f).also { require(it in 0f..1f) })
+                            NightVolumeMode.HARD -> NightVolumePolicy.Hard(LocalTime.parse(timeText), targetPercent.toFloat().div(100f).also { require(it in 0f..1f) })
+                        }
+                    }.getOrElse { error = "Use HH:mm times and a target from 0 to 100%."; null }
+                    if (saved != null) { onSave(saved); showDialog = false }
+                },
+                modifier = Modifier.heightIn(min = 48.dp),
+            ) { Text("Save") }
+        },
+        dismissButton = { TextButton(onClick = { showDialog = false }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Cancel") } },
+    )
+}
+
+@Composable
+private fun NightVolumeModeButton(label: String, selected: Boolean, modifier: Modifier, onClick: () -> Unit) {
+    if (selected) FilledTonalButton(onClick = onClick, modifier = modifier.heightIn(min = 48.dp)) { Text(label) }
+    else OutlinedButton(onClick = onClick, modifier = modifier.heightIn(min = 48.dp)) { Text(label) }
+}
+
+private fun NightVolumePolicy.toMode(): NightVolumeMode = when (this) {
+    NightVolumePolicy.Off -> NightVolumeMode.OFF
+    is NightVolumePolicy.Gradual -> NightVolumeMode.GRADUAL
+    is NightVolumePolicy.Hard -> NightVolumeMode.HARD
+}
+
+private fun NightVolumePolicy.targetPercentText(): String = when (this) {
+    NightVolumePolicy.Off -> "40"
+    is NightVolumePolicy.Gradual -> (targetVolume * 100).toInt().toString()
+    is NightVolumePolicy.Hard -> (targetVolume * 100).toInt().toString()
+}
+
+private fun NightVolumePolicy.summary(): String = when (this) {
+    NightVolumePolicy.Off -> "Off"
+    is NightVolumePolicy.Gradual -> "Gradual · $start → $end · ${targetPercentText()}%"
+    is NightVolumePolicy.Hard -> "Hard · $time · ${targetPercentText()}%"
+}
 @Composable
 private fun SettingsHeading(text: String) {
     Text(

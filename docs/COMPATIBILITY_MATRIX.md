@@ -30,6 +30,10 @@ Targets:
 - Android TV (Cast).
 - Samsung TV (DLNA).
 - LG TV (DLNA).
+- A television that exposes both Cast and DLNA: verify one physical-TV row only when the evidence is
+  confident, then exercise fallback in both endpoint directions.
+- A separate Chromecast/Google TV dongle attached to a DLNA television: verify the two devices remain
+  separate even when their display names are similar.
 
 Media (codec/container/subtitle):
 - H.264/AAC MP4; H.264/AC3; HEVC/EAC3; MKV/DTS; MKV/TrueHD.
@@ -41,6 +45,13 @@ Media (codec/container/subtitle):
 Lifecycle / resilience:
 - Target disconnect; screen off; app background/killed; server restart; token revoked; foreground
   service killed; memory pressure.
+- Temporary Wi-Fi loss: one same-endpoint retry, no unnecessary transcode, and Stop cancels later work.
+- Incompatible original stream: conservative server fallback and an eligible lower-resolution attempt.
+- App/process restart: the newest confirmed position wins; exact previous-TV identity can be reused;
+  an offline previous TV does not delete the Smart Resume record.
+- Exhaustion: Now Playing remains usable with Retry, Change TV, Stop, and redacted attempt history.
+- Gradual and hard night volume: sparse reduction-only commands, manual phone override, midnight/DST,
+  and no duplicate command after a protocol handoff.
 
 ## Samsung/LG focused tests
 
@@ -55,6 +66,8 @@ transcode; phone-proxy reachability with VPN/split-tunnel; same-Wi-Fi and guest-
 | Date / app version | |
 | Protocol (Cast/DLNA) | |
 | Target (model) | |
+| Physical-TV rows / matching reason | |
+| Stable association or unlink checked | |
 | Receiver app ID (Cast) | |
 | Jellyfin route (LAN-HTTP/LAN-HTTPS/remote-HTTPS/VPN/split) | |
 | Media source / container | |
@@ -67,6 +80,9 @@ transcode; phone-proxy reachability with VPN/split-tunnel; same-Wi-Fi and guest-
 | 30 s play | |
 | Seek | |
 | Pause / resume | |
+| Confirmed resume position / restart | |
+| Same-endpoint retry / alternate endpoint | |
+| Night-volume mode / commands | |
 | Stop | |
 | Range behavior (200/206/416) | |
 | Buffer behavior (pass-through/prebuffer/pressure) | |

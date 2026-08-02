@@ -44,8 +44,10 @@ construction, or playback reporting. It depends only on the domain interfaces in
 | `data.cache` | Optional app-private cache of library **metadata** (`LibraryCache` + `CachingMediaLibraryRepository`) for offline/fast browsing. |
 | `data.download` | Optional offline downloads (`DownloadStore` + `MediaDownloader`): saves the original file to app-private storage. |
 | `data.local` | On-device video source: user-elective SAF folder/file grants (`LocalSourceStore`) + optional MediaStore, enumerated and exposed as a `MediaSource` (`LocalMediaSource`). |
-| `data.resume` | Local "continue where you left off" store (`ResumeStore`) for on-device files, which have no server-side resume point. |
-| `playback` | `PlaybackEngine` orchestrates select → proxy → renderer and runs adaptive bitrate; failure **recovery** is factored into pure, tested units — `PlaybackRecovery` (`decideRecovery`), `StartupWatchdog` (silent-failure/early-bail heuristics) and `RendererCapabilityStore` (learns per-renderer transcode needs). Also `MediaSessionController` (system playback controls) and `PlaybackServiceController`. |
+| `data.resume` | `ResumeStore` for per-file local positions plus versioned `SmartResumeStore` for safe cross-restart reconstruction data and previous physical-TV identity. |
+| `data.volume` | Small SharedPreferences-backed night-volume settings store; no background service or automation database. |
+| `physical` | Pure conservative Cast/DLNA aggregation, stable association/unlink policy, endpoint selection, and exact resume identity matching. |
+| `playback` | `PlaybackEngine` remains the orchestrator for source → proxy → renderer, adaptive bitrate, generation ownership, and bounded recovery. Pure `PlaybackRecoverySession`, existing `PlaybackRecovery` / `StartupWatchdog`, and `RendererCapabilityStore` hold policy outside the UI. Also `MediaSessionController` and `PlaybackServiceController`. |
 | `playback.streamselection` | Chooses a TV-compatible Jellyfin stream server-side. Online media is never transcoded on the phone; the separate `data.transcode` path is local-file-only. |
 | `playback.proxy` | `ProxyPlaybackService` foreground service (type `mediaPlayback`) hosting the MediaStyle controls notification. |
 | `playback.buffer` | Memory buffer policy (pass-through + rolling prebuffer). |
@@ -53,13 +55,14 @@ construction, or playback reporting. It depends only on the domain interfaces in
 | `playback.reporting` | `JellyfinPlaybackReporter` (start/progress/pause/seek/stop/cleanup). |
 | `permissions` | Local-network / notification permission management. |
 | `diagnostics`, `logging` | Redacting logger, network info, compatibility runner. |
-| `core.*` | **Pure-JVM, dependency-free, unit-tested** building blocks (see below). |
+| `core.*` | **Pure-JVM, dependency-free, unit-tested** matching, resume, volume, security, stream, and recovery policy (see below). |
 
 ## Adaptive application shell
 
 The Compose shell separates durable destinations from contextual media work:
 
-- **Library**, **Downloads**, and **Settings** are the three top-level destinations. Compact-height
+- **Library** and **Settings** are the top-level destinations; Downloads is a contextual route reached
+  from Settings. Compact-height
   windows and windows at least 600 dp wide use a navigation rail; other compact windows use a bottom
   navigation bar. Content is width-bounded instead of stretching phone layouts across a tablet.
 - Details, TV selection, Now Playing, Diagnostics, servers, and About remain contextual routes. Back
@@ -83,9 +86,10 @@ is consolidated, and the gallery alphabet rail provides 48 dp touch width plus n
 
 ## Verified pure-JVM core (`com.adsamcik.streamferry.core`)
 
-All security- and correctness-critical logic lives in framework-free Kotlin so it can be unit tested
-without an emulator. This is the only part runnable in the build sandbox and is covered by 215 passing
-tests (`./gradlew testDebugUnitTest`, or the `kotlinc` procedure in [BUILD.md](BUILD.md)).
+Security- and correctness-critical policy is kept in framework-free Kotlin so it can be unit tested
+without an emulator. The complete unit suite runs with `./gradlew testDebugUnitTest`; the core-only
+`kotlinc` procedure in [BUILD.md](BUILD.md) is a smaller fallback when Android dependencies are
+unavailable. Exact test totals belong in the current verification report rather than this document.
 
 - `core.http.HttpRange` — RFC 9110 single byte-range parsing.
 - `core.http.HttpResponsePlan` — 200 / 206 / 416 selection + `Content-Range` / `Content-Length` /
@@ -107,10 +111,14 @@ tests (`./gradlew testDebugUnitTest`, or the `kotlinc` procedure in [BUILD.md](B
 - `core.hls.MediaPlaylistPlanner` — seekable VOD HLS playlist + seek→segment mapping for the limited
   local on-device path, so a compatible Cast receiver can request a position on demand.
 - `core.transcode.*` — phone-side HLS/fMP4 target admission (hardware H.264 and opportunistic HEVC only)
-  plus per-source routing (DIRECT_PLAY / SERVER_TRANSCODE / CLIENT_TRANSCODE). It does not establish a
-  phone DASH, MPEG-TS, AV1/VP9, CPU, Main10, HDR, or production-reliability contract.
+  plus capability-gated per-source routing (DIRECT_PLAY / SERVER_TRANSCODE / CLIENT_TRANSCODE /
+  UNSUPPORTED). Jellyfin server transcoding remains the online fallback; no remote client-transcoder
+  input provider is claimed.
 - `core.local.LocalMediaRules` — local-file video filtering, display titles, and container MIME.
-- `core.resume.ResumePolicy` — resume-vs-restart-vs-finished decision from a saved position + duration.
+- `core.resume.*` — resume-vs-restart-vs-finished decisions, versioned Smart Resume records,
+  local/server position reconciliation, and completion/stale-write protection.
+- `core.volume.NightVolumePolicy` — local-time gradual/hard reduction decisions, sparse command
+  scheduling, manual override, and DST/midnight handling.
 - `core.dlna.SecureXml` — XXE-hardened XML parsing.
 - `core.dlna.DidlLite`, `core.dlna.SsdpParser` — DIDL-Lite metadata + bounded SSDP parsing.
 - `core.resilience.ResilientStreamPolicy`, `RetryBudget` / `Backoff`, `UpstreamRetry` — spotty-link
@@ -130,9 +138,11 @@ state. Manual DI via `AppContainer` (no DI framework — §14).
 
 ## Session lifecycle
 
-1. User picks media + target → `PlaybackEngine` asks Jellyfin (PlaybackInfo) for a target-compatible
-   source at the chosen quality, preserving `PlaySessionId`. Playback **resumes** from the item's
-   Jellyfin resume point when one exists (the gallery shows a "Resume" hint).
+1. User picks media, then one conservatively aggregated physical TV. Selecting it enters the durable
+   Now Playing route and chooses an eligible Cast or DLNA endpoint internally. `PlaybackEngine` resolves
+   a target-compatible source, preserving `PlaySessionId`. Smart Resume uses the newer safe local
+   renderer-confirmed checkpoint and Jellyfin position, and auto-reuses a previous TV only by exact
+   stable identity.
 2. `PlaybackSessionCoordinator` creates a proxy session (256-bit id), starts the foreground service,
    binds the proxy to an ephemeral LAN port.
 3. The Cast/DLNA controller loads **only** the phone proxy URL.
@@ -143,12 +153,12 @@ state. Manual DI via `AppContainer` (no DI framework — §14).
    ≥ 30 s window (plus renderer rebuffer events) and, with hysteresis, may switch quality mid-stream
    by re-resolving PlaybackInfo at the current position and reloading the renderer with a new proxy
    session ([ADAPTIVE_BITRATE.md](ADAPTIVE_BITRATE.md)).
-6. **Auto-reconnect:** if the renderer connection drops unexpectedly (network blip, Cast session lost),
-   the app retries the same item on the same TV with bounded backoff (capped per attempt), **resuming
-   at the last reported position**, surfaced as a "reconnecting" overlay; it gives up with a clear
-   message if the drop is permanent (e.g. the TV was switched off). This covers **both** Jellyfin and
-   on-device local sessions. A deliberate user stop is never auto-reconnected. The CPU + Wi-Fi locks are
-   held for the whole session (`ProxyPlaybackService`) so playback survives the screen turning off for
-   hours.
+6. **Bounded recovery:** transient renderer/network failure admits one same-stream endpoint retry.
+   Eligible startup incompatibility can advance through finite server compatibility/quality variants;
+   after same-endpoint work, one alternate endpoint of the same confidently merged TV may be reserved.
+   Every continuation resumes at renderer-confirmed progress. A user Stop invalidates the generation and
+   cancels recovery; old controllers cannot act. Exhaustion retains Now Playing with Retry, Change TV,
+   Stop, and redacted history. The CPU + Wi-Fi locks remain owned by `ProxyPlaybackService` while the
+   session is active.
 7. On stop/error/expiry/end: proxy session revoked, buffers cleared, Jellyfin transcode/HLS session
    stopped, foreground service stopped.

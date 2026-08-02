@@ -4,6 +4,7 @@ import com.adsamcik.streamferry.core.adaptive.AdaptiveBitrateController
 import com.adsamcik.streamferry.core.adaptive.BitrateLadder
 import com.adsamcik.streamferry.core.resume.NoOpSmartResumeRecordStore
 import com.adsamcik.streamferry.core.resume.SmartResumeCheckpointKind
+import com.adsamcik.streamferry.core.resume.SmartResumeDeviceContext
 import com.adsamcik.streamferry.core.resume.SmartResumeSeed
 import com.adsamcik.streamferry.core.resume.SmartResumeSessionTracker
 import com.adsamcik.streamferry.core.stream.AudioTrackSelection
@@ -37,6 +38,10 @@ import com.adsamcik.streamferry.core.transcode.TranscodeNegotiator
 import com.adsamcik.streamferry.core.stream.MediaProfile
 import com.adsamcik.streamferry.core.transcode.TranscodeTarget
 import com.adsamcik.streamferry.core.transcode.VideoCodec
+import com.adsamcik.streamferry.core.volume.NightVolumeInput
+import com.adsamcik.streamferry.core.volume.NightVolumePolicy
+import com.adsamcik.streamferry.core.volume.NightVolumeScheduler
+import com.adsamcik.streamferry.core.volume.NightVolumeSession
 import com.adsamcik.streamferry.core.segments.MediaSegment
 import com.adsamcik.streamferry.core.segments.MediaSegmentTracker
 import com.adsamcik.streamferry.data.transcode.ClientTranscodeSession
@@ -45,11 +50,14 @@ import com.adsamcik.streamferry.data.transcode.LocalMediaProbe
 import com.adsamcik.streamferry.data.transcode.OnDeviceTranscoder
 import android.content.Context
 import java.io.File
+import java.time.Instant
+import java.time.ZoneId
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
@@ -97,8 +105,16 @@ data class PlaybackStatus(
     /** Short description of the OUTPUT sent to the TV when transcoding (codec · resolution · engine); null = direct. */
     val outputFormat: String? = null,
     val volume: Float = 1f,
+    /** False when discovery could not validate a renderer volume-control service. */
+    val volumeSupported: Boolean = false,
     val title: String = "",
     val errorMessage: String? = null,
+    /** Bounded recovery state. All entries are redacted and safe to render/report. */
+    val phase: PlaybackPhase = PlaybackPhase.STOPPED,
+    val attemptGeneration: Long = 0,
+    val attemptHistory: List<PlaybackAttemptDescriptor> = emptyList(),
+    val recoveryBudget: RecoveryBudgetStatus = RecoveryBudget().status(RecoveryBudgetUsage()),
+    val isTerminal: Boolean = false,
     /** True when an active session's renderer connection dropped unexpectedly (drives auto-reconnect). */
     val connectionLost: Boolean = false,
     /** Selectable audio tracks for the current media (empty for local/offline or single-track sources). */
@@ -153,6 +169,8 @@ class PlaybackEngine(
     private val rendererCaps: RendererCapabilityStore,
     private val smartResume: SmartResumeSessionTracker = SmartResumeSessionTracker(NoOpSmartResumeRecordStore),
     private val clock: () -> Long = System::currentTimeMillis,
+    /** Read lazily so a settings change applies to the next active scheduler tick. */
+    private val nightVolumePolicyProvider: () -> NightVolumePolicy = { NightVolumePolicy.Off },
     /** Fresh local-network permission check for UI, notification, autoplay, and reconnect paths. */
     private val requireLocalNetworkAccess: () -> Unit = {},
 ) {
@@ -260,6 +278,9 @@ class PlaybackEngine(
     // without requiring the user to leave playback or edit their default in Settings.
     @Volatile private var manualMaxVideoHeight: Int? = null
     @Volatile private var volume = 1f
+    @Volatile private var smartResumeDeviceContext: SmartResumeDeviceContext? = null
+    /** Session-only state survives an automatic protocol handoff, but never a fresh user Play. */
+    @Volatile private var nightVolumeSession = NightVolumeSession()
 
     private var eventsJob: Job? = null
     private var monitorJob: Job? = null
@@ -284,11 +305,125 @@ class PlaybackEngine(
     // if it is still current, so a stale "finished" from a just-stopped stream can't kill a newer session
     // that won the mutex first (e.g. when the user immediately starts a different item).
     @Volatile private var playGeneration = 0L
+    /** Pure ledger for attempt ordering, stale-work rejection, and the finite recovery budget. */
+    @Volatile private var recoverySession = PlaybackRecoverySession()
+    @Volatile private var pendingRecoveryKind: RecoveryAttemptKind? = null
 
     private val absolutePositionSeconds: Long get() = streamStartSeconds + reportedPositionSeconds
 
     /** Persist the latest renderer-confirmed position when the app leaves the foreground. */
     fun checkpointSmartResumeLifecycle() = smartResume.checkpoint(SmartResumeCheckpointKind.LIFECYCLE)
+    /** Redacted snapshot for UI diagnostics and for coordinator-owned recovery decisions. */
+    fun recoverySnapshot(): PlaybackRecoverySession = recoverySession
+
+    /**
+     * Reserve the one alternate-protocol recovery before the caller replaces the target controller and
+     * invokes [play] or [playLocal] with the returned continuation. This preserves the shared attempt
+     * budget/history across stop/start; a normal user-initiated retry simply omits the continuation.
+     */
+    fun reserveAlternateProtocolContinuation(
+        hasAlternateProtocol: Boolean,
+        failureStage: PlaybackFailureStage,
+        failureCause: PlaybackFailureCause,
+        sameEndpointRecoveryExhausted: Boolean = retriedOnce,
+        isLocalSessionHint: Boolean? = null,
+        isOnlineSessionHint: Boolean? = null,
+    ): PlaybackRecoveryContinuation? = synchronized(recoveryLock) {
+        val current = recoverySession
+        val continuation = current.reserveAlternateProtocol(
+            ProtocolSwitchInput(
+                // Startup cleanup intentionally clears live source handles. The coordinator can provide
+                // safe source-kind hints so a classified failed attempt remains eligible for handoff.
+                isLocalSession = isLocalSessionHint ?: (localPlayback != null),
+                isOnlineSession = isOnlineSessionHint ?: (currentInfo != null),
+                hasAlternateProtocol = hasAlternateProtocol,
+                hasAlreadySwitchedProtocol = current.alternateProtocolReserved || current.attempts.any {
+                    it.automaticRecovery == RecoveryAttemptKind.ALTERNATE_PROTOCOL
+                },
+                sameEndpointRecoveryExhausted = sameEndpointRecoveryExhausted,
+                failureStage = failureStage,
+                failureCause = failureCause,
+                budget = current.budget,
+                usage = current.usage,
+            ),
+        )
+        if (continuation != null) recoverySession = continuation.session
+        continuation
+    }
+
+    /**
+     * Reconnect the current endpoint once without creating a fresh playback session or resetting its
+     * finite recovery budget. The existing renderer controller, proxy orchestration and media choices are
+     * reused; failure leaves the redacted ledger available for a possible alternate-protocol handoff.
+     */
+    suspend fun retrySameEndpointAfterDisconnect(): Boolean = withContext(Dispatchers.Default) {
+        mutex.withLock {
+            requireLocalNetworkAccess()
+            if (!connectionLost) return@withLock false
+            val activeTarget = target ?: return@withLock false
+            val endpoint = selectedTarget ?: return@withLock false
+            if (currentInfo == null && localPlayback == null) return@withLock false
+            val reserved = synchronized(recoveryLock) {
+                recoverySession.reserveRecovery(
+                    RecoveryAttemptKind.SAME_STREAM_NETWORK,
+                    PlaybackPhase.RECONNECTING,
+                )?.also {
+                    recoverySession = it
+                    retriedOnce = true
+                    pendingRecoveryKind = RecoveryAttemptKind.SAME_STREAM_NETWORK
+                }
+            }
+            if (reserved == null) {
+                recoverySession = recoverySession.fail()
+                publishStatus(error = "Couldn't reconnect to the TV.")
+                return@withLock false
+            }
+            val resumeAt = absolutePositionSeconds
+            val wasReloading = isReloadingStream
+            isReloadingStream = true
+            var endpointConnected = false
+            try {
+                activeTarget.connect(endpoint)
+                endpointConnected = true
+                if (localPlayback != null) {
+                    reloadLocalInPlace(resumeAt, "endpoint reconnect")
+                } else {
+                    reloadStream(
+                        resumeAt,
+                        requestedBitrate = adaptive?.currentBitrateBps,
+                        reason = "endpoint reconnect",
+                        armWatchdog = true,
+                    )
+                }
+                connectionLost = false
+                lastNote = "Reconnected to the TV"
+                publishStatus()
+                true
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                smartResume.checkpoint(SmartResumeCheckpointKind.FAILURE, smartResumeDeviceContext)
+                val stage = when {
+                    e.isPreparationFailure() -> PlaybackFailureStage.STREAM_RESOLUTION
+                    !endpointConnected -> PlaybackFailureStage.ENDPOINT_CONNECTION
+                    else -> PlaybackFailureStage.SEEK_OR_RELOAD
+                }
+                val cause = when {
+                    e.isPreparationFailure() -> PlaybackFailureCause.UPSTREAM_OR_SERVER_UNAVAILABLE
+                    !endpointConnected -> PlaybackFailureCause.ENDPOINT_UNAVAILABLE
+                    else -> PlaybackFailureCause.UNKNOWN
+                }
+                recoverySession = recoverySession
+                    .recordFailure(stage, cause)
+                    .fail()
+                logger.w(TAG, "Same-endpoint reconnect failed", e)
+                publishStatus(error = "Couldn't reconnect to the TV.")
+                false
+            } finally {
+                isReloadingStream = wasReloading
+            }
+        }
+    }
 
     /** Begin playing [item] to [selectedTarget] via [target]. [resumePositionOverrideSeconds], when set,
      *  takes precedence over the item's Jellyfin resume point (used by auto-reconnect to resume at the
@@ -303,7 +438,9 @@ class PlaybackEngine(
         resumePositionOverrideSeconds: Long? = null,
         autoAdvance: Boolean = false,
         smartResumeSeed: SmartResumeSeed? = null,
+        smartResumeDeviceContext: SmartResumeDeviceContext? = null,
         onForegrounded: () -> Unit = {},
+        recoveryContinuation: PlaybackRecoveryContinuation? = null,
     ) = withContext(Dispatchers.Default) {
         // Run playback startup OFF the main thread. The Cast/DLNA controllers switch to Main internally
         // for each SDK call, so the main thread stays free BETWEEN them for the foreground service to
@@ -311,16 +448,28 @@ class PlaybackEngine(
         // ForegroundServiceDidNotStartInTimeException (seen on Galaxy S24 / Android 16).
         mutex.withLock {
         requireLocalNetworkAccess()
+        val preservedNightVolumeSession = if (recoveryContinuation != null) nightVolumeSession else null
         stopInternalLocked("starting new playback")
-        smartResume.prepare(smartResumeSeed)
+        nightVolumeSession = preservedNightVolumeSession ?: NightVolumeSession(
+            startedAt = Instant.ofEpochMilli(clock()),
+            startingVolume = volume,
+        )
+        this@PlaybackEngine.smartResumeDeviceContext = smartResumeDeviceContext
+        smartResume.prepare(smartResumeSeed, smartResumeDeviceContext)
         playGeneration++
+        recoverySession = recoveryContinuation?.let { recoverySession.continueFrom(it) } ?: recoverySession.startSession()
+        pendingRecoveryKind = recoveryContinuation?.reservedKind
         connectionLost = false
-        // A fresh item starts with the server-default audio and subtitles OFF; the user picks tracks
-        // via selectAudioTrack/selectSubtitleTrack, which re-resolve at the current position.
-        audioSelection = null
-        subtitleSelection = null
-        preferredCodec = null
-        languagePreferenceApplied = false
+        // A fresh item starts from its saved/default track choices. An automatic protocol handoff keeps
+        // the user's source track selections because it is the same media session on the same screen.
+        if (recoveryContinuation == null) {
+            audioSelection = null
+            subtitleSelection = null
+            preferredCodec = null
+            languagePreferenceApplied = false
+        } else {
+            languagePreferenceApplied = true
+        }
         mediaSegments = emptyList()
         skippedSegments.clear()
         mediaAudioTracks = emptyList()
@@ -341,7 +490,7 @@ class PlaybackEngine(
             // foregrounded do we signal the caller to navigate ([onForegrounded]) and start the handshake.
             ensureProxyServiceForegrounded()
             onForegrounded()
-            eventsJob = scope.launch { target.events.collect { onTargetEvent(it) } }
+            eventsJob = scope.launch { target.events.collect { onTargetEvent(target, it) } }
             target.connect(selectedTarget)
             val startPos = resumePositionOverrideSeconds ?: item.resumePositionSeconds ?: 0L
             startPlaybackWithFallback(startPos, requestedBitrate = prefs.maxBitrateBps)
@@ -361,7 +510,18 @@ class PlaybackEngine(
                 }
             }
             logger.event("playback", "Playing ${item.title} -> ${selectedTarget.displayName} (${selectedTarget.protocol})")
+        } catch (e: CancellationException) {
+            withContext(NonCancellable) { stopInternalLocked("playback start cancelled") }
+            throw e
         } catch (e: Exception) {
+            // Keep a classified terminal checkpoint even though cleanup invalidates the active generation.
+            val cause = if (e.isPreparationFailure()) {
+                PlaybackFailureCause.UPSTREAM_OR_SERVER_UNAVAILABLE
+            } else {
+                PlaybackFailureCause.UNKNOWN
+            }
+            recoverySession = recoverySession.recordFailure(PlaybackFailureStage.STREAM_RESOLUTION, cause).fail()
+            smartResume.checkpoint(SmartResumeCheckpointKind.FAILURE, smartResumeDeviceContext)
             // Roll back any partial setup so the user isn't left on a stuck "preparing" screen.
             stopInternalLocked("playback start failed")
             logger.e("playback", "Playback start failed", e)
@@ -385,7 +545,8 @@ class PlaybackEngine(
             if (tgt == null || sel == null) return@withLock false // no live session — caller falls back to full play
             autoAdvanceTimeoutJob?.cancel(); autoAdvanceTimeoutJob = null
             playGeneration++ // supersede the ended session (its pending end-of-media stop/timeout is now stale)
-            smartResume.prepare(smartResumeSeed)
+            recoverySession = recoverySession.startSession()
+            smartResume.prepare(smartResumeSeed, smartResumeDeviceContext)
             connectionLost = false
             // Fresh per-item + recovery state. We do NOT tear the session down (that's the whole point), so
             // reset the flags stopInternalLocked would otherwise clear.
@@ -482,6 +643,7 @@ class PlaybackEngine(
 
     suspend fun setVolume(level: Float) = mutex.withLock {
         requireLocalNetworkAccess()
+        suspendNightVolumeAutomationForManualAdjustment()
         setVolumeLocked(level)
     }
 
@@ -498,6 +660,7 @@ class PlaybackEngine(
         if (direction == 0) return
         mutex.withLock {
             requireLocalNetworkAccess()
+            suspendNightVolumeAutomationForManualAdjustment()
             setVolumeLocked(volume + if (direction > 0) VOLUME_STEP else -VOLUME_STEP)
         }
     }
@@ -515,16 +678,26 @@ class PlaybackEngine(
         allowClientTranscode: Boolean,
         resumePositionSeconds: Long = 0,
         smartResumeSeed: SmartResumeSeed? = null,
+        smartResumeDeviceContext: SmartResumeDeviceContext? = null,
         target: PlaybackTargetController,
         selectedTarget: DiscoveredTarget,
         onForegrounded: () -> Unit = {},
+        recoveryContinuation: PlaybackRecoveryContinuation? = null,
     ) = withContext(Dispatchers.Default) {
         // Off the main thread so the foreground service can foreground within its deadline (see play()).
         mutex.withLock {
         requireLocalNetworkAccess()
+        val preservedNightVolumeSession = if (recoveryContinuation != null) nightVolumeSession else null
         stopInternalLocked("starting downloaded playback")
-        smartResume.prepare(smartResumeSeed)
+        nightVolumeSession = preservedNightVolumeSession ?: NightVolumeSession(
+            startedAt = Instant.ofEpochMilli(clock()),
+            startingVolume = volume,
+        )
+        this@PlaybackEngine.smartResumeDeviceContext = smartResumeDeviceContext
+        smartResume.prepare(smartResumeSeed, smartResumeDeviceContext)
         playGeneration++
+        recoverySession = recoveryContinuation?.let { recoverySession.continueFrom(it) } ?: recoverySession.startSession()
+        pendingRecoveryKind = recoveryContinuation?.reservedKind
         this@PlaybackEngine.target = target
         this@PlaybackEngine.selectedTarget = selectedTarget
         localPlayback = LocalPlaybackParams(filePath, contentType, title, runtimeSeconds, allowClientTranscode)
@@ -536,10 +709,21 @@ class PlaybackEngine(
             // so the startForegroundService() deadline can't be missed behind main-thread work.
             ensureProxyServiceForegrounded()
             onForegrounded()
-            eventsJob = scope.launch { target.events.collect { onTargetEvent(it) } }
+            eventsJob = scope.launch { target.events.collect { onTargetEvent(target, it) } }
             target.connect(selectedTarget)
             loadLocalStreamLocked(resumePositionSeconds.coerceAtLeast(0))
+            monitorJob = scope.launch { monitorLoop() }
+        } catch (e: CancellationException) {
+            withContext(NonCancellable) { stopInternalLocked("downloaded playback start cancelled") }
+            throw e
         } catch (e: Exception) {
+            val cause = if (e.isPreparationFailure()) {
+                PlaybackFailureCause.UPSTREAM_OR_SERVER_UNAVAILABLE
+            } else {
+                PlaybackFailureCause.UNKNOWN
+            }
+            recoverySession = recoverySession.recordFailure(PlaybackFailureStage.RENDERER_LOAD, cause).fail()
+            smartResume.checkpoint(SmartResumeCheckpointKind.FAILURE, smartResumeDeviceContext)
             stopInternalLocked("downloaded playback start failed")
             logger.e("playback", "Playback start failed", e)
             throw e
@@ -595,7 +779,7 @@ class PlaybackEngine(
                     ?: "direct play"),
         )
         val phoneIp = networkInfo.lanIpv4()
-            ?: throw IllegalStateException("No Wi-Fi/LAN address to host the stream (check Wi-Fi/VPN).")
+            ?: throw PlaybackPreparationException("No phone LAN address is available for the media gateway.")
         currentInfo = null
         // An on-device transcode is a full-timeline HLS stream (seekable): reflect that so the seek
         // path (renderer-seek, not server re-resolve) and status/telemetry are correct. A direct-play
@@ -621,7 +805,9 @@ class PlaybackEngine(
                 hlsSegmentFormat = HlsSegmentFormat.FMP4,
             )
         } else {
-            url = coordinator.startLocalAndBuildUrl(params.filePath, params.contentType, phoneIp).second
+            url = preparePlaybackSource("Couldn't start the local media gateway.") {
+                coordinator.startLocalAndBuildUrl(params.filePath, params.contentType, phoneIp).second
+            }
             // A file-backed local resource has a known byte range. SAF descriptors may not, so
             // keep their DLNA metadata conservative rather than advertising a range we cannot prove.
             streamForTv = RendererStream(
@@ -638,9 +824,26 @@ class PlaybackEngine(
             "Loading ${if (transcodeTarget != null) "on-device HLS transcode" else "direct-play (${streamForTv.mimeType})"} " +
                 "on ${sel.displayName} (${sel.protocol})",
         )
+        recoverySession = recoverySession.beginAttempt(
+            PlaybackAttemptDescriptor(
+                generation = 0,
+                endpoint = redactPlaybackEndpoint(phoneIp),
+                protocol = sel.protocol.name,
+                sourceKind = if (transcodeTarget != null) PlaybackAttemptSourceKind.ON_DEVICE_TRANSCODE else PlaybackAttemptSourceKind.LOCAL,
+                route = if (transcodeTarget != null) PlaybackAttemptRoute.ON_DEVICE_TRANSCODE else PlaybackAttemptRoute.DIRECT,
+                codec = transcodeTarget?.videoCodec?.name?.lowercase() ?: localSourceProfile?.videoCodec,
+                container = localSourceProfile?.container,
+                capabilitySummary = "hls=${sel.capabilities.supportsHls};hevc=${sel.capabilities.supportsHevc}",
+                startPositionSeconds = startPos,
+                reason = "local stream load",
+                automaticRecovery = pendingRecoveryKind,
+            ),
+        )
+        val attemptGeneration = recoverySession.generation
+        pendingRecoveryKind = null
         tgt.load(url, streamForTv, params.title, effectiveRuntimeSeconds, startPositionSeconds = reportedPositionSeconds)
         requestPlaybackAfterLoad(tgt)
-        armStartupWatchdog()
+        armStartupWatchdog(attemptGeneration)
         publishStatus()
         logger.event("playback", "Playing ${params.title} -> ${sel.displayName} (${sel.protocol})")
     }
@@ -652,6 +855,7 @@ class PlaybackEngine(
      */
     private suspend fun reloadLocalInPlace(startPos: Long, reason: String) {
         playGeneration++ // supersede the current stream (its stray end-of-media/watchdog is now stale)
+        val wasReloading = isReloadingStream
         isReloadingStream = true
         connectionLost = false
         playbackStarted = false
@@ -665,7 +869,7 @@ class PlaybackEngine(
             runCatching { coordinator.stop(reason) }
             loadLocalStreamLocked(startPos)
         } finally {
-            isReloadingStream = false
+            isReloadingStream = wasReloading
         }
     }
 
@@ -956,6 +1160,19 @@ class PlaybackEngine(
     private fun deviceKey(t: DiscoveredTarget): String =
         "${t.protocol}:${t.capabilities.modelName ?: t.displayName}"
 
+    private suspend fun <T> preparePlaybackSource(message: String, block: suspend () -> T): T = try {
+        block()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: PlaybackPreparationException) {
+        throw e
+    } catch (e: Exception) {
+        throw PlaybackPreparationException(message, e)
+    }
+
+    private fun Throwable.isPreparationFailure(): Boolean =
+        generateSequence(this) { it.cause }.any { it is PlaybackPreparationException }
+
     /**
      * Fail closed on foreground-service setup. The local proxy is not a best-effort convenience: it owns
      * the network/CPU locks that keep the receiver's URL usable while the app is backgrounded, so a load
@@ -968,14 +1185,14 @@ class PlaybackEngine(
             }
             is ForegroundServiceStartResult.StartRejected -> {
                 logger.e("playback", "Proxy foreground-service start was rejected; aborting before renderer load", result.cause)
-                throw IllegalStateException("Couldn't start the playback service. Please reopen the app and try again.", result.cause)
+                throw PlaybackPreparationException("The phone playback service was rejected.", result.cause)
             }
             is ForegroundServiceStartResult.ConfirmationTimedOut -> {
                 logger.e(
                     "playback",
                     "Proxy foreground service was not confirmed within ${result.timeoutMs}ms; aborting before renderer load",
                 )
-                throw IllegalStateException("The playback service didn't start in time. Please try again.")
+                throw PlaybackPreparationException("The phone playback service did not start in time.")
             }
         }
     }
@@ -1024,7 +1241,7 @@ class PlaybackEngine(
         onDeviceTranscodeTarget = null // a server resolve is not an on-device transcode (the fallback sets it)
         val caps = effectiveCaps()
         val phoneIp = networkInfo.lanIpv4()
-            ?: throw IllegalStateException("No Wi-Fi/LAN address to host the stream (check Wi-Fi/VPN).")
+            ?: throw PlaybackPreparationException("No phone LAN address is available for the media gateway.")
 
         val bitrate = requestedBitrate ?: adaptive?.currentBitrateBps
             // 4K HDR passthrough: on the first resolve (no explicit/adaptive bitrate yet) lift the request
@@ -1044,21 +1261,23 @@ class PlaybackEngine(
         val profileOverride = preferredCodec?.let {
             DeviceProfiles.forTarget(caps, bitrate, forceTranscode, burnIn, preferredVideoCodec = it, maxVideoHeight = effectiveMaxVideoHeight())
         }
-        val info = jellyfin.playbackInfo(
-            itemId = item.id,
-            capabilities = caps,
-            maxBitrateBps = bitrate,
-            forceTranscode = forceTranscode,
-            // A selected subtitle is burned into the video (the only way to show it reliably through the
-            // proxy on both Cast and DLNA), so enable burn-in whenever one is chosen.
-            allowSubtitleBurnIn = burnIn,
-            audioStreamIndex = audioSelection,
-            // null selection = OFF: pass -1 so the server explicitly omits subtitles (not its default).
-            subtitleStreamIndex = subtitleSelection ?: -1,
-            startPositionSeconds = positionSeconds,
-            maxVideoHeight = effectiveMaxVideoHeight(),
-            deviceProfileOverride = profileOverride,
-        ).getOrThrow()
+        val info = preparePlaybackSource("Jellyfin couldn't prepare this media source.") {
+            jellyfin.playbackInfo(
+                itemId = item.id,
+                capabilities = caps,
+                maxBitrateBps = bitrate,
+                forceTranscode = forceTranscode,
+                // A selected subtitle is burned into the video (the only way to show it reliably through the
+                // proxy on both Cast and DLNA), so enable burn-in whenever one is chosen.
+                allowSubtitleBurnIn = burnIn,
+                audioStreamIndex = audioSelection,
+                // null selection = OFF: pass -1 so the server explicitly omits subtitles (not its default).
+                subtitleStreamIndex = subtitleSelection ?: -1,
+                startPositionSeconds = positionSeconds,
+                maxVideoHeight = effectiveMaxVideoHeight(),
+                deviceProfileOverride = profileOverride,
+            ).getOrThrow()
+        }
 
         // If this renderer previously rejected this exact direct-play media format, don't hand it the
         // original again — force a transcode from the start (skips the doomed direct-play round-trip +
@@ -1072,7 +1291,9 @@ class PlaybackEngine(
             resolveAndLoad(positionSeconds, requestedBitrate, initialiseAdaptive, armWatchdog)
             return
         }
-        val upstream = jellyfin.resolveUpstream(info)
+        val upstream = preparePlaybackSource("Jellyfin couldn't resolve the selected media stream.") {
+            jellyfin.resolveUpstream(info)
+        }
 
         if (initialiseAdaptive) {
             val ladder = BitrateLadder.forSource(info.sourceBitrateBps)
@@ -1100,7 +1321,9 @@ class PlaybackEngine(
         reportedPositionSeconds = if (serverSideStart) 0L else positionSeconds
         seekSettleTargetSeconds = null // fresh stream: don't let a prior seek's hold suppress its statuses
 
-        val (_, url) = coordinator.startAndBuildUrl(info, upstream, phoneIp)
+        val (_, url) = preparePlaybackSource("Couldn't establish the phone-hosted Jellyfin gateway.") {
+            coordinator.startAndBuildUrl(info, upstream, phoneIp)
+        }
         coordinator.notePosition(positionSeconds)
         // Hand the start position to load() so the renderer begins AT it (Cast sets it in the load request;
         // DLNA seeks once playing) for a direct-play file or a full-timeline HLS transcode — no separate,
@@ -1113,11 +1336,30 @@ class PlaybackEngine(
                     "${upstream.contentType}, output=${upstream.outputContainer}) at ${loadStart}s " +
                 "on ${selectedTarget?.displayName} (${selectedTarget?.protocol})",
         )
+        recoverySession = recoverySession.beginAttempt(
+            PlaybackAttemptDescriptor(
+                generation = 0,
+                endpoint = redactPlaybackEndpoint(phoneIp),
+                protocol = selectedTarget?.protocol?.name,
+                sourceKind = PlaybackAttemptSourceKind.ONLINE,
+                route = if (upstream.isTranscoding) PlaybackAttemptRoute.SERVER_TRANSCODE else PlaybackAttemptRoute.DIRECT,
+                codec = info.profile.videoCodec,
+                container = info.profile.container ?: upstream.outputContainer,
+                capabilitySummary = "hls=${caps.supportsHls};hevc=${caps.supportsHevc};10bit=${caps.supports10Bit}",
+                startPositionSeconds = positionSeconds,
+                audioStreamIndex = audioSelection,
+                subtitleStreamIndex = subtitleSelection,
+                reason = if (armWatchdog) "automatic recovery load" else "stream load",
+                automaticRecovery = pendingRecoveryKind,
+            ),
+        )
+        val attemptGeneration = recoverySession.generation
+        pendingRecoveryKind = null
         target.load(url, upstream.rendererStream, item.title, info.runtimeSeconds, startPositionSeconds = loadStart)
         requestPlaybackAfterLoad(target)
         // Watch for the TV silently never starting (ideas 1+7). Only for a fresh start / recovery reload —
         // not a seek or bitrate switch, where playback is already established.
-        if (armWatchdog) armStartupWatchdog()
+        if (armWatchdog) armStartupWatchdog(attemptGeneration)
         publishStatus()
     }
 
@@ -1134,11 +1376,17 @@ class PlaybackEngine(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
+            if (e.isPreparationFailure()) throw e
             if (!prefs.preferDirectPlay || effectiveForceTranscode()) throw e
             logger.w(TAG, "Playback failed to start on the renderer; retrying once with a server transcode", e)
             // A thrown startup/load exception has no qualified decoder evidence. Recover once, but do not
             // permanently downgrade this renderer: the cause may have been the proxy, CORS, a range request,
             // network loss, or an interrupted session rather than an unsupported media format.
+            val reserved = recoverySession.reserveRecovery(
+                RecoveryAttemptKind.FORMAT_COMPATIBILITY, PlaybackPhase.CHANGING_STREAM,
+            ) ?: throw e
+            recoverySession = reserved
+            pendingRecoveryKind = RecoveryAttemptKind.FORMAT_COMPATIBILITY
             forceTranscodeFallback = true
             resolveAndLoad(positionSeconds, requestedBitrate = requestedBitrate, initialiseAdaptive = true, armWatchdog = true)
         }
@@ -1154,6 +1402,7 @@ class PlaybackEngine(
         // The coordinator reports a terminal position while replacing the Jellyfin session. Record the
         // requested resume point first so a seek, bitrate switch, or recovery cannot save stale progress.
         coordinator.notePosition(positionSeconds)
+        val wasReloading = isReloadingStream
         isReloadingStream = true
         try {
             // Revoke the old phone-hosted stream before any renderer control call can block. The
@@ -1166,7 +1415,7 @@ class PlaybackEngine(
             runCatching { coordinator.stop(reason) }
             resolveAndLoad(positionSeconds, requestedBitrate = requestedBitrate, initialiseAdaptive = false, armWatchdog = armWatchdog)
         } finally {
-            isReloadingStream = false
+            isReloadingStream = wasReloading
         }
     }
 
@@ -1178,13 +1427,30 @@ class PlaybackEngine(
      * later session because it re-checks state under the mutex).
      */
     private fun launchRecoveryReload(requestedBitrate: Long?, reason: String) {
+        if (fallbackJob?.isActive == true) return // one automatic recovery coroutine at a time
         val resumeAt = absolutePositionSeconds
+        val expectedGeneration = recoverySession.generation
         fallbackJob = scope.launch {
             mutex.withLock {
+                if (!recoverySession.acceptsEvent(expectedGeneration)) {
+                    logger.trace(TAG, "Ignoring stale recovery reload for generation $expectedGeneration")
+                    return@withLock
+                }
                 runCatching { reloadStream(resumeAt, requestedBitrate, reason, armWatchdog = true) }
                     .onFailure {
                         if (it !is CancellationException) {
                             logger.e("playback", "Recovery reload failed ($reason); giving up", it)
+                            recoverySession = if (it.isPreparationFailure()) {
+                                recoverySession
+                                    .recordFailure(
+                                        PlaybackFailureStage.STREAM_RESOLUTION,
+                                        PlaybackFailureCause.UPSTREAM_OR_SERVER_UNAVAILABLE,
+                                    )
+                                    .fail()
+                            } else {
+                                recoverySession.fail()
+                            }
+                            smartResume.checkpoint(SmartResumeCheckpointKind.FAILURE, smartResumeDeviceContext)
                             publishStatus(error = "Couldn't start playback.")
                         }
                     }
@@ -1192,6 +1458,37 @@ class PlaybackEngine(
         }
     }
 
+    /** Reserve automatic work after the duplicate-event guard has claimed the reload window. */
+    private fun admitRecoveryDecision(action: RecoveryAction): RecoveryAction {
+        val kind = when (action) {
+            RecoveryAction.RETRY_SAME_STREAM -> RecoveryAttemptKind.SAME_STREAM_NETWORK
+            RecoveryAction.TRANSCODE_FALLBACK -> RecoveryAttemptKind.FORMAT_COMPATIBILITY
+            RecoveryAction.LOWER_RESOLUTION_FALLBACK -> RecoveryAttemptKind.LOWER_RESOLUTION
+            else -> null
+        } ?: run {
+            if (action == RecoveryAction.SURFACE) recoverySession = recoverySession.fail()
+            return action
+        }
+        val phase = when (kind) {
+            RecoveryAttemptKind.SAME_STREAM_NETWORK -> PlaybackPhase.RECONNECTING
+            RecoveryAttemptKind.FORMAT_COMPATIBILITY,
+            RecoveryAttemptKind.LOWER_RESOLUTION -> PlaybackPhase.CHANGING_STREAM
+            RecoveryAttemptKind.ALTERNATE_PROTOCOL -> PlaybackPhase.CHANGING_PROTOCOL
+        }
+        val reserved = recoverySession.reserveRecovery(kind, phase)
+        if (reserved != null) {
+            recoverySession = reserved
+            pendingRecoveryKind = kind
+            return action
+        }
+        // The existing failure handler set isReloadingStream before admission. Undo that claim when the
+        // finite budget rejects it so the terminal state is stable and no orphan reload can start.
+        isReloadingStream = false
+        terminalFailureSurfaced = true
+        recoverySession = recoverySession.fail()
+        logger.w(TAG, "Recovery budget exhausted; surfacing playback failure")
+        return RecoveryAction.SURFACE
+    }
     /**
      * Central handler for a playback failure — whether a renderer-reported [PlaybackTargetEvent.Error] or
      * one synthesized by the startup watchdog. The decision + the flags that gate re-entry (so concurrent
@@ -1202,7 +1499,14 @@ class PlaybackEngine(
         kind: PlaybackFailureKind,
         message: String,
         qualifiedFormatEvidence: Boolean = false,
+        expectedGeneration: Long? = null,
+        failureStage: PlaybackFailureStage = PlaybackFailureStage.RENDERER_LOAD,
     ) {
+        if (expectedGeneration != null && !recoverySession.acceptsEvent(expectedGeneration)) {
+            logger.trace(TAG, "Ignoring stale playback failure for generation $expectedGeneration")
+            return
+        }
+        recoverySession = recoverySession.recordFailure(failureStage, kind.toRecoveryCause())
         // Local on-device transcode AUTO-FALLBACK: if the TV rejected this format before playback started,
         // re-encode to the next codec it can decode (and this phone can encode) before giving up. Guarded by
         // recoveryLock + isReloadingStream so the burst of duplicate error events can't each trigger a reload,
@@ -1234,6 +1538,10 @@ class PlaybackEngine(
                             if (it !is CancellationException) {
                                 logger.e("playback", "On-device codec fallback failed; giving up", it)
                                 terminalFailureSurfaced = true
+                                recoverySession = recoverySession
+                                    .recordFailure(PlaybackFailureStage.RENDERER_LOAD, PlaybackFailureCause.ON_DEVICE_TRANSCODE)
+                                    .fail()
+                                smartResume.checkpoint(SmartResumeCheckpointKind.FAILURE, smartResumeDeviceContext)
                                 publishStatus(error = "Couldn't play this video on your TV.")
                             }
                         }
@@ -1243,7 +1551,7 @@ class PlaybackEngine(
         }
         val online = currentInfo != null
         val transcoding = currentIsTranscoding || effectiveForceTranscode()
-        val action = synchronized(recoveryLock) {
+        val decidedAction = synchronized(recoveryLock) {
             // A single failure often arrives as multiple events (Cast fires onMediaError twice plus an
             // IDLE/ERROR status); once we've surfaced a terminal failure for this stream, drop the extras.
             if (terminalFailureSurfaced) {
@@ -1273,6 +1581,7 @@ class PlaybackEngine(
             }
             decided
         }
+        val action = admitRecoveryDecision(decidedAction)
         // Always-on: attribute the recovery decision to its inputs so a shared report explains WHY a
         // failure was retried, transcoded, ignored, or surfaced (e.g. "kind=UNKNOWN ... -> SURFACE").
         logger.event(
@@ -1308,6 +1617,7 @@ class PlaybackEngine(
             }
             RecoveryAction.SURFACE -> {
                 logger.e("playback", "Unrecoverable playback failure (kind=$kind); surfaced to user")
+                smartResume.checkpoint(SmartResumeCheckpointKind.FAILURE, smartResumeDeviceContext)
                 publishStatus(error = message)
             }
         }
@@ -1319,12 +1629,16 @@ class PlaybackEngine(
      * event — synthesize a failure so recovery still runs. Bytes-flowed distinguishes a decode/format
      * failure (transcodable) from a TV that never even fetched. Cancelled the moment playback starts.
      */
-    private fun armStartupWatchdog() {
+    private fun armStartupWatchdog(generation: Long = recoverySession.generation) {
         startupWatchdogJob?.cancel()
         playbackStarted = false
         startupBytesServed = 0L
         startupWatchdogJob = scope.launch {
             delay(StartupWatchdog.GRACE_MS)
+            if (!recoverySession.acceptsEvent(generation)) {
+                logger.trace(TAG, "Ignoring stale startup watchdog for generation $generation")
+                return@launch
+            }
             if (!playbackStarted && !isReloadingStream) {
                 val kind = StartupWatchdog.graceTimeoutKind(startupBytesServed)
                 // Capture WHY the TV never started (Cast state/idle/mediaInfo, DLNA transport state) so a
@@ -1335,7 +1649,10 @@ class PlaybackEngine(
                     "Stream didn't start within ${StartupWatchdog.GRACE_MS / 1000}s " +
                         "(${startupBytesServed / 1024} KiB served to the TV; renderer: ${rendererStatus.ifBlank { "unknown" }}); attempting recovery",
                 )
-                handlePlaybackFailure(kind, startupFailureMessage())
+                handlePlaybackFailure(
+                    kind, startupFailureMessage(), expectedGeneration = generation,
+                    failureStage = PlaybackFailureStage.FIRST_FRAME,
+                )
             }
         }
     }
@@ -1405,7 +1722,18 @@ class PlaybackEngine(
     private suspend fun monitorLoop() {
         while (scope.isActive) {
             delay(MONITOR_INTERVAL_MS)
-            val a = adaptive ?: continue
+            try {
+                mutex.withLock { evaluateNightVolumeLocked() }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logger.w(TAG, "Night-volume scheduler tick failed; leaving volume unchanged", e)
+            }
+            val a = adaptive
+            if (a == null) {
+                publishStatus()
+                continue
+            }
             val now = clock()
             runCatching { coordinator.reportProgress(isPaused = !isPlaying) }
             // A transient failure here must never silently kill adaptation for the rest of the session.
@@ -1434,6 +1762,45 @@ class PlaybackEngine(
         }
     }
 
+    /** Polling is frequent, but the pure scheduler admits only sparse, reduction-only commands. */
+    private suspend fun evaluateNightVolumeLocked() {
+        val endpoint = selectedTarget ?: return
+        val policy = runCatching(nightVolumePolicyProvider).getOrDefault(NightVolumePolicy.Off)
+        val decision = NightVolumeScheduler.evaluate(
+            policy,
+            NightVolumeInput(
+                now = Instant.ofEpochMilli(clock()),
+                zoneId = ZoneId.systemDefault(),
+                activePlayback = isPlaying,
+                volumeSupported = endpoint.discoveryMetadata.volumeControlAvailable,
+                effectiveVolume = volume,
+            ),
+            nightVolumeSession,
+        )
+        nightVolumeSession = decision.session
+        decision.commandVolume?.let { reducedVolume ->
+            setVolumeLocked(reducedVolume)
+            logger.event("playback", "Night volume reduced to ${(reducedVolume * 100).toInt()}%")
+        }
+    }
+
+    private fun suspendNightVolumeAutomationForManualAdjustment() {
+        val endpoint = selectedTarget
+        val decision = NightVolumeScheduler.evaluate(
+            runCatching(nightVolumePolicyProvider).getOrDefault(NightVolumePolicy.Off),
+            NightVolumeInput(
+                now = Instant.ofEpochMilli(clock()),
+                zoneId = ZoneId.systemDefault(),
+                activePlayback = target != null,
+                volumeSupported = endpoint?.discoveryMetadata?.volumeControlAvailable == true,
+                effectiveVolume = volume,
+                manualVolumeAdjusted = true,
+            ),
+            nightVolumeSession,
+        )
+        nightVolumeSession = decision.session
+    }
+
     /**
      * Auto-skip the segment (intro/outro/recap) covering the current position, at most once per segment
      * per item. Non-suspending: launches the seek so [onTargetEvent] never blocks on the [mutex].
@@ -1460,9 +1827,14 @@ class PlaybackEngine(
         seekTo(segments[idx].endSeconds)
     }
 
-    private fun onTargetEvent(event: PlaybackTargetEvent) {
+    private fun onTargetEvent(source: PlaybackTargetController, event: PlaybackTargetEvent) {
+        if (source !== target) {
+            logger.w(TAG, "Ignoring event from a replaced playback controller")
+            return
+        }
         when (event) {
             is PlaybackTargetEvent.Connected -> {
+                recoverySession = recoverySession.transition(PlaybackPhase.PREPARING)
                 logger.event("playback", "Renderer connected (${selectedTarget?.protocol})")
                 publishStatus()
             }
@@ -1480,15 +1852,22 @@ class PlaybackEngine(
                 seekSettleTargetSeconds = null // no seek pending, confirmed near target, or window expired
                 reportedPositionSeconds = event.positionSeconds
                 isPlaying = event.isPlaying
+                recoverySession = recoverySession.transition(if (event.isPlaying) PlaybackPhase.PLAYING else PlaybackPhase.PAUSED)
                 // Evidence the stream actually started playing on the TV — cancels the startup watchdog.
                 if (event.isPlaying || event.positionSeconds > 0) markPlaybackStarted()
                 coordinator.notePosition(absolutePositionSeconds)
-                smartResume.onRendererStatus(absolutePositionSeconds, item?.runtimeSeconds ?: localPlayback?.runtimeSeconds, event.isPlaying)
+                smartResume.onRendererStatus(
+                    absolutePositionSeconds,
+                    item?.runtimeSeconds ?: localPlayback?.runtimeSeconds,
+                    event.isPlaying,
+                    smartResumeDeviceContext,
+                )
                 maybeAutoSkip()
                 publishStatus()
             }
             is PlaybackTargetEvent.BufferingChanged -> {
                 isBuffering = event.isBuffering
+                recoverySession = recoverySession.transition(if (event.isBuffering) PlaybackPhase.BUFFERING else if (isPlaying) PlaybackPhase.PLAYING else PlaybackPhase.PAUSED)
                 if (event.isBuffering) adaptive?.recordRebuffer(clock())
                 logger.trace(TAG, "Buffering ${if (event.isBuffering) "started" else "ended"} at ${absolutePositionSeconds}s")
                 publishStatus()
@@ -1506,8 +1885,9 @@ class PlaybackEngine(
                 if (isReloadingStream) {
                     logger.w(TAG, "Ignoring end-of-media during a stream reload (seek/bitrate switch)")
                 } else {
+                    recoverySession = recoverySession.transition(PlaybackPhase.COMPLETED)
                     logger.event("playback", "End of media reached at ${absolutePositionSeconds}s")
-                    smartResume.complete()
+                    smartResume.complete(smartResumeDeviceContext)
                     // Signal a genuine end-of-media so the ViewModel can autoplay the next episode (a
                     // user-stop tears down eventsJob first, so this never fires for a deliberate stop).
                     _endOfMedia.tryEmit(Unit)
@@ -1533,8 +1913,11 @@ class PlaybackEngine(
                 // BEFORE disconnecting the target (stopInternalLocked), so this handler never runs for a
                 // user stop — only for a real, unexpected drop. Flag it so the ViewModel can auto-reconnect
                 // and resume from the last reported position.
-                if (item != null && selectedTarget != null) {
+                if (currentInfo != null || localPlayback != null) {
                     connectionLost = true
+                    recoverySession = recoverySession
+                        .recordFailure(PlaybackFailureStage.ENDPOINT_DISCONNECT, PlaybackFailureCause.ENDPOINT_UNAVAILABLE)
+                        .transition(PlaybackPhase.RECONNECTING)
                     logger.w("playback", "Renderer connection lost unexpectedly at ${absolutePositionSeconds}s; auto-reconnecting")
                 }
                 publishStatus()
@@ -1565,7 +1948,15 @@ class PlaybackEngine(
             return null
         }
         val decision = streamSelection.select(target.capabilities, profile, StreamPreferences())
-        val route = playbackRouter.route(decision, SourceCapabilities(canServerTranscode = false, isSeekable = true))
+        val route = playbackRouter.route(
+            decision,
+            SourceCapabilities(
+                canServerTranscode = false,
+                isSeekable = true,
+                isReopenable = true,
+                canStreamToClientTranscoder = true,
+            ),
+        )
         if (route.kind != RouteKind.CLIENT_TRANSCODE) {
             logger.event("transcode", "Local ${profile.videoCodec}/$container is direct-playable to this TV (${route.kind}); no on-device transcode")
             return null
@@ -1677,6 +2068,10 @@ class PlaybackEngine(
     }
 
     private suspend fun stopInternalLocked(reason: String) {
+        recoverySession = recoverySession.stop().let { stopped ->
+            if (reason.endsWith("failed")) stopped.fail() else stopped
+        }
+        pendingRecoveryKind = null
         smartResume.checkpoint(SmartResumeCheckpointKind.STOPPED)
         monitorJob?.cancel(); monitorJob = null
         startupWatchdogJob?.cancel(); startupWatchdogJob = null
@@ -1727,8 +2122,10 @@ class PlaybackEngine(
         manualQuality = false
         manualMaxVideoHeight = null
         lastThroughputBps = 0
+        nightVolumeSession = NightVolumeSession()
         _status.value = null
         smartResume.detach()
+        smartResumeDeviceContext = null
     }
 
     /** "H.264 · MKV · 1080p" style summary of the source media, or null when nothing is known. */
@@ -1764,6 +2161,7 @@ class PlaybackEngine(
         val a = adaptive
         val srcProfile = currentInfo?.profile ?: localSourceProfile
         val odt = onDeviceTranscodeTarget
+        val recovery = recoverySession
         _status.value = PlaybackStatus(
             targetName = sel.displayName,
             protocolName = sel.protocol.name,
@@ -1800,8 +2198,14 @@ class PlaybackEngine(
             sourceFormat = describeSource(srcProfile),
             outputFormat = describeOutput(odt),
             volume = volume,
-            title = item?.title ?: "",
+            volumeSupported = sel.discoveryMetadata.volumeControlAvailable,
+            title = item?.title ?: localPlayback?.title.orEmpty(),
             errorMessage = error,
+            phase = recovery.phase,
+            attemptGeneration = recovery.generation,
+            attemptHistory = recovery.attempts,
+            recoveryBudget = recovery.budgetStatus,
+            isTerminal = recovery.phase == PlaybackPhase.FAILED,
             connectionLost = connectionLost,
             audioTracks = mediaAudioTracks,
             subtitleTracks = mediaSubtitleTracks,

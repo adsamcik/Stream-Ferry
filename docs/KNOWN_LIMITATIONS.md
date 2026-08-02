@@ -1,18 +1,19 @@
 # Known Limitations
 
-This is an MVP scaffold. The following are explicitly documented per the spec's requirement that any
-unmet item be stated with reasons.
+These constraints distinguish implemented, unit-verified policy from behavior that still needs a
+specific server, phone, network, or physical receiver. They are not broad compatibility promises.
 
 ## Build / environment
 
-- **Android assembly not run in the sandbox.** `dl.google.com` / `maven.google.com` are blocked here,
-  so AGP/AndroidX/Compose/Cast cannot be resolved and `assembleDebug`/`lintDebug`/instrumented tests
-  cannot run. The pure-JVM core is fully compiled and **128 unit tests pass**. See
-  [BUILD.md](BUILD.md) and [API37_MIGRATION.md](API37_MIGRATION.md).
-- **`gradle/verification-metadata.xml` not generated here** (requires resolving Google Maven). It must
-  be produced with `./gradlew --write-verification-metadata sha256 help` at the first online build.
-- **Compose BOM 2026.06.00 and Cast 22.3.1 are web-search-only versions**; re-verify and pin at the
-  online build (flagged in the version catalog and [DEPENDENCY_RISK.md](DEPENDENCY_RISK.md)).
+- **Android verification is environment-dependent.** `assembleDebug`, `testDebugUnitTest`, and
+  `lintDebug` require Android SDK 37 plus resolved Google Maven dependencies. A host without those
+  dependencies must report the gate as unavailable rather than treating the core-only fallback as a
+  full Android build. See [BUILD.md](BUILD.md) and [API37_MIGRATION.md](API37_MIGRATION.md).
+- **`gradle/verification-metadata.xml` is not present.** Generate and review it with
+  `./gradlew --write-verification-metadata sha256 help` on a connected host before relying on
+  dependency verification.
+- Dependency versions remain pinned in the version catalog and should be re-resolved by CI before a
+  release; a successful historical build is not a guarantee that an external repository is available.
 
 ## Hardware-dependent acceptance criteria
 
@@ -25,8 +26,8 @@ unmet item be stated with reasons.
   speed, thermal throttling, fMP4 timeline/seek behaviour, A/V continuity, and receiver behaviour under
   speculative requests still require physical validation. It must not be represented as reliable across
   OEM phones or Cast devices.
-- No Jellyfin test server was available in-sandbox, so live auth/playback-info/media-source/reporting
-  flows are implemented against the documented HTTP API but not executed end-to-end here.
+- The optional live Jellyfin integration test needs an explicitly configured server and skips itself
+  when none is reachable. Ordinary unit/assemble/lint gates therefore do not prove live server behavior.
 
 ## Functional scope (intentional MVP boundaries)
 
@@ -37,23 +38,25 @@ unmet item be stated with reasons.
   compatible Cast receivers only. There is no phone DASH or MPEG-TS muxer, no AV1/VP9 or CPU encoder
   path, and no Main10/HDR output or conversion contract. H.264/AAC is the compatibility floor; HEVC/AAC
   is hardware- and receiver-gated. DLNA does not receive an on-device HLS/fMP4 stream.
-- **Online phone transcoding is unsupported by design.** Jellyfin server transcoding is the supported
-  online conversion route; the phone transcodes only eligible local files for Cast.
+- **Remote Jellyfin-to-phone transcoding is not implemented.** Source capability models now expose the
+  necessary seekability, reopenability, streamability, and client/server-transcode gates, but Jellyfin
+  has no authenticated origin-pinned client-transcoder input provider. Server transcoding remains the
+  preferred online compatibility route; the phone transcodes only eligible local files for Cast.
 - **Rolling in-memory prebuffer** (Phase 9) policy + decisions are implemented and unit-tested; wiring
   it into the live streaming loop beyond pass-through is a follow-up.
 - **Jellyfin SDK vs HTTP API:** the playback path uses the documented Jellyfin **HTTP API** (OkHttp)
   to avoid inventing/guessing SDK signatures; the SDK is retained in the catalog for models/future and
   carries LGPL-3.0 obligations ([LICENSES.md](LICENSES.md)).
-- **Compose screens are an MVP scaffold:** all 11 screens exist with correct separation (Cast-first /
-  DLNA-second, redacted diagnostics, delete-all-data), but rich interactions (live target lists, full
-  audio/subtitle pickers, seek/volume controls bound to a live session) are stubbed pending the live
-  playback path.
+- **Physical-TV and playback UI require device validation.** The live physical-TV picker and bound
+  Now Playing seek/volume/recovery controls are implemented, but receiver support and error semantics
+  still vary by Cast/DLNA firmware. Audio/subtitle switching remains less complete than core transport
+  controls.
 - Audio/video track switching, embedded/ASS/SSA/PGS subtitles, and codec probing are treated as
   unverified / test-required, not guaranteed.
 - Out of scope by design (§1): direct Jellyfin-to-TV, screen mirroring, broad/general-purpose phone
-  transcoding, full-file predownload, disk cache, offline downloads, music/photos/live-TV/SyncPlay,
-  native TV apps, Media3 Cast. The limited experimental local Cast HLS/fMP4 path above is the only
-  phone-transcoding exception.
+  transcoding, a general media disk cache, music/photos/live-TV/SyncPlay, native TV apps, and Media3
+  Cast. The implemented app-private offline download and limited experimental local Cast HLS/fMP4
+  paths are narrow exceptions, not general caching/transcoding systems.
 - **DRM / protected content is out of scope and not relayable.** An encrypted/DRM-protected stream
   cannot be proxied (or screen-captured) without the rights system's keys, so it is a deliberate
   non-goal rather than a regression. Jellyfin personal media is generally DRM-free.

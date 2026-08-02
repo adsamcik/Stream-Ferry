@@ -1,8 +1,8 @@
 # Google Cast Integration
 
-Cast is the **preferred** backend. The MVP uses the **direct Google Cast Sender SDK**
+Cast uses the **direct Google Cast Sender SDK**
 (`play-services-cast-framework`), not AndroidX Media3 Cast / `CastPlayer` / `RemoteCastPlayer` (§10).
-A written decision is required before introducing Media3 Cast; none is made for the MVP because the
+A written decision is required before introducing Media3 Cast; none is made because the
 direct SDK fully covers load/control/status/lifecycle of a phone-hosted URL on the Default Media
 Receiver.
 
@@ -13,16 +13,17 @@ Receiver.
 - `data.cast.CastTargetController` — implements `CastTargetController`: session lifecycle,
   generation-bound route/session binding, result-aware `RemoteMediaClient` load/control, media status
   + error handling, progress, SDK-owned resume, and stop cleanup.
-- A framework `MediaRouteButton` in the target picker owns live Cast discovery, route selection, and the
-  connected-device affordance; the adjacent list is reserved for the independent DLNA flow.
+- `TargetPickerScreen` renders protocol-independent `PhysicalTv` rows. `CastTargetController` owns an
+  active `MediaRouter` scan while that screen is visible and contributes raw Cast endpoints to the
+  conservative Cast/DLNA aggregator. Selecting a TV chooses an endpoint internally.
 
 ## Discovery & permissions
 
-Discovery/selection uses the AndroidX `MediaRouteButton` (Cast route picker). The app **explicitly
-requests `ACCESS_LOCAL_NETWORK`** for LAN discovery/control and the proxy-to-TV leg
+Discovery/selection uses AndroidX `MediaRouter` through the app-level physical-TV picker. The app
+**explicitly requests `ACCESS_LOCAL_NETWORK`** for LAN discovery/control and the proxy-to-TV leg
 ([MANIFEST_PERMISSIONS.md](MANIFEST_PERMISSIONS.md)). Android's system **Output Switcher** can act as
-an in-app picker that is *exempt* from the local-network permission, but Stream Ferry deliberately
-keeps the explicit permission: the proxy leg needs LAN access regardless of how the target is picked,
+an in-app picker that is *exempt* from the local-network permission, but it is not Stream Ferry's normal
+selection path. The proxy leg needs LAN access regardless of how the target is picked,
 and an explicit request yields a clear rationale prompt plus a graceful denied/revoked fallback
 (Jellyfin browsing stays usable — [VPN_LAN_DIAGNOSTICS.md](VPN_LAN_DIAGNOSTICS.md)).
 

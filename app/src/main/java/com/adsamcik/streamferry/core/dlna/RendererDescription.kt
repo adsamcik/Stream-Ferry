@@ -15,6 +15,7 @@ data class RendererServiceEndpoint(
 data class RendererDescription(
     val udn: String?,
     val friendlyName: String,
+    val manufacturer: String?,
     val modelName: String?,
     val modelNumber: String?,
     val firmware: String?,
@@ -56,6 +57,7 @@ object RendererDescriptionParser {
         return RendererDescription(
             udn = directText(device, "UDN"),
             friendlyName = friendly,
+            manufacturer = directText(device, "manufacturer"),
             modelName = directText(device, "modelName"),
             modelNumber = directText(device, "modelNumber"),
             firmware = directText(device, "modelDescription"),

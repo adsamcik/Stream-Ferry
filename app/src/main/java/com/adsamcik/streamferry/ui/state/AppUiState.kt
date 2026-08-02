@@ -6,6 +6,13 @@ import com.adsamcik.streamferry.domain.MediaSourceIds
 import com.adsamcik.streamferry.domain.MediaTrack
 import com.adsamcik.streamferry.domain.ServerProfile
 import com.adsamcik.streamferry.logging.LogEntry
+import com.adsamcik.streamferry.physical.PhysicalTv
+import com.adsamcik.streamferry.playback.PlaybackAttemptDescriptor
+import com.adsamcik.streamferry.playback.PlaybackPhase
+import com.adsamcik.streamferry.playback.RecoveryBudget
+import com.adsamcik.streamferry.playback.RecoveryBudgetStatus
+import com.adsamcik.streamferry.playback.RecoveryBudgetUsage
+import com.adsamcik.streamferry.playback.status
 import com.adsamcik.streamferry.ui.theme.ThemeMode
 
 /** Navigation routes (§18 screens). */
@@ -61,7 +68,13 @@ data class AppUiState(
     val castAvailable: Boolean = true,
     val castTargets: List<DiscoveredTarget> = emptyList(),
     val dlnaTargets: List<DiscoveredTarget> = emptyList(),
+    /** Conservative protocol-independent picker rows derived from the raw discovery snapshots above. */
+    val physicalTvs: List<PhysicalTv> = emptyList(),
+    val selectedPhysicalTv: PhysicalTv? = null,
+    /** Active protocol endpoint; kept separate from the user's physical-TV selection. */
     val selectedTarget: DiscoveredTarget? = null,
+    /** Safe display hint from Smart Resume; it is never used as identity evidence. */
+    val previousPhysicalTvName: String? = null,
     val localNetworkPermissionGranted: Boolean = false,
 
     // ----- background playback -----
@@ -113,6 +126,7 @@ data class QuickConnectUiState(
 data class PlaybackUiState(
     val targetName: String,
     val protocol: String,
+    val mediaTitle: String = "",
     val isPlaying: Boolean = false,
     val isBuffering: Boolean = false,
     val positionSeconds: Long = 0,
@@ -141,7 +155,13 @@ data class PlaybackUiState(
     /** Transcode output summary (codec · resolution · engine), or null for direct play. */
     val outputFormat: String? = null,
     val volume: Float = 1f,
+    val volumeSupported: Boolean = false,
     val errorMessage: String? = null,
+    val phase: PlaybackPhase = PlaybackPhase.STOPPED,
+    val attemptGeneration: Long = 0,
+    val attemptHistory: List<PlaybackAttemptDescriptor> = emptyList(),
+    val recoveryBudget: RecoveryBudgetStatus = RecoveryBudget().status(RecoveryBudgetUsage()),
+    val isTerminal: Boolean = false,
     /** True while the app is auto-reconnecting after an unexpected drop (shows a reconnecting overlay). */
     val reconnecting: Boolean = false,
     /** Selectable audio tracks (empty hides the audio picker). */
