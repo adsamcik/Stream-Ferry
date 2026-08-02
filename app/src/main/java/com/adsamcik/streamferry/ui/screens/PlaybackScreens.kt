@@ -3,7 +3,6 @@ package com.adsamcik.streamferry.ui.screens
 import android.content.res.Configuration
 import android.os.SystemClock
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
@@ -61,14 +60,12 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledIconButton
-import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilledTonalIconButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -76,7 +73,6 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.SheetValue
 import androidx.compose.material3.rememberBottomSheetState
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
@@ -115,18 +111,12 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.IntOffset
-import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.repeatOnLifecycle
-import androidx.mediarouter.app.MediaRouteButton
-import androidx.mediarouter.media.MediaRouteSelector
-import androidx.mediarouter.media.MediaRouter
 import coil.compose.AsyncImage
-import com.google.android.gms.cast.CastMediaControlIntent
-import com.google.android.gms.cast.framework.CastButtonFactory
 import com.adsamcik.streamferry.core.adaptive.QualityMenu
 import com.adsamcik.streamferry.core.chapter.chapterIndexForPosition
 import com.adsamcik.streamferry.core.stream.Protocol
@@ -183,8 +173,8 @@ fun TargetPickerScreen(state: AppUiState, viewModel: MainViewModel, onRescan: ()
             verticalArrangement = Arrangement.spacedBy(12.dp),
             contentPadding = PaddingValues(bottom = 4.dp),
         ) {
-            item(key = "target-discovery-hero") {
-                TargetDiscoveryHero(
+            item(key = "target-tv-heading") {
+                TargetPickerHeader(
                     scanning = state.isScanningTargets,
                     permissionGranted = state.localNetworkPermissionGranted,
                     secondsUntilRefresh = secondsUntilRefresh,
@@ -205,16 +195,6 @@ fun TargetPickerScreen(state: AppUiState, viewModel: MainViewModel, onRescan: ()
                 }
             }
 
-            item(key = "target-tv-heading") {
-                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    Text("Nearby TVs", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                    Text(
-                        "Choose the screen itself. Stream Ferry will pick the best available connection.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-            }
             state.previousPhysicalTvName?.let { previousName ->
                 item(key = "target-previous-tv") {
                     Text(
@@ -225,15 +205,16 @@ fun TargetPickerScreen(state: AppUiState, viewModel: MainViewModel, onRescan: ()
                     )
                 }
             }
-            item(key = "target-tv-list") {
-                PhysicalTvGroup(
-                    targets = state.physicalTvs,
-                    selected = state.selectedPhysicalTv,
-                    empty = "No compatible TVs yet. Make sure the TV is on and connected to this network.",
-                    scanning = state.isScanningTargets,
-                    onSelect = viewModel::selectPhysicalTv,
-                    onUnlink = viewModel::unlinkPhysicalTv,
-                )
+            if (state.localNetworkPermissionGranted) {
+                item(key = "target-tv-list") {
+                    PhysicalTvGroup(
+                        targets = state.physicalTvs,
+                        empty = "Make sure the TV is on and connected to this network.",
+                        scanning = state.isScanningTargets,
+                        onSelect = viewModel::selectPhysicalTv,
+                        onUnlink = viewModel::unlinkPhysicalTv,
+                    )
+                }
             }
         }
     }
@@ -242,7 +223,6 @@ fun TargetPickerScreen(state: AppUiState, viewModel: MainViewModel, onRescan: ()
 @Composable
 private fun PhysicalTvGroup(
     targets: List<PhysicalTv>,
-    selected: PhysicalTv?,
     empty: String,
     scanning: Boolean,
     onSelect: (PhysicalTv) -> Unit,
@@ -289,19 +269,12 @@ private fun PhysicalTvGroup(
     }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         targets.forEach { target ->
-            val isSelected = target.id == selected?.id
             Card(
                 onClick = { onSelect(target) },
                 modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(if (isSelected) 28.dp else 22.dp),
-                colors = CardDefaults.cardColors(
-                    containerColor = if (isSelected) MaterialTheme.colorScheme.primaryContainer
-                    else MaterialTheme.colorScheme.surfaceContainerHigh,
-                ),
-                border = BorderStroke(
-                    if (isSelected) 2.dp else 1.dp,
-                    if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant,
-                ),
+                shape = RoundedCornerShape(22.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
             ) {
                 Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Row(
@@ -312,8 +285,8 @@ private fun PhysicalTvGroup(
                         Surface(
                             modifier = Modifier.size(48.dp),
                             shape = CircleShape,
-                            color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondaryContainer,
-                            contentColor = if (isSelected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSecondaryContainer,
+                            color = MaterialTheme.colorScheme.secondaryContainer,
+                            contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
                         ) {
                             Box(contentAlignment = Alignment.Center) {
                                 Icon(Icons.Rounded.Tv, contentDescription = null, modifier = Modifier.size(26.dp))
@@ -337,7 +310,19 @@ private fun PhysicalTvGroup(
                                 overflow = TextOverflow.Ellipsis,
                             )
                         }
-                        RadioButton(selected = isSelected, onClick = null)
+                        Surface(
+                            modifier = Modifier.size(48.dp),
+                            shape = CircleShape,
+                            color = MaterialTheme.colorScheme.secondaryContainer,
+                            contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(
+                                    Icons.Rounded.PlayArrow,
+                                    contentDescription = "Play on ${target.displayName}",
+                                )
+                            }
+                        }
                     }
                     if (target.castEndpoint != null && target.dlnaEndpoint != null) {
                         TextButton(
@@ -352,98 +337,41 @@ private fun PhysicalTvGroup(
 }
 
 @Composable
-private fun TargetDiscoveryHero(
+private fun TargetPickerHeader(
     scanning: Boolean,
     permissionGranted: Boolean,
     secondsUntilRefresh: Int,
     onRefresh: () -> Unit,
 ) {
-    ElevatedCard(
+    Card(
         modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(32.dp),
-        colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer),
-        elevation = CardDefaults.elevatedCardElevation(defaultElevation = 4.dp),
+        shape = RoundedCornerShape(24.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
     ) {
-        Column(
-            modifier = Modifier.fillMaxWidth().padding(18.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp),
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(16.dp),
-            ) {
-                Box(modifier = Modifier.size(68.dp), contentAlignment = Alignment.Center) {
-                    Surface(
-                        modifier = Modifier.size(56.dp),
-                        shape = CircleShape,
-                        color = MaterialTheme.colorScheme.tertiary,
-                        contentColor = MaterialTheme.colorScheme.onTertiary,
-                    ) {
-                        Box(contentAlignment = Alignment.Center) {
-                            Icon(Icons.Rounded.Tv, contentDescription = null, modifier = Modifier.size(30.dp))
-                        }
-                    }
-                    if (scanning) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.fillMaxSize(),
-                            strokeWidth = 3.dp,
-                            color = MaterialTheme.colorScheme.onTertiaryContainer,
-                        )
-                    }
-                }
-                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                    Text(
-                        "Where should it play?",
-                        style = MaterialTheme.typography.headlineSmall,
-                        fontWeight = FontWeight.ExtraBold,
-                        color = MaterialTheme.colorScheme.onTertiaryContainer,
-                    )
-                    Text(
-                        if (scanning) "Looking around for nearby screens…" else "Pick a screen and the show is on",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onTertiaryContainer.copy(alpha = 0.82f),
-                    )
-                }
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                Text("Nearby TVs", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                Text(
+                    when {
+                        !permissionGranted -> "Allow network access to find TVs nearby."
+                        scanning -> "Searching this network…"
+                        else -> "Refreshes automatically in ${secondsUntilRefresh}s"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
-
-            Surface(
-                shape = RoundedCornerShape(18.dp),
-                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.72f),
-                contentColor = MaterialTheme.colorScheme.onSurface,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(9.dp),
-                ) {
-                    Icon(Icons.Rounded.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Text(
-                        when {
-                            !permissionGranted -> "Auto-refresh starts after network access is allowed"
-                            scanning -> "Auto-refresh is searching now"
-                            else -> "Auto-refresh on · next search in ${secondsUntilRefresh}s"
-                        },
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = FontWeight.SemiBold,
-                        modifier = Modifier.weight(1f),
-                    )
-                }
-            }
-
-            FilledTonalButton(
+            FilledTonalIconButton(
                 onClick = onRefresh,
-                enabled = !scanning,
-                modifier = Modifier.fillMaxWidth().height(52.dp),
-                shape = RoundedCornerShape(19.dp),
+                enabled = permissionGranted && !scanning,
+                modifier = Modifier.size(48.dp),
             ) {
-                if (scanning) {
-                    CircularProgressIndicator(Modifier.size(19.dp), strokeWidth = 2.dp)
-                    Text("  Searching…")
-                } else {
-                    Icon(Icons.Rounded.Refresh, contentDescription = null, modifier = Modifier.size(20.dp))
-                    Text("  Refresh now", fontWeight = FontWeight.Bold)
-                }
+                if (scanning) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                else Icon(Icons.Rounded.Refresh, contentDescription = "Refresh nearby TVs")
             }
         }
     }
@@ -474,342 +402,6 @@ private fun LocalNetworkAccessCard(onOpenSettings: () -> Unit) {
             OutlinedButton(onClick = onOpenSettings, shape = RoundedCornerShape(18.dp)) {
                 Text("Open app settings")
             }
-        }
-    }
-}
-
-@Composable
-private fun CastTargetCard(
-    castAvailable: Boolean,
-    permissionGranted: Boolean,
-    selected: DiscoveredTarget?,
-    onSelect: (DiscoveredTarget) -> Unit,
-) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(28.dp),
-        colors = CardDefaults.cardColors(
-            containerColor = if (selected != null) {
-                MaterialTheme.colorScheme.primaryContainer
-            } else {
-                MaterialTheme.colorScheme.surfaceContainerHigh
-            },
-        ),
-        border = selected?.let { BorderStroke(2.dp, MaterialTheme.colorScheme.primary) },
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(16.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(14.dp),
-        ) {
-            Surface(
-                modifier = Modifier.size(50.dp),
-                shape = CircleShape,
-                color = if (selected != null) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondaryContainer,
-                contentColor = if (selected != null) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSecondaryContainer,
-            ) {
-                Box(contentAlignment = Alignment.Center) {
-                    Icon(Icons.Rounded.Cast, contentDescription = null, modifier = Modifier.size(26.dp))
-                }
-            }
-            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                Text("Google Cast", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                Text(
-                    when {
-                        !castAvailable -> "Google Cast isn't available on this phone"
-                        !permissionGranted -> "Allow network access to choose a Cast screen"
-                        selected != null -> "Selected: ${selected.displayName}"
-                        else -> "Open Google's live device chooser"
-                    },
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                AnimatedVisibility(visible = selected != null) {
-                    Text(
-                        "Ready to play",
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.primary,
-                    )
-                }
-            }
-            if (castAvailable && permissionGranted) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    FrameworkCastRouteButton(onSelect = onSelect)
-                    Text("Choose", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.SemiBold)
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun TargetPlayDock(
-    selected: DiscoveredTarget?,
-    enabled: Boolean,
-    onPlay: () -> Unit,
-) {
-    Surface(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(28.dp),
-        color = MaterialTheme.colorScheme.surfaceContainerHighest,
-        tonalElevation = 5.dp,
-        shadowElevation = 7.dp,
-    ) {
-        Column(
-            modifier = Modifier.fillMaxWidth().padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(9.dp),
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 5.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(9.dp),
-            ) {
-                Icon(Icons.Rounded.Tv, contentDescription = null, modifier = Modifier.size(19.dp))
-                Text(
-                    selected?.displayName ?: "Choose a TV above",
-                    style = MaterialTheme.typography.labelLarge,
-                    fontWeight = FontWeight.Bold,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f),
-                )
-                selected?.let {
-                    Text(
-                        if (it.protocol == Protocol.CAST) "Cast" else "Smart TV",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.primary,
-                        fontWeight = FontWeight.Bold,
-                    )
-                }
-            }
-            Button(
-                onClick = onPlay,
-                enabled = enabled,
-                modifier = Modifier.fillMaxWidth().height(58.dp),
-                shape = RoundedCornerShape(21.dp),
-            ) {
-                Icon(Icons.Rounded.PlayArrow, contentDescription = null, modifier = Modifier.size(22.dp))
-                Text(
-                    if (selected != null) "  Play on ${selected.displayName}" else "  Select a TV to play",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-        }
-    }
-}
-
-/**
- * The framework-owned Cast chooser. It provides the connected-device affordance and owns route
- * discovery/transfer semantics; the surrounding picker remains responsible for DLNA selection.
- *
- * A chosen route is mirrored into the app's existing target state, so tapping Play uses the exact
- * route the Cast framework selected rather than a stale custom-picker row.
- */
-
-/** Safe policy baseline used only to turn the framework-selected route into the existing app target model. */
-private val FRAMEWORK_CAST_BASELINE = TargetCapabilities(
-    protocol = Protocol.CAST,
-    supportedContainers = setOf("mp4"),
-    supportedVideoCodecs = setOf("h264"),
-    supportedAudioCodecs = setOf("aac", "mp3"),
-    supportsHevc = false,
-    supports10Bit = false,
-    supportsHls = true,
-    supportedExternalSubtitleFormats = setOf("vtt"),
-)
-
-@Composable
-private fun FrameworkCastRouteButton(
-    onSelect: (DiscoveredTarget) -> Unit,
-) {
-    val context = LocalContext.current
-    val latestOnSelect by rememberUpdatedState(onSelect)
-    val selector = remember {
-        MediaRouteSelector.Builder()
-            .addControlCategory(
-                CastMediaControlIntent.categoryForCast(
-                    CastMediaControlIntent.DEFAULT_MEDIA_RECEIVER_APPLICATION_ID,
-                ),
-            )
-            .build()
-    }
-
-    // The Cast controller owns the active scan while the picker is open. This passive callback only
-    // mirrors a route selected through Google's framework chooser into the app's target state.
-    DisposableEffect(context, selector) {
-        val router = MediaRouter.getInstance(context)
-        val callback = object : MediaRouter.Callback() {
-            override fun onRouteSelected(
-                router: MediaRouter,
-                route: MediaRouter.RouteInfo,
-                reason: Int,
-            ) {
-                // The framework route is authoritative. Constructing the selection from this callback
-                // avoids depending on a delayed custom discovery snapshot that may already be stale.
-                latestOnSelect(
-                    DiscoveredTarget(
-                        id = route.id,
-                        displayName = route.name,
-                        protocol = Protocol.CAST,
-                        capabilities = FRAMEWORK_CAST_BASELINE.copy(modelName = route.description),
-                        lastTestedStatus = null,
-                    ),
-                )
-            }
-        }
-        router.addCallback(selector, callback)
-        onDispose { router.removeCallback(callback) }
-    }
-
-    AndroidView(
-        factory = { viewContext ->
-            MediaRouteButton(viewContext).also { button ->
-                CastButtonFactory.setUpMediaRouteButton(viewContext.applicationContext, viewContext.mainExecutor, button)
-                button.contentDescription = "Choose a Google Cast TV"
-            }
-        },
-        modifier = Modifier.size(48.dp),
-    )
-}
-
-@Composable
-private fun TargetGroup(
-    targets: List<DiscoveredTarget>,
-    selected: DiscoveredTarget?,
-    empty: String,
-    scanning: Boolean = false,
-    onSelect: (DiscoveredTarget) -> Unit,
-) {
-    if (targets.isEmpty()) {
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(26.dp),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
-        ) {
-            Column(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 24.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
-                Box(Modifier.size(56.dp), contentAlignment = Alignment.Center) {
-                    Surface(
-                        modifier = Modifier.size(48.dp),
-                        shape = CircleShape,
-                        color = MaterialTheme.colorScheme.secondaryContainer,
-                        contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
-                    ) {
-                        Box(contentAlignment = Alignment.Center) {
-                            Icon(Icons.Rounded.Tv, contentDescription = null, modifier = Modifier.size(26.dp))
-                        }
-                    }
-                    if (scanning) {
-                        CircularProgressIndicator(Modifier.fillMaxSize(), strokeWidth = 2.dp)
-                    }
-                }
-                Text(
-                    if (scanning) "Still looking…" else "No other TVs found yet",
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.Bold,
-                )
-                Text(
-                    empty,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    textAlign = TextAlign.Center,
-                )
-            }
-        }
-        return
-    }
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        targets.forEach { target ->
-            TargetOptionCard(
-                target = target,
-                selected = target.id == selected?.id && target.protocol == selected.protocol,
-                onClick = { onSelect(target) },
-            )
-        }
-    }
-}
-
-@Composable
-private fun TargetOptionCard(target: DiscoveredTarget, selected: Boolean, onClick: () -> Unit) {
-    val interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
-    val pressed by interactionSource.collectIsPressedAsState()
-    val scale by animateFloatAsState(
-        targetValue = if (pressed) 0.98f else 1f,
-        animationSpec = spring(
-            dampingRatio = Spring.DampingRatioMediumBouncy,
-            stiffness = Spring.StiffnessMedium,
-        ),
-        label = "target-card-press",
-    )
-    val containerColor by animateColorAsState(
-        targetValue = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerHigh,
-        animationSpec = tween(220),
-        label = "target-card-color",
-    )
-
-    Card(
-        onClick = onClick,
-        interactionSource = interactionSource,
-        modifier = Modifier.fillMaxWidth().graphicsLayer {
-            scaleX = scale
-            scaleY = scale
-        },
-        shape = RoundedCornerShape(if (selected) 28.dp else 22.dp),
-        colors = CardDefaults.cardColors(containerColor = containerColor),
-        border = BorderStroke(
-            if (selected) 2.dp else 1.dp,
-            if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant,
-        ),
-        elevation = CardDefaults.cardElevation(defaultElevation = if (selected) 3.dp else 0.dp),
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(14.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            Surface(
-                modifier = Modifier.size(46.dp),
-                shape = CircleShape,
-                color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondaryContainer,
-                contentColor = if (selected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSecondaryContainer,
-            ) {
-                Box(contentAlignment = Alignment.Center) {
-                    Icon(Icons.Rounded.Tv, contentDescription = null, modifier = Modifier.size(25.dp))
-                }
-            }
-            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text(
-                    target.displayName,
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.Bold,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                Text(
-                    target.capabilities.modelName ?: if (target.protocol == Protocol.CAST) "Google Cast" else "Smart TV",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                target.lastTestedStatus?.let { status ->
-                    Text(
-                        status,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.primary,
-                    )
-                }
-            }
-            RadioButton(selected = selected, onClick = null)
         }
     }
 }
@@ -1992,17 +1584,26 @@ private fun PlaybackControlsPreview() {
 @Preview(name = "Device picker", showBackground = true)
 @Preview(name = "Device picker · dark", showBackground = true, uiMode = Configuration.UI_MODE_NIGHT_YES)
 @Composable
-private fun TargetGroupPreview() {
+private fun PhysicalTvGroupPreview() {
+    val livingRoomEndpoint = DiscoveredTarget(
+        id = "1",
+        displayName = "Living Room TV",
+        protocol = Protocol.CAST,
+        capabilities = TargetCapabilities(Protocol.CAST, modelName = "Google TV"),
+        lastTestedStatus = "Ready",
+    )
     val targets = listOf(
-        DiscoveredTarget(
-            id = "1", displayName = "Living Room TV", protocol = Protocol.CAST,
-            capabilities = TargetCapabilities(Protocol.CAST, modelName = "Chromecast"),
-            lastTestedStatus = "Ready",
-        ),
-        DiscoveredTarget(
-            id = "2", displayName = "Bedroom TV", protocol = Protocol.DLNA,
-            capabilities = TargetCapabilities(Protocol.DLNA, modelName = "webOS TV"),
-            lastTestedStatus = null,
+        PhysicalTv(id = "living-room", displayName = "Living Room TV", castEndpoint = livingRoomEndpoint),
+        PhysicalTv(
+            id = "bedroom",
+            displayName = "Bedroom TV",
+            dlnaEndpoint = DiscoveredTarget(
+                id = "2",
+                displayName = "Bedroom TV",
+                protocol = Protocol.DLNA,
+                capabilities = TargetCapabilities(Protocol.DLNA, modelName = "webOS TV"),
+                lastTestedStatus = null,
+            ),
         ),
     )
     StreamFerryTheme {
@@ -2011,11 +1612,12 @@ private fun TargetGroupPreview() {
                 Modifier.fillMaxWidth().padding(16.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                TargetGroup(
+                PhysicalTvGroup(
                     targets = targets,
-                    selected = targets.first(),
                     empty = "No devices found.",
+                    scanning = false,
                     onSelect = {},
+                    onUnlink = {},
                 )
             }
         }
