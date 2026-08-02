@@ -53,6 +53,7 @@ import androidx.compose.material.icons.rounded.Subtitles
 import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material.icons.rounded.Tv
 import androidx.compose.material3.Button
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -145,6 +146,8 @@ fun TargetPickerScreen(state: AppUiState, viewModel: MainViewModel, onRescan: ()
     val latestRescan by rememberUpdatedState(onRescan)
     val latestScanning by rememberUpdatedState(state.isScanningTargets)
     var secondsUntilRefresh by remember { mutableIntStateOf(TARGET_AUTO_REFRESH_SECONDS) }
+    var unlinkCandidate by remember { mutableStateOf<PhysicalTv?>(null) }
+    val playbackTargetId = state.playbackStartingTargetId
 
     // Refresh only while this picker is actually in the foreground. The ViewModel guards against
     // overlapping work and stops discovery when navigation leaves this route.
@@ -176,6 +179,7 @@ fun TargetPickerScreen(state: AppUiState, viewModel: MainViewModel, onRescan: ()
             item(key = "target-tv-heading") {
                 TargetPickerHeader(
                     scanning = state.isScanningTargets,
+                    playbackStarting = playbackTargetId != null,
                     permissionGranted = state.localNetworkPermissionGranted,
                     secondsUntilRefresh = secondsUntilRefresh,
                     onRefresh = {
@@ -211,12 +215,41 @@ fun TargetPickerScreen(state: AppUiState, viewModel: MainViewModel, onRescan: ()
                         targets = state.physicalTvs,
                         empty = "Make sure the TV is on and connected to this network.",
                         scanning = state.isScanningTargets,
+                        playbackTargetId = playbackTargetId,
                         onSelect = viewModel::selectPhysicalTv,
-                        onUnlink = viewModel::unlinkPhysicalTv,
+                        onUnlink = { unlinkCandidate = it },
                     )
                 }
             }
         }
+    }
+
+    unlinkCandidate?.let { target ->
+        AlertDialog(
+            onDismissRequest = { unlinkCandidate = null },
+            title = { Text("Treat these as separate devices?") },
+            text = {
+                Text(
+                    "${target.displayName} will appear as separate Cast and DLNA entries on future scans. " +
+                        "You can restore automatic matching by resetting learned TV data in Settings.",
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        unlinkCandidate = null
+                        viewModel.unlinkPhysicalTv(target)
+                    },
+                    modifier = Modifier.heightIn(min = 48.dp),
+                ) { Text("Separate devices") }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { unlinkCandidate = null },
+                    modifier = Modifier.heightIn(min = 48.dp),
+                ) { Text("Cancel") }
+            },
+        )
     }
 }
 
@@ -225,6 +258,7 @@ private fun PhysicalTvGroup(
     targets: List<PhysicalTv>,
     empty: String,
     scanning: Boolean,
+    playbackTargetId: String?,
     onSelect: (PhysicalTv) -> Unit,
     onUnlink: (PhysicalTv) -> Unit,
 ) {
@@ -269,12 +303,23 @@ private fun PhysicalTvGroup(
     }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         targets.forEach { target ->
+            val playbackStarting = target.id == playbackTargetId
             Card(
                 onClick = { onSelect(target) },
+                enabled = playbackTargetId == null,
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(22.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
-                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                colors = CardDefaults.cardColors(
+                    containerColor = if (playbackStarting) {
+                        MaterialTheme.colorScheme.primaryContainer
+                    } else {
+                        MaterialTheme.colorScheme.surfaceContainerHigh
+                    },
+                ),
+                border = BorderStroke(
+                    if (playbackStarting) 2.dp else 1.dp,
+                    if (playbackStarting) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant,
+                ),
             ) {
                 Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Row(
@@ -310,23 +355,33 @@ private fun PhysicalTvGroup(
                                 overflow = TextOverflow.Ellipsis,
                             )
                         }
-                        Surface(
-                            modifier = Modifier.size(48.dp),
-                            shape = CircleShape,
-                            color = MaterialTheme.colorScheme.secondaryContainer,
-                            contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
-                        ) {
-                            Box(contentAlignment = Alignment.Center) {
-                                Icon(
-                                    Icons.Rounded.PlayArrow,
-                                    contentDescription = "Play on ${target.displayName}",
+                        if (playbackStarting) {
+                            Box(Modifier.size(48.dp), contentAlignment = Alignment.Center) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(26.dp),
+                                    strokeWidth = 2.dp,
                                 )
+                            }
+                        } else {
+                            Surface(
+                                modifier = Modifier.size(48.dp),
+                                shape = CircleShape,
+                                color = MaterialTheme.colorScheme.secondaryContainer,
+                                contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                            ) {
+                                Box(contentAlignment = Alignment.Center) {
+                                    Icon(
+                                        Icons.Rounded.PlayArrow,
+                                        contentDescription = "Play on ${target.displayName}",
+                                    )
+                                }
                             }
                         }
                     }
                     if (target.castEndpoint != null && target.dlnaEndpoint != null) {
                         TextButton(
                             onClick = { onUnlink(target) },
+                            enabled = playbackTargetId == null,
                             modifier = Modifier.align(Alignment.End).heightIn(min = 48.dp),
                         ) { Text("These are separate devices") }
                     }
@@ -339,6 +394,7 @@ private fun PhysicalTvGroup(
 @Composable
 private fun TargetPickerHeader(
     scanning: Boolean,
+    playbackStarting: Boolean,
     permissionGranted: Boolean,
     secondsUntilRefresh: Int,
     onRefresh: () -> Unit,
@@ -367,7 +423,7 @@ private fun TargetPickerHeader(
             }
             FilledTonalIconButton(
                 onClick = onRefresh,
-                enabled = permissionGranted && !scanning,
+                enabled = permissionGranted && !scanning && !playbackStarting,
                 modifier = Modifier.size(48.dp),
             ) {
                 if (scanning) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
@@ -433,6 +489,9 @@ fun PlaybackScreen(state: AppUiState, viewModel: MainViewModel) {
         initialValue = SheetValue.Hidden,
         enabledValues = setOf(SheetValue.Hidden, SheetValue.Expanded),
     )
+    LaunchedEffect(p.isTerminal) {
+        if (p.isTerminal) showOptions = false
+    }
 
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val wide = maxWidth >= 700.dp
@@ -518,7 +577,7 @@ fun PlaybackScreen(state: AppUiState, viewModel: MainViewModel) {
             }
         }
 
-        if (showOptions) {
+        if (showOptions && !p.isTerminal) {
             PlaybackOptionsSheet(
                 p = p,
                 viewModel = viewModel,
@@ -613,18 +672,19 @@ private fun TerminalPlaybackCard(
                 Icon(Icons.Rounded.Refresh, contentDescription = null)
                 Text("Retry")
             }
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            OutlinedButton(
+                onClick = onChangeTv,
+                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
             ) {
-                OutlinedButton(onClick = onChangeTv, modifier = Modifier.weight(1f).heightIn(min = 48.dp)) {
-                    Icon(Icons.Rounded.Tv, contentDescription = null)
-                    Text("Change TV")
-                }
-                OutlinedButton(onClick = onStop, modifier = Modifier.weight(1f).heightIn(min = 48.dp)) {
-                    Icon(Icons.Rounded.Stop, contentDescription = null)
-                    Text("Stop")
-                }
+                Icon(Icons.Rounded.Tv, contentDescription = null)
+                Text("Change TV")
+            }
+            OutlinedButton(
+                onClick = onStop,
+                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+            ) {
+                Icon(Icons.Rounded.Stop, contentDescription = null)
+                Text("Stop")
             }
         }
     }
@@ -1593,6 +1653,7 @@ private fun PhysicalTvGroupPreview() {
                     targets = targets,
                     empty = "No devices found.",
                     scanning = false,
+                    playbackTargetId = null,
                     onSelect = {},
                     onUnlink = {},
                 )

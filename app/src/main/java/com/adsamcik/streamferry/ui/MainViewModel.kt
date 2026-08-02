@@ -853,11 +853,13 @@ class MainViewModel(
 
     /** One picker action chooses the physical screen; protocol selection stays internal. */
     fun selectPhysicalTv(target: PhysicalTv) {
+        if (_state.value.playbackStartingTargetId != null) return
         pendingResumeDeviceContext = null
         _state.update {
             it.copy(
                 selectedPhysicalTv = target,
                 selectedTarget = target.selectEndpoint(),
+                playbackStartingTargetId = target.id,
                 previousPhysicalTvName = null,
             )
         }
@@ -882,6 +884,7 @@ class MainViewModel(
     fun play() = viewModelScope.launch {
         if (!container.permissions.hasLocalNetworkAccess()) {
             onLocalNetworkPermissionDenied()
+            _state.update { it.copy(playbackStartingTargetId = null) }
             return@launch
         }
         // A fresh, user-initiated play supersedes any in-flight auto-reconnect.
@@ -904,8 +907,14 @@ class MainViewModel(
         currentDurationSeconds = null
         val requestedSmartResumePosition = smartResumeOverrideSeconds
         val s = _state.value
-        val physicalTv = s.selectedPhysicalTv ?: return@launch
-        val target = physicalTv.selectEndpoint() ?: return@launch
+        val physicalTv = s.selectedPhysicalTv ?: run {
+            _state.update { it.copy(playbackStartingTargetId = null) }
+            return@launch
+        }
+        val target = physicalTv.selectEndpoint() ?: run {
+            _state.update { it.copy(playbackStartingTargetId = null) }
+            return@launch
+        }
         val resumeDeviceContext = smartResumeDeviceContext(physicalTv, target)
         _state.update { it.copy(selectedTarget = target) }
         val controller = if (target.protocol == Protocol.CAST) container.castController else container.dlnaController
@@ -1071,7 +1080,7 @@ class MainViewModel(
             }
         }
         playbackStarting = false
-        _state.update { it.copy(selectedDownloadId = null) }
+        _state.update { it.copy(selectedDownloadId = null, playbackStartingTargetId = null) }
     }
 
     /**
@@ -1831,13 +1840,19 @@ class MainViewModel(
         return item.seriesId ?: item.id
     }
 
-    /**
-     * Forget which formats each TV has previously failed to direct-play, so the app re-attempts direct
-     * play (e.g. after enabling 4K HDR, or a TV firmware update added HEVC). A no-op if nothing was learned.
-     */
+    /** Forget learned format results and physical-TV associations without disturbing active playback. */
     fun resetLearnedTvCapabilities() {
         container.rendererCapabilityStore.clear()
-        container.logger.event("playback", "Learned TV capabilities reset; direct play will be re-attempted")
+        container.physicalTvAssociations.clear()
+        _state.update { current ->
+            current.copy(
+                physicalTvs = PhysicalTvAggregator.aggregate(
+                    current.castTargets + current.dlnaTargets,
+                    container.physicalTvAssociations,
+                ).physicalTvs,
+            )
+        }
+        container.logger.event("playback", "Learned TV data reset; formats and endpoint associations will be rediscovered")
     }
 
     /** Build the per-play stream preferences from the persisted playback settings. */

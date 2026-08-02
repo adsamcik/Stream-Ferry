@@ -71,6 +71,8 @@ data class AppUiState(
     /** Conservative protocol-independent picker rows derived from the raw discovery snapshots above. */
     val physicalTvs: List<PhysicalTv> = emptyList(),
     val selectedPhysicalTv: PhysicalTv? = null,
+    /** Stable physical-TV id while a user-initiated start is in flight; null outside that short window. */
+    val playbackStartingTargetId: String? = null,
     /** Active protocol endpoint; kept separate from the user's physical-TV selection. */
     val selectedTarget: DiscoveredTarget? = null,
     /** Safe display hint from Smart Resume; it is never used as identity evidence. */

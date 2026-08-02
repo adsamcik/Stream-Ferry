@@ -35,7 +35,7 @@ import com.adsamcik.streamferry.ui.state.formatSmartResumeTime
 
 @Composable
 fun SmartResumeCard(state: SmartResumeUiState, onResume: () -> Unit, onDiscard: () -> Unit) {
-    var confirmDiscard by rememberSaveable { mutableStateOf(false) }
+    var confirmDiscard by rememberSaveable(state.mediaId, state.sourceType) { mutableStateOf(false) }
     val animatedProgress by animateFloatAsState(
         targetValue = state.progressFraction ?: 0f,
         animationSpec = MaterialTheme.motionScheme.defaultEffectsSpec(),
@@ -108,14 +108,21 @@ fun SmartResumeCard(state: SmartResumeUiState, onResume: () -> Unit, onDiscard: 
                     trackColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.2f),
                 )
             }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = onResume, shape = MaterialTheme.shapes.large) {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Button(
+                    onClick = onResume,
+                    shape = MaterialTheme.shapes.large,
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                ) {
                     Icon(Icons.Rounded.PlayArrow, contentDescription = null)
                     Text(state.actionLabel, modifier = Modifier.padding(start = 6.dp))
                 }
                 TextButton(
                     onClick = { confirmDiscard = true },
-                    modifier = Modifier.heightIn(min = 48.dp),
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
                 ) { Text("Discard resume") }
             }
         }
