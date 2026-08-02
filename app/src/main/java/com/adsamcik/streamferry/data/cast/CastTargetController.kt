@@ -33,10 +33,14 @@ import com.adsamcik.streamferry.domain.PlaybackTargetEvent
 import com.adsamcik.streamferry.domain.RendererStream
 import com.adsamcik.streamferry.logging.DiagnosticsLogger
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -127,6 +131,8 @@ class CastTargetController(
 
     private var mediaCallbackRegistration: MediaCallbackRegistration? = null
     private var sessionListenerRegistration: SessionListenerRegistration? = null
+    private val callbackScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var suspensionWatchdogJob: Job? = null
     /** Incremented before every connect/disconnect so delayed callbacks from a superseded session are inert. */
     private var connectionGeneration = 0L
     private var activeBinding: ActiveCastBinding? = null
@@ -385,12 +391,15 @@ class CastTargetController(
 
             override fun onSessionSuspended(s: CastSession, reason: Int) {
                 if (!isExpectedActiveSession(s)) return
-                // The SDK can resume a suspended session after more than a few seconds. A timer-driven
-                // Disconnected event races that recovery and starts a needless reconnect/reload.
-                logger.event("playback", "Cast session suspended (reason $reason); awaiting auto-recovery")
+                logger.event(
+                    "playback",
+                    "Cast session suspended (reason $reason); allowing SDK recovery for ${SUSPENSION_GRACE_MS}ms",
+                )
+                armSuspensionWatchdog(s, generation)
             }
             override fun onSessionResumed(s: CastSession, wasSuspended: Boolean) {
                 if (!isExpectedActiveSession(s)) return
+                cancelSuspensionWatchdog()
                 logger.event("playback", "Cast session resumed (wasSuspended=$wasSuspended) — recovered")
             }
             override fun onSessionEnded(s: CastSession, error: Int) {
@@ -414,9 +423,35 @@ class CastTargetController(
     }
 
     private fun removeSessionListener() {
+        cancelSuspensionWatchdog()
         val registration = sessionListenerRegistration ?: return
         registration.manager.removeSessionManagerListener(registration.listener, CastSession::class.java)
         sessionListenerRegistration = null
+    }
+
+    /**
+     * A brief Wi-Fi interruption should remain the Cast SDK's responsibility, but some TV reboots leave
+     * a session suspended forever without an ended/resume-failed callback. Convert only a prolonged,
+     * still-disconnected suspension into the normal terminal-disconnect event so app recovery can
+     * rediscover the restarted receiver and resume playback.
+     */
+    private fun armSuspensionWatchdog(castSession: CastSession, generation: Long) {
+        if (suspensionWatchdogJob?.isActive == true) return
+        cancelSuspensionWatchdog()
+        suspensionWatchdogJob = callbackScope.launch {
+            delay(SUSPENSION_GRACE_MS)
+            if (!isTrackedActiveSession(castSession, generation)) return@launch
+            if (castSession.isConnected) {
+                logger.event("playback", "Cast session recovered before the suspension watchdog fired")
+                return@launch
+            }
+            emitTerminalDisconnect(castSession, generation, "remained suspended for ${SUSPENSION_GRACE_MS}ms")
+        }
+    }
+
+    private fun cancelSuspensionWatchdog() {
+        suspensionWatchdogJob?.cancel()
+        suspensionWatchdogJob = null
     }
 
     /**
@@ -793,6 +828,7 @@ class CastTargetController(
         private const val CONNECT_RETRY_DELAY_MS = 900L
         private const val LOAD_TIMEOUT_MS = 20_000L
         private const val ROUTE_RECOVER_MS = 4_000L
+        private const val SUSPENSION_GRACE_MS = 30_000L
         private const val SESSION_END_TIMEOUT_MS = 5_000L
         private const val SESSION_END_POLL_MS = 50L
 

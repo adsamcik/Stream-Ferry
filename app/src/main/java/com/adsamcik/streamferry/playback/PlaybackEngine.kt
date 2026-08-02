@@ -355,15 +355,23 @@ class PlaybackEngine(
 
     /**
      * Reconnect the current endpoint once without creating a fresh playback session or resetting its
-     * finite recovery budget. The existing renderer controller, proxy orchestration and media choices are
-     * reused; failure leaves the redacted ledger available for a possible alternate-protocol handoff.
+     * finite recovery budget. [refreshedEndpoint] is the same physical endpoint rebound by stable identity
+     * after rediscovery, so a TV reboot can replace an ephemeral Cast route or DLNA control address. The
+     * existing renderer controller, proxy orchestration and media choices are reused; failure leaves the
+     * redacted ledger available for a possible alternate-protocol handoff.
      */
-    suspend fun retrySameEndpointAfterDisconnect(): Boolean = withContext(Dispatchers.Default) {
+    suspend fun retrySameEndpointAfterDisconnect(
+        refreshedEndpoint: DiscoveredTarget? = null,
+    ): Boolean = withContext(Dispatchers.Default) {
         mutex.withLock {
             requireLocalNetworkAccess()
             if (!connectionLost) return@withLock false
             val activeTarget = target ?: return@withLock false
-            val endpoint = selectedTarget ?: return@withLock false
+            val endpoint = refreshedEndpoint ?: selectedTarget ?: return@withLock false
+            if (endpoint.protocol != activeTarget.protocol) {
+                logger.w(TAG, "Ignoring same-endpoint retry with a different protocol")
+                return@withLock false
+            }
             if (currentInfo == null && localPlayback == null) return@withLock false
             val reserved = synchronized(recoveryLock) {
                 recoverySession.reserveRecovery(
@@ -385,6 +393,7 @@ class PlaybackEngine(
             isReloadingStream = true
             var endpointConnected = false
             try {
+                selectedTarget = endpoint
                 activeTarget.connect(endpoint)
                 endpointConnected = true
                 if (localPlayback != null) {

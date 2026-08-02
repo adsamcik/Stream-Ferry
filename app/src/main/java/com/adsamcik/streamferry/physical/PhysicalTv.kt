@@ -121,6 +121,48 @@ object PhysicalTvResumeMatcher {
     }
 }
 
+data class PhysicalTvReconnectMatch(
+    val physicalTv: PhysicalTv,
+    val sameProtocolEndpoint: DiscoveredTarget?,
+)
+
+/**
+ * Rebinds a playback session after a TV restart. Discovery records are ephemeral (a Cast route ID,
+ * DLNA address or control URL may change across a reboot), so only persisted stable identity is
+ * authoritative. A display-name match is deliberately never enough to resume controlling a TV.
+ */
+object PhysicalTvReconnectPolicy {
+    const val REDISCOVERY_TIMEOUT_MILLIS = 90_000L
+
+    fun hasStableIdentity(previousTv: PhysicalTv, previousEndpoint: DiscoveredTarget): Boolean =
+        PhysicalEndpointKey.from(previousEndpoint) != null ||
+            previousTv.availableEndpoints.any { PhysicalEndpointKey.from(it) != null }
+
+    fun find(
+        physicalTvs: Collection<PhysicalTv>,
+        previousTv: PhysicalTv,
+        previousEndpoint: DiscoveredTarget,
+    ): PhysicalTvReconnectMatch? {
+        val stablePhysicalId = previousTv.id.takeIf {
+            previousTv.availableEndpoints.any { endpoint -> PhysicalEndpointKey.from(endpoint) != null }
+        }
+        val endpointToken = PhysicalEndpointKey.from(previousEndpoint)?.storageToken
+        val refreshedTv = PhysicalTvResumeMatcher.findConfident(
+            physicalTvs,
+            physicalStableId = stablePhysicalId,
+            endpointStorageToken = endpointToken,
+        ) ?: return null
+        return PhysicalTvReconnectMatch(
+            physicalTv = refreshedTv,
+            sameProtocolEndpoint = refreshedTv.availableEndpoints
+                .firstOrNull { it.protocol == previousEndpoint.protocol },
+        )
+    }
+
+    fun delayAfterScanMillis(completedScans: Int): Long =
+        (completedScans.coerceAtLeast(1) * 1_500L).coerceAtMost(10_000L)
+}
+
 /** Pure, deterministic, deliberately conservative cross-protocol matching policy. */
 object PhysicalTvMatcher {
     fun match(

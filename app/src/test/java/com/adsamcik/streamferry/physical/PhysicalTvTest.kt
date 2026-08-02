@@ -94,9 +94,70 @@ class PhysicalTvTest {
         assertNull(PhysicalTvResumeMatcher.findConfident(listOf(first, second), "Living Room", null))
     }
 
-    private fun cast(id: String = "cast-id", name: String = "TV", host: String? = null, model: String? = null) = target(
+    @Test fun reconnectPolicyRebindsChangedRouteAndAddressByStableDeviceId() {
+        val previousEndpoint = cast(
+            id = "route-before-reboot",
+            stableId = "living-room-device",
+            host = "192.168.1.20",
+        )
+        val refreshedEndpoint = cast(
+            id = "route-after-reboot",
+            stableId = "living-room-device",
+            host = "192.168.1.44",
+        )
+        val previousTv = PhysicalTvAggregator.aggregate(listOf(previousEndpoint)).physicalTvs.single()
+        val refreshedTv = PhysicalTvAggregator.aggregate(listOf(refreshedEndpoint)).physicalTvs.single()
+
+        val match = PhysicalTvReconnectPolicy.find(listOf(refreshedTv), previousTv, previousEndpoint)
+
+        assertEquals(refreshedTv, match?.physicalTv)
+        assertEquals(refreshedEndpoint, match?.sameProtocolEndpoint)
+    }
+
+    @Test fun reconnectPolicyNeverUsesDisplayNameWithoutStableIdentity() {
+        val previousEndpoint = cast(id = "route-old", name = "Living Room", stableId = null)
+        val unrelatedEndpoint = cast(id = "route-new", name = "Living Room", stableId = null)
+        val previousTv = PhysicalTvAggregator.aggregate(listOf(previousEndpoint)).physicalTvs.single()
+        val unrelatedTv = PhysicalTvAggregator.aggregate(listOf(unrelatedEndpoint)).physicalTvs.single()
+
+        assertFalse(PhysicalTvReconnectPolicy.hasStableIdentity(previousTv, previousEndpoint))
+        assertNull(PhysicalTvReconnectPolicy.find(listOf(unrelatedTv), previousTv, previousEndpoint))
+    }
+
+    @Test fun reconnectPolicyCanReturnOnlyARefreshedAlternateProtocol() {
+        val store = InMemoryPhysicalTvAssociationStore()
+        val cast = cast(id = "cast-route", stableId = "cast-device")
+        val dlna = dlna(id = "uuid:renderer")
+        store.link(requireNotNull(PhysicalEndpointKey.from(cast)), requireNotNull(PhysicalEndpointKey.from(dlna)))
+        val previousTv = PhysicalTvAggregator.aggregate(listOf(cast, dlna), store).physicalTvs.single()
+        val refreshedTv = PhysicalTvAggregator.aggregate(listOf(dlna), store).physicalTvs.single()
+
+        val match = PhysicalTvReconnectPolicy.find(listOf(refreshedTv), previousTv, cast)
+
+        assertEquals(refreshedTv, match?.physicalTv)
+        assertNull(match?.sameProtocolEndpoint)
+        assertEquals(dlna, match?.physicalTv?.dlnaEndpoint)
+    }
+
+    @Test fun reconnectScanBackoffIsBounded() {
+        assertEquals(1_500L, PhysicalTvReconnectPolicy.delayAfterScanMillis(1))
+        assertEquals(10_000L, PhysicalTvReconnectPolicy.delayAfterScanMillis(100))
+    }
+
+    private fun cast(
+        id: String = "cast-id",
+        name: String = "TV",
+        host: String? = null,
+        model: String? = null,
+        stableId: String? = id,
+    ) = target(
         id, name, Protocol.CAST,
-        TargetDiscoveryMetadata(castDeviceId = id, validatedSourceHost = host, modelName = model, volumeControlAvailable = true),
+        TargetDiscoveryMetadata(
+            castDeviceId = stableId,
+            validatedSourceHost = host,
+            modelName = model,
+            volumeControlAvailable = true,
+        ),
     )
     private fun dlna(id: String = "uuid:dlna-id", name: String = "TV", host: String? = null, model: String? = null) = target(
         id, name, Protocol.DLNA,

@@ -30,6 +30,8 @@ import com.adsamcik.streamferry.permissions.AndroidNetworkPermissionManager
 import com.adsamcik.streamferry.physical.PhysicalEndpointKey
 import com.adsamcik.streamferry.physical.PhysicalTv
 import com.adsamcik.streamferry.physical.PhysicalTvAggregator
+import com.adsamcik.streamferry.physical.PhysicalTvReconnectMatch
+import com.adsamcik.streamferry.physical.PhysicalTvReconnectPolicy
 import com.adsamcik.streamferry.physical.PhysicalTvResumeMatcher
 import com.adsamcik.streamferry.playback.PlaybackStatus
 import com.adsamcik.streamferry.playback.PlaybackFailureCause
@@ -50,6 +52,7 @@ import com.adsamcik.streamferry.ui.state.toUiState
 import com.adsamcik.streamferry.ui.theme.ThemeMode
 import com.adsamcik.streamferry.BuildConfig
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
@@ -1524,6 +1527,11 @@ class MainViewModel(
         is ReconnectContext.Local -> copy(endpoint = endpoint)
     }
 
+    private fun ReconnectContext.withPhysicalTv(physicalTv: PhysicalTv): ReconnectContext = when (this) {
+        is ReconnectContext.Online -> copy(physicalTv = physicalTv)
+        is ReconnectContext.Local -> copy(physicalTv = physicalTv)
+    }
+
     private suspend fun playContext(
         context: ReconnectContext,
         endpoint: DiscoveredTarget,
@@ -1600,6 +1608,7 @@ class MainViewModel(
         val generation = ++reconnectGeneration
         reconnecting = true
         reconnectJob = viewModelScope.launch {
+            var recoveryContext = originalContext
             try {
                 _state.update { current ->
                     current.copy(
@@ -1613,10 +1622,45 @@ class MainViewModel(
                     )
                 }
                 if (retrySameEndpoint) {
-                    container.logger.event("playback", "Connection lost; trying the same TV endpoint once")
+                    container.logger.event("playback", "Connection lost; waiting for the TV to reappear")
                     delay(RECONNECT_DELAY_MS)
                     if (generation != reconnectGeneration) return@launch
-                    if (container.playbackEngine.retrySameEndpointAfterDisconnect()) {
+                    val rediscovered = if (PhysicalTvReconnectPolicy.hasStableIdentity(
+                            originalContext.physicalTv,
+                            originalContext.endpoint,
+                        )
+                    ) {
+                        rediscoverPhysicalTvAfterRestart(originalContext, generation)
+                    } else {
+                        container.logger.w(
+                            "playback",
+                            "TV endpoint has no stable identity; restart rediscovery cannot safely auto-select it",
+                        )
+                        null
+                    }
+                    if (generation != reconnectGeneration) return@launch
+                    val sameProtocolEndpoint = if (rediscovered != null) {
+                        recoveryContext = originalContext.withPhysicalTv(rediscovered.physicalTv)
+                        reconnectContext = recoveryContext
+                        rediscovered.sameProtocolEndpoint
+                    } else {
+                        // Preserve the old one-shot behavior when identity is unavailable or discovery
+                        // timed out. It can still work when the reboot retained its route/address.
+                        originalContext.endpoint
+                    }
+                    if (sameProtocolEndpoint != null) {
+                        recoveryContext = recoveryContext.withEndpoint(sameProtocolEndpoint)
+                        reconnectContext = recoveryContext
+                        _state.update { current ->
+                            current.copy(
+                                selectedPhysicalTv = recoveryContext.physicalTv,
+                                selectedTarget = sameProtocolEndpoint,
+                            )
+                        }
+                    }
+                    if (sameProtocolEndpoint != null &&
+                        container.playbackEngine.retrySameEndpointAfterDisconnect(sameProtocolEndpoint)
+                    ) {
                         container.logger.event("playback", "Reconnected and resumed on the same endpoint")
                         return@launch
                     }
@@ -1624,7 +1668,7 @@ class MainViewModel(
                 if (generation != reconnectGeneration) return@launch
                 val latest = container.playbackEngine.recoverySnapshot().attempts.lastOrNull()
                 val switched = tryAlternateProtocol(
-                    originalContext,
+                    recoveryContext,
                     failureStage = latest?.failureStage ?: initialStage ?: PlaybackFailureStage.UNKNOWN,
                     failureCause = latest?.failureCause ?: initialCause ?: PlaybackFailureCause.UNKNOWN,
                     generation = generation,
@@ -1635,7 +1679,7 @@ class MainViewModel(
                     return@launch
                 }
                 surfaceTerminalPlaybackFailure(
-                    originalContext,
+                    recoveryContext,
                     if (retrySameEndpoint) {
                         "The connection to the TV couldn't be restored automatically."
                     } else {
@@ -1647,8 +1691,14 @@ class MainViewModel(
             } catch (error: Exception) {
                 if (generation != reconnectGeneration) return@launch
                 container.logger.w("playback", "Automatic playback recovery failed", error)
-                surfaceTerminalPlaybackFailure(originalContext, "Playback couldn't be restored automatically.")
+                surfaceTerminalPlaybackFailure(recoveryContext, "Playback couldn't be restored automatically.")
             } finally {
+                // A reboot scan keeps the Cast route callback alive until connect() can select the
+                // refreshed route. Release it only after the whole recovery attempt completes.
+                withContext(NonCancellable) {
+                    runCatching { container.castController.stopDiscovery() }
+                        .onFailure { container.logger.w("discovery", "Couldn't stop restart rediscovery", it) }
+                }
                 if (generation == reconnectGeneration) {
                     reconnecting = false
                     reconnectJob = null
@@ -1659,6 +1709,99 @@ class MainViewModel(
             }
         }
     }
+
+    private suspend fun rediscoverPhysicalTvAfterRestart(
+        context: ReconnectContext,
+        generation: Long,
+    ): PhysicalTvReconnectMatch? {
+        val deadlineNanos = System.nanoTime() +
+            PhysicalTvReconnectPolicy.REDISCOVERY_TIMEOUT_MILLIS * NANOS_PER_MILLISECOND
+        var completedScans = 0
+        while (currentCoroutineContext().isActive && generation == reconnectGeneration) {
+            val remainingMillis = ((deadlineNanos - System.nanoTime()) / NANOS_PER_MILLISECOND)
+                .coerceAtLeast(0)
+            if (remainingMillis == 0L) break
+            val discovered = discoverTargetsDuringReconnect(remainingMillis)
+            if (generation != reconnectGeneration) return null
+            val physicalTvs = PhysicalTvAggregator.aggregate(
+                discovered,
+                container.physicalTvAssociations,
+            ).physicalTvs
+            val match = PhysicalTvReconnectPolicy.find(
+                physicalTvs,
+                previousTv = context.physicalTv,
+                previousEndpoint = context.endpoint,
+            )
+            if (match != null) {
+                val cast = discovered.filter { it.protocol == Protocol.CAST }
+                val dlna = discovered.filter { it.protocol == Protocol.DLNA }
+                _state.update {
+                    it.copy(
+                        castTargets = cast,
+                        dlnaTargets = dlna,
+                        physicalTvs = physicalTvs,
+                        selectedPhysicalTv = match.physicalTv,
+                        selectedTarget = match.sameProtocolEndpoint ?: match.physicalTv.selectEndpoint(),
+                    )
+                }
+                container.logger.event(
+                    "playback",
+                    "TV rediscovered after restart (same protocol available=${match.sameProtocolEndpoint != null})",
+                )
+                return match
+            }
+            completedScans += 1
+            val afterScanRemaining = ((deadlineNanos - System.nanoTime()) / NANOS_PER_MILLISECOND)
+                .coerceAtLeast(0)
+            if (afterScanRemaining == 0L) break
+            val retryDelay = PhysicalTvReconnectPolicy.delayAfterScanMillis(completedScans)
+                .coerceAtMost(afterScanRemaining)
+            container.logger.event(
+                "playback",
+                "TV has not reappeared yet (rediscovery scan $completedScans); retrying",
+            )
+            delay(retryDelay)
+        }
+        container.logger.w("playback", "TV restart rediscovery timed out")
+        return null
+    }
+
+    private suspend fun discoverTargetsDuringReconnect(remainingMillis: Long): List<DiscoveredTarget> =
+        coroutineScope {
+            val castTimeout = remainingMillis.coerceAtMost(CAST_SCAN_MS)
+            val dlnaTimeout = remainingMillis.coerceAtMost(DLNA_SCAN_MS)
+            val castDeferred = async {
+                try {
+                    if (container.awaitCastContext() == null) {
+                        Result.success(emptyList())
+                    } else {
+                        Result.success(container.castController.discover(castTimeout))
+                    }
+                } catch (c: CancellationException) {
+                    throw c
+                } catch (error: Exception) {
+                    Result.failure(error)
+                }
+            }
+            val dlnaDeferred = async {
+                try {
+                    Result.success(container.dlnaController.discover(dlnaTimeout))
+                } catch (c: CancellationException) {
+                    throw c
+                } catch (error: Exception) {
+                    Result.failure(error)
+                }
+            }
+            val castResult = castDeferred.await()
+            val dlnaResult = dlnaDeferred.await()
+            castResult.exceptionOrNull()?.let {
+                container.logger.w("discovery", "Cast restart rediscovery failed", it)
+            }
+            dlnaResult.exceptionOrNull()?.let {
+                container.logger.w("discovery", "DLNA restart rediscovery failed", it)
+            }
+            castResult.getOrDefault(emptyList()) + dlnaResult.getOrDefault(emptyList())
+        }
 
     private suspend fun tryAlternateProtocol(
         context: ReconnectContext,
@@ -1679,6 +1822,8 @@ class MainViewModel(
             isOnlineSessionHint = context is ReconnectContext.Online,
         ) ?: return false
         if (generation != reconnectGeneration) return false
+        val alternateContext = context.withEndpoint(alternate)
+        reconnectContext = alternateContext
         _state.update { current ->
             current.copy(
                 selectedTarget = alternate,
@@ -1691,12 +1836,11 @@ class MainViewModel(
             )
         }
         return try {
-            playContext(context, alternate, lastPlaybackPositionSeconds, continuation)
+            playContext(alternateContext, alternate, lastPlaybackPositionSeconds, continuation)
             if (generation != reconnectGeneration) return false
-            reconnectContext = context.withEndpoint(alternate)
             _state.update {
                 it.copy(
-                    selectedPhysicalTv = context.physicalTv,
+                    selectedPhysicalTv = alternateContext.physicalTv,
                     selectedTarget = alternate,
                 )
             }
@@ -2108,5 +2252,6 @@ class MainViewModel(
         const val SEARCH_DEBOUNCE_MS = 350L
         const val RECONNECT_DELAY_MS = 2_000L
         const val RESUME_SAVE_INTERVAL_MS = 10_000L
+        const val NANOS_PER_MILLISECOND = 1_000_000L
     }
 }
