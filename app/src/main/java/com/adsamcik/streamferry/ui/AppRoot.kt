@@ -276,6 +276,9 @@ private fun ScreenContent(
     }
     val topPadding = if (!expanded && state.route == Route.GALLERY) 8.dp else 12.dp
     val bottomPadding = if (reserveMiniPlayerSpace) 104.dp else 12.dp
+    val shellErrorMessage = state.errorMessage?.takeUnless { message ->
+        state.route == Route.PLAYBACK && message == state.playback?.errorMessage
+    }
 
     Box(
         modifier = Modifier.fillMaxSize(),
@@ -290,7 +293,7 @@ private fun ScreenContent(
         if (state.route in selfScrollingRoutes) {
             Column(modifier = baseModifier.fillMaxWidth()) {
                 ErrorBannerHost(
-                    message = state.errorMessage,
+                    message = shellErrorMessage,
                     onDismiss = viewModel::dismissError,
                 )
                 Box(
@@ -308,7 +311,7 @@ private fun ScreenContent(
                     .verticalScroll(rememberScrollState()),
             ) {
                 ErrorBannerHost(
-                    message = state.errorMessage,
+                    message = shellErrorMessage,
                     onDismiss = viewModel::dismissError,
                 )
                 RouteContent(state, viewModel, onScanDevices, context, nightVolumePolicy, onNightVolumePolicyChange, compact = !expanded)
@@ -442,6 +445,7 @@ private fun MiniPlayer(
     )
     val effectsMotion = MaterialTheme.motionScheme.defaultEffectsSpec<Float>()
     val playbackState = when {
+        playback.isTerminal -> "Playback needs attention"
         playback.reconnecting -> "Reconnecting to ${playback.targetName}"
         playback.isBuffering -> "Buffering on ${playback.targetName}"
         playback.isPlaying -> "Playing on ${playback.targetName}"
@@ -461,8 +465,8 @@ private fun MiniPlayer(
                 onClickLabel = "Open Now Playing",
                 onClick = { viewModel.navigate(Route.PLAYBACK) },
             ),
-        color = MaterialTheme.colorScheme.tertiaryContainer,
-        contentColor = MaterialTheme.colorScheme.onTertiaryContainer,
+        color = if (playback.isTerminal) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.tertiaryContainer,
+        contentColor = if (playback.isTerminal) MaterialTheme.colorScheme.onErrorContainer else MaterialTheme.colorScheme.onTertiaryContainer,
         shape = MaterialTheme.shapes.extraLarge,
         shadowElevation = 6.dp,
     ) {
@@ -490,23 +494,32 @@ private fun MiniPlayer(
                         Text(status, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
                 }
-                FilledIconButton(
-                    onClick = { viewModel.togglePlayPause() },
-                    modifier = Modifier.size(if (compact) 40.dp else 48.dp),
-                ) {
-                    AnimatedContent(
-                        targetState = playback.isPlaying,
-                        transitionSpec = { fadeIn(effectsMotion).togetherWith(fadeOut(effectsMotion)) },
-                        label = "mini player play state",
-                    ) { isPlaying ->
-                        Icon(
-                            if (isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
-                            contentDescription = if (isPlaying) "Pause" else "Play",
-                        )
+                if (playback.isTerminal) {
+                    FilledIconButton(
+                        onClick = { viewModel.navigate(Route.PLAYBACK) },
+                        modifier = Modifier.size(if (compact) 40.dp else 48.dp),
+                    ) {
+                        Icon(Icons.Rounded.ErrorOutline, contentDescription = "Review playback problem")
+                    }
+                } else {
+                    FilledIconButton(
+                        onClick = { viewModel.togglePlayPause() },
+                        modifier = Modifier.size(if (compact) 40.dp else 48.dp),
+                    ) {
+                        AnimatedContent(
+                            targetState = playback.isPlaying,
+                            transitionSpec = { fadeIn(effectsMotion).togetherWith(fadeOut(effectsMotion)) },
+                            label = "mini player play state",
+                        ) { isPlaying ->
+                            Icon(
+                                if (isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
+                                contentDescription = if (isPlaying) "Pause" else "Play",
+                            )
+                        }
                     }
                 }
             }
-            if (progress != null) {
+            if (progress != null && !playback.isTerminal) {
                 LinearProgressIndicator(progress = { animatedProgress }, modifier = Modifier.fillMaxWidth().clearAndSetSemantics {})
             }
         }

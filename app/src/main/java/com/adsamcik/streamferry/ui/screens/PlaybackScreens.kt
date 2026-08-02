@@ -9,6 +9,7 @@ import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.interaction.collectIsPressedAsState
@@ -18,7 +19,6 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -28,6 +28,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -98,7 +99,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.ProgressBarRangeInfo
-import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.progressBarRangeInfo
@@ -443,28 +443,34 @@ fun PlaybackScreen(state: AppUiState, viewModel: MainViewModel) {
             state.selectedItem?.let { viewModel.chapterImageUrl(it, index, CHAPTER_PREVIEW_WIDTH_PX) }
         }
 
-        if (wide) {
+        if (p.isTerminal) {
+            Column(
+                modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(if (compactHeight) 8.dp else 12.dp),
+            ) {
+                NowPlayingHero(p, mediaTitle = title ?: p.mediaTitle, compact = compactHeight || !wide)
+                TerminalPlaybackCard(
+                    message = p.errorMessage ?: "Stream Ferry ran out of safe automatic options.",
+                    onRetry = viewModel::retryPlayback,
+                    onChangeTv = viewModel::changeTv,
+                    onStop = viewModel::stopPlayback,
+                    compact = compactHeight || !wide,
+                )
+                if (p.attemptHistory.isNotEmpty()) PlaybackAttemptHistory(p.attemptHistory)
+            }
+        } else if (wide) {
             Row(
                 modifier = Modifier.fillMaxSize(),
                 horizontalArrangement = Arrangement.spacedBy(18.dp),
             ) {
                 Column(
-                    modifier = Modifier.weight(0.43f).fillMaxHeight(),
+                    modifier = Modifier.weight(0.43f).fillMaxHeight().verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(if (compactHeight) 8.dp else 12.dp),
                 ) {
                     NowPlayingHero(p, mediaTitle = title ?: p.mediaTitle, compact = compactHeight)
-                    if (p.isTerminal) {
-                        TerminalPlaybackCard(
-                            message = p.errorMessage ?: "Stream Ferry ran out of safe automatic options.",
-                            onRetry = viewModel::retryPlayback,
-                            onChangeTv = viewModel::changeTv,
-                            onStop = viewModel::stopPlayback,
-                            compact = compactHeight,
-                        )
-                    } else p.errorMessage?.let {
+                    p.errorMessage?.let {
                         PlaybackIssueBanner(it, onOpenOptions = { showOptions = true }, compact = compactHeight)
                     }
-                    Spacer(Modifier.weight(1f))
                     PlaybackQuickActions(
                         p = p,
                         viewModel = viewModel,
@@ -473,55 +479,36 @@ fun PlaybackScreen(state: AppUiState, viewModel: MainViewModel) {
                     )
                 }
                 Column(
-                    modifier = Modifier.weight(0.57f).fillMaxHeight(),
+                    modifier = Modifier.weight(0.57f).fillMaxHeight().verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(if (compactHeight) 7.dp else 11.dp),
                 ) {
-                    Spacer(Modifier.weight(1f))
-                    SeekScrubber(
+                    PlaybackTimelineControls(
                         p = p,
                         positionProvider = positionProvider,
                         chapters = chapters,
                         previewUrlFor = previewUrlFor,
-                        onSeek = viewModel::seekTo,
+                        viewModel = viewModel,
+                        compact = compactHeight,
                     )
-                    p.skipSegmentLabel?.let { label ->
-                        SkipSegmentButton(label, onSkip = viewModel::skipSegment, compact = compactHeight)
-                    }
-                    TransportControls(p, positionProvider, viewModel, compact = compactHeight)
-                    if (p.volumeSupported) VolumeControl(p, viewModel, compact = true)
-                    Spacer(Modifier.weight(1f))
                 }
             }
         } else {
             Column(
-                modifier = Modifier.fillMaxSize(),
+                modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(if (compactHeight) 6.dp else 10.dp),
             ) {
                 NowPlayingHero(p, mediaTitle = title ?: p.mediaTitle, compact = true)
-                if (p.isTerminal) {
-                    TerminalPlaybackCard(
-                        message = p.errorMessage ?: "Stream Ferry ran out of safe automatic options.",
-                        onRetry = viewModel::retryPlayback,
-                        onChangeTv = viewModel::changeTv,
-                        onStop = viewModel::stopPlayback,
-                        compact = true,
-                    )
-                } else p.errorMessage?.let {
+                p.errorMessage?.let {
                     PlaybackIssueBanner(it, onOpenOptions = { showOptions = true }, compact = true)
                 }
-                Spacer(Modifier.weight(1f))
-                SeekScrubber(
+                PlaybackTimelineControls(
                     p = p,
                     positionProvider = positionProvider,
                     chapters = chapters,
                     previewUrlFor = previewUrlFor,
-                    onSeek = viewModel::seekTo,
+                    viewModel = viewModel,
+                    compact = compactHeight,
                 )
-                p.skipSegmentLabel?.let { label ->
-                    SkipSegmentButton(label, onSkip = viewModel::skipSegment, compact = compactHeight)
-                }
-                TransportControls(p, positionProvider, viewModel, compact = compactHeight)
-                if (p.volumeSupported) VolumeControl(p, viewModel, compact = true)
                 PlaybackQuickActions(
                     p = p,
                     viewModel = viewModel,
@@ -540,6 +527,29 @@ fun PlaybackScreen(state: AppUiState, viewModel: MainViewModel) {
             )
         }
     }
+}
+
+@Composable
+private fun PlaybackTimelineControls(
+    p: PlaybackUiState,
+    positionProvider: () -> Long,
+    chapters: List<MediaChapter>,
+    previewUrlFor: (Int) -> String?,
+    viewModel: MainViewModel,
+    compact: Boolean,
+) {
+    SeekScrubber(
+        p = p,
+        positionProvider = positionProvider,
+        chapters = chapters,
+        previewUrlFor = previewUrlFor,
+        onSeek = viewModel::seekTo,
+    )
+    p.skipSegmentLabel?.let { label ->
+        SkipSegmentButton(label, onSkip = viewModel::skipSegment, compact = compact)
+    }
+    TransportControls(p, positionProvider, viewModel, compact = compact)
+    if (p.volumeSupported) VolumeControl(p, viewModel, compact = true)
 }
 
 @Composable
@@ -596,20 +606,24 @@ private fun TerminalPlaybackCard(
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onErrorContainer,
             )
+            Button(
+                onClick = onRetry,
+                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+            ) {
+                Icon(Icons.Rounded.Refresh, contentDescription = null)
+                Text("Retry")
+            }
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                Button(onClick = onRetry, modifier = Modifier.weight(1f).heightIn(min = 48.dp)) {
-                    Icon(Icons.Rounded.Refresh, contentDescription = null)
-                    Text("Retry")
-                }
                 OutlinedButton(onClick = onChangeTv, modifier = Modifier.weight(1f).heightIn(min = 48.dp)) {
                     Icon(Icons.Rounded.Tv, contentDescription = null)
                     Text("Change TV")
                 }
-                OutlinedButton(onClick = onStop, modifier = Modifier.heightIn(min = 48.dp)) {
-                    Icon(Icons.Rounded.Stop, contentDescription = "Stop")
+                OutlinedButton(onClick = onStop, modifier = Modifier.weight(1f).heightIn(min = 48.dp)) {
+                    Icon(Icons.Rounded.Stop, contentDescription = null)
+                    Text("Stop")
                 }
             }
         }
@@ -853,46 +867,6 @@ private fun SkipSegmentButton(label: String, onSkip: () -> Unit, compact: Boolea
     ) {
         Icon(Icons.Rounded.SkipNext, contentDescription = null, modifier = Modifier.size(22.dp))
         Text("  $label", style = MaterialTheme.typography.titleMedium)
-    }
-}
-
-@Composable
-private fun ReconnectingBanner() {
-    Card(
-        shape = RoundedCornerShape(20.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer),
-        modifier = Modifier.fillMaxWidth(),
-    ) {
-        Row(
-            Modifier
-                .fillMaxWidth()
-                .padding(16.dp)
-                .semantics(mergeDescendants = true) { liveRegion = LiveRegionMode.Polite },
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(14.dp),
-        ) {
-            CircularProgressIndicator(
-                Modifier.size(22.dp).clearAndSetSemantics { },
-                strokeWidth = 2.dp,
-                color = MaterialTheme.colorScheme.onTertiaryContainer,
-            )
-            Column(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(2.dp),
-            ) {
-                Text(
-                    "Reconnecting to the TV…",
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onTertiaryContainer,
-                )
-                Text(
-                    "The connection dropped — restoring playback from where it left off.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onTertiaryContainer,
-                )
-            }
-        }
     }
 }
 
@@ -1237,6 +1211,7 @@ private fun TransportControls(
     viewModel: MainViewModel,
     compact: Boolean = false,
 ) {
+    val duration = p.durationSeconds?.takeIf { it > 0 }
     val interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
     val pressed by interactionSource.collectIsPressedAsState()
     val playScale by animateFloatAsState(
@@ -1256,6 +1231,7 @@ private fun TransportControls(
     ) {
         FilledTonalIconButton(
             onClick = { viewModel.seekTo((positionProvider() - 30).coerceAtLeast(0)) },
+            enabled = duration != null,
             modifier = Modifier.size(sideSize),
             shape = RoundedCornerShape(if (compact) 18.dp else 20.dp),
         ) {
@@ -1277,7 +1253,8 @@ private fun TransportControls(
             )
         }
         FilledTonalIconButton(
-            onClick = { viewModel.seekTo(positionProvider() + 30) },
+            onClick = { duration?.let { viewModel.seekTo((positionProvider() + 30).coerceAtMost(it)) } },
+            enabled = duration != null,
             modifier = Modifier.size(sideSize),
             shape = RoundedCornerShape(if (compact) 18.dp else 20.dp),
         ) {
