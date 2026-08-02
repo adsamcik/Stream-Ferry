@@ -46,6 +46,9 @@ object RendererDescriptionParser {
         val usnUdn = ssdpUsn?.substringBefore("::")?.trim()?.takeIf { it.startsWith("uuid:", ignoreCase = true) }
         val device = when {
             usnUdn != null -> renderers.firstOrNull { directText(it, "UDN")?.equals(usnUdn, ignoreCase = true) == true }
+                // Some otherwise compliant single-device renderers omit UDN from the description.
+                // Accept only that unambiguous omission; a present-but-different UDN remains rejected.
+                ?: renderers.singleOrNull()?.takeIf { directText(it, "UDN") == null }
                 ?: return null
             renderers.size == 1 -> renderers.single()
             else -> return null // do not borrow a service from an ambiguous embedded device tree
@@ -68,13 +71,20 @@ object RendererDescriptionParser {
 
     private fun rendererDevices(root: Element): List<Element> {
         val result = mutableListOf<Element>()
-        fun visit(device: Element) {
+        val pending = java.util.ArrayDeque<Pair<Element, Int>>()
+        directChildren(root, "device").forEach { pending.addLast(it to 0) }
+        var visited = 0
+        while (pending.isNotEmpty()) {
+            val (device, depth) = pending.removeFirst()
+            visited += 1
+            if (visited > MAX_DEVICE_NODES || depth > MAX_DEVICE_DEPTH) return emptyList()
             val version = DEVICE_TYPE.matchEntire(directText(device, "deviceType").orEmpty())
                 ?.groupValues?.get(1)?.toIntOrNull()
             if (version != null && version >= 1) result += device
-            directChildren(device, "deviceList").flatMap { directChildren(it, "device") }.forEach(::visit)
+            directChildren(device, "deviceList")
+                .flatMap { directChildren(it, "device") }
+                .forEach { pending.addLast(it to depth + 1) }
         }
-        directChildren(root, "device").forEach(::visit)
         return result
     }
 
@@ -93,7 +103,12 @@ object RendererDescriptionParser {
                     serviceType = "urn:schemas-upnp-org:service:$requiredName:$version",
                 ) to version
             }
-        return candidates.maxByOrNull { it.second }?.first
+        val highestVersion = candidates.maxOfOrNull { it.second } ?: return null
+        return candidates.asSequence()
+            .filter { it.second == highestVersion }
+            .map { it.first }
+            .distinct()
+            .singleOrNull()
     }
 
     private fun validBase(raw: String?): String? = raw?.let { candidate ->
@@ -123,4 +138,6 @@ object RendererDescriptionParser {
     }
 
     private const val MAX_TEXT_LENGTH = 256
+    private const val MAX_DEVICE_DEPTH = 32
+    private const val MAX_DEVICE_NODES = 256
 }

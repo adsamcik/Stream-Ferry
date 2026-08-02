@@ -20,11 +20,31 @@ data class SsdpMessage(
     /** True only for a successful HTTP-style M-SEARCH response status line. */
     fun isSuccessfulSearchResponse(): Boolean = SsdpParser.isSuccessfulSearchResponse(startLine)
 
+    /** First reason this datagram cannot become a renderer-description candidate, or null if valid. */
+    fun candidateRejection(): SsdpCandidateRejection? = when {
+        !isSuccessfulSearchResponse() -> SsdpCandidateRejection.STATUS
+        usn.isNullOrBlank() -> SsdpCandidateRejection.MISSING_USN
+        st.isNullOrBlank() -> SsdpCandidateRejection.MISSING_SEARCH_TARGET
+        location.isNullOrBlank() -> SsdpCandidateRejection.MISSING_LOCATION
+        !isMediaRenderer() -> SsdpCandidateRejection.NOT_MEDIA_RENDERER
+        !SsdpParser.isAcceptableLocation(location) -> SsdpCandidateRejection.UNSAFE_LOCATION
+        else -> null
+    }
+
     /** True if this looks like a UPnP MediaRenderer advertisement. */
     fun isMediaRenderer(): Boolean {
         val t = (st ?: "") + (usn ?: "")
         return t.contains("MediaRenderer", ignoreCase = true)
     }
+}
+
+enum class SsdpCandidateRejection(val diagnostic: String) {
+    STATUS("non-success response status"),
+    MISSING_USN("missing USN"),
+    MISSING_SEARCH_TARGET("missing ST"),
+    MISSING_LOCATION("missing LOCATION"),
+    NOT_MEDIA_RENDERER("response is not a MediaRenderer"),
+    UNSAFE_LOCATION("LOCATION is not an approved LAN URL"),
 }
 
 object SsdpParser {

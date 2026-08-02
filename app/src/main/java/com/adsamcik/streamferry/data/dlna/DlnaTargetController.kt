@@ -5,6 +5,8 @@ import com.adsamcik.streamferry.core.http.BoundedBody
 import com.adsamcik.streamferry.core.dlna.SecureXml
 import com.adsamcik.streamferry.core.dlna.RendererDescriptionParser
 import com.adsamcik.streamferry.core.dlna.RendererServiceEndpoint
+import com.adsamcik.streamferry.core.dlna.SsdpCandidateRegistry
+import com.adsamcik.streamferry.core.dlna.SsdpCandidateRejection
 import com.adsamcik.streamferry.core.dlna.SsdpDiscoveryLimiter
 import com.adsamcik.streamferry.core.dlna.SsdpParser
 import com.adsamcik.streamferry.core.redaction.LogRedactor
@@ -18,6 +20,7 @@ import com.adsamcik.streamferry.domain.PlaybackTargetController
 import com.adsamcik.streamferry.domain.PlaybackTargetEvent
 import com.adsamcik.streamferry.domain.RendererStream
 import com.adsamcik.streamferry.logging.DiagnosticsLogger
+import com.adsamcik.streamferry.permissions.LocalNetworkAccessDeniedException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
@@ -48,6 +51,7 @@ import java.net.InetSocketAddress
 import java.net.MulticastSocket
 import java.net.NetworkInterface
 import java.net.SocketTimeoutException
+import java.util.Locale
 
 /**
  * DLNA / UPnP control point (Digital Media Controller) (§11). The Android app discovers MediaRenderers
@@ -81,8 +85,14 @@ class DlnaTargetController(
         val avTransport: ControlEndpoint,
         val renderingControl: ControlEndpoint?,
     )
+    private data class DescribedRenderer(
+        val target: DiscoveredTarget,
+        val renderer: Renderer,
+    )
+
     private var connected: Renderer? = null
     private val endpointPolicy = RendererEndpointPolicy(network)
+    @Volatile private var rendererEndpoints: Map<String, Renderer> = emptyMap()
 
     // A resume/reload start position (seconds) requested by [load]. DLNA has no "start position" in
     // SetAVTransportURI, so we issue a REL_TIME Seek — but only once the renderer is actually PLAYING (the
@@ -108,7 +118,8 @@ class DlnaTargetController(
             throw e
         } catch (e: Exception) {
             logger.w(TAG, "SSDP discovery failed (multicast may be blocked)", e)
-            emptyList()
+            logger.event("discovery", "DLNA scan failed before completion")
+            throw e
         } finally {
             runCatching { if (lock?.isHeld == true) lock.release() }
         }
@@ -122,11 +133,19 @@ class DlnaTargetController(
         val deadlineNanos = System.nanoTime() + timeoutMillis.coerceAtLeast(0) * NANOS_PER_MILLISECOND
         fun remainingMillis(): Long = ((deadlineNanos - System.nanoTime()) / NANOS_PER_MILLISECOND).coerceAtLeast(0)
 
-        val scheduledIds = HashSet<String>()
-        val descriptionJobs = mutableListOf<Deferred<DiscoveredTarget?>>()
+        val candidates = SsdpCandidateRegistry()
+        val descriptionJobs = mutableListOf<Deferred<DescribedRenderer?>>()
         val limiter = SsdpDiscoveryLimiter()
         val semaphore = Semaphore(MAX_CONCURRENT_DESCRIPTIONS)
-        val socket = openSsdpSocket() ?: return@coroutineScope emptyList()
+        val rejectionCounts = mutableMapOf<SsdpCandidateRejection, Int>()
+        var receivedPackets = 0
+        var parsedPackets = 0
+        var truncatedPackets = 0
+        var malformedPackets = 0
+        var duplicateCandidates = 0
+        var rendererLimitedCandidates = 0
+        var floodLimitedCandidates = 0
+        val socket = openSsdpSocket() ?: throw IOException("No usable physical LAN socket for SSDP discovery")
         socket.use { s ->
             val msearch = (
                 "M-SEARCH * HTTP/1.1\r\n" +
@@ -137,12 +156,25 @@ class DlnaTargetController(
                 ).toByteArray()
             val group = InetAddress.getByName(SSDP_ADDR)
             val datagram = DatagramPacket(msearch, msearch.size, InetSocketAddress(group, SSDP_PORT))
+            var probesSent = 0
+            var lastSendFailure: Exception? = null
             repeat(SSDP_PROBES) { index ->
                 if (remainingMillis() <= 0) return@repeat
-                runCatching { s.send(datagram) }
+                try {
+                    s.send(datagram)
+                    probesSent += 1
+                } catch (error: Exception) {
+                    lastSendFailure = error
+                }
                 if (index < SSDP_PROBES - 1 && remainingMillis() > 0) delay(minOf(SSDP_PROBE_SPACING_MS, remainingMillis()))
             }
-            logger.trace(TAG, "SSDP M-SEARCH sent on the selected LAN network")
+            if (probesSent == 0) {
+                throw IOException("All SSDP M-SEARCH sends failed on the selected LAN", lastSendFailure)
+            }
+            logger.trace(
+                TAG,
+                "SSDP M-SEARCH sent on the selected LAN network (" + probesSent + "/" + SSDP_PROBES + " probes)",
+            )
             logger.trace(
                 TAG,
                 "DLNA discovery context: lanIp=${network.lanIpv4() ?: "none"} vpnActive=${network.isVpnActive()} " +
@@ -151,6 +183,7 @@ class DlnaTargetController(
 
             val buf = ByteArray(SsdpParser.MAX_MESSAGE_LEN + 1)
             val tracedUsns = HashSet<String>()
+            val tracedRejections = HashSet<String>()
             while (remainingMillis() > 0) {
                 s.soTimeout = minOf(remainingMillis(), SSDP_RECEIVE_SLICE_MS).coerceAtLeast(1).toInt()
                 val packet = DatagramPacket(buf, buf.size)
@@ -158,46 +191,102 @@ class DlnaTargetController(
                     s.receive(packet)
                 } catch (_: SocketTimeoutException) {
                     continue // slice timeout; retain the absolute scan deadline
-                } catch (_: Exception) {
-                    break
+                } catch (error: Exception) {
+                    throw IOException("SSDP receive failed on the selected LAN", error)
                 }
+                receivedPackets += 1
                 // DatagramPacket does not expose a truncation flag. A full buffer is unsafe because it
                 // may be a longer message silently truncated by the socket; reject it before parsing.
-                if (packet.length >= buf.size) continue
-                val msg = SsdpParser.parse(String(packet.data, 0, packet.length, Charsets.UTF_8)) ?: continue
+                if (packet.length >= buf.size) {
+                    truncatedPackets += 1
+                    continue
+                }
+                val msg = SsdpParser.parse(String(packet.data, 0, packet.length, Charsets.UTF_8))
+                if (msg == null) {
+                    malformedPackets += 1
+                    continue
+                }
+                parsedPackets += 1
                 if (tracedUsns.add(msg.usn ?: msg.location ?: "?")) {
                     logger.trace(TAG, "SSDP <- mediaRenderer=${msg.isMediaRenderer()} usn=${msg.usn} loc=${msg.location}")
                 }
-                if (!msg.isSuccessfulSearchResponse() ||
-                    msg.usn.isNullOrBlank() ||
-                    msg.st.isNullOrBlank() ||
-                    msg.location.isNullOrBlank() ||
-                    !msg.isMediaRenderer() ||
-                    !SsdpParser.isAcceptableLocation(msg.location)
-                ) {
+                val rejection = msg.candidateRejection()
+                if (rejection != null) {
+                    rejectionCounts[rejection] = rejectionCounts.getOrDefault(rejection, 0) + 1
+                    val rejectionKey = (msg.usn ?: msg.location ?: msg.startLine) + "|" + rejection.name
+                    if (tracedRejections.add(rejectionKey)) {
+                        logger.trace(TAG, "SSDP candidate rejected: " + rejection.diagnostic)
+                    }
                     continue
                 }
-                val identity = msg.usn ?: continue
-                if (!scheduledIds.add(identity)) continue
                 val sourceAddress = packet.address ?: continue
                 val sourceIp = sourceAddress.hostAddress ?: "unknown"
+                val identity = msg.usn?.trim().orEmpty()
+                val location = msg.location?.trim().orEmpty()
+                when (candidates.register(identity, location, sourceIp)) {
+                    SsdpCandidateRegistry.Decision.DUPLICATE -> {
+                        duplicateCandidates += 1
+                        continue
+                    }
+                    SsdpCandidateRegistry.Decision.RENDERER_LIMIT -> {
+                        rendererLimitedCandidates += 1
+                        if (tracedRejections.add(identity + "|candidate-limit")) {
+                            logger.trace(TAG, "SSDP renderer candidate limit reached")
+                        }
+                        continue
+                    }
+                    SsdpCandidateRegistry.Decision.ACCEPT -> Unit
+                }
                 if (!limiter.allowDescribe(sourceIp)) {
+                    floodLimitedCandidates += 1
                     logger.trace(TAG, "SSDP describe rate-limited (flood guard)")
                     continue
                 }
-                val location = msg.location ?: continue
                 descriptionJobs += async {
                     semaphore.withPermit {
                         val remaining = remainingMillis()
-                        if (remaining <= 0) null else describe(location, identity, sourceAddress, remaining)
+                        if (remaining <= 0) {
+                            null
+                        } else {
+                            try {
+                                describe(location, identity, sourceAddress, remaining)
+                            } catch (error: CancellationException) {
+                                throw error
+                            } catch (error: LocalNetworkAccessDeniedException) {
+                                throw error
+                            } catch (error: Exception) {
+                                logger.w(
+                                    TAG,
+                                    "Renderer description candidate failed unexpectedly from " + sourceIp +
+                                        " (" + error.javaClass.simpleName + ")",
+                                )
+                                null
+                            }
+                        }
                     }
                 }
             }
         }
 
-        val targets = descriptionJobs.awaitAll().filterNotNull().distinctBy { it.id }
-        logger.trace(TAG, "SSDP discovery finished: ${targets.size} renderer(s)")
-        logger.event("discovery", "DLNA scan: ${targets.size} renderer(s)")
+        val selected = LinkedHashMap<String, DescribedRenderer>()
+        descriptionJobs.awaitAll().filterNotNull().forEach { described ->
+            selected.putIfAbsent(described.target.id.trim().lowercase(Locale.ROOT), described)
+        }
+        rendererEndpoints = selected.values.associate { it.target.id to it.renderer }
+        val targets = selected.values.map { it.target }
+        val rejected = rejectionCounts.entries
+            .sortedBy { it.key.name }
+            .joinToString { it.key.name.lowercase(Locale.ROOT) + "=" + it.value }
+            .ifEmpty { "none" }
+        logger.trace(
+            TAG,
+            "SSDP discovery finished: " + targets.size + " renderer(s); packets=" + receivedPackets +
+                " parsed=" + parsedPackets + " malformed=" + malformedPackets +
+                " truncated=" + truncatedPackets + " describes=" + descriptionJobs.size +
+                " duplicates=" + duplicateCandidates + " rendererLimited=" + rendererLimitedCandidates +
+                " floodLimited=" + floodLimitedCandidates + " rejected=[" + rejected + "]",
+        )
+        logger.event("discovery", "DLNA scan: " + targets.size + " renderer(s)")
         targets
     }
 
@@ -226,6 +315,7 @@ class DlnaTargetController(
             lanNetwork.bindSocket(networkBound)
             networkBound.bind(InetSocketAddress(lanAddress, 0))
             lanInterface?.let { networkBound.networkInterface = it }
+            networkBound.timeToLive = SSDP_TTL
             return networkBound
         }.onFailure { error ->
             runCatching { networkBound.close() }
@@ -241,6 +331,7 @@ class DlnaTargetController(
             interfaceBound.reuseAddress = true
             lanInterface?.let { interfaceBound.networkInterface = it }
             interfaceBound.bind(InetSocketAddress(lanAddress, 0))
+            interfaceBound.timeToLive = SSDP_TTL
             logger.trace(TAG, "SSDP socket pinned directly to the physical LAN interface")
             interfaceBound
         }.onFailure {
@@ -254,7 +345,7 @@ class DlnaTargetController(
         usn: String,
         sourceAddress: InetAddress,
         remainingMillis: Long,
-    ): DiscoveredTarget? {
+    ): DescribedRenderer? {
         val locationEndpoint = endpointPolicy.location(location, sourceAddress) ?: run {
             logger.trace(TAG, "Rejected SSDP LOCATION outside the selected renderer network")
             return null
@@ -278,7 +369,7 @@ class DlnaTargetController(
         }
         val renderingService = description.renderingControl
         val renderingRoute = renderingService?.let { endpointPolicy.service(it.controlUrl, locationEndpoint) }
-        rendererEndpoints[usn] = Renderer(
+        val renderer = Renderer(
             avTransport = ControlEndpoint(description.avTransport, avRoute),
             renderingControl = if (renderingService != null && renderingRoute != null) {
                 ControlEndpoint(renderingService, renderingRoute)
@@ -288,28 +379,29 @@ class DlnaTargetController(
         )
         val friendly = description.friendlyName.take(64)
         logger.trace(TAG, "describe: '$friendly' ready (MediaRenderer + AVTransport resolved)")
-        return DiscoveredTarget(
-            id = usn,
-            // Compose renders plain text; XML-escaping here displays entities such as &amp; literally.
-            displayName = friendly,
-            protocol = Protocol.DLNA,
-            capabilities = DLNA_BASELINE.copy(modelName = (description.modelName ?: friendly).take(64)),
-            lastTestedStatus = null,
-            discoveryMetadata = TargetDiscoveryMetadata(
-                dlnaUdn = description.udn,
-                dlnaUsn = usn,
-                // location() proved LOCATION resolves to this SSDP source on the selected LAN.
-                validatedSourceHost = sourceAddress.hostAddress,
-                validatedDescriptionHost = locationEndpoint.host,
-                manufacturer = description.manufacturer,
-                modelName = description.modelName,
-                // Advertise volume only after its separately validated control URL resolved.
-                volumeControlAvailable = renderingService != null && renderingRoute != null,
+        return DescribedRenderer(
+            target = DiscoveredTarget(
+                id = usn,
+                // Compose renders plain text; XML-escaping here displays entities such as &amp; literally.
+                displayName = friendly,
+                protocol = Protocol.DLNA,
+                capabilities = DLNA_BASELINE.copy(modelName = (description.modelName ?: friendly).take(64)),
+                lastTestedStatus = null,
+                discoveryMetadata = TargetDiscoveryMetadata(
+                    dlnaUdn = description.udn,
+                    dlnaUsn = usn,
+                    // location() pins LOCATION to this SSDP source on the selected LAN.
+                    validatedSourceHost = sourceAddress.hostAddress,
+                    validatedDescriptionHost = locationEndpoint.host,
+                    manufacturer = description.manufacturer,
+                    modelName = description.modelName,
+                    // Advertise volume only after its separately validated control URL resolved.
+                    volumeControlAvailable = renderingService != null && renderingRoute != null,
+                ),
             ),
+            renderer = renderer,
         )
     }
-
-    private val rendererEndpoints = java.util.concurrent.ConcurrentHashMap<String, Renderer>()
 
     override suspend fun connect(target: DiscoveredTarget) {
         requireLocalNetworkAccess()
@@ -628,6 +720,7 @@ class DlnaTargetController(
         private const val TAG = "DlnaTargetController"
         private const val SSDP_ADDR = "239.255.255.250"
         private const val SSDP_PORT = 1900
+        private const val SSDP_TTL = 2
         private const val SSDP_PROBES = 3
         private const val SSDP_PROBE_SPACING_MS = 150L
         private const val SSDP_RECEIVE_SLICE_MS = 250L

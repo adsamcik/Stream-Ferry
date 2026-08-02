@@ -3,6 +3,7 @@ package com.adsamcik.streamferry.core
 import com.adsamcik.streamferry.core.buffer.MemoryBufferPolicy
 import com.adsamcik.streamferry.core.dlna.DidlLite
 import com.adsamcik.streamferry.core.dlna.SecureXml
+import com.adsamcik.streamferry.core.dlna.SsdpCandidateRejection
 import com.adsamcik.streamferry.core.dlna.SsdpParser
 import com.adsamcik.streamferry.core.hls.HlsRewriter
 import java.nio.charset.StandardCharsets
@@ -92,6 +93,7 @@ class CorePolicyTest {
         assertNotNull(msg)
         assertEquals("http://192.168.1.5:7676/desc.xml", msg.location)
         assertTrue(msg.isSuccessfulSearchResponse())
+        assertEquals(null, msg.candidateRejection())
         assertTrue(msg.isMediaRenderer())
         assertTrue(SsdpParser.isAcceptableLocation(msg.location))
     }
@@ -107,6 +109,22 @@ class CorePolicyTest {
         assertFalse(SsdpParser.isSuccessfulSearchResponse("HTTP/2 200 OK"))
         assertFalse(SsdpParser.isSuccessfulSearchResponse("NOTIFY * HTTP/1.1"))
         assertFalse(SsdpParser.isSuccessfulSearchResponse("HTTP/1.1 200 OK\r\nLOCATION: http://10.0.0.2/"))
+    }
+
+    @Test fun reportsWhyRendererResponseCannotBecomeCandidate() {
+        val wrongStatus = SsdpParser.parse(
+            "HTTP/1.1 404 Not Found\r\nST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n" +
+                "USN: uuid:abc::urn:schemas-upnp-org:device:MediaRenderer:1\r\n" +
+                "LOCATION: http://10.0.0.2/desc.xml\r\n\r\n",
+        )
+        assertNotNull(wrongStatus)
+        assertEquals(SsdpCandidateRejection.STATUS, wrongStatus.candidateRejection())
+
+        val unsafe = wrongStatus.copy(
+            startLine = "HTTP/1.1 200 OK",
+            headers = wrongStatus.headers + ("LOCATION" to "http://8.8.8.8/desc.xml"),
+        )
+        assertEquals(SsdpCandidateRejection.UNSAFE_LOCATION, unsafe.candidateRejection())
     }
 
     @Test fun rejectsNonHttpLocation() {
