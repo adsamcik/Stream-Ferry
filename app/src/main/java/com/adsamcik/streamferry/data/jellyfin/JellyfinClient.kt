@@ -300,6 +300,9 @@ class JellyfinClient(
                 "parentId" to parentId,
                 "startIndex" to startIndex.toString(),
                 "limit" to limit.toString(),
+                // A full browse snapshot must know when the server has no more pages. Some Jellyfin
+                // configurations omit TotalRecordCount unless it is explicitly requested.
+                "enableTotalRecordCount" to "true",
                 "sortBy" to "SortName",
                 "sortOrder" to "Ascending",
                 "fields" to "Overview",
@@ -930,6 +933,7 @@ class JellyfinClient(
                 ?.takeIf { it > 0 }?.let { it / TICKS_PER_SECOND },
             isFolder = folder,
             type = kind,
+            indexNumber = indexNumber,
             seriesId = seriesId,
             subtitle = episodeSubtitle(),
             imageTag = imageTags?.get("Primary"),

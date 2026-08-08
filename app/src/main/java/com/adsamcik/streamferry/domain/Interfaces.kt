@@ -38,6 +38,11 @@ data class MediaItem(
     val isFolder: Boolean,
     /** Jellyfin item type, e.g. "CollectionFolder", "Series", "Season", "Movie", "Episode". */
     val type: String? = null,
+    /**
+     * Jellyfin's numeric position within its parent when supplied (for example Season 0, Season 1,
+     * …). A complete paged season snapshot uses this to keep its rows in a stable numeric order.
+     */
+    val indexNumber: Int? = null,
     /** For an Episode, the parent Series id — used to resolve the next episode for autoplay. Null otherwise. */
     val seriesId: String? = null,
     /** Optional secondary line for the gallery (e.g. "Series · S1 E3"); never a secret. */

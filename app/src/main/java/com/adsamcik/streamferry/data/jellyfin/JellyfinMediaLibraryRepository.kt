@@ -4,6 +4,7 @@ import com.adsamcik.streamferry.core.resilience.LibraryPagingPolicy
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.domain.MediaLibraryRepository
 import com.adsamcik.streamferry.logging.DiagnosticsLogger
+import java.util.Locale
 
 /**
  * [MediaLibraryRepository] over [JellyfinClient] (§8 browse). Lists the user's video libraries, walks
@@ -30,8 +31,9 @@ class JellyfinMediaLibraryRepository(
             all += page.items
             request = paging.nextPage(req, page.items.size, page.totalRecordCount)
         }
-        logger.event("library", "Loaded ${all.size} items under a folder")
-        all
+        val snapshot = canonicalizeJellyfinChildren(all)
+        logger.event("library", "Loaded ${snapshot.size} unique items under a folder")
+        snapshot
     }.onFailure { logger.w("library", "Failed to load folder items", it) }
 
     override suspend fun item(itemId: String): Result<MediaItem> =
@@ -58,5 +60,28 @@ class JellyfinMediaLibraryRepository(
         val NON_VIDEO_COLLECTIONS = setOf("music", "musicvideos", "books", "photos", "livetv", "playlists", "audiobooks")
         const val SEARCH_LIMIT = 60
         const val RESUME_LIMIT = 16
+    }
+}
+
+/**
+ * Produces one stable, complete browse snapshot after the Jellyfin page walk finishes. Offset pages can
+ * overlap when a server is scanning or an item changes sort position mid-request; keep the first server
+ * occurrence of each id and never expose those transient duplicates to a lazy list. Seasons additionally
+ * use Jellyfin's numeric index so Season 20 cannot move ahead of Season 3 because of lexical titles.
+ */
+internal fun canonicalizeJellyfinChildren(items: Iterable<MediaItem>): List<MediaItem> {
+    val unique = LinkedHashMap<String, MediaItem>()
+    items.forEach { item -> unique.putIfAbsent(item.id, item) }
+    val snapshot = unique.values.toList()
+    return if (snapshot.isNotEmpty() && snapshot.all { it.type.equals("Season", ignoreCase = true) }) {
+        snapshot.sortedWith(
+            compareBy<MediaItem>(
+                { it.indexNumber ?: Int.MAX_VALUE },
+                { it.title.lowercase(Locale.ROOT) },
+                { it.id },
+            ),
+        )
+    } else {
+        snapshot
     }
 }

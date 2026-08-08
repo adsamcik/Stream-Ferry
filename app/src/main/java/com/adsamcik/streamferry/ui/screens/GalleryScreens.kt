@@ -219,7 +219,7 @@ fun GalleryScreen(state: AppUiState, viewModel: MainViewModel, compact: Boolean 
         }
         when {
             needsJellyfinLogin -> JellyfinLoginPrompt(viewModel)
-            state.galleryLoading || state.searching -> CenteredProgress("Loading…")
+            (state.galleryLoading && entries.isEmpty()) || state.searching -> CenteredProgress("Loading…")
             entries.isEmpty() && searchActive -> Text("No results for \"${state.searchQuery}\".")
             entries.isEmpty() -> EmptyLibraryPrompt(state, viewModel, isLocalSource)
             showingSeasons -> SeasonList(
@@ -555,7 +555,7 @@ private fun LibraryHome(
             needsJellyfinLogin -> item(span = { GridItemSpan(maxLineSpan) }) {
                 JellyfinLoginPrompt(viewModel)
             }
-            state.galleryLoading -> item(span = { GridItemSpan(maxLineSpan) }) {
+            state.galleryLoading && entries.isEmpty() -> item(span = { GridItemSpan(maxLineSpan) }) {
                 CenteredProgress("Loading…")
             }
             entries.isEmpty() -> item(span = { GridItemSpan(maxLineSpan) }) {

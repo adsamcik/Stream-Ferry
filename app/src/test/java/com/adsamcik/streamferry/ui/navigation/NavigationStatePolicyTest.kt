@@ -6,6 +6,8 @@ import com.adsamcik.streamferry.ui.navigation.NavigationStatePolicy.TopLevelDest
 import com.adsamcik.streamferry.ui.state.Route
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertTrue
 
 class NavigationStatePolicyTest {
 
@@ -74,6 +76,22 @@ class NavigationStatePolicyTest {
         assertEquals(MediaSourceIds.JELLYFIN, NavigationStatePolicy.restoreSource("stale-source"))
     }
 
+    @Test
+    fun `gallery request gate rejects a late response after navigating to another folder`() {
+        val gate = GalleryLoadRequestGate()
+        val seasonOne = GalleryBrowseTarget(MediaSourceIds.JELLYFIN, "series-one")
+        val seasonTwenty = GalleryBrowseTarget(MediaSourceIds.JELLYFIN, "series-twenty")
+        val firstRequest = gate.begin(seasonOne)
+
+        assertTrue(gate.isCurrent(firstRequest, seasonOne))
+
+        val newerRequest = gate.begin(seasonTwenty)
+        assertFalse(gate.isCurrent(firstRequest, seasonTwenty))
+        assertTrue(gate.isCurrent(newerRequest, seasonTwenty))
+
+        gate.invalidate()
+        assertFalse(gate.isCurrent(newerRequest, seasonTwenty))
+    }
     @Test
     fun `top level grouping follows the durable information architecture`() {
         assertEquals(TopLevelDestination.LIBRARY, NavigationStatePolicy.topLevelFor(Route.MEDIA_DETAIL))

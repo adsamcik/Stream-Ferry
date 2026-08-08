@@ -78,3 +78,37 @@ internal object NavigationStatePolicy {
         else -> MediaSourceIds.JELLYFIN
     }
 }
+
+/** Immutable identity of the currently browsed source/folder. */
+internal data class GalleryBrowseTarget(
+    val sourceId: String,
+    val folderId: String?,
+)
+
+/** A monotonically newer gallery request supersedes every earlier request. */
+internal data class GalleryLoadRequest(
+    val generation: Long,
+    val target: GalleryBrowseTarget,
+)
+
+/**
+ * Keeps asynchronous gallery responses tied to the source and folder that started them. It is deliberately
+ * UI-framework-free so a late Jellyfin response cannot replace a newer browse target or reset its scroll.
+ */
+internal class GalleryLoadRequestGate {
+    private var nextGeneration = 0L
+    private var current: GalleryLoadRequest? = null
+
+    fun begin(target: GalleryBrowseTarget): GalleryLoadRequest = GalleryLoadRequest(
+        generation = ++nextGeneration,
+        target = target,
+    ).also { current = it }
+
+    fun invalidate() {
+        current = null
+        nextGeneration += 1
+    }
+
+    fun isCurrent(request: GalleryLoadRequest, currentTarget: GalleryBrowseTarget): Boolean =
+        current == request && request.target == currentTarget
+}

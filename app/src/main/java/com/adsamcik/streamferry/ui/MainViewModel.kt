@@ -41,6 +41,9 @@ import com.adsamcik.streamferry.playback.PlaybackFailureStage
 import com.adsamcik.streamferry.playback.PlaybackPhase
 import com.adsamcik.streamferry.playback.PlaybackPreparationException
 import com.adsamcik.streamferry.playback.PlaybackRecoveryContinuation
+import com.adsamcik.streamferry.ui.navigation.GalleryBrowseTarget
+import com.adsamcik.streamferry.ui.navigation.GalleryLoadRequest
+import com.adsamcik.streamferry.ui.navigation.GalleryLoadRequestGate
 import com.adsamcik.streamferry.ui.navigation.NavigationStatePolicy
 import com.adsamcik.streamferry.ui.state.AppUiState
 import com.adsamcik.streamferry.ui.state.ConnectionState
@@ -104,6 +107,11 @@ class MainViewModel(
     private var downloadEntries: List<DownloadEntry> = emptyList()
     private val downloadTitles = HashMap<DownloadIdentity, String>()
     private val downloadRefreshMutex = Mutex()
+
+    // One current browse request owns gallery publication. Every folder/source transition supersedes
+    // earlier work so a late Jellyfin response cannot replace the list currently on screen.
+    private var galleryLoadJob: Job? = null
+    private val galleryLoadGate = GalleryLoadRequestGate()
 
     // ----- auto-reconnect after an unexpected renderer disconnect -----
     private var reconnectJob: Job? = null
@@ -253,7 +261,7 @@ class MainViewModel(
             if (initialGallery && (cached != null || _state.value.activeSourceId == MediaSourceIds.LOCAL)) {
                 val restoredQuery = _state.value.searchQuery
                 _state.update { it.copy(galleryLoading = true) }
-                loadRoots()
+                launchGalleryLoad()
                 if (restoredQuery.isNotBlank()) onSearchQueryChanged(restoredQuery)
             }
 
@@ -264,7 +272,7 @@ class MainViewModel(
                 if (_state.value.route == Route.GALLERY && _state.value.activeSourceId == MediaSourceIds.JELLYFIN) {
                     val restoredQuery = _state.value.searchQuery
                     _state.update { it.copy(galleryLoading = true) }
-                    loadRoots()
+                    launchGalleryLoad()
                     if (restoredQuery.isNotBlank()) onSearchQueryChanged(restoredQuery)
                 }
             } else if (cached != null) {
@@ -345,7 +353,7 @@ class MainViewModel(
             val restoredQuery = _state.value.searchQuery
             _state.update { it.copy(galleryLoading = true) }
             viewModelScope.launch {
-                loadRoots()
+                launchGalleryLoad()
                 if (restoredQuery.isNotBlank()) onSearchQueryChanged(restoredQuery)
             }
         }
@@ -573,12 +581,45 @@ class MainViewModel(
                 errorMessage = null, searchQuery = "", searchResults = emptyList(), searching = false,
             )
         }
-        loadRoots()
+        launchGalleryLoad()
     }
 
     /** Active browsable source (Jellyfin / on-device), per [AppUiState.activeSourceId]. */
-    private fun activeSource(): MediaSource =
-        container.mediaSources.firstOrNull { it.id == _state.value.activeSourceId } ?: container.jellyfinMediaSource
+    private fun activeSource(): MediaSource = sourceFor(_state.value.activeSourceId)
+
+    private fun sourceFor(sourceId: String): MediaSource =
+        container.mediaSources.firstOrNull { it.id == sourceId } ?: container.jellyfinMediaSource
+
+    private fun AppUiState.galleryTarget(): GalleryBrowseTarget =
+        GalleryBrowseTarget(activeSourceId, currentFolder?.id)
+
+    private fun isCurrentGalleryLoad(request: GalleryLoadRequest): Boolean =
+        galleryLoadGate.isCurrent(request, _state.value.galleryTarget())
+
+    private inline fun updateCurrentGalleryLoad(
+        request: GalleryLoadRequest,
+        transform: (AppUiState) -> AppUiState,
+    ) {
+        _state.update { current ->
+            if (galleryLoadGate.isCurrent(request, current.galleryTarget())) transform(current) else current
+        }
+    }
+
+    private fun cancelGalleryLoad() {
+        galleryLoadJob?.cancel()
+        galleryLoadJob = null
+        galleryLoadGate.invalidate()
+    }
+
+    private fun launchGalleryLoad(target: GalleryBrowseTarget = _state.value.galleryTarget()) {
+        // A delayed refresh may resume after navigation; it must not start a request for a stale folder.
+        if (_state.value.galleryTarget() != target) return
+        galleryLoadJob?.cancel()
+        val request = galleryLoadGate.begin(target)
+        galleryLoadJob = viewModelScope.launch {
+            if (target.folderId == null) loadRoots(request) else loadChildren(request)
+        }
+    }
 
     /** Sources for the gallery switcher, as (id, displayName) in display order. */
     val sources: List<Pair<String, String>> get() = container.mediaSources.map { it.id to it.displayName }
@@ -612,7 +653,7 @@ class MainViewModel(
                 searchQuery = "", searchResults = emptyList(), searching = false, errorMessage = null, galleryLoading = true,
             )
         }
-        viewModelScope.launch { loadRoots() }
+        launchGalleryLoad()
     }
 
     /** Persist a SAF folder grant for the on-device source and refresh if it is showing. */
@@ -637,34 +678,50 @@ class MainViewModel(
     private fun reloadIfLocalActive() {
         if (_state.value.activeSourceId != MediaSourceIds.LOCAL) return
         _state.update { it.copy(galleryLoading = true, folderStack = emptyList(), items = emptyList()) }
-        viewModelScope.launch { loadRoots() }
+        launchGalleryLoad()
     }
 
-    private suspend fun loadRoots() {
+    private suspend fun loadRoots(request: GalleryLoadRequest) {
+        if (!isCurrentGalleryLoad(request)) return
+        val target = request.target
         // Jellyfin can be browsed through an authenticated live session OR an isolated cached-session
         // scope. The latter never permits the repository to make a token-bearing remote request.
-        if (_state.value.activeSourceId == MediaSourceIds.JELLYFIN && !_state.value.canBrowseJellyfin) {
-            _state.update { it.copy(libraries = emptyList(), continueWatching = emptyList(), galleryLoading = false) }
+        if (target.sourceId == MediaSourceIds.JELLYFIN && !_state.value.canBrowseJellyfin) {
+            updateCurrentGalleryLoad(request) {
+                it.copy(libraries = emptyList(), continueWatching = emptyList(), galleryLoading = false)
+            }
             return
         }
-        activeSource().roots().fold(
-            onSuccess = { libs -> _state.update { it.copy(libraries = libs, galleryLoading = false) } },
-            onFailure = { e ->
-                if (isSessionExpired(e)) handleSessionExpired()
-                else _state.update { it.copy(galleryLoading = false, libraries = emptyList(), errorMessage = libraryErrorMessage(e)) }
+        val result = sourceFor(target.sourceId).roots()
+        if (!isCurrentGalleryLoad(request)) return
+        result.fold(
+            onSuccess = { libraries ->
+                updateCurrentGalleryLoad(request) { it.copy(libraries = libraries, galleryLoading = false) }
+                // Continue Watching belongs to the source rather than the open folder. It is safe to refresh
+                // only while this same source remains selected; a source switch drops the late result.
+                loadContinueWatching(target.sourceId)
+            },
+            onFailure = { error ->
+                if (!isCurrentGalleryLoad(request)) return@fold
+                if (isSessionExpired(error)) handleSessionExpired()
+                // Keep a populated snapshot visible on a manual refresh failure. A first-load failure still
+                // naturally presents the empty/error state, but scrolling is never reset by clearing data.
+                else updateCurrentGalleryLoad(request) {
+                    it.copy(galleryLoading = false, errorMessage = libraryErrorMessage(error))
+                }
             },
         )
-        loadContinueWatching()
     }
 
     /**
-     * Load the "Continue Watching" row (Jellyfin resume list) alongside the library roots. Best-effort:
-     * a failure just leaves the row empty (the libraries below still load). Sources without a server-side
-     * watch state (on-device local) return empty, which clears any previously-shown row.
+     * Load the "Continue Watching" row. The source id is captured before the request so a late result from
+     * one Jellyfin account/source cannot replace the row after the user switched elsewhere.
      */
-    private suspend fun loadContinueWatching() {
-        val items = activeSource().continueWatching().getOrDefault(emptyList())
-        _state.update { it.copy(continueWatching = items) }
+    private suspend fun loadContinueWatching(sourceId: String = _state.value.activeSourceId) {
+        val items = sourceFor(sourceId).continueWatching().getOrDefault(emptyList())
+        _state.update { current ->
+            if (current.activeSourceId == sourceId) current.copy(continueWatching = items) else current
+        }
     }
 
     fun onItemClicked(item: MediaItem) {
@@ -672,30 +729,41 @@ class MainViewModel(
         if (item.isFolder) openFolder(item) else openDetail(item)
     }
 
-    private fun openFolder(folder: MediaItem) = viewModelScope.launch {
+    private fun openFolder(folder: MediaItem) {
         _state.update { it.copy(folderStack = it.folderStack + folder, galleryLoading = true, items = emptyList(), errorMessage = null) }
-        loadChildren(folder.id)
+        launchGalleryLoad()
     }
 
     /** Go up one level in the gallery; returns to the welcome/library root from the top. */
-    fun popFolder() = viewModelScope.launch {
+    fun popFolder() {
         val stack = _state.value.folderStack
-        if (stack.isEmpty()) return@launch
+        if (stack.isEmpty()) return
         val newStack = stack.dropLast(1)
         _state.update { it.copy(folderStack = newStack, items = emptyList(), galleryLoading = newStack.isNotEmpty()) }
-        newStack.lastOrNull()?.let { loadChildren(it.id) }
+        if (newStack.isEmpty()) cancelGalleryLoad() else launchGalleryLoad()
     }
 
-    private suspend fun loadChildren(parentId: String) {
-        activeSource().children(parentId).fold(
-            onSuccess = { kids -> _state.update { it.copy(items = kids, galleryLoading = false) } },
-            onFailure = { e ->
-                if (isSessionExpired(e)) handleSessionExpired()
-                else _state.update { it.copy(galleryLoading = false, errorMessage = libraryErrorMessage(e)) }
+    private suspend fun loadChildren(request: GalleryLoadRequest) {
+        if (!isCurrentGalleryLoad(request)) return
+        val target = request.target
+        val parentId = target.folderId ?: return
+        val result = sourceFor(target.sourceId).children(parentId)
+        if (!isCurrentGalleryLoad(request)) return
+        result.fold(
+            onSuccess = { children ->
+                updateCurrentGalleryLoad(request) { it.copy(items = children, galleryLoading = false) }
+            },
+            onFailure = { error ->
+                if (!isCurrentGalleryLoad(request)) return@fold
+                if (isSessionExpired(error)) handleSessionExpired()
+                // Children are intentionally left intact during a refresh failure; navigation cleared them
+                // before a new folder load, so no prior folder can be shown under a new breadcrumb.
+                else updateCurrentGalleryLoad(request) {
+                    it.copy(galleryLoading = false, errorMessage = libraryErrorMessage(error))
+                }
             },
         )
     }
-
     /**
      * Detect a 401 anywhere in the cause chain: the server revoked/expired our token, so the stored
      * session is no longer usable.
@@ -772,11 +840,16 @@ class MainViewModel(
         }
 
     /** Reload the current gallery view (libraries at the root, otherwise the current folder). */
-    fun refreshGallery() = viewModelScope.launch {
-        refreshOnlineJellyfinSessionIfNeeded()
-        val folder = _state.value.currentFolder
-        _state.update { it.copy(galleryLoading = true, errorMessage = null) }
-        if (folder == null) loadRoots() else loadChildren(folder.id)
+    fun refreshGallery() {
+        val target = _state.value.galleryTarget()
+        viewModelScope.launch {
+            refreshOnlineJellyfinSessionIfNeeded()
+            if (_state.value.galleryTarget() != target) return@launch
+            _state.update { current ->
+                if (current.galleryTarget() == target) current.copy(galleryLoading = true, errorMessage = null) else current
+            }
+            launchGalleryLoad(target)
+        }
     }
 
     /** A manual refresh is the explicit retry boundary for a cache-only Jellyfin session. */
@@ -796,6 +869,7 @@ class MainViewModel(
 
     /** Debounced free-text search across the whole library; a blank query restores the normal view. */
     fun onSearchQueryChanged(query: String) {
+        val sourceId = _state.value.activeSourceId
         _state.update { it.copy(searchQuery = query, searching = query.isNotBlank()) }
         searchJob?.cancel()
         if (query.isBlank()) {
@@ -804,11 +878,29 @@ class MainViewModel(
         }
         searchJob = viewModelScope.launch {
             delay(SEARCH_DEBOUNCE_MS)
-            activeSource().search(query.trim()).fold(
-                onSuccess = { results -> _state.update { it.copy(searchResults = results, searching = false) } },
-                onFailure = { e ->
-                    if (isSessionExpired(e)) handleSessionExpired()
-                    else _state.update { it.copy(searching = false, errorMessage = libraryErrorMessage(e)) }
+            val result = sourceFor(sourceId).search(query.trim())
+            val stillCurrent = { _state.value.activeSourceId == sourceId && _state.value.searchQuery == query }
+            if (!stillCurrent()) return@launch
+            result.fold(
+                onSuccess = { results ->
+                    _state.update { current ->
+                        if (current.activeSourceId == sourceId && current.searchQuery == query) {
+                            current.copy(searchResults = results, searching = false)
+                        } else {
+                            current
+                        }
+                    }
+                },
+                onFailure = { error ->
+                    if (!stillCurrent()) return@fold
+                    if (isSessionExpired(error)) handleSessionExpired()
+                    else _state.update { current ->
+                        if (current.activeSourceId == sourceId && current.searchQuery == query) {
+                            current.copy(searching = false, errorMessage = libraryErrorMessage(error))
+                        } else {
+                            current
+                        }
+                    }
                 },
             )
         }
@@ -1551,9 +1643,14 @@ class MainViewModel(
     }
 
     /** Reconcile watch state from the server after a change (folder/series rollups, resume row). */
-    private fun refreshWatchStateFromServer() = viewModelScope.launch {
-        _state.value.currentFolder?.let { loadChildren(it.id) } // silent (no loading flash)
-        loadContinueWatching()
+    private fun refreshWatchStateFromServer() {
+        val target = _state.value.galleryTarget()
+        // This is intentionally silent: keep the current rows mounted and atomically replace them only if
+        // this exact source/folder is still current when the server responds.
+        launchGalleryLoad(target)
+        if (target.folderId != null) {
+            viewModelScope.launch { loadContinueWatching(target.sourceId) }
+        }
     }
 
     private fun MediaItem.withWatched(played: Boolean): MediaItem = copy(
