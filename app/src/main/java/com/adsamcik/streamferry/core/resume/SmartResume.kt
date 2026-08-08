@@ -100,6 +100,30 @@ data class SmartResumeCheckpoint(
  * checkpoint move this device backwards. Finished records remain finished even if late telemetry arrives.
  */
 object SmartResumePositionReconciler {
+    /**
+     * Reconcile a crash-safe renderer checkpoint only when it belongs to the exact Jellyfin account and
+     * library item being played. A stale checkpoint from another show or account must never move playback.
+     */
+    fun reconcileJellyfinItem(
+        record: SmartResumeRecord?,
+        itemId: String,
+        serverId: String,
+        userId: String,
+        jellyfinResumeSeconds: Long?,
+    ): Long? {
+        val matchingRecord = record?.takeIf {
+            it.sourceType == SmartResumeSourceType.JELLYFIN &&
+                it.mediaId == itemId &&
+                it.serverId == serverId &&
+                it.userId == userId
+        }
+        return if (matchingRecord != null) {
+            reconcile(matchingRecord, rendererConfirmedSeconds = null, jellyfinResumeSeconds = jellyfinResumeSeconds)
+        } else {
+            jellyfinResumeSeconds
+        }
+    }
+
     fun reconcile(
         record: SmartResumeRecord?,
         rendererConfirmedSeconds: Long?,
@@ -120,7 +144,14 @@ object SmartResumeReducer {
             update.deviceContext?.isStructurallyValid() == false) return current
         if (current == null) return if (update.kind == SmartResumeCheckpointKind.STARTED) create(update) else null
         if (current.sessionId != update.sessionId) {
-            return if (update.kind == SmartResumeCheckpointKind.STARTED && update.generation > current.generation) create(update) else current
+            if (update.kind != SmartResumeCheckpointKind.STARTED || update.generation <= current.generation) return current
+            // A delayed/optimistic zero position from a fresh renderer session must not wipe the last
+            // durable checkpoint for the exact same unfinished item. A confirmed backward seek in the
+            // previous session is already represented by current.confirmedPositionSeconds.
+            val minimumPosition = current.takeIf {
+                it.state == SmartResumeRecordState.IN_PROGRESS && it.identityKey() == update.seed.identityKey()
+            }?.confirmedPositionSeconds
+            return create(update, minimumPosition)
         }
         if (update.generation != current.generation || current.identityKey() != update.seed.identityKey() ||
             update.sequence <= current.sequence || current.state == SmartResumeRecordState.FINISHED) return current
@@ -142,7 +173,10 @@ object SmartResumeReducer {
         )
     }
 
-    private fun create(update: SmartResumeCheckpoint) = SmartResumeRecord(
+    private fun create(
+        update: SmartResumeCheckpoint,
+        minimumPositionSeconds: Long? = null,
+    ) = SmartResumeRecord(
         sourceType = update.seed.sourceType,
         mediaId = update.seed.mediaId,
         displayTitle = update.seed.displayTitle,
@@ -151,7 +185,7 @@ object SmartResumeReducer {
         serverId = update.seed.serverId,
         userId = update.seed.userId,
         localContentUri = update.seed.localContentUri,
-        confirmedPositionSeconds = update.confirmedPositionSeconds,
+        confirmedPositionSeconds = maxOf(update.confirmedPositionSeconds, minimumPositionSeconds ?: 0L),
         updatedAtMillis = update.updatedAtMillis,
         sessionId = update.sessionId,
         generation = update.generation,
@@ -278,7 +312,8 @@ class SmartResumeSessionTracker(
     }
 
     companion object {
-        const val DEFAULT_WRITE_INTERVAL_MS = 10_000L
+        // Bounds loss after a sudden process death while keeping AtomicFile writes sparse.
+        const val DEFAULT_WRITE_INTERVAL_MS = 5_000L
         const val POSITION_TOLERANCE_SECONDS = 5L
         private const val POSITION_REGRESSION_TOLERANCE_SECONDS = 2L
     }

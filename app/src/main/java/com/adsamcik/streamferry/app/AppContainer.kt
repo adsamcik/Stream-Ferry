@@ -425,9 +425,14 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
         ioScope.launch { runCatching { diagnosticsEventLog.flush() } }
     }
 
-    /** Save renderer-confirmed Smart Resume progress as the app leaves the foreground. */
+    /**
+     * Save renderer-confirmed Smart Resume progress before lifecycle teardown continues. The store uses an
+     * AtomicFile, so this small synchronous checkpoint is intentionally not left in a coroutine that a
+     * background process kill could cancel before it runs.
+     */
     fun checkpointSmartResume() {
-        ioScope.launch { runCatching { playbackEngine.checkpointSmartResumeLifecycle() } }
+        runCatching { playbackEngine.checkpointSmartResumeLifecycle() }
+            .onFailure { logger.w("resume", "Couldn't persist lifecycle playback checkpoint", it) }
     }
 
     /**

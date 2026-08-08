@@ -50,6 +50,33 @@ class SmartResumeTest {
         assertEquals(135, SmartResumePositionReconciler.reconcile(record, rendererConfirmedSeconds = 135, jellyfinResumeSeconds = 90))
     }
 
+    @Test fun matchingJellyfinCheckpointWinsOverStaleServerResume() {
+        val record = SmartResumeReducer.reduce(null, checkpoint(position = 135))!!
+
+        assertEquals(135, SmartResumePositionReconciler.reconcileJellyfinItem(
+            record, itemId = "movie-1", serverId = "server", userId = "user", jellyfinResumeSeconds = 90,
+        ))
+    }
+
+    @Test fun unrelatedJellyfinCheckpointCannotOverrideServerResume() {
+        val record = SmartResumeReducer.reduce(null, checkpoint(position = 135))!!
+
+        assertEquals(90, SmartResumePositionReconciler.reconcileJellyfinItem(
+            record, itemId = "another-movie", serverId = "server", userId = "user", jellyfinResumeSeconds = 90,
+        ))
+    }
+
+    @Test fun finishedMatchingCheckpointPreventsResumingFromStaleServerProgress() {
+        val started = SmartResumeReducer.reduce(null, checkpoint(position = 900))!!
+        val finished = SmartResumeReducer.reduce(
+            started, checkpoint(sequence = 2, position = 995, kind = SmartResumeCheckpointKind.COMPLETED),
+        )!!
+
+        assertNull(SmartResumePositionReconciler.reconcileJellyfinItem(
+            finished, itemId = "movie-1", serverId = "server", userId = "user", jellyfinResumeSeconds = 900,
+        ))
+    }
+
     @Test fun reconciliationKeepsCompletionProtection() {
         val finished = SmartResumeReducer.reduce(
             SmartResumeReducer.reduce(null, checkpoint(position = 900))!!,
@@ -75,6 +102,33 @@ class SmartResumeTest {
         val current = SmartResumeReducer.reduce(null, checkpoint(position = 400))!!
         val sought = SmartResumeReducer.reduce(current, checkpoint(sequence = 2, position = 120, kind = SmartResumeCheckpointKind.SEEK_CONFIRMED))!!
         assertEquals(120, sought.confirmedPositionSeconds)
+    }
+
+    @Test fun lowerNewSessionStartCannotOverwriteSameInProgressCheckpoint() {
+        val current = SmartResumeReducer.reduce(null, checkpoint(position = 900))!!
+
+        val restarted = SmartResumeReducer.reduce(
+            current, checkpoint(sequence = 1, position = 300, generation = 2, sessionId = "new-session"),
+        )!!
+
+        assertEquals(900, restarted.confirmedPositionSeconds)
+        assertEquals("new-session", restarted.sessionId)
+    }
+
+    @Test fun steadyRendererSamplesAdvanceCrashCheckpointWithinFiveSeconds() {
+        var now = 0L
+        val store = MemoryStore()
+        val tracker = SmartResumeSessionTracker(store, clock = { now }, newSessionId = { "session" })
+        tracker.prepare(seed)
+        tracker.onRendererStatus(100, 1_000, isPlaying = true)
+
+        now = 4_999L
+        tracker.onRendererStatus(104, 1_000, isPlaying = true)
+        assertEquals(100, store.current!!.confirmedPositionSeconds)
+
+        now = 5_000L
+        tracker.onRendererStatus(105, 1_000, isPlaying = true)
+        assertEquals(105, store.current!!.confirmedPositionSeconds)
     }
 
     @Test fun lateTeardownCannotResurrectCompletion() {

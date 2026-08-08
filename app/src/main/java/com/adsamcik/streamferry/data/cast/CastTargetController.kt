@@ -40,6 +40,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -133,6 +134,8 @@ class CastTargetController(
     private var sessionListenerRegistration: SessionListenerRegistration? = null
     private val callbackScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var suspensionWatchdogJob: Job? = null
+    /** Keeps durable progress current while the Cast SDK is quiet during steady playback. */
+    private var positionHeartbeatJob: Job? = null
     /** Incremented before every connect/disconnect so delayed callbacks from a superseded session are inert. */
     private var connectionGeneration = 0L
     private var activeBinding: ActiveCastBinding? = null
@@ -273,6 +276,7 @@ class CastTargetController(
     ) = withContext(Dispatchers.Main) {
         val activeClient = requireActiveMediaClient()
         registerMediaCallback()
+        cancelPositionHeartbeat()
         lastPlayerState = null // a fresh load: log the new session's first state transition from "none"
         val metadata = MediaMetadata(MediaMetadata.MEDIA_TYPE_MOVIE).apply {
             putString(MediaMetadata.KEY_TITLE, MetadataSanitizer.receiverTitle(title))
@@ -311,6 +315,7 @@ class CastTargetController(
                 "title=$title dur=${durationSeconds}s start=${startPositionSeconds}s url=$proxyUrl",
         )
         awaitMediaCommand("load", activeClient.client.load(request), activeClient)
+        startPositionHeartbeat(activeClient)
         logger.i(TAG, "Cast load accepted (proxy URL, redacted)")
     }
 
@@ -460,6 +465,32 @@ class CastTargetController(
     }
 
     /**
+     * Cast status callbacks are transition-driven, not a reliable telemetry clock. While media is loaded,
+     * sample the SDK's locally-maintained approximate position on a short, bounded cadence so a sudden
+     * process death loses only a few seconds of progress rather than every quiet minute since the last
+     * receiver callback. No receiver request is issued here.
+     */
+    private fun startPositionHeartbeat(activeClient: ActiveMediaClient) {
+        cancelPositionHeartbeat()
+        positionHeartbeatJob = callbackScope.launch {
+            while (isActive && isCurrentMediaCallback(activeClient.client, activeClient.generation)) {
+                delay(POSITION_HEARTBEAT_INTERVAL_MS)
+                if (isCurrentMediaCallback(activeClient.client, activeClient.generation)) {
+                    emitStatus(activeClient.client, activeClient.generation, isHeartbeat = true)
+                    // Paused/buffering state is checkpointed once above. A later PLAYING callback restarts
+                    // this loop, so an idle TV does not keep writing unchanged progress to disk.
+                    if (activeClient.client.mediaStatus?.playerState != MediaStatus.PLAYER_STATE_PLAYING) return@launch
+                }
+            }
+        }
+    }
+
+    private fun cancelPositionHeartbeat() {
+        positionHeartbeatJob?.cancel()
+        positionHeartbeatJob = null
+    }
+
+    /**
      * Start a Cast session, retrying a transient failure automatically ([ConnectRetryPolicy]) so a first-try
      * hiccup doesn't force the user to tap again. Between attempts it drops any half-open session and settles
      * briefly, then re-selects the route to trigger a fresh start. Throws only after retries are exhausted.
@@ -604,7 +635,7 @@ class CastTargetController(
             .onFailure { logger.w(TAG, "Couldn't unregister Cast media callback: ${it.message ?: it.javaClass.simpleName}") }
     }
 
-    private fun emitStatus(client: RemoteMediaClient, generation: Long) {
+    private fun emitStatus(client: RemoteMediaClient, generation: Long, isHeartbeat: Boolean = false) {
         if (!isCurrentMediaCallback(client, generation)) return
         val status = client.mediaStatus
         val positionSeconds = client.approximateStreamPosition / 1000L
@@ -617,7 +648,17 @@ class CastTargetController(
             logger.event("cast", "Cast player state ${playerStateName(lastPlayerState)} -> ${playerStateName(state)}$detail at ${positionSeconds}s")
             lastPlayerState = state
         }
-        logger.trace(TAG, "Cast status: state=${playerStateName(state)} idle=${idleReasonName(status?.idleReason)} pos=${positionSeconds}s")
+        if (!isHeartbeat) {
+            logger.trace(TAG, "Cast status: state=${playerStateName(state)} idle=${idleReasonName(status?.idleReason)} pos=${positionSeconds}s")
+            val activeClient = activeMediaClientOrNull()
+            if (state == MediaStatus.PLAYER_STATE_PLAYING &&
+                activeClient?.client === client && activeClient.generation == generation
+            ) {
+                startPositionHeartbeat(activeClient)
+            } else if (state != MediaStatus.PLAYER_STATE_PLAYING) {
+                cancelPositionHeartbeat()
+            }
+        }
         when (status?.playerState) {
             MediaStatus.PLAYER_STATE_BUFFERING -> {
                 if (!lastBuffering) { lastBuffering = true; _events.tryEmit(PlaybackTargetEvent.BufferingChanged(true)) }
@@ -766,6 +807,7 @@ class CastTargetController(
     }
 
     private fun detachActiveSession(clearTerminalDisconnectMarker: Boolean = true) {
+        cancelPositionHeartbeat()
         unregisterMediaCallback()
         removeSessionListener()
         activeBinding = null
@@ -834,6 +876,7 @@ class CastTargetController(
         private const val LOAD_TIMEOUT_MS = 20_000L
         private const val ROUTE_RECOVER_MS = 4_000L
         private const val SUSPENSION_GRACE_MS = 30_000L
+        private const val POSITION_HEARTBEAT_INTERVAL_MS = 5_000L
         private const val SESSION_END_TIMEOUT_MS = 5_000L
         private const val SESSION_END_POLL_MS = 50L
 

@@ -1126,6 +1126,7 @@ class MainViewModel(
         reconnectContext = null
         currentResumeKey = null
         currentDurationSeconds = null
+        lastResumeSaveMs = 0L
         val requestedSmartResumePosition = smartResumeOverrideSeconds
         val s = _state.value
         val physicalTv = s.selectedPhysicalTv ?: run {
@@ -1234,6 +1235,11 @@ class MainViewModel(
                     container.playbackEngine.play(
                         item, controller, target,
                         streamPreferences(item),
+                        // Prefer the exact, atomic renderer checkpoint for this item/account. Jellyfin's
+                        // server resume remains the fallback and is refreshed by the next heartbeat.
+                        resumePositionOverrideSeconds = requestedSmartResumePosition
+                            ?: durableOnlineResumePosition(item)
+                            ?: 0L,
                         autoAdvance = autoAdvance,
                         smartResumeSeed = onlineSmartResumeSeed(item),
                         smartResumeDeviceContext = resumeDeviceContext,
@@ -2390,6 +2396,22 @@ class MainViewModel(
             }
         }
     }
+    /**
+     * Use the local AtomicFile checkpoint only for the exact Jellyfin identity currently selected.
+     * This lets a direct tap on Continue Watching recover from a crash even before the server receives
+     * the next progress report, without allowing another account's checkpoint to affect playback.
+     */
+    private fun durableOnlineResumePosition(item: MediaItem): Long? {
+        val user = container.authRepository.currentUser.value ?: return item.resumePositionSeconds
+        return SmartResumePositionReconciler.reconcileJellyfinItem(
+            record = container.smartResumeStore.current,
+            itemId = item.id,
+            serverId = user.serverId,
+            userId = user.userId,
+            jellyfinResumeSeconds = item.resumePositionSeconds,
+        )
+    }
+
     /** Throttled persist of the current local-file playback position ("where you left off"). */
     private fun saveResumeThrottled(positionSeconds: Long) {
         val key = currentResumeKey ?: return
@@ -2404,6 +2426,7 @@ class MainViewModel(
         currentResumeKey?.let { container.resumeStore.save(it, lastPlaybackPositionSeconds, currentDurationSeconds) }
         currentResumeKey = null
         currentDurationSeconds = null
+        lastResumeSaveMs = 0L
     }
 
     /** A genuine local/download completion is not resumable; discard any checkpoint from its last status tick. */
@@ -2411,6 +2434,7 @@ class MainViewModel(
         currentResumeKey?.let { container.resumeStore.remove(it) }
         currentResumeKey = null
         currentDurationSeconds = null
+        lastResumeSaveMs = 0L
     }
 
     /**
@@ -2761,7 +2785,7 @@ class MainViewModel(
         const val LIBRARY_ERROR = "Couldn't load your library. Check the connection and try again."
         const val SEARCH_DEBOUNCE_MS = 350L
         const val RECONNECT_DELAY_MS = 2_000L
-        const val RESUME_SAVE_INTERVAL_MS = 10_000L
+        const val RESUME_SAVE_INTERVAL_MS = 5_000L
         const val NANOS_PER_MILLISECOND = 1_000_000L
     }
 }

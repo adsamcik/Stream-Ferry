@@ -23,9 +23,11 @@ class ResumeStore(context: Context) {
             remove(itemId)
             return
         }
+        // This is the local/offline crash checkpoint. Commit before returning so an abrupt process
+        // death cannot discard a position that the caller has already acknowledged as saved.
         prefs.edit()
             .putString(itemId, encode(Entry(positionSeconds, durationSeconds, System.currentTimeMillis())))
-            .apply()
+            .commit()
         evictIfNeeded()
     }
 
@@ -38,11 +40,11 @@ class ResumeStore(context: Context) {
     fun get(itemId: String): Entry? = prefs.getString(itemId, null)?.let(::decode)
 
     fun remove(itemId: String) {
-        prefs.edit().remove(itemId).apply()
+        prefs.edit().remove(itemId).commit()
     }
 
     fun clear() {
-        prefs.edit().clear().apply()
+        prefs.edit().clear().commit()
     }
 
     private fun evictIfNeeded() {
@@ -53,7 +55,7 @@ class ResumeStore(context: Context) {
             .sortedBy { it.second }
             .take(all.size - MAX_ENTRIES)
             .map { it.first }
-        prefs.edit().apply { oldest.forEach { remove(it) } }.apply()
+        prefs.edit().apply { oldest.forEach { remove(it) } }.commit()
     }
 
     private fun encode(entry: Entry): String =
