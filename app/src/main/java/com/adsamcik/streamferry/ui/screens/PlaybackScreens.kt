@@ -305,6 +305,12 @@ private fun PhysicalTvGroup(
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         targets.forEach { target ->
             val playbackStarting = target.id == playbackTargetId
+            val connectionSummary = target.connectionSummary()
+            val targetIcon = if (target.castEndpoint != null && target.dlnaEndpoint == null) {
+                Icons.Rounded.Cast
+            } else {
+                Icons.Rounded.Tv
+            }
             Card(
                 onClick = { onSelect(target) },
                 enabled = playbackTargetId == null,
@@ -335,7 +341,7 @@ private fun PhysicalTvGroup(
                             contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
                         ) {
                             Box(contentAlignment = Alignment.Center) {
-                                Icon(Icons.Rounded.Tv, contentDescription = null, modifier = Modifier.size(26.dp))
+                                Icon(targetIcon, contentDescription = null, modifier = Modifier.size(26.dp))
                             }
                         }
                         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
@@ -346,10 +352,8 @@ private fun PhysicalTvGroup(
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
                             )
-                            val models = target.availableEndpoints.mapNotNull { it.capabilities.modelName }
-                                .map(String::trim).filter(String::isNotEmpty).distinct()
                             Text(
-                                models.firstOrNull() ?: "Available now",
+                                target.connectionDetail(),
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 maxLines = 1,
@@ -373,7 +377,7 @@ private fun PhysicalTvGroup(
                                 Box(contentAlignment = Alignment.Center) {
                                     Icon(
                                         Icons.Rounded.PlayArrow,
-                                        contentDescription = "Play on ${target.displayName}",
+                                        contentDescription = "Play on ${target.displayName} via $connectionSummary",
                                     )
                                 }
                             }
@@ -390,6 +394,27 @@ private fun PhysicalTvGroup(
             }
         }
     }
+}
+
+private fun PhysicalTv.connectionSummary(): String = buildList {
+    if (castEndpoint != null) add("Google Cast")
+    if (dlnaEndpoint != null) add("DLNA")
+}.joinToString(" + ")
+
+private fun PhysicalTv.connectionDetail(): String {
+    val summary = connectionSummary()
+    val selectedEndpoint = selectEndpoint()
+    return if (availableEndpoints.size > 1) {
+        "$summary • ${selectedEndpoint?.protocol?.pickerLabel() ?: "Preferred connection"} selected"
+    } else {
+        val model = selectedEndpoint?.capabilities?.modelName?.trim()?.takeIf(String::isNotEmpty)
+        "$summary • ${model ?: "Available now"}"
+    }
+}
+
+private fun Protocol.pickerLabel(): String = when (this) {
+    Protocol.CAST -> "Google Cast"
+    Protocol.DLNA -> "DLNA"
 }
 
 @Composable

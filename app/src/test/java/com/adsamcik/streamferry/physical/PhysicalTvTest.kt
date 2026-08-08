@@ -17,6 +17,29 @@ class PhysicalTvTest {
         assertTrue(PhysicalMatchReason.MATCHING_VALIDATED_HOST_AND_MODEL in match.reasons)
     }
 
+    @Test fun integratedLgTvMatchesCastHardwareModelWithGenericDlnaModel() {
+        val cast = cast(
+            name = "[LG] webOS TV UR81003LJ",
+            host = "192.168.1.20",
+            model = "43UR81003LJ",
+        )
+        val dlna = dlna(
+            name = "[LG] webOS TV UR81003LJ",
+            host = "192.168.1.20",
+            model = "LG TV",
+            manufacturer = "LG Electronics",
+        )
+
+        val match = PhysicalTvMatcher.match(cast, dlna)
+        val tv = PhysicalTvAggregator.aggregate(listOf(cast, dlna)).physicalTvs.single()
+
+        assertEquals(PhysicalMatchOutcome.CONFIDENT, match.outcome)
+        assertTrue(PhysicalMatchReason.MATCHING_VALIDATED_HOST_AND_INTEGRATED_TV_IDENTITY in match.reasons)
+        assertEquals(cast, tv.castEndpoint)
+        assertEquals(dlna, tv.dlnaEndpoint)
+        assertEquals(Protocol.CAST, tv.selectEndpoint()?.protocol)
+    }
+
     @Test fun hostEqualityAloneIsAmbiguous() {
         val match = PhysicalTvMatcher.match(cast(host = "192.168.1.20", model = "Sony XR-55A80L"), dlna(host = "192.168.1.20", model = "LG OLED C4"))
         assertEquals(PhysicalMatchOutcome.AMBIGUOUS, match.outcome)
@@ -159,9 +182,21 @@ class PhysicalTvTest {
             volumeControlAvailable = true,
         ),
     )
-    private fun dlna(id: String = "uuid:dlna-id", name: String = "TV", host: String? = null, model: String? = null) = target(
+    private fun dlna(
+        id: String = "uuid:dlna-id",
+        name: String = "TV",
+        host: String? = null,
+        model: String? = null,
+        manufacturer: String? = null,
+    ) = target(
         id, name, Protocol.DLNA,
-        TargetDiscoveryMetadata(dlnaUdn = id, dlnaUsn = "$id::urn:schemas-upnp-org:device:MediaRenderer:1", validatedSourceHost = host, modelName = model),
+        TargetDiscoveryMetadata(
+            dlnaUdn = id,
+            dlnaUsn = "$id::urn:schemas-upnp-org:device:MediaRenderer:1",
+            validatedSourceHost = host,
+            manufacturer = manufacturer,
+            modelName = model,
+        ),
     )
     private fun target(id: String, name: String, protocol: Protocol, metadata: TargetDiscoveryMetadata) = DiscoveredTarget(
         id = id,

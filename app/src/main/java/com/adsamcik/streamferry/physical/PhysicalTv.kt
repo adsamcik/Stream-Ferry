@@ -34,6 +34,7 @@ enum class PhysicalMatchOutcome { CONFIDENT, AMBIGUOUS, NO_MATCH }
 enum class PhysicalMatchReason {
     PERSISTED_STABLE_ID_ASSOCIATION,
     MATCHING_VALIDATED_HOST_AND_MODEL,
+    MATCHING_VALIDATED_HOST_AND_INTEGRATED_TV_IDENTITY,
     MISSING_STABLE_ID,
     SAME_PROTOCOL,
     NO_SHARED_VALIDATED_HOST,
@@ -207,6 +208,12 @@ object PhysicalTvMatcher {
                 setOf(PhysicalMatchReason.MATCHING_VALIDATED_HOST_AND_MODEL),
             )
         }
+        if (matchesIntegratedTvIdentity(cast, dlna, sameName)) {
+            return PhysicalTvMatch(
+                cast, dlna, PhysicalMatchOutcome.CONFIDENT,
+                setOf(PhysicalMatchReason.MATCHING_VALIDATED_HOST_AND_INTEGRATED_TV_IDENTITY),
+            )
+        }
         return PhysicalTvMatch(cast, dlna, PhysicalMatchOutcome.AMBIGUOUS, buildSet {
             add(PhysicalMatchReason.SHARED_HOST_WITHOUT_INDEPENDENT_DEVICE_EVIDENCE)
             if (missingStableId) add(PhysicalMatchReason.MISSING_STABLE_ID)
@@ -227,6 +234,33 @@ object PhysicalTvMatcher {
 
     private fun hasConflictingSpecificModel(first: TargetDiscoveryMetadata, second: TargetDiscoveryMetadata): Boolean =
         specificModel(first.modelName)?.let { it != specificModel(second.modelName) } == true
+
+    /**
+     * Some renderers advertise only a manufacturer family (for example "LG TV") over DLNA while
+     * Cast reports the hardware model. A shared, validated host plus an exact route name and a
+     * shared TV brand is enough to identify that integrated screen, but only when Cast carries a
+     * specific hardware model and DLNA does not claim a different one.
+     */
+    private fun matchesIntegratedTvIdentity(
+        cast: DiscoveredTarget,
+        dlna: DiscoveredTarget,
+        sameName: Boolean,
+    ): Boolean {
+        if (!sameName) return false
+        if (specificModel(cast.discoveryMetadata.modelName) == null) return false
+        if (specificModel(dlna.discoveryMetadata.modelName) != null) return false
+        val castBrand = recognizedTvBrand(
+            cast.discoveryMetadata.manufacturer,
+            cast.discoveryMetadata.modelName,
+            cast.displayName,
+        )
+        val dlnaBrand = recognizedTvBrand(
+            dlna.discoveryMetadata.manufacturer,
+            dlna.discoveryMetadata.modelName,
+            dlna.displayName,
+        )
+        return castBrand != null && castBrand == dlnaBrand
+    }
 }
 
 /** Aggregates only mutual one-to-one confident pairs; uncertain endpoints stay separate. */
@@ -289,7 +323,37 @@ private fun TargetDiscoveryMetadata.validatedHosts(): Set<String> =
 private fun String?.stableId(): String? = normalizedLabel(this)?.take(256)
 private fun normalizedHost(value: String?): String? = normalizedLabel(value)
 private fun normalizedLabel(value: String?): String? = value?.trim()?.lowercase(Locale.ROOT)?.takeIf { it.isNotEmpty() }
+private val genericModelIdentities = setOf(
+    "androidtv",
+    "googletv",
+    "lgtv",
+    "mediarenderer",
+    "smarttv",
+    "tizen",
+    "tizentv",
+    "unknown",
+    "vidaa",
+    "webostv",
+)
+
+private val knownTvBrandSignatures = listOf(
+    "lg" to Regex("""\blg\b|\bwebos\b"""),
+    "samsung" to Regex("""\bsamsung\b|\btizen\b"""),
+    "sony" to Regex("""\bsony\b|\bbravia\b"""),
+    "tcl" to Regex("""\btcl\b"""),
+    "hisense" to Regex("""\bhisense\b|\bvidaa\b"""),
+    "philips" to Regex("""\bphilips\b"""),
+    "panasonic" to Regex("""\bpanasonic\b"""),
+    "sharp" to Regex("""\bsharp\b"""),
+    "vizio" to Regex("""\bvizio\b"""),
+)
+
+private fun recognizedTvBrand(vararg values: String?): String? {
+    val identity = values.mapNotNull(::normalizedLabel).joinToString(" ")
+    return knownTvBrandSignatures.firstOrNull { (_, signature) -> signature.containsMatchIn(identity) }?.first
+}
+
 private fun specificModel(value: String?): String? {
     val model = normalizedLabel(value)?.replace(Regex("[^a-z0-9]+"), "") ?: return null
-    return model.takeIf { it.length >= 5 && it !in setOf("smarttv", "androidtv", "mediarenderer", "unknown") }
+    return model.takeIf { it.length >= 5 && it !in genericModelIdentities }
 }
