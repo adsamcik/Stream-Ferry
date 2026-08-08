@@ -343,6 +343,8 @@ interface PlaybackTargetController {
     suspend fun pause()
     suspend fun seekTo(positionSeconds: Long)
     suspend fun stop()
+    /** Current normalized master volume from the renderer, or null when it cannot be read safely. */
+    suspend fun readCurrentVolume(): Float? = null
     suspend fun setVolume(level: Float)
     suspend fun disconnect()
 

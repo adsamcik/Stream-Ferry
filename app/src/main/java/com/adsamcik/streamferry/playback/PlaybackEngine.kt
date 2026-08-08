@@ -42,6 +42,7 @@ import com.adsamcik.streamferry.core.volume.NightVolumeInput
 import com.adsamcik.streamferry.core.volume.NightVolumePolicy
 import com.adsamcik.streamferry.core.volume.NightVolumeScheduler
 import com.adsamcik.streamferry.core.volume.NightVolumeSession
+import com.adsamcik.streamferry.core.volume.RendererVolumeState
 import com.adsamcik.streamferry.core.segments.MediaSegment
 import com.adsamcik.streamferry.core.segments.MediaSegmentTracker
 import com.adsamcik.streamferry.data.transcode.ClientTranscodeSession
@@ -107,7 +108,7 @@ data class PlaybackStatus(
     /** Short description of the OUTPUT sent to the TV when transcoding (codec · resolution · engine); null = direct. */
     val outputFormat: String? = null,
     val volume: Float = 1f,
-    /** False when discovery could not validate a renderer volume-control service. */
+    /** False until the active renderer has reported a valid volume baseline. */
     val volumeSupported: Boolean = false,
     val title: String = "",
     val errorMessage: String? = null,
@@ -279,7 +280,9 @@ class PlaybackEngine(
     // Optional current-session cap. Choosing it forces a server transcode so it can recover a stream
     // without requiring the user to leave playback or edit their default in Settings.
     @Volatile private var manualMaxVideoHeight: Int? = null
-    @Volatile private var volume = 1f
+    @Volatile private var rendererVolume = RendererVolumeState()
+    private val volume: Float get() = rendererVolume.level
+    private val volumeSynchronized: Boolean get() = rendererVolume.isSynchronized
     @Volatile private var smartResumeDeviceContext: SmartResumeDeviceContext? = null
     /** Session-only state survives an automatic protocol handoff, but never a fresh user Play. */
     @Volatile private var nightVolumeSession = NightVolumeSession()
@@ -463,7 +466,6 @@ class PlaybackEngine(
         stopInternalLocked("starting new playback")
         nightVolumeSession = preservedNightVolumeSession ?: NightVolumeSession(
             startedAt = Instant.ofEpochMilli(clock()),
-            startingVolume = volume,
         )
         this@PlaybackEngine.smartResumeDeviceContext = smartResumeDeviceContext
         smartResume.prepare(smartResumeSeed, smartResumeDeviceContext)
@@ -503,6 +505,7 @@ class PlaybackEngine(
             onForegrounded()
             eventsJob = scope.launch { target.events.collect { onTargetEvent(target, it) } }
             target.connect(selectedTarget)
+            synchronizeVolumeFromTargetLocked()
             val startPos = resumePositionOverrideSeconds ?: item.resumePositionSeconds ?: 0L
             startPlaybackWithFallback(startPos, requestedBitrate = prefs.maxBitrateBps)
             // Now that the first resolve has revealed the media's tracks, honor the user's preferred /
@@ -662,8 +665,31 @@ class PlaybackEngine(
         val t = target ?: return
         val requested = level.coerceIn(0f, 1f)
         t.setVolume(requested)
-        volume = requested
+        rendererVolume = rendererVolume.acceptExplicit(requested)
         publishStatus()
+    }
+
+    /** Reads the TV before enabling a relative adjustment; a stale phone-side default is never used. */
+    private suspend fun synchronizeVolumeFromTargetLocked(): Boolean {
+        val controller = target ?: return false
+        val endpoint = selectedTarget ?: return false
+        if (!endpoint.discoveryMetadata.volumeControlAvailable) return false
+        rendererVolume = rendererVolume.awaitRenderer()
+        val reported = runCatching { controller.readCurrentVolume() }
+            .onFailure { logger.w(TAG, "Couldn't read the TV's current volume", it) }
+            .getOrNull()
+        rendererVolume = rendererVolume.acceptReported(reported)
+        if (!volumeSynchronized) {
+            logger.w(TAG, "TV did not report an initial volume; remote volume controls remain disabled")
+            publishStatus()
+            return false
+        }
+        if (nightVolumeSession.startingVolume == null) {
+            nightVolumeSession = nightVolumeSession.copy(startingVolume = volume)
+        }
+        logger.event("playback", "TV volume synchronized to ${(volume * 100).toInt()}%")
+        publishStatus()
+        return true
     }
 
     /** Step volume up (direction > 0) or down (direction < 0) by one notch. */
@@ -671,8 +697,10 @@ class PlaybackEngine(
         if (direction == 0) return
         mutex.withLock {
             requireLocalNetworkAccess()
+            if (!volumeSynchronized && !synchronizeVolumeFromTargetLocked()) return@withLock
+            val requested = rendererVolume.adjustedLevel(direction, VOLUME_STEP) ?: return@withLock
             suspendNightVolumeAutomationForManualAdjustment()
-            setVolumeLocked(volume + if (direction > 0) VOLUME_STEP else -VOLUME_STEP)
+            setVolumeLocked(requested)
         }
     }
 
@@ -702,7 +730,6 @@ class PlaybackEngine(
         stopInternalLocked("starting downloaded playback")
         nightVolumeSession = preservedNightVolumeSession ?: NightVolumeSession(
             startedAt = Instant.ofEpochMilli(clock()),
-            startingVolume = volume,
         )
         this@PlaybackEngine.smartResumeDeviceContext = smartResumeDeviceContext
         smartResume.prepare(smartResumeSeed, smartResumeDeviceContext)
@@ -722,6 +749,7 @@ class PlaybackEngine(
             onForegrounded()
             eventsJob = scope.launch { target.events.collect { onTargetEvent(target, it) } }
             target.connect(selectedTarget)
+            synchronizeVolumeFromTargetLocked()
             loadLocalStreamLocked(resumePositionSeconds.coerceAtLeast(0))
             monitorJob = scope.launch { monitorLoop() }
         } catch (e: CancellationException) {
@@ -1789,7 +1817,7 @@ class PlaybackEngine(
                 now = Instant.ofEpochMilli(clock()),
                 zoneId = ZoneId.systemDefault(),
                 activePlayback = isPlaying,
-                volumeSupported = endpoint.discoveryMetadata.volumeControlAvailable,
+                volumeSupported = endpoint.discoveryMetadata.volumeControlAvailable && volumeSynchronized,
                 effectiveVolume = volume,
             ),
             nightVolumeSession,
@@ -1809,7 +1837,7 @@ class PlaybackEngine(
                 now = Instant.ofEpochMilli(clock()),
                 zoneId = ZoneId.systemDefault(),
                 activePlayback = target != null,
-                volumeSupported = endpoint?.discoveryMetadata?.volumeControlAvailable == true,
+                volumeSupported = endpoint?.discoveryMetadata?.volumeControlAvailable == true && volumeSynchronized,
                 effectiveVolume = volume,
                 manualVolumeAdjusted = true,
             ),
@@ -2140,6 +2168,7 @@ class PlaybackEngine(
         manualMaxVideoHeight = null
         lastThroughputBps = 0
         nightVolumeSession = NightVolumeSession()
+        rendererVolume = RendererVolumeState()
         _status.value = null
         smartResume.detach()
         smartResumeDeviceContext = null
@@ -2216,7 +2245,7 @@ class PlaybackEngine(
             sourceFormat = describeSource(srcProfile),
             outputFormat = describeOutput(odt),
             volume = volume,
-            volumeSupported = sel.discoveryMetadata.volumeControlAvailable,
+            volumeSupported = sel.discoveryMetadata.volumeControlAvailable && volumeSynchronized,
             title = item?.title ?: localPlayback?.title.orEmpty(),
             errorMessage = error,
             phase = recovery.phase,

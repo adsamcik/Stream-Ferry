@@ -479,6 +479,16 @@ class DlnaTargetController(
         "<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>${DidlLite.formatDuration(positionSeconds)}</Target>",
     )
 
+    override suspend fun readCurrentVolume(): Float? = withContext(Dispatchers.IO) {
+        val endpoint = connected?.renderingControl ?: return@withContext null
+        runCatching {
+            val reported = TAG_CURRENT_VOLUME.find(
+                soap(endpoint, "GetVolume", "<InstanceID>0</InstanceID><Channel>Master</Channel>"),
+            )?.groupValues?.get(1)?.trim()?.toIntOrNull() ?: return@runCatching null
+            reported.takeIf { it in 0..100 }?.div(100f)
+        }.onFailure { logger.w(TAG, "DLNA GetVolume failed", it) }.getOrNull()
+    }
+
     /**
      * Issue an AVTransport control action, then wake the status poll so the phone reflects the change (new
      * position after a seek / transport state after play/pause) within ~a SOAP round-trip instead of up to
@@ -748,6 +758,7 @@ class DlnaTargetController(
         private const val UPNP_TRANSITION_NOT_AVAILABLE = 701
         private const val SET_URI_RETRY_DELAY_MS = 800L
         private val TAG_REL_TIME = Regex("<(?:[\\w-]+:)?RelTime>([^<]*)</", RegexOption.IGNORE_CASE)
+        private val TAG_CURRENT_VOLUME = Regex("<(?:[\\w-]+:)?CurrentVolume>\\s*([^<]+?)\\s*</", RegexOption.IGNORE_CASE)
         private val TAG_UPNP_ERROR = Regex("<errorCode>\\s*(\\d+)\\s*</errorCode>", RegexOption.IGNORE_CASE)
 
         /**

@@ -349,6 +349,11 @@ class CastTargetController(
         client.seek(MediaSeekOptions.Builder().setPosition(positionSeconds.coerceAtLeast(0) * 1000L).build())
     }
     override suspend fun stop() = runMediaCommand("stop") { it.stop() }
+    override suspend fun readCurrentVolume(): Float? = withContext(Dispatchers.Main) {
+        requireActiveMediaClient().session.volume.toFloat().takeIf { level ->
+            !level.isNaN() && !level.isInfinite() && level in 0f..1f
+        }
+    }
     override suspend fun setVolume(level: Float) = withContext(Dispatchers.Main) {
         val activeClient = requireActiveMediaClient()
         activeClient.session.volume = level.coerceIn(0f, 1f).toDouble()

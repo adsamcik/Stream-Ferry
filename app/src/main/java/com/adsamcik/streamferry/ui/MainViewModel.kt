@@ -1128,7 +1128,7 @@ class MainViewModel(
             durationSeconds = s.selectedItem?.runtimeSeconds,
             phase = PlaybackPhase.CONNECTING,
             adaptiveNote = "Connecting to the TV…",
-            volumeSupported = target.discoveryMetadata.volumeControlAvailable,
+            volumeSupported = false,
         )
         val goToPlayback = {
             _state.update {
@@ -2106,7 +2106,7 @@ class MainViewModel(
                 targetName = context.physicalTv.displayName,
                 protocol = context.endpoint.protocol.name,
                 durationSeconds = currentDurationSeconds,
-                volumeSupported = context.endpoint.discoveryMetadata.volumeControlAvailable,
+                volumeSupported = false,
             )
             current.copy(
                 route = Route.PLAYBACK,

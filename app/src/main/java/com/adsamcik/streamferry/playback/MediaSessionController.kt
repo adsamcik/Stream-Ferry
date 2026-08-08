@@ -13,6 +13,7 @@ import android.os.Looper
 import android.os.SystemClock
 import com.adsamcik.streamferry.R
 import com.adsamcik.streamferry.core.metadata.MetadataSanitizer
+import kotlin.math.roundToInt
 
 /**
  * Bridges the [PlaybackEngine] to the Android media framework so the user gets real **playback
@@ -41,6 +42,8 @@ class MediaSessionController(
 
     private val appContext = context.applicationContext
     private val notificationManager = appContext.getSystemService(NotificationManager::class.java)
+    @Volatile private var remoteVolumeEnabled = false
+    private val remoteVolumeProvider = volumeProvider()
 
     private val session = MediaSession(appContext, "StreamFerry").apply {
         // Bind callbacks to the main Looper explicitly: the 1-arg setCallback() would otherwise use
@@ -59,7 +62,7 @@ class MediaSessionController(
             Handler(Looper.getMainLooper()),
         )
         contentIntent?.let(::setSessionActivity)
-        setPlaybackToRemote(volumeProvider())
+        setPlaybackToRemote(remoteVolumeProvider)
     }
 
     val token: MediaSession.Token get() = session.sessionToken
@@ -76,10 +79,12 @@ class MediaSessionController(
     private fun volumeProvider(): VolumeProvider =
         object : VolumeProvider(VOLUME_CONTROL_RELATIVE, MAX_VOLUME, MAX_VOLUME) {
             override fun onAdjustVolume(direction: Int) {
+                if (!remoteVolumeEnabled) return
                 currentVolume = (currentVolume + direction).coerceIn(0, MAX_VOLUME)
                 transport.onAdjustVolume(direction)
             }
             override fun onSetVolumeTo(volume: Int) {
+                if (!remoteVolumeEnabled) return
                 currentVolume = volume.coerceIn(0, MAX_VOLUME)
                 transport.onSetVolume(currentVolume.toFloat() / MAX_VOLUME)
             }
@@ -87,6 +92,10 @@ class MediaSessionController(
 
     /** Reflect the latest engine status into the session + notification. */
     fun update(status: PlaybackStatus?) {
+        remoteVolumeEnabled = status?.volumeSupported == true
+        if (remoteVolumeEnabled) {
+            remoteVolumeProvider.setCurrentVolume((status!!.volume * MAX_VOLUME).roundToInt().coerceIn(0, MAX_VOLUME))
+        }
         if (status == null) {
             session.setPlaybackState(stateOf(PlaybackState.STATE_STOPPED, 0, false))
             session.isActive = false
