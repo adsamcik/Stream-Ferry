@@ -1,6 +1,5 @@
 package com.adsamcik.streamferry.data.download
 
-import com.adsamcik.streamferry.core.download.DownloadPaths
 import com.adsamcik.streamferry.core.net.TrustedMediaOriginPolicy
 import com.adsamcik.streamferry.core.resilience.Backoff
 import com.adsamcik.streamferry.core.resilience.RetryBudget
@@ -47,6 +46,8 @@ class MediaDownloader(
     private val httpClient: OkHttpClient,
     private val logger: DiagnosticsLogger,
     private val scope: CoroutineScope,
+    /** Non-null in production: the one account whose token/origin is installed in [jellyfin]. */
+    private val activeOwnerProvider: (() -> DownloadOwner?)? = null,
 ) {
     /** Redirects are inspected below before an authenticated download request is re-issued. */
     private val pinnedHttpClient = httpClient.newBuilder()
@@ -63,16 +64,23 @@ class MediaDownloader(
         data class Failed(val reason: String) : DownloadState
     }
 
-    private val _states = MutableStateFlow<Map<String, DownloadState>>(emptyMap())
-    val states: StateFlow<Map<String, DownloadState>> = _states.asStateFlow()
+    /**
+     * Live download state keyed by the full server/user/item identity, never by a bare Jellyfin id.
+     * Consumers must filter by [DownloadIdentity.owner] before presenting a server's downloads.
+     */
+    private val _states = MutableStateFlow<Map<DownloadIdentity, DownloadState>>(emptyMap())
+    val states: StateFlow<Map<DownloadIdentity, DownloadState>> = _states.asStateFlow()
 
-    private val jobs = ConcurrentHashMap<String, Job>()
+    private val jobs = ConcurrentHashMap<DownloadIdentity, Job>()
+    /** Identities explicitly paused for an auth transition; their queue rows and partial bytes survive. */
+    private val pauseRequests = ConcurrentHashMap.newKeySet<DownloadIdentity>()
 
     /** Titles of in-flight downloads, so the UI can label a download resumed after process death. */
-    private val titles = ConcurrentHashMap<String, String>()
+    private val titles = ConcurrentHashMap<DownloadIdentity, String>()
 
     /** Title for an in-flight (queued/running) download, or null once it has completed/cleared. */
-    fun titleFor(itemId: String): String? = titles[itemId]
+    fun titleFor(itemId: String, owner: DownloadOwner? = null): String? =
+        titles[DownloadIdentity(owner, itemId)]
 
     // Progress-aware retry budget so a download auto-recovers across brief outages, server flakiness,
     // or Wi-Fi<->cellular switches without user action. The consecutive-failure counter resets whenever
@@ -87,104 +95,145 @@ class MediaDownloader(
     /** Start downloading [item] with the chosen [format] (no-op if already in progress). A previously
      *  interrupted Original download resumes from its `.part` file; Transcode downloads always restart.
      *  The request is persisted so it can be resumed automatically if the process is killed. */
-    fun download(item: MediaItem, format: DownloadFormat = DownloadFormat.Original) {
+    fun download(
+        item: MediaItem,
+        format: DownloadFormat = DownloadFormat.Original,
+        owner: DownloadOwner? = null,
+    ) {
+        val identity = DownloadIdentity(owner, item.id)
         // Build the job LAZILY and claim the per-item slot atomically with putIfAbsent, so two callers
         // (e.g. the sticky-service restart and the connectivity callback both invoking resumePending on
         // different dispatchers) can never start two coroutines writing the same `.part` concurrently.
         val job = scope.launch(start = CoroutineStart.LAZY) {
             try {
                 // Persist the intent FIRST so a kill mid-download still leaves a resumable record.
-                runCatching { queue.add(PendingDownload(item.id, item.title, PersistedFormat.from(format))) }
+                runCatching {
+                    queue.add(
+                        PendingDownload(
+                            itemId = item.id,
+                            title = item.title,
+                            format = PersistedFormat.from(format),
+                            owner = owner,
+                            mediaItem = item,
+                        ),
+                    )
+                }
                     .onFailure { logger.w("download", "Failed to persist download intent; resume-after-kill unavailable", it) }
                 logger.event("download", "Download started: ${item.title} (${format.label})")
-                runDownloadWithRecovery(item, format)
-                setState(item.id, DownloadState.Completed)
+                runDownloadWithRecovery(item, format, owner)
+                setState(identity, DownloadState.Completed)
                 logger.event("download", "Download completed: ${item.title}")
-                titles.remove(item.id)
-                runCatching { queue.remove(item.id) }
+                titles.remove(identity)
+                runCatching { queue.remove(item.id, owner) }
             } catch (c: CancellationException) {
-                // Explicit cancel: discard the partial file + validator (a fresh start next time). The
-                // queue entry is removed by cancel()/delete()/cancelAllAndJoin(), not here (we may be
-                // running in an already-cancelled context where suspend calls can't complete).
-                runCatching { store.partFileFor(item.id).delete() }
-                runCatching { store.partMetaFileFor(item.id).delete() }
-                clearState(item.id)
+                // An auth transition pauses rather than cancels: retain the queue row, validator, and
+                // partial bytes so the same owner can safely resume later. Explicit cancellation/delete
+                // still discards the partial copy through the normal path below.
+                if (pauseRequests.remove(identity)) {
+                    logger.event("download", "Paused download until its Jellyfin account is active again")
+                } else {
+                    runCatching { store.partFileFor(item.id, owner).delete() }
+                    runCatching { store.partMetaFileFor(item.id, owner).delete() }
+                }
+                clearState(identity)
+                titles.remove(identity)
                 throw c
             } catch (e: Exception) {
                 if (isRecoverable(e)) {
                     // Transient (network/5xx): keep the `.part` AND the queue entry so it auto-resumes on
                     // the next connectivity callback, app launch, or sticky-service restart.
                     logger.w("download", "Download failed; will auto-resume (${e.javaClass.simpleName})", e)
-                    setState(item.id, DownloadState.Failed(friendly(e)))
+                    setState(identity, DownloadState.Failed(friendly(e)))
                 } else {
                     // Permanent (404/403/auth, or a non-downloadable/HLS-only title): drop the queue
                     // entry so it is NOT relaunched forever, and discard the unusable partial file.
                     logger.e("download", "Download failed permanently (${e.javaClass.simpleName})", e)
-                    runCatching { queue.remove(item.id) }
-                    runCatching { store.partFileFor(item.id).delete() }
-                    runCatching { store.partMetaFileFor(item.id).delete() }
-                    setState(item.id, DownloadState.Failed(friendly(e)))
+                    runCatching { queue.remove(item.id, owner) }
+                    runCatching { store.partFileFor(item.id, owner).delete() }
+                    runCatching { store.partMetaFileFor(item.id, owner).delete() }
+                    setState(identity, DownloadState.Failed(friendly(e)))
                 }
             }
         }
         // Always untrack our own job on any terminal state (complete/fail/cancel, even if never started),
         // so a slot can't leak and block a future re-download.
-        job.invokeOnCompletion { jobs.remove(item.id, job) }
-        if (jobs.putIfAbsent(item.id, job) != null) {
+        job.invokeOnCompletion { jobs.remove(identity, job) }
+        if (jobs.putIfAbsent(identity, job) != null) {
             job.cancel() // another download for this item already owns the slot
             return
         }
-        titles[item.id] = item.title
-        setState(item.id, DownloadState.Queued)
+        titles[identity] = item.title
+        setState(identity, DownloadState.Queued)
         job.start()
     }
 
     /**
-     * Re-enqueue any persisted-but-unfinished downloads (after a process kill or sticky-service restart).
-     * Returns true if at least one download was (re)started. Idempotent: skips items already completed or
-     * already running this session.
+     * Re-enqueue persisted-but-unfinished requests for the currently authenticated Jellyfin owner.
+     * The owner is required: the underlying Jellyfin client carries one server/token and must never
+     * resolve another account's queued item after an account switch.
      */
-    suspend fun resumePending(): Boolean {
-        val pending = queue.all()
-        if (pending.isEmpty()) return false
-        val completed = runCatching { store.list().map { it.itemId }.toSet() }.getOrDefault(emptySet())
+    suspend fun resumePending(owner: DownloadOwner): Boolean {
+        if (!isOwnerActive(owner)) return false
+        return resumePendingEntries(owner, queue.allForOwner(owner))
+    }
+
+    /** True when this authenticated Jellyfin owner has a persisted unfinished request. */
+    suspend fun hasPendingPersisted(owner: DownloadOwner): Boolean =
+        hasPendingEntries(owner, queue.allForOwner(owner))
+
+    private suspend fun resumePendingEntries(
+        owner: DownloadOwner,
+        pending: List<PendingDownload>,
+    ): Boolean {
+        val uniquePending = pending.distinctBy { it.identity }
+        if (uniquePending.isEmpty()) return false
+        val completed = runCatching { store.list(owner).map { it.identity }.toSet() }.getOrDefault(emptySet())
         // Drop stale entries whose download actually completed already.
-        pending.filter { it.itemId in completed }.forEach { runCatching { queue.remove(it.itemId) } }
-        val toResume = DownloadQueue.selectResumable(pending, completed, jobs.keys)
-        toResume.forEach { p -> download(reconstructItem(p), p.format.toDownloadFormat()) }
+        uniquePending.filter { it.identity in completed }.forEach { pendingEntry ->
+            runCatching { queue.remove(pendingEntry.itemId, owner) }
+        }
+        val toResume = DownloadQueue.selectResumable(uniquePending, completed, jobs.keys)
+        toResume.forEach { pendingEntry ->
+            download(reconstructItem(pendingEntry), pendingEntry.format.toDownloadFormat(), owner)
+        }
         if (toResume.isNotEmpty()) logger.event("download", "Resuming ${toResume.size} download(s)")
         return toResume.isNotEmpty()
     }
 
-    /** True if there is at least one persisted download that has not yet completed (for app-open resume). */
-    suspend fun hasPendingPersisted(): Boolean {
-        val pending = queue.all()
+    private suspend fun hasPendingEntries(
+        owner: DownloadOwner,
+        pending: List<PendingDownload>,
+    ): Boolean {
         if (pending.isEmpty()) return false
-        val completed = runCatching { store.list().map { it.itemId }.toSet() }.getOrDefault(emptySet())
-        return pending.any { it.itemId !in completed }
+        val completed = runCatching { store.list(owner).map { it.identity }.toSet() }.getOrDefault(emptySet())
+        return pending.any { it.identity !in completed }
     }
 
-    private fun reconstructItem(p: PendingDownload): MediaItem = MediaItem(
-        id = p.itemId,
-        title = p.title,
-        year = null,
-        runtimeSeconds = null,
-        overview = null,
-        resumePositionSeconds = null,
-        isFolder = false,
-    )
+    private fun reconstructItem(p: PendingDownload): MediaItem =
+        p.mediaItem?.takeIf { it.id == p.itemId } ?: MediaItem(
+            id = p.itemId,
+            title = p.title,
+            year = null,
+            runtimeSeconds = null,
+            overview = null,
+            resumePositionSeconds = null,
+            isFolder = false,
+        )
 
-    fun cancel(itemId: String) {
+    fun cancel(itemId: String, owner: DownloadOwner? = null) {
+        val identity = DownloadIdentity(owner, itemId)
+        pauseRequests.remove(identity)
         // Let the job's own cancellation handler delete the `.part` and remove itself from `jobs`,
         // so a subsequent re-download can't race that cleanup. (No eager removal / async delete here.)
-        jobs[itemId]?.cancel()
-        clearState(itemId)
-        titles.remove(itemId)
-        scope.launch { runCatching { queue.remove(itemId) } }
+        jobs[identity]?.cancel()
+        clearState(identity)
+        titles.remove(identity)
+        scope.launch { runCatching { queue.remove(itemId, owner) } }
     }
 
     /** Cancel every in-flight download and wait for them to finish unwinding (used by delete-all). */
     suspend fun cancelAllAndJoin() {
+        pauseRequests.clear()
         val active = jobs.values.toList()
         active.forEach { it.cancel() }
         active.forEach { runCatching { it.join() } }
@@ -193,14 +242,34 @@ class MediaDownloader(
         _states.value = emptyMap()
     }
 
-    suspend fun delete(itemId: String) {
+    /**
+     * Stop every active request before the singleton Jellyfin client changes server/user credentials.
+     * Unlike [cancelAllAndJoin], it preserves the queue and `.part`/validator files for a later resume.
+     */
+    suspend fun pauseAllAndJoin() {
+        val active = jobs.entries.toList()
+        active.forEach { (identity, _) -> pauseRequests.add(identity) }
+        active.forEach { (_, job) -> job.cancel() }
+        active.forEach { (_, job) -> runCatching { job.join() } }
+        active.forEach { (identity, _) ->
+            // A job that was cancelled before its coroutine started never reaches the handler above.
+            // Clear its marker after join so a later download of the same identity is not misclassified.
+            pauseRequests.remove(identity)
+            clearState(identity)
+            titles.remove(identity)
+        }
+    }
+
+    suspend fun delete(itemId: String, owner: DownloadOwner? = null) {
+        val identity = DownloadIdentity(owner, itemId)
+        pauseRequests.remove(identity)
         // Cancel and fully unwind the job (its handler deletes the `.part`) before removing files, so
         // a still-running write can't recreate a `.part` after we delete it.
-        jobs[itemId]?.let { it.cancel(); runCatching { it.join() } }
-        clearState(itemId)
-        titles.remove(itemId)
-        runCatching { queue.remove(itemId) }
-        store.remove(itemId)
+        jobs[identity]?.let { it.cancel(); runCatching { it.join() } }
+        clearState(identity)
+        titles.remove(identity)
+        runCatching { queue.remove(itemId, owner) }
+        store.remove(itemId, owner)
     }
 
     /**
@@ -212,18 +281,25 @@ class MediaDownloader(
      * forever — those failures strictly count toward [RetryBudget.maxConsecutiveFailures] and then
      * propagate (to be resumed later). Permanent failures (bad/HLS-only item, 4xx) are not retried.
      */
-    private suspend fun runDownloadWithRecovery(item: MediaItem, format: DownloadFormat) {
+    private suspend fun runDownloadWithRecovery(
+        item: MediaItem,
+        format: DownloadFormat,
+        owner: DownloadOwner?,
+    ) {
         var consecutiveFailures = 0
-        var highWaterBytes = currentPartLength(item.id)
+        var highWaterBytes = currentPartLength(item.id, owner)
         while (true) {
             try {
-                runDownload(item, format)
+                ensureOwnerActive(owner)
+                runDownload(item, format, owner)
                 return
             } catch (c: CancellationException) {
                 throw c
             } catch (e: Exception) {
-                if (!isRecoverable(e)) throw e
-                val len = currentPartLength(item.id)
+                // An account transition is a deliberate pause boundary, never a retry loop against the
+                // newly configured Jellyfin client.
+                if (e is DownloadOwnerInactiveException || !isRecoverable(e)) throw e
+                val len = currentPartLength(item.id, owner)
                 val madeProgress = format is DownloadFormat.Original && len > highWaterBytes
                 highWaterBytes = maxOf(highWaterBytes, len)
                 consecutiveFailures = if (madeProgress) 0 else consecutiveFailures + 1
@@ -235,13 +311,27 @@ class MediaDownloader(
         }
     }
 
-    private fun currentPartLength(itemId: String): Long =
-        runCatching { store.partFileFor(itemId).length() }.getOrDefault(0L)
+    private fun currentPartLength(itemId: String, owner: DownloadOwner?): Long =
+        runCatching { store.partFileFor(itemId, owner).length() }.getOrDefault(0L)
 
     /** Whether a failure is transient (worth auto-retrying / keeping for later resume) vs. permanent. */
-    private fun isRecoverable(e: Throwable): Boolean = DownloadQueue.isRecoverableFailure(e)
+    private fun isRecoverable(e: Throwable): Boolean =
+        e is DownloadOwnerInactiveException || DownloadQueue.isRecoverableFailure(e)
 
-    private suspend fun runDownload(item: MediaItem, format: DownloadFormat) {
+    /** Ownerless legacy jobs/tests are permitted; production owner jobs must match the installed session. */
+    private fun isOwnerActive(owner: DownloadOwner?): Boolean {
+        if (owner == null) return true
+        val provider = activeOwnerProvider ?: return true
+        return provider() == owner
+    }
+
+    private fun ensureOwnerActive(owner: DownloadOwner?) {
+        if (!isOwnerActive(owner)) throw DownloadOwnerInactiveException()
+    }
+
+    private suspend fun runDownload(item: MediaItem, format: DownloadFormat, owner: DownloadOwner?) {
+        val identity = DownloadIdentity(owner, item.id)
+        ensureOwnerActive(owner)
         val info = when (format) {
             is DownloadFormat.Original -> jellyfin.playbackInfo(
                 itemId = item.id,
@@ -271,13 +361,14 @@ class MediaDownloader(
             ).getOrThrow()
         }
         val upstream = jellyfin.resolveUpstream(info)
+        ensureOwnerActive(owner)
         require(!upstream.isHls) { "This title can only be streamed, not downloaded." }
         val originPolicy = TrustedMediaOriginPolicy.fromBaseUrl(upstream.url)
             ?: throw IOException("Refusing a download with an invalid Jellyfin origin.")
 
-        val fileName = DownloadPaths.fileName(item.id, info.profile.container, upstream.contentType)
-        val part = store.partFileFor(item.id)
-        val meta = store.partMetaFileFor(item.id)
+        val fileName = identity.fileName(info.profile.container, upstream.contentType)
+        val part = store.partFileFor(item.id, owner)
+        val meta = store.partMetaFileFor(item.id, owner)
         part.parentFile?.mkdirs()
 
         // Resume an interrupted download from the bytes already on disk. We send Range + If-Range, but
@@ -305,6 +396,7 @@ class MediaDownloader(
         fun openPinned(request: Request): okhttp3.Response {
             var current = request
             repeat(MAX_DOWNLOAD_REDIRECTS + 1) {
+                ensureOwnerActive(owner)
                 if (!originPolicy.isTrusted(current.url)) {
                     throw IOException("Refusing a download request outside the configured Jellyfin origin.")
                 }
@@ -373,7 +465,7 @@ class MediaDownloader(
             }
             expectedTotal = total?.takeIf { it >= startAt }
             downloaded = startAt
-            setState(item.id, DownloadState.Running(downloaded, expectedTotal))
+            setState(identity, DownloadState.Running(downloaded, expectedTotal))
             val body = r.body ?: error("Empty response")
             body.byteStream().use { ins ->
                 val fos = FileOutputStream(part, /* append = */ resumed)
@@ -387,13 +479,14 @@ class MediaDownloader(
                     var lastEmit = downloaded
                     while (true) {
                         coroutineContext.ensureActive() // cooperative cancellation
+                        ensureOwnerActive(owner)
                         val n = ins.read(buf)
                         if (n < 0) break
                         out.write(buf, 0, n)
                         downloaded += n
                         if (downloaded - lastEmit >= PROGRESS_EMIT_BYTES) {
                             lastEmit = downloaded
-                            setState(item.id, DownloadState.Running(downloaded, total))
+                            setState(identity, DownloadState.Running(downloaded, total))
                         }
                     }
                     out.flush()
@@ -409,6 +502,9 @@ class MediaDownloader(
             }
         }
 
+        // Do not publish a completed entry under an owner after the singleton client moved elsewhere.
+        // Leave the validated partial intact so that owner can resume safely when they return.
+        ensureOwnerActive(owner)
         runCatching { meta.delete() } // validator no longer needed once fully downloaded
 
         val finalFile = File(part.parentFile, fileName)
@@ -428,13 +524,20 @@ class MediaDownloader(
                 runtimeSeconds = info.runtimeSeconds,
                 downloadedAtMillis = System.currentTimeMillis(),
                 qualityLabel = format.label,
+                owner = owner,
+                mediaItem = item,
             ),
         )
         logger.event("download", "Saved offline copy (${downloaded / (1024 * 1024)} MiB)")
     }
 
-    private fun setState(id: String, s: DownloadState) = _states.update { it + (id to s) }
-    private fun clearState(id: String) = _states.update { it - id }
+    private fun setState(identity: DownloadIdentity, s: DownloadState) = _states.update { it + (identity to s) }
+    private fun clearState(identity: DownloadIdentity) = _states.update { it - identity }
+
+    /** A deliberate session boundary: retain queue/partial bytes until this owner is live again. */
+    private class DownloadOwnerInactiveException : IOException(
+        "Download paused until its Jellyfin account is active again.",
+    )
 
     private data class ContentRange(val start: Long, val endInclusive: Long, val total: Long?)
 
@@ -449,6 +552,7 @@ class MediaDownloader(
     }
 
     private fun friendly(e: Exception): String = when (e) {
+        is DownloadOwnerInactiveException -> "Paused until this Jellyfin account is active again."
         is JellyfinHttpException -> e.serverReason?.let { "Server error: $it" } ?: "Server error (HTTP ${e.code})."
         is IllegalArgumentException, is IllegalStateException -> e.message ?: "Download failed."
         else -> "Download failed. Check your connection and try again."

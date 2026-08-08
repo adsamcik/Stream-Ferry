@@ -36,6 +36,12 @@ class JellyfinAuthRepository(
 
     private val _currentUser = MutableStateFlow<UserSession?>(null)
     override val currentUser = _currentUser.asStateFlow()
+    /**
+     * A tokenless identity used only to scope cached metadata and completed downloads while the server
+     * cannot be verified. The stored token is deliberately never installed into [client] in this mode.
+     */
+    private val _cachedSession = MutableStateFlow<UserSession?>(null)
+    val cachedSession = _cachedSession.asStateFlow()
 
     /** All client/session mutations are atomic against a monotonically increasing auth generation. */
     private val stateLock = Any()
@@ -52,8 +58,20 @@ class JellyfinAuthRepository(
 
     private data class CredentialOperation(val generation: Long, val serverId: String)
 
+    /** Non-secret identity retained solely for cache and completed-download scoping. */
+    private data class CachedSessionOperation(
+        val generation: Long,
+        val serverId: String,
+        val userId: String,
+    )
+
     /** A user action superseded a suspended auth operation; it must not alter the new server/session. */
     private class SupersededAuthOperation : IllegalStateException("A newer server or sign-in action superseded this request.")
+
+    /** A live verification failed, while a scoped cache-only session may still be usable. */
+    private class JellyfinServerUnavailableException : IllegalStateException(
+        "Jellyfin is unavailable or the saved session cannot be verified.",
+    )
 
     override suspend fun setServer(rawUrl: String, userApprovedHttp: Boolean): Result<ServerProfile> {
         return when (val v = ServerUrlValidator.validate(rawUrl, userApprovedHttp)) {
@@ -169,6 +187,7 @@ class JellyfinAuthRepository(
             // every in-memory credential before the keystore operation suspends.
             client.clearAuth()
             _currentUser.value = null
+            _cachedSession.value = null
             currentId
         }
         id?.let { tokenStore.remove(it) }
@@ -182,6 +201,7 @@ class JellyfinAuthRepository(
                 client.clearAll()
                 this.serverId = null
                 _currentUser.value = null
+                _cachedSession.value = null
                 true
             }
         }
@@ -196,6 +216,7 @@ class JellyfinAuthRepository(
             client.clearAll()
             serverId = null
             _currentUser.value = null
+            _cachedSession.value = null
         }
         tokenStore.clear()
         persistenceMutex.withLock { configStore.clear() }
@@ -220,6 +241,7 @@ class JellyfinAuthRepository(
             client.clearAuth()
             this.serverId = null
             _currentUser.value = null
+            _cachedSession.value = null
             stateGeneration
         }
         persistenceMutex.withLock {
@@ -231,41 +253,77 @@ class JellyfinAuthRepository(
         restoreSessionLocked(expectedServerId = serverId)
     }
 
+    /**
+     * Restore a non-secret identity for the active profile without sending or installing its token.
+     * It permits only scoped cached-library and verified-download access while connectivity is unknown.
+     */
+    suspend fun restoreCachedSession(): UserSession? = authOperationMutex.withLock {
+        currentSessionForActiveProfile()
+            ?: restoreCachedSessionLocked(expectedServerId = null)?.let { UserSession(it.userId, it.serverId) }
+    }
+
     /** Restore the active server only after fresh unauthenticated discovery verifies the stored identity. */
     suspend fun restoreSession(): UserSession? = authOperationMutex.withLock {
-        restoreSessionLocked(expectedServerId = null)
+        currentSessionForActiveProfile() ?: restoreSessionLocked(expectedServerId = null)
+    }
+
+    /** Attempt live verification while retaining a cache-only identity if the server is unreachable. */
+    suspend fun ensureOnlineSession(): Result<UserSession> = authOperationMutex.withLock {
+        (currentSessionForActiveProfile() ?: restoreSessionLocked(expectedServerId = null))
+            ?.let { Result.success(it) }
+            ?: Result.failure(JellyfinServerUnavailableException())
     }
 
     /** Caller holds [authOperationMutex], keeping the mutable client bound to this saved profile. */
     private suspend fun restoreSessionLocked(expectedServerId: String?): UserSession? {
-        val saved = configStore.active() ?: return null
-        if (expectedServerId != null && saved.serverId != expectedServerId) return null
-        val generation = beginRestore(saved)
-        val token = tokenStore.get(saved.serverId) ?: return null
-        if (!isCurrent(generation, saved.serverId)) return null
-        val uid = saved.userId ?: return null
+        val cached = restoreCachedSessionLocked(expectedServerId) ?: return null
         // Never send a persisted token until a fresh unauthenticated discovery confirms the server
-        // identity. A timeout, malformed response, or missing Id is fail-closed rather than an
-        // "offline" exception that an attacker could deliberately trigger.
+        // identity. A timeout, malformed response, or missing Id is fail-closed: the token remains
+        // uninstalled, while the non-secret cache scope stays available for offline browsing.
         val discoveredId = client.publicInfo()?.serverId?.takeIf { it.isNotBlank() }
-        if (!isCurrent(generation, saved.serverId)) return null
+        if (!isCurrent(cached.generation, cached.serverId)) return null
         if (discoveredId == null) {
-            if (clearAuthIfCurrent(generation, saved.serverId)) {
-                logger.w("auth", "Server identity could not be verified — refusing stored token; profile kept")
+            logger.event("auth", "Server unavailable; retaining tokenless cached library session")
+            return null
+        }
+        if (ServerIdentity.isMismatch(cached.serverId, discoveredId)) {
+            if (clearAuthIfCurrent(cached.generation, cached.serverId)) {
+                logger.w("auth", "Server identity mismatch — refusing token and cached session (possible spoof); profile kept")
             }
             return null
         }
-        if (ServerIdentity.isMismatch(saved.serverId, discoveredId)) {
-            if (clearAuthIfCurrent(generation, saved.serverId)) {
-                logger.w("auth", "Server identity mismatch — refusing token (possible spoof); profile kept")
-            }
-            return null
-        }
-        val operation = CredentialOperation(generation, saved.serverId)
-        val session = installAuthIfCurrent(operation, JellyfinApi.AuthResult(token, uid, serverVersion = null))
+        val token = tokenStore.get(cached.serverId) ?: return null
+        if (!isCurrent(cached.generation, cached.serverId)) return null
+        val operation = CredentialOperation(cached.generation, cached.serverId)
+        val session = installAuthIfCurrent(operation, JellyfinApi.AuthResult(token, cached.userId, serverVersion = null))
             ?: return null
         logger.event("auth", "Session restored")
         return session
+    }
+
+    /** Caller holds [authOperationMutex] and checks whether an already verified session is still active. */
+    private suspend fun currentSessionForActiveProfile(): UserSession? {
+        val current = _currentUser.value ?: return null
+        val active = configStore.active() ?: return null
+        return current.takeIf { it.serverId == active.serverId && it.userId == active.userId }
+    }
+
+    /** Caller holds [authOperationMutex]. This must never install a token into [client]. */
+    private suspend fun restoreCachedSessionLocked(expectedServerId: String?): CachedSessionOperation? {
+        val saved = configStore.active() ?: return null
+        if (expectedServerId != null && saved.serverId != expectedServerId) return null
+        val userId = saved.userId ?: return null
+        // A cached profile is only meaningful when an account token remains stored for this exact server.
+        if (tokenStore.get(saved.serverId) == null) return null
+        val generation = beginRestore(saved)
+        if (!isCurrent(generation, saved.serverId)) return null
+        val published = synchronized(stateLock) {
+            if (stateGeneration != generation || serverId != saved.serverId) false else {
+                _cachedSession.value = UserSession(userId, saved.serverId)
+                true
+            }
+        }
+        return if (published) CachedSessionOperation(generation, saved.serverId, userId) else null
     }
 
     /** Configure a new unauthenticated candidate and invalidate every previous suspended operation. */
@@ -274,6 +332,7 @@ class JellyfinAuthRepository(
         client.configureServer(baseUrl)
         serverId = null
         _currentUser.value = null
+        _cachedSession.value = null
         stateGeneration
     }
 
@@ -282,6 +341,7 @@ class JellyfinAuthRepository(
         client.configureServer(saved.baseUrl)
         serverId = saved.serverId
         _currentUser.value = null
+        _cachedSession.value = null
         stateGeneration
     }
 
@@ -310,13 +370,17 @@ class JellyfinAuthRepository(
     private fun installAuthIfCurrent(operation: CredentialOperation, auth: JellyfinApi.AuthResult): UserSession? = synchronized(stateLock) {
         if (stateGeneration != operation.generation || serverId != operation.serverId) return@synchronized null
         client.setAuth(auth.accessToken, auth.userId)
-        UserSession(auth.userId, operation.serverId).also { _currentUser.value = it }
+        UserSession(auth.userId, operation.serverId).also {
+            _currentUser.value = it
+            _cachedSession.value = null
+        }
     }
 
     private fun clearAuthIfCurrent(generation: Long, expectedServerId: String): Boolean = synchronized(stateLock) {
         if (stateGeneration != generation || serverId != expectedServerId) return@synchronized false
         client.clearAuth()
         _currentUser.value = null
+        _cachedSession.value = null
         true
     }
 

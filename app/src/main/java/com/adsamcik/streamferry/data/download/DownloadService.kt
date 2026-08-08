@@ -48,32 +48,44 @@ class DownloadService : Service() {
             }
         }
         // START_STICKY: if the OS kills the process while a download is active, recreate the service
-        // (with a null intent) so resumePending() can continue the download from its `.part` file.
+        // (with a null intent) so resumePending(owner) can continue the active account's `.part` file.
         return START_STICKY
     }
 
     private fun startObservingWithResume() {
-        val downloader = (application as? StreamFerryApplication)?.container?.downloader
-        if (downloader == null) { stopSelf(); return }
+        val container = (application as? StreamFerryApplication)?.container
+        val downloader = container?.downloader
+        // The downloader uses the active Jellyfin client, which can authenticate only one account at a
+        // time. Never resurrect an arbitrary persisted owner from a sticky service restart: wait until
+        // the app has restored a live, identity-verified session and resume that exact account only.
+        val user = container?.authRepository?.currentUser?.value
+        if (downloader == null || user == null) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
+        }
+        val owner = DownloadOwner(serverId = user.serverId, userId = user.userId)
         // Each download enqueue re-sends ACTION_START; keep exactly ONE observer (cancel any prior)
         // so we don't accumulate N collectors racing the notification/stop logic.
         observerJob?.cancel()
         observerJob = serviceScope.launch {
             // Re-enqueue persisted-but-unfinished downloads BEFORE observing, so the first emitted
             // state reflects them and the idle check below can't stop the service prematurely.
-            runCatching { downloader.resumePending() }
+            runCatching { downloader.resumePending(owner) }
                 .onFailure {
-                    (application as? StreamFerryApplication)?.container?.logger?.w("download", "resumePending failed", it)
+                    container.logger.w("download", "resumePending failed", it)
                 }
             downloader.states.collect { states ->
-                val active = states.values.count { it is DownloadState.Queued || it is DownloadState.Running }
+                val active = states.count { (identity, state) ->
+                    identity.owner == owner && (state is DownloadState.Queued || state is DownloadState.Running)
+                }
                 if (active == 0) {
                     stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf()
                     cancel() // stop collecting; onDestroy will cancel the scope
                 } else {
                     getSystemService(NotificationManager::class.java)
-                        .notify(NOTIF_ID, buildNotification(active, aggregateFraction(states)))
+                        .notify(NOTIF_ID, buildNotification(active, aggregateFraction(states, owner)))
                 }
             }
         }
@@ -121,8 +133,12 @@ class DownloadService : Service() {
         return builder.build()
     }
 
-    private fun aggregateFraction(states: Map<String, DownloadState>): Float? {
-        val fractions = states.values.filterIsInstance<DownloadState.Running>().mapNotNull { it.fraction }
+    private fun aggregateFraction(states: Map<DownloadIdentity, DownloadState>, owner: DownloadOwner): Float? {
+        val fractions = states
+            .filterKeys { it.owner == owner }
+            .values
+            .filterIsInstance<DownloadState.Running>()
+            .mapNotNull { it.fraction }
         return if (fractions.isEmpty()) null else fractions.average().toFloat()
     }
 

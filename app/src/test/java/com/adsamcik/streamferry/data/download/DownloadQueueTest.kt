@@ -1,7 +1,9 @@
 package com.adsamcik.streamferry.data.download
 
 import com.adsamcik.streamferry.data.jellyfin.JellyfinHttpException
+import kotlinx.coroutines.runBlocking
 import java.io.IOException
+import java.nio.file.Files
 import java.net.SocketTimeoutException
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -41,10 +43,61 @@ class DownloadQueueTest {
         val pending = listOf(pending("a"), pending("b"), pending("c"), pending("d"))
         val resumable = DownloadQueue.selectResumable(
             pending = pending,
-            completedIds = setOf("b"),
-            activeIds = setOf("c"),
+            completed = setOf(pending[1].identity),
+            active = setOf(pending[2].identity),
         )
         assertEquals(listOf("a", "d"), resumable.map { it.itemId })
+    }
+
+    @Test
+    fun sameItemIdFromDifferentOwnersDoesNotBlockResume() {
+        val first = PendingDownload(
+            "same", "First", PersistedFormat.from(DownloadFormat.Original), DownloadOwner("server-a", "user-a"),
+        )
+        val second = PendingDownload(
+            "same", "Second", PersistedFormat.from(DownloadFormat.Original), DownloadOwner("server-b", "user-b"),
+        )
+
+        val resumable = DownloadQueue.selectResumable(
+            listOf(first, second),
+            completed = setOf(first.identity),
+            active = emptySet(),
+        )
+
+        assertEquals(listOf(second), resumable)
+    }
+
+    @Test
+    fun queueStorageKeepsSameIdSeparatedByOwner() = runBlocking {
+        val root = Files.createTempDirectory("download-queue-owner").toFile()
+        try {
+            val ownerA = DownloadOwner("server-a", "user-a")
+            val ownerB = DownloadOwner("server-b", "user-b")
+            val first = PendingDownload(
+                itemId = "same",
+                title = "First",
+                format = PersistedFormat.from(DownloadFormat.Original),
+                owner = ownerA,
+            )
+            val second = PendingDownload(
+                itemId = "same",
+                title = "Second",
+                format = PersistedFormat.from(DownloadFormat.Original),
+                owner = ownerB,
+            )
+            val queue = DownloadQueueStore.forFilesDir(root)
+
+            queue.add(first)
+            queue.add(second)
+            assertEquals(listOf(first), queue.allForOwner(ownerA))
+            assertEquals(listOf(second), queue.allForOwner(ownerB))
+
+            queue.remove(first.itemId, ownerA)
+            assertTrue(queue.allForOwner(ownerA).isEmpty())
+            assertEquals(listOf(second), queue.allForOwner(ownerB))
+        } finally {
+            root.deleteRecursively()
+        }
     }
 
     @Test

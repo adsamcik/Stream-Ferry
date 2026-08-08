@@ -15,10 +15,13 @@ import com.google.android.gms.cast.framework.CastContext
 import com.google.android.gms.tasks.Task
 import com.adsamcik.streamferry.core.session.SessionRegistry
 import com.adsamcik.streamferry.data.cache.CachingMediaLibraryRepository
+import com.adsamcik.streamferry.data.cache.JellyfinConnectionMonitor
 import com.adsamcik.streamferry.data.cache.LibraryCache
 import com.adsamcik.streamferry.data.cast.CastTargetController
 import com.adsamcik.streamferry.data.dlna.DlnaTargetController
 import com.adsamcik.streamferry.data.download.DownloadService
+import com.adsamcik.streamferry.data.download.DownloadedJellyfinMediaLibraryRepository
+import com.adsamcik.streamferry.data.download.DownloadOwner
 import com.adsamcik.streamferry.data.download.DownloadQueueStore
 import com.adsamcik.streamferry.data.download.DownloadStore
 import com.adsamcik.streamferry.data.download.MediaDownloader
@@ -43,6 +46,7 @@ import com.adsamcik.streamferry.diagnostics.CrashReporter
 import com.adsamcik.streamferry.diagnostics.DiagnosticsEventLog
 import com.adsamcik.streamferry.diagnostics.DiagnosticsPreferences
 import com.adsamcik.streamferry.diagnostics.NetworkInfoProvider
+import com.adsamcik.streamferry.domain.JellyfinLibraryScope
 import com.adsamcik.streamferry.domain.MediaLibraryRepository
 import com.adsamcik.streamferry.domain.MediaSource
 import com.adsamcik.streamferry.domain.SecureTokenStore
@@ -144,6 +148,8 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
     val authRepository: JellyfinAuthRepository by lazy {
         JellyfinAuthRepository(jellyfinClient, tokenStore, serverConfigStore, logger)
     }
+    /** Reachability is intentionally separate from authentication so cache-only browsing can be explicit. */
+    val jellyfinConnectionMonitor: JellyfinConnectionMonitor by lazy { JellyfinConnectionMonitor() }
 
     // ----- in-app poster images (Coil) -----
     /**
@@ -178,15 +184,26 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
             .build()
     }
     val mediaRepository: MediaLibraryRepository by lazy {
-        CachingMediaLibraryRepository(
-            delegate = JellyfinMediaLibraryRepository(jellyfinClient, logger),
-            cache = libraryCache,
-            // Library/resume data is account-specific. Use the authenticated server + user identity,
-            // never a collision-prone URL hash, so offline fallback cannot cross accounts or servers.
-            scope = {
-                authRepository.currentUser.value
-                    ?.let { "server_${it.serverId}_user_${it.userId}" }
-                    ?: "unauthenticated"
+        DownloadedJellyfinMediaLibraryRepository(
+            delegate = CachingMediaLibraryRepository(
+                delegate = JellyfinMediaLibraryRepository(jellyfinClient, logger),
+                cache = libraryCache,
+                // Library/resume data is account-specific. A tokenless cached session has the same stable
+                // scope but never enables a remote request; it only unlocks that account's local metadata.
+                scope = {
+                    (authRepository.currentUser.value ?: authRepository.cachedSession.value)
+                        ?.let { JellyfinLibraryScope(it.serverId, it.userId).cacheKey }
+                        ?: "unauthenticated"
+                },
+                // A cached session intentionally has no token installed. It may read disk metadata but
+                // never cause the Jellyfin repository to issue a request until verification succeeds.
+                isLiveSession = { authRepository.currentUser.value != null },
+                connectionMonitor = jellyfinConnectionMonitor,
+            ),
+            downloadStore = downloadStore,
+            owner = {
+                (authRepository.currentUser.value ?: authRepository.cachedSession.value)
+                    ?.let { DownloadOwner(it.serverId, it.userId) }
             },
         )
     }
@@ -311,7 +328,21 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
     // ----- optional: offline downloads -----
     private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     val downloader: MediaDownloader by lazy {
-        MediaDownloader(jellyfinRepository, downloadStore, downloadQueueStore, httpClient, logger, ioScope)
+        MediaDownloader(
+            jellyfin = jellyfinRepository,
+            store = downloadStore,
+            queue = downloadQueueStore,
+            httpClient = httpClient,
+            logger = logger,
+            scope = ioScope,
+            // JellyfinClient is a singleton mutable session. A download may make remote requests only
+            // while its persisted owner is still the verified account installed in that client.
+            activeOwnerProvider = {
+                authRepository.currentUser.value?.let { user ->
+                    DownloadOwner(serverId = user.serverId, userId = user.userId)
+                }
+            },
+        )
     }
 
     /** Start the download foreground service so active downloads survive process backgrounding. */
@@ -412,7 +443,12 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
                 override fun onAvailable(network: Network) {
                     ioScope.launch {
                         runCatching {
-                            if (downloader.resumePending()) runCatching { startDownloadService() }
+                            // A single Jellyfin client is configured for the active verified account.
+                            // Keep other accounts' persisted queues dormant until that account is restored.
+                            authRepository.currentUser.value?.let { user ->
+                                val owner = DownloadOwner(serverId = user.serverId, userId = user.userId)
+                                if (downloader.resumePending(owner)) runCatching { startDownloadService() }
+                            }
                         }
                     }
                 }

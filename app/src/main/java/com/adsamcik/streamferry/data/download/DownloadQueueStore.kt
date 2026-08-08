@@ -3,6 +3,7 @@ package com.adsamcik.streamferry.data.download
 import android.content.Context
 import com.adsamcik.streamferry.core.resilience.UpstreamRetry
 import com.adsamcik.streamferry.data.jellyfin.JellyfinHttpException
+import com.adsamcik.streamferry.domain.MediaItem
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -18,14 +19,19 @@ import java.io.IOException
  * **resumed automatically** after the process is killed in the background (e.g. aggressive OEM battery
  * management) or after the foreground service is restarted by the system.
  *
- * Holds only the item id, the (non-secret) title and the chosen format — never a token or URL. The
- * actual stream is always re-resolved through Jellyfin at resume time, so nothing sensitive is stored.
+ * Holds the item id, selected format, owner ids and a non-secret [MediaItem] snapshot — never a token
+ * or URL. The actual stream is always re-resolved through Jellyfin at resume time, so nothing sensitive
+ * is stored.
  */
 @Serializable
 data class PendingDownload(
     val itemId: String,
     val title: String,
     val format: PersistedFormat,
+    /** Owner at enqueue time. Null only for queues written by older app builds. */
+    val owner: DownloadOwner? = null,
+    /** Complete non-secret gallery metadata, used to faithfully resume an interrupted request. */
+    val mediaItem: MediaItem? = null,
 )
 
 /** A refactor-stable, serialisable projection of [DownloadFormat] (avoids polymorphic class-name coupling). */
@@ -69,10 +75,10 @@ object DownloadQueue {
      */
     fun selectResumable(
         pending: List<PendingDownload>,
-        completedIds: Set<String>,
-        activeIds: Set<String>,
+        completed: Set<DownloadIdentity>,
+        active: Set<DownloadIdentity>,
     ): List<PendingDownload> =
-        pending.filter { it.itemId !in completedIds && it.itemId !in activeIds }
+        pending.filter { it.identity !in completed && it.identity !in active }
 
     /**
      * Whether a download failure is transient (worth auto-retrying and keeping in the queue for a later
@@ -91,9 +97,11 @@ object DownloadQueue {
  * App-private, mutex-guarded JSON store of the not-yet-finished download requests. Lives alongside the
  * completed-downloads index in the sandboxed `downloads` dir (removed by "Delete all app data").
  */
-class DownloadQueueStore(context: Context) {
+class DownloadQueueStore private constructor(filesDir: File) {
 
-    private val dir = File(context.applicationContext.filesDir, DIR)
+    constructor(context: Context) : this(context.applicationContext.filesDir)
+
+    private val dir = File(filesDir, DIR)
     private val queueFile = File(dir, "queue.json")
     private val json = Json { ignoreUnknownKeys = true; prettyPrint = false }
     private val serializer = ListSerializer(PendingDownload.serializer())
@@ -103,18 +111,24 @@ class DownloadQueueStore(context: Context) {
         withContext(Dispatchers.IO) { loadUnlocked() }
     }
 
-    /** Insert or replace the request for an item (keyed by item id). */
+    /** Pending entries belonging to exactly [owner] (or the ownerless legacy scope when null). */
+    suspend fun allForOwner(owner: DownloadOwner?): List<PendingDownload> = mutex.withLock {
+        withContext(Dispatchers.IO) { loadUnlocked().filter { it.owner == owner } }
+    }
+
+    /** Insert or replace the request for an item within its owning Jellyfin account. */
     suspend fun add(entry: PendingDownload) = mutex.withLock {
         withContext(Dispatchers.IO) {
             dir.mkdirs()
-            val updated = loadUnlocked().filterNot { it.itemId == entry.itemId } + entry
+            val updated = loadUnlocked().filterNot { it.identity == entry.identity } + entry
             writeUnlocked(updated)
         }
     }
 
-    suspend fun remove(itemId: String) = mutex.withLock {
+    suspend fun remove(itemId: String, owner: DownloadOwner? = null) = mutex.withLock {
         withContext(Dispatchers.IO) {
-            writeUnlocked(loadUnlocked().filterNot { it.itemId == itemId })
+            val identity = DownloadIdentity(owner, itemId)
+            writeUnlocked(loadUnlocked().filterNot { it.identity == identity })
         }
     }
 
@@ -136,5 +150,10 @@ class DownloadQueueStore(context: Context) {
         }
     }
 
-    private companion object { const val DIR = "downloads" }
+    companion object {
+        private const val DIR = "downloads"
+
+        /** JVM test seam; production callers must use the application [Context] constructor. */
+        internal fun forFilesDir(filesDir: File): DownloadQueueStore = DownloadQueueStore(filesDir)
+    }
 }

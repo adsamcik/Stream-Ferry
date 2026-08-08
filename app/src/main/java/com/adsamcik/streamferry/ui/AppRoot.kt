@@ -80,6 +80,8 @@ import androidx.compose.ui.unit.dp
 import com.adsamcik.streamferry.app.StreamFerryApplication
 import com.adsamcik.streamferry.core.volume.NightVolumePolicy
 import com.adsamcik.streamferry.diagnostics.ReportShare
+import com.adsamcik.streamferry.domain.JellyfinLibraryStatus
+import com.adsamcik.streamferry.domain.MediaSourceIds
 import com.adsamcik.streamferry.ui.navigation.NavigationStatePolicy
 import com.adsamcik.streamferry.ui.navigation.NavigationStatePolicy.TopLevelDestination
 import com.adsamcik.streamferry.ui.screens.AboutScreen
@@ -87,6 +89,7 @@ import com.adsamcik.streamferry.ui.screens.DiagnosticsScreen
 import com.adsamcik.streamferry.ui.screens.DownloadsScreen
 import com.adsamcik.streamferry.ui.screens.ExpressiveSettingsScreen
 import com.adsamcik.streamferry.ui.screens.GalleryScreen
+import com.adsamcik.streamferry.ui.screens.JellyfinUnavailableHeaderNotice
 import com.adsamcik.streamferry.ui.screens.LoginScreen
 import com.adsamcik.streamferry.ui.screens.MediaDetailScreen
 import com.adsamcik.streamferry.ui.screens.PlaybackScreen
@@ -150,6 +153,8 @@ fun AppRoot(state: AppUiState, viewModel: MainViewModel, onScanDevices: () -> Un
         )
         val showMiniPlayer = state.playback != null && state.route != Route.PLAYBACK
         val galleryOwnsPhoneHeader = !useNavigationRail && state.route == Route.GALLERY
+        val showJellyfinUnavailableNotice = state.activeSourceId == MediaSourceIds.JELLYFIN &&
+            state.jellyfinLibraryStatus == JellyfinLibraryStatus.UNAVAILABLE
         val spatialMotion = MaterialTheme.motionScheme.defaultSpatialSpec<IntOffset>()
         val effectsMotion = MaterialTheme.motionScheme.defaultEffectsSpec<Float>()
 
@@ -158,14 +163,22 @@ fun AppRoot(state: AppUiState, viewModel: MainViewModel, onScanDevices: () -> Un
             contentWindowInsets = WindowInsets.safeDrawing,
             topBar = {
                 if (!galleryOwnsPhoneHeader) {
-                    TopAppBar(
-                        title = { Text(titleFor(state.route), fontWeight = FontWeight.Bold, maxLines = 1) },
-                        navigationIcon = { if (showUpNavigation && back != null) IconBack(back) },
-                        colors = TopAppBarDefaults.topAppBarColors(
-                            containerColor = MaterialTheme.colorScheme.surfaceContainer,
-                            titleContentColor = MaterialTheme.colorScheme.onSurface,
-                        ),
-                    )
+                    Column {
+                        TopAppBar(
+                            title = { Text(titleFor(state.route), fontWeight = FontWeight.Bold, maxLines = 1) },
+                            navigationIcon = { if (showUpNavigation && back != null) IconBack(back) },
+                            colors = TopAppBarDefaults.topAppBarColors(
+                                containerColor = MaterialTheme.colorScheme.surfaceContainer,
+                                titleContentColor = MaterialTheme.colorScheme.onSurface,
+                            ),
+                        )
+                        if (showJellyfinUnavailableNotice) {
+                            JellyfinUnavailableHeaderNotice(
+                                onRetry = viewModel::refreshGallery,
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+                            )
+                        }
+                    }
                 }
             },
             bottomBar = {

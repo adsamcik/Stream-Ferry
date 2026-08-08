@@ -1,6 +1,7 @@
 package com.adsamcik.streamferry.ui.state
 
 import com.adsamcik.streamferry.domain.DiscoveredTarget
+import com.adsamcik.streamferry.domain.JellyfinLibraryStatus
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.domain.MediaSourceIds
 import com.adsamcik.streamferry.domain.MediaTrack
@@ -41,7 +42,12 @@ data class AppUiState(
     val serverName: String? = null,             // safe display string (name + version)
 
     // ----- auth -----
+    /** A live, identity-verified Jellyfin session is installed. */
     val loggedIn: Boolean = false,
+    /** A tokenless scope has usable Jellyfin cache/download metadata while live verification is unavailable. */
+    val hasCachedJellyfinSession: Boolean = false,
+    /** Reachability of the active Jellyfin library; never used as a substitute for authentication. */
+    val jellyfinLibraryStatus: JellyfinLibraryStatus = JellyfinLibraryStatus.UNKNOWN,
     val servers: List<ServerProfile> = emptyList(),
 
     // ----- quick connect (device-code style login) -----
@@ -102,9 +108,23 @@ data class AppUiState(
     /** The folder currently being browsed, or null at the library root. */
     val currentFolder: MediaItem? get() = folderStack.lastOrNull()
 
+    /** True when Jellyfin content can be browsed from a live session or its safe tokenless cache scope. */
+    val canBrowseJellyfin: Boolean get() = loggedIn || hasCachedJellyfinSession
+
     /** Download state for a given item id, or null if not downloaded/downloading. */
     fun downloadFor(itemId: String?): DownloadUiItem? = itemId?.let { id -> downloads.firstOrNull { it.itemId == id } }
+
+    /** How a gallery/detail item can be used at this moment. */
+    fun availabilityFor(item: MediaItem): JellyfinItemAvailability = when {
+        item.sourceId != MediaSourceIds.JELLYFIN -> JellyfinItemAvailability.AVAILABLE
+        downloadFor(item.id)?.completed == true -> JellyfinItemAvailability.DOWNLOADED
+        jellyfinLibraryStatus == JellyfinLibraryStatus.UNAVAILABLE -> JellyfinItemAvailability.UNAVAILABLE
+        else -> JellyfinItemAvailability.AVAILABLE
+    }
 }
+
+/** Visual/playback availability for a Jellyfin item; a completed download always wins over an outage. */
+enum class JellyfinItemAvailability { AVAILABLE, UNAVAILABLE, DOWNLOADED }
 
 /** UI view of a download (completed or in-progress). No secrets. */
 data class DownloadUiItem(

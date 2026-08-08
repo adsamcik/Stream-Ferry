@@ -7,7 +7,8 @@ import com.adsamcik.streamferry.core.resume.ResumePolicy
  * Persists per-item "continue where you left off" positions for on-device local files (which have no
  * server-side resume point). App-private SharedPreferences, bounded to the most-recently-updated
  * [MAX_ENTRIES] items. The key is the caller's stable item id (a `content://` URI for picked files, or
- * `dl:<id>` for a downloaded copy); the value encodes `positionSeconds|durationSeconds|updatedAtMillis`.
+ * an account-scoped `dl:<download-hash>` key for a downloaded copy); the value encodes
+ * `positionSeconds|durationSeconds|updatedAtMillis`.
  */
 class ResumeStore(context: Context) {
 

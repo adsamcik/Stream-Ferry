@@ -18,6 +18,8 @@ import com.adsamcik.streamferry.core.resume.SmartResumeSourceType
 import com.adsamcik.streamferry.core.stream.StreamPreferences
 import com.adsamcik.streamferry.data.download.DownloadEntry
 import com.adsamcik.streamferry.data.download.DownloadFormat
+import com.adsamcik.streamferry.data.download.DownloadIdentity
+import com.adsamcik.streamferry.data.download.DownloadOwner
 import com.adsamcik.streamferry.data.download.MediaDownloader.DownloadState
 import com.adsamcik.streamferry.data.jellyfin.HttpApprovalRequiredException
 import com.adsamcik.streamferry.data.jellyfin.JellyfinHttpException
@@ -44,6 +46,7 @@ import com.adsamcik.streamferry.ui.state.AppUiState
 import com.adsamcik.streamferry.ui.state.ConnectionState
 import com.adsamcik.streamferry.ui.state.DiagnosticsUiState
 import com.adsamcik.streamferry.ui.state.DownloadUiItem
+import com.adsamcik.streamferry.ui.state.JellyfinItemAvailability
 import com.adsamcik.streamferry.ui.state.NowPlayingDiagnostics
 import com.adsamcik.streamferry.ui.state.PlaybackUiState
 import com.adsamcik.streamferry.ui.state.QuickConnectUiState
@@ -64,6 +67,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.coroutines.cancellation.CancellationException
@@ -97,7 +102,8 @@ class MainViewModel(
     // collect), and mergeDownloads() reads these — a later declaration would leave them null at that
     // moment (NPE).
     private var downloadEntries: List<DownloadEntry> = emptyList()
-    private val downloadTitles = HashMap<String, String>()
+    private val downloadTitles = HashMap<DownloadIdentity, String>()
+    private val downloadRefreshMutex = Mutex()
 
     // ----- auto-reconnect after an unexpected renderer disconnect -----
     private var reconnectJob: Job? = null
@@ -137,7 +143,7 @@ class MainViewModel(
         ) : ReconnectContext
     }
 
-    // The current session's resume key (a content:// URI, or "dl:<id>") + duration, used to remember
+    // The current session's resume key (a content:// URI, or an account-scoped downloaded-copy key) + duration, used to remember
     // "where you left off" for local files (Jellyfin uses its own server-side resume). Cleared on stop.
     @Volatile private var currentResumeKey: String? = null
     @Volatile private var currentDurationSeconds: Long? = null
@@ -193,7 +199,35 @@ class MainViewModel(
         }
         viewModelScope.launch {
             container.authRepository.currentUser.collect { user ->
-                _state.update { it.copy(loggedIn = user != null, smartResume = container.smartResumeStore.current?.toUiState(user)) }
+                _state.update {
+                    it.copy(
+                        loggedIn = user != null,
+                        smartResume = container.smartResumeStore.current?.toUiState(user),
+                    )
+                }
+                refreshDownloadEntries()
+                // Pending requests are owner-scoped. Resuming only after this live session is installed
+                // prevents a sticky service or connectivity callback from using this account's client
+                // credentials to request another account's item id.
+                user?.let { activeUser ->
+                    val owner = DownloadOwner(serverId = activeUser.serverId, userId = activeUser.userId)
+                    if (container.authRepository.currentUser.value == activeUser &&
+                        runCatching { container.downloader.hasPendingPersisted(owner) }.getOrDefault(false)
+                    ) {
+                        runCatching { container.startDownloadService() }
+                    }
+                }
+            }
+        }
+        viewModelScope.launch {
+            container.authRepository.cachedSession.collect { cached ->
+                _state.update { it.copy(hasCachedJellyfinSession = cached != null) }
+                refreshDownloadEntries()
+            }
+        }
+        viewModelScope.launch {
+            container.jellyfinConnectionMonitor.status.collect { status ->
+                _state.update { it.copy(jellyfinLibraryStatus = status) }
             }
         }
         viewModelScope.launch {
@@ -207,19 +241,34 @@ class MainViewModel(
         viewModelScope.launch {
             container.playbackEngine.endOfMedia.collect { onEndOfMedia() }
         }
-        // Best-effort: resume a previously saved server + login across launches.
+        // Rehydrate a non-secret scope first, so a previous Jellyfin gallery and completed downloads are
+        // useful immediately when the server is down. Live restoration below independently verifies the
+        // server identity before installing the stored token.
         viewModelScope.launch {
-            val restored = runCatching { container.authRepository.restoreSession() }.getOrNull()
-            if (restored != null) {
-                _state.update { it.copy(loggedIn = true, connectionState = ConnectionState.CONNECTED) }
+            val cached = runCatching { container.authRepository.restoreCachedSession() }.getOrNull()
+            if (cached != null) {
+                _state.update { it.copy(hasCachedJellyfinSession = true) }
             }
-            val shouldRestoreLibrary = _state.value.route == Route.GALLERY &&
-                (restored != null || _state.value.activeSourceId == MediaSourceIds.LOCAL)
-            if (shouldRestoreLibrary) {
+            val initialGallery = _state.value.route == Route.GALLERY
+            if (initialGallery && (cached != null || _state.value.activeSourceId == MediaSourceIds.LOCAL)) {
                 val restoredQuery = _state.value.searchQuery
                 _state.update { it.copy(galleryLoading = true) }
                 loadRoots()
                 if (restoredQuery.isNotBlank()) onSearchQueryChanged(restoredQuery)
+            }
+
+            val restored = container.authRepository.ensureOnlineSession().getOrNull()
+            if (restored != null) {
+                container.jellyfinConnectionMonitor.markOnline()
+                _state.update { it.copy(loggedIn = true, connectionState = ConnectionState.CONNECTED) }
+                if (_state.value.route == Route.GALLERY && _state.value.activeSourceId == MediaSourceIds.JELLYFIN) {
+                    val restoredQuery = _state.value.searchQuery
+                    _state.update { it.copy(galleryLoading = true) }
+                    loadRoots()
+                    if (restoredQuery.isNotBlank()) onSearchQueryChanged(restoredQuery)
+                }
+            } else if (cached != null) {
+                container.jellyfinConnectionMonitor.markUnavailable()
             }
         }
         // Offline downloads: completed set (persistent) + live progress.
@@ -230,14 +279,7 @@ class MainViewModel(
                 _state.update { it.copy(downloads = mergeDownloads(states)) }
             }
         }
-        // If a download was interrupted by the OS killing the backgrounded process, start the foreground
-        // service on launch so it resumes the persisted download(s) from their `.part` files. Guarded:
-        // a cold-start foreground-service start can be rejected by the OS, and that must not crash.
-        viewModelScope.launch {
-            runCatching {
-                if (container.downloader.hasPendingPersisted()) container.startDownloadService()
-            }
-        }
+
         // If a previous run crashed ON THIS BUILD, prompt to export the report on launch (works before
         // login too). Only latest-build crashes are counted/shared — older-build reports (from before an
         // update) aren't relevant to the current build.
@@ -247,26 +289,37 @@ class MainViewModel(
         }
     }
 
-    private suspend fun refreshDownloadEntries() {
-        downloadEntries = runCatching { container.downloadStore.list() }.getOrDefault(emptyList())
-        downloadEntries.forEach { downloadTitles[it.itemId] = it.title }
+    private suspend fun refreshDownloadEntries() = downloadRefreshMutex.withLock {
+        val owner = activeDownloadOwner()
+        val entries = owner?.let { currentOwner ->
+            runCatching { container.downloadStore.list(currentOwner) }.getOrDefault(emptyList())
+        }.orEmpty()
+        // Do not publish entries for a profile that switched while the disk read was in flight.
+        if (owner != activeDownloadOwner()) return@withLock
+        downloadEntries = entries
+        downloadTitles.clear()
+        entries.forEach { entry ->
+            owner?.let { downloadTitles[DownloadIdentity(it, entry.itemId)] = entry.title }
+        }
         _state.update { it.copy(downloads = mergeDownloads(container.downloader.states.value)) }
     }
 
-    private fun mergeDownloads(states: Map<String, DownloadState>): List<DownloadUiItem> {
+    private fun mergeDownloads(states: Map<DownloadIdentity, DownloadState>): List<DownloadUiItem> {
+        val owner = activeDownloadOwner() ?: return emptyList()
         val byId = LinkedHashMap<String, DownloadUiItem>()
-        downloadEntries.forEach { e ->
-            byId[e.itemId] = DownloadUiItem(e.itemId, e.title, "Downloaded", 1f, completed = true)
+        downloadEntries.forEach { entry ->
+            byId[entry.itemId] = DownloadUiItem(entry.itemId, entry.title, "Downloaded", 1f, completed = true)
         }
-        states.forEach { (id, st) ->
-            val title = downloadTitles[id] ?: container.downloader.titleFor(id) ?: id
-            val ui = when (st) {
-                is DownloadState.Queued -> DownloadUiItem(id, title, "Queued…", null, completed = false)
-                is DownloadState.Running -> DownloadUiItem(id, title, runningText(st), st.fraction, completed = false)
-                is DownloadState.Completed -> byId[id] ?: DownloadUiItem(id, title, "Downloaded", 1f, completed = true)
-                is DownloadState.Failed -> DownloadUiItem(id, title, st.reason, null, completed = false, failed = true)
+        states.filterKeys { it.owner == owner }.forEach { (identity, status) ->
+            val itemId = identity.itemId
+            val title = downloadTitles[identity] ?: container.downloader.titleFor(itemId, owner) ?: itemId
+            val ui = when (status) {
+                is DownloadState.Queued -> DownloadUiItem(itemId, title, "Queued…", null, completed = false)
+                is DownloadState.Running -> DownloadUiItem(itemId, title, runningText(status), status.fraction, completed = false)
+                is DownloadState.Completed -> byId[itemId] ?: DownloadUiItem(itemId, title, "Downloaded", 1f, completed = true)
+                is DownloadState.Failed -> DownloadUiItem(itemId, title, status.reason, null, completed = false, failed = true)
             }
-            if (st !is DownloadState.Completed || byId[id] == null) byId[id] = ui
+            if (status !is DownloadState.Completed || byId[itemId] == null) byId[itemId] = ui
         }
         return byId.values.sortedBy { it.title.lowercase() }
     }
@@ -301,7 +354,7 @@ class MainViewModel(
     fun dismissError() = _state.update { it.copy(errorMessage = null) }
 
     fun onWelcomeContinue() {
-        if (_state.value.loggedIn) openLibraries() else navigate(Route.SERVER_SETUP)
+        if (_state.value.canBrowseJellyfin) openLibraries() else navigate(Route.SERVER_SETUP)
     }
 
     /** Open the multi-server picker (kept even when offline). */
@@ -315,15 +368,30 @@ class MainViewModel(
         // the UI cannot keep polling or display a code from the previous server while the switch queues.
         cancelQuickConnect()
         viewModelScope.launch {
+            pauseDownloadsForAuthTransition()
             val session = container.authRepository.switchServer(serverId)
-            if (session != null) openLibraries()
-            else _state.update { it.copy(route = Route.SERVER_SETUP, loggedIn = false, errorMessage = "Sign in to that server to continue.") }
+            val cached = container.authRepository.cachedSession.value
+            when {
+                session != null -> {
+                    container.jellyfinConnectionMonitor.markOnline()
+                    openLibraries()
+                }
+                cached != null -> {
+                    container.jellyfinConnectionMonitor.markUnavailable()
+                    _state.update { it.copy(hasCachedJellyfinSession = true, loggedIn = false) }
+                    openLibraries()
+                }
+                else -> _state.update {
+                    it.copy(route = Route.SERVER_SETUP, loggedIn = false, errorMessage = "Sign in to that server to continue.")
+                }
+            }
         }
     }
 
     fun forgetServer(serverId: String) {
         cancelQuickConnect()
         viewModelScope.launch {
+            if (activeJellyfinSession()?.serverId == serverId) pauseDownloadsForAuthTransition()
             container.authRepository.deleteServerProfile(serverId)
             _state.update { it.copy(servers = container.authRepository.servers()) }
         }
@@ -349,6 +417,7 @@ class MainViewModel(
         viewModelScope.launch {
             val s = _state.value
             _state.update { it.copy(connectionState = ConnectionState.TESTING, isBusy = true, errorMessage = null) }
+            pauseDownloadsForAuthTransition()
             container.authRepository.setServer(s.serverUrlInput, s.allowHttp).fold(
                 onSuccess = { profile ->
                     _state.update {
@@ -384,9 +453,11 @@ class MainViewModel(
     // ----- auth -----
 
     fun login(username: String, password: String) = viewModelScope.launch {
+        pauseDownloadsForAuthTransition()
         _state.update { it.copy(isBusy = true, errorMessage = null) }
         container.authRepository.login(username, password).fold(
             onSuccess = {
+                container.jellyfinConnectionMonitor.markOnline()
                 _state.update { it.copy(isBusy = false, loggedIn = true) }
                 openLibraries()
             },
@@ -451,8 +522,10 @@ class MainViewModel(
                 return
             }
             if (poll.getOrDefault(false) != true) continue
+            pauseDownloadsForAuthTransition()
             container.authRepository.completeQuickConnect(session).fold(
                 onSuccess = {
+                    container.jellyfinConnectionMonitor.markOnline()
                     _state.update { it.copy(quickConnect = null, loggedIn = true, errorMessage = null) }
                     openLibraries()
                 },
@@ -478,9 +551,17 @@ class MainViewModel(
         cancelQuickConnect()
         viewModelScope.launch {
             runCatching { container.playbackEngine.stop() }
+            pauseDownloadsForAuthTransition()
             container.authRepository.logout()
+            container.jellyfinConnectionMonitor.reset()
             _state.value = AppUiState()
         }
+    }
+
+    /** Keep queued bytes intact while the singleton Jellyfin client changes account/origin. */
+    private suspend fun pauseDownloadsForAuthTransition() {
+        runCatching { container.downloader.pauseAllAndJoin() }
+            .onFailure { container.logger.w("download", "Could not pause downloads before changing Jellyfin session", it) }
     }
 
     // ----- gallery -----
@@ -560,9 +641,9 @@ class MainViewModel(
     }
 
     private suspend fun loadRoots() {
-        // The Jellyfin source needs a logged-in server; if there's none, show the connect prompt
-        // (the gallery) rather than a failed load — local videos still work without Jellyfin.
-        if (_state.value.activeSourceId == MediaSourceIds.JELLYFIN && !_state.value.loggedIn) {
+        // Jellyfin can be browsed through an authenticated live session OR an isolated cached-session
+        // scope. The latter never permits the repository to make a token-bearing remote request.
+        if (_state.value.activeSourceId == MediaSourceIds.JELLYFIN && !_state.value.canBrowseJellyfin) {
             _state.update { it.copy(libraries = emptyList(), continueWatching = emptyList(), galleryLoading = false) }
             return
         }
@@ -646,7 +727,10 @@ class MainViewModel(
 
     /** Clear the dead session and route back to login so the user can re-authenticate. */
     private fun handleSessionExpired() {
-        viewModelScope.launch { runCatching { container.authRepository.logout() } }
+        viewModelScope.launch {
+            pauseDownloadsForAuthTransition()
+            runCatching { container.authRepository.logout() }
+        }
         _state.update {
             it.copy(
                 route = Route.LOGIN,
@@ -659,7 +743,16 @@ class MainViewModel(
     }
 
     private fun openDetail(item: MediaItem) {
-        _state.update { it.copy(selectedItem = withLocalResume(item), route = Route.MEDIA_DETAIL, errorMessage = null) }
+        val shouldPreferOfflineCopy = _state.value.availabilityFor(item) == JellyfinItemAvailability.DOWNLOADED &&
+            _state.value.jellyfinLibraryStatus == com.adsamcik.streamferry.domain.JellyfinLibraryStatus.UNAVAILABLE
+        _state.update {
+            it.copy(
+                selectedItem = withLocalResume(item),
+                selectedDownloadId = if (shouldPreferOfflineCopy) item.id else null,
+                route = Route.MEDIA_DETAIL,
+                errorMessage = null,
+            )
+        }
         // Enrich with full details (chapters power the seek-preview scrubber) in the background — the
         // gallery item carries only summary fields. Best-effort: if it fails (e.g. offline), or the user
         // has since selected a different item, the summary item is kept.
@@ -679,15 +772,21 @@ class MainViewModel(
         }
 
     /** Reload the current gallery view (libraries at the root, otherwise the current folder). */
-    fun refreshGallery() {
+    fun refreshGallery() = viewModelScope.launch {
+        refreshOnlineJellyfinSessionIfNeeded()
         val folder = _state.value.currentFolder
-        if (folder == null) {
-            openLibraries()
+        _state.update { it.copy(galleryLoading = true, errorMessage = null) }
+        if (folder == null) loadRoots() else loadChildren(folder.id)
+    }
+
+    /** A manual refresh is the explicit retry boundary for a cache-only Jellyfin session. */
+    private suspend fun refreshOnlineJellyfinSessionIfNeeded() {
+        val current = _state.value
+        if (current.activeSourceId != MediaSourceIds.JELLYFIN || current.loggedIn || !current.hasCachedJellyfinSession) return
+        if (container.authRepository.ensureOnlineSession().isSuccess) {
+            container.jellyfinConnectionMonitor.markOnline()
         } else {
-            viewModelScope.launch {
-                _state.update { it.copy(galleryLoading = true, errorMessage = null) }
-                loadChildren(folder.id)
-            }
+            container.jellyfinConnectionMonitor.markUnavailable()
         }
     }
 
@@ -929,7 +1028,11 @@ class MainViewModel(
         val pendingPlayback = PlaybackUiState(
             targetName = physicalTv.displayName,
             protocol = target.protocol.name,
-            mediaTitle = s.selectedItem?.title ?: downloadId?.let(downloadTitles::get).orEmpty(),
+            mediaTitle = s.selectedItem?.title ?: downloadId?.let { itemId ->
+                activeDownloadOwner()?.let { owner ->
+                    downloadTitles[DownloadIdentity(owner, itemId)] ?: container.downloader.titleFor(itemId, owner)
+                }
+            }.orEmpty(),
             durationSeconds = s.selectedItem?.runtimeSeconds,
             phase = PlaybackPhase.CONNECTING,
             adaptiveNote = "Connecting to the TV…",
@@ -947,9 +1050,14 @@ class MainViewModel(
         playbackStarting = true
         runCatching {
             if (downloadId != null) {
-                val entry = container.downloadStore.get(downloadId) ?: error("Download no longer available.")
+                val owner = activeDownloadOwner() ?: error("The Jellyfin account for this download is unavailable.")
+                val entry = container.downloadStore.get(owner, downloadId) ?: error("Download no longer available.")
                 val file = container.downloadStore.fileFor(entry)
-                val resumeKey = "dl:$downloadId"
+                check(file.isFile && file.canRead() && file.length() > 0L &&
+                    (entry.sizeBytes <= 0L || file.length() == entry.sizeBytes)) {
+                    "The downloaded copy is unavailable."
+                }
+                val resumeKey = DownloadIdentity(owner, downloadId).resumeKey
                 reconnectContext = ReconnectContext.Local(
                     file.absolutePath, entry.mimeType, entry.title, entry.runtimeSeconds,
                     physicalTv, target, downloadId, downloadedSmartResumeSeed(entry),
@@ -995,6 +1103,9 @@ class MainViewModel(
                     currentResumeKey = item.id
                     currentDurationSeconds = item.runtimeSeconds
                 } else {
+                    check(s.availabilityFor(item) != JellyfinItemAvailability.UNAVAILABLE) {
+                        "Jellyfin is unavailable. Download this item to play it offline."
+                    }
                     // Arm seamless autoplay-next: for an eligible series episode the engine holds the TV
                     // connection at end-of-media so the next episode loads without a reconnect.
                     val autoAdvance = container.playbackPreferences.autoPlayNextEpisode &&
@@ -1161,12 +1272,15 @@ class MainViewModel(
                 }
                 SmartResumeSourceType.DOWNLOADED -> {
                     requireRecordOwner(record)
-                    val entry = container.downloadStore.get(record.mediaId) ?: error("The downloaded copy was deleted.")
+                    val owner = downloadOwnerFor(record)
+                    val entry = container.downloadStore.get(owner, record.mediaId) ?: error("The downloaded copy was deleted.")
                     val file = container.downloadStore.fileFor(entry)
                     check(file.isFile && file.canRead() && file.length() > 0L) { "The downloaded copy is unavailable." }
                     val position = SmartResumePositionReconciler.reconcile(
                         record,
-                        rendererConfirmedSeconds = container.resumeStore.resumePosition("dl:${entry.itemId}"),
+                        rendererConfirmedSeconds = container.resumeStore.resumePosition(
+                            DownloadIdentity(owner, entry.itemId).resumeKey,
+                        ),
                         jellyfinResumeSeconds = null,
                     ) ?: error("This playback is already complete.")
                     beginSmartResumeTargetSelection(null, entry.itemId, position, record.deviceContext())
@@ -1200,11 +1314,23 @@ class MainViewModel(
     }
 
     private fun requireRecordOwner(record: SmartResumeRecord) {
-        val current = container.authRepository.currentUser.value
+        val current = activeJellyfinSession()
         check(current?.serverId == record.serverId && current?.userId == record.userId) {
             "Sign in to the Jellyfin account that played this video to resume it."
         }
     }
+
+    private fun downloadOwnerFor(record: SmartResumeRecord): DownloadOwner = DownloadOwner(
+        serverId = record.serverId ?: error("The saved Jellyfin server is unavailable."),
+        userId = record.userId ?: error("The saved Jellyfin user is unavailable."),
+    )
+
+    /** A cached session is sufficient to identify and play its local downloaded copies. */
+    private fun activeJellyfinSession() =
+        container.authRepository.currentUser.value ?: container.authRepository.cachedSession.value
+
+    private fun activeDownloadOwner(): DownloadOwner? = activeJellyfinSession()
+        ?.let { DownloadOwner(serverId = it.serverId, userId = it.userId) }
 
     private fun onlineSmartResumeSeed(item: MediaItem): SmartResumeSeed? =
         container.authRepository.currentUser.value?.let { user ->
@@ -1212,8 +1338,15 @@ class MainViewModel(
         }
 
     private fun downloadedSmartResumeSeed(entry: DownloadEntry): SmartResumeSeed? =
-        container.authRepository.currentUser.value?.let { user ->
-            SmartResumeSeed(SmartResumeSourceType.DOWNLOADED, entry.itemId, entry.title, durationSeconds = entry.runtimeSeconds, serverId = user.serverId, userId = user.userId)
+        (entry.owner ?: activeDownloadOwner())?.let { owner ->
+            SmartResumeSeed(
+                SmartResumeSourceType.DOWNLOADED,
+                entry.itemId,
+                entry.title,
+                durationSeconds = entry.runtimeSeconds,
+                serverId = owner.serverId,
+                userId = owner.userId,
+            )
         }
 
     private fun localSmartResumeSeed(item: MediaItem): SmartResumeSeed =
@@ -1222,10 +1355,16 @@ class MainViewModel(
     // ----- offline downloads -----
 
     fun downloadItem(item: MediaItem, format: DownloadFormat = DownloadFormat.Original) {
-        downloadTitles[item.id] = item.title
+        val owner = activeDownloadOwner()
+        if (!_state.value.loggedIn || owner == null) {
+            _state.update { it.copy(errorMessage = "Reconnect to Jellyfin before starting a download.") }
+            return
+        }
+        val identity = DownloadIdentity(owner, item.id)
+        downloadTitles[identity] = item.title
         // Enqueue (this persists the request and sets the Queued state) BEFORE starting the service, so
         // the service's idle check always observes the new download and can't stop before it begins.
-        container.downloader.download(item, format)
+        container.downloader.download(item, format, owner)
         container.startDownloadService()
     }
 
@@ -1233,10 +1372,12 @@ class MainViewModel(
         _state.value.selectedItem?.let { downloadItem(it, format) }
     }
 
-    fun cancelDownload(itemId: String) = container.downloader.cancel(itemId)
+    fun cancelDownload(itemId: String) {
+        activeDownloadOwner()?.let { owner -> container.downloader.cancel(itemId, owner) }
+    }
 
     fun deleteDownload(itemId: String) = viewModelScope.launch {
-        container.downloader.delete(itemId)
+        activeDownloadOwner()?.let { owner -> container.downloader.delete(itemId, owner) }
         refreshDownloadEntries()
     }
 

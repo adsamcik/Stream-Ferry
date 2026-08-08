@@ -52,6 +52,7 @@ import androidx.compose.material.icons.rounded.Cast
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Dns
+import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.PhoneAndroid
 import androidx.compose.material.icons.rounded.PlayArrow
@@ -99,11 +100,13 @@ import coil.compose.AsyncImage
 import com.adsamcik.streamferry.core.resume.ResumePolicy
 import com.adsamcik.streamferry.core.resume.SmartResumeSourceType
 import com.adsamcik.streamferry.data.download.DownloadFormat
+import com.adsamcik.streamferry.domain.JellyfinLibraryStatus
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.domain.MediaSourceIds
 import com.adsamcik.streamferry.ui.MainViewModel
 import com.adsamcik.streamferry.ui.components.ExpressiveLoadingIndicator
 import com.adsamcik.streamferry.ui.state.AppUiState
+import com.adsamcik.streamferry.ui.state.JellyfinItemAvailability
 import com.adsamcik.streamferry.ui.state.Route
 import com.adsamcik.streamferry.ui.theme.StreamFerryTheme
 import kotlinx.coroutines.launch
@@ -148,10 +151,12 @@ fun GalleryScreen(state: AppUiState, viewModel: MainViewModel, compact: Boolean 
     var indexedSection by remember(entries) { mutableStateOf<String?>(null) }
     var indexScrubbing by remember(entries) { mutableStateOf(false) }
     val isLocalSource = state.activeSourceId == MediaSourceIds.LOCAL
+    val isJellyfinSource = state.activeSourceId == MediaSourceIds.JELLYFIN
     val sources = viewModel.sources
     val activeSourceName = sources.firstOrNull { it.first == state.activeSourceId }?.second ?: "Library"
     val searchLabel = if (isLocalSource) "Search this device" else "Search $activeSourceName"
-    val needsJellyfinLogin = !isLocalSource && !state.loggedIn
+    val needsJellyfinLogin = isJellyfinSource && !state.canBrowseJellyfin
+    val jellyfinUnavailable = isJellyfinSource && state.jellyfinLibraryStatus == JellyfinLibraryStatus.UNAVAILABLE
     val showingSeasons = !searchActive && !atRoot && (
         state.currentFolder?.type.equals("Series", ignoreCase = true) ||
             (entries.isNotEmpty() && entries.all { it.type.equals("Season", ignoreCase = true) })
@@ -186,6 +191,8 @@ fun GalleryScreen(state: AppUiState, viewModel: MainViewModel, compact: Boolean 
                 },
                 onSearch = { searchOpen = true },
                 searchVisible = searchActive || searchOpen,
+                showJellyfinUnavailableNotice = jellyfinUnavailable,
+                onRetryJellyfin = viewModel::refreshGallery,
             )
             if (searchActive || searchOpen) {
                 LibrarySearchField(
@@ -214,6 +221,7 @@ fun GalleryScreen(state: AppUiState, viewModel: MainViewModel, compact: Boolean 
                 seasons = entries,
                 compact = compact,
                 posterUrlFor = { viewModel.posterUrl(it, POSTER_CARD_WIDTH_PX) },
+                availabilityFor = state::availabilityFor,
                 onSeasonClick = { viewModel.onItemClicked(it) },
             )
             else -> if (compact) {
@@ -231,6 +239,7 @@ fun GalleryScreen(state: AppUiState, viewModel: MainViewModel, compact: Boolean 
                                 item = item,
                                 posterUrl = viewModel.posterUrl(item, POSTER_CARD_WIDTH_PX),
                                 localThumbnailUri = item.localThumbnailUri(),
+                                availability = state.availabilityFor(item),
                                 compact = true,
                                 highlighted = indexScrubbing && indexedSection == sectionKey(item.title),
                                 onClick = { viewModel.onItemClicked(item) },
@@ -276,6 +285,7 @@ fun GalleryScreen(state: AppUiState, viewModel: MainViewModel, compact: Boolean 
                                 item = item,
                                 posterUrl = viewModel.posterUrl(item, POSTER_CARD_WIDTH_PX),
                                 localThumbnailUri = item.localThumbnailUri(),
+                                availability = state.availabilityFor(item),
                                 highlighted = indexScrubbing && indexedSection == sectionKey(item.title),
                                 onClick = { viewModel.onItemClicked(item) },
                             )
@@ -303,6 +313,7 @@ private fun SeasonList(
     seasons: List<MediaItem>,
     compact: Boolean,
     posterUrlFor: (MediaItem) -> String?,
+    availabilityFor: (MediaItem) -> JellyfinItemAvailability,
     onSeasonClick: (MediaItem) -> Unit,
 ) {
     LazyColumn(
@@ -334,6 +345,7 @@ private fun SeasonList(
                 index = index,
                 compact = compact,
                 posterUrl = posterUrlFor(season),
+                availability = availabilityFor(season),
                 onClick = { onSeasonClick(season) },
             )
         }
@@ -346,6 +358,7 @@ private fun AnimatedSeasonEntry(
     index: Int,
     compact: Boolean,
     posterUrl: String?,
+    availability: JellyfinItemAvailability,
     onClick: () -> Unit,
 ) {
     var visible by remember(season.id) { mutableStateOf(false) }
@@ -364,7 +377,13 @@ private fun AnimatedSeasonEntry(
                 initialOffsetY = { it / 3 },
             ),
     ) {
-        SeasonListCard(season, posterUrl, compact, onClick)
+        SeasonListCard(
+            season = season,
+            posterUrl = posterUrl,
+            availability = availability,
+            compact = compact,
+            onClick = onClick,
+        )
     }
 }
 
@@ -372,6 +391,7 @@ private fun AnimatedSeasonEntry(
 private fun SeasonListCard(
     season: MediaItem,
     posterUrl: String?,
+    availability: JellyfinItemAvailability,
     compact: Boolean,
     onClick: () -> Unit,
 ) {
@@ -461,6 +481,7 @@ private fun SeasonListCard(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
+                ItemAvailabilityLabel(availability)
             }
             Surface(
                 shape = CircleShape,
@@ -499,6 +520,8 @@ private fun LibraryHome(
         ?.takeIf { it.sourceType == SmartResumeSourceType.JELLYFIN }
         ?.mediaId
     val visibleContinueWatching = state.continueWatching.filterNot { it.id == smartResumeMediaId }
+    val jellyfinUnavailable = state.activeSourceId == MediaSourceIds.JELLYFIN &&
+        state.jellyfinLibraryStatus == JellyfinLibraryStatus.UNAVAILABLE
 
     LazyVerticalGrid(
         columns = if (compact) GridCells.Fixed(2) else GridCells.Adaptive(minSize = 150.dp),
@@ -515,6 +538,8 @@ private fun LibraryHome(
                         onBack = null,
                         onSearch = onOpenSearch,
                         searchVisible = searchOpen,
+                        showJellyfinUnavailableNotice = jellyfinUnavailable,
+                        onRetryJellyfin = viewModel::refreshGallery,
                     )
                 }
                 SourceSwitcher(viewModel.sources, state.activeSourceId, viewModel::selectSource)
@@ -560,6 +585,7 @@ private fun LibraryHome(
                     LibraryTile(
                         item = item,
                         posterUrl = viewModel.posterUrl(item, POSTER_CARD_WIDTH_PX),
+                        availability = state.availabilityFor(item),
                         onClick = { viewModel.onItemClicked(item) },
                     )
                 } else {
@@ -567,6 +593,7 @@ private fun LibraryHome(
                         item = item,
                         posterUrl = viewModel.posterUrl(item, POSTER_CARD_WIDTH_PX),
                         localThumbnailUri = item.localThumbnailUri(),
+                        availability = state.availabilityFor(item),
                         compact = compact,
                         onClick = { viewModel.onItemClicked(item) },
                     )
@@ -588,6 +615,7 @@ private fun LibraryHome(
                 ContinueWatchingRow(
                     items = visibleContinueWatching,
                     posterUrlFor = { viewModel.posterUrl(it, POSTER_CARD_WIDTH_PX) },
+                    availabilityFor = state::availabilityFor,
                     onClick = { viewModel.onItemClicked(it) },
                 )
             }
@@ -630,7 +658,10 @@ private fun PhoneGalleryHeader(
     onBack: (() -> Unit)?,
     onSearch: () -> Unit,
     searchVisible: Boolean,
+    showJellyfinUnavailableNotice: Boolean = false,
+    onRetryJellyfin: () -> Unit = {},
 ) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
     Row(
         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -663,6 +694,54 @@ private fun PhoneGalleryHeader(
         if (!searchVisible) {
             FilledTonalIconButton(onClick = onSearch) {
                 Icon(Icons.Rounded.Search, contentDescription = "Search library")
+            }
+        }
+    }
+        if (showJellyfinUnavailableNotice) {
+            JellyfinUnavailableHeaderNotice(
+                onRetry = onRetryJellyfin,
+                modifier = Modifier.padding(bottom = 4.dp),
+            )
+        }
+    }
+}
+@Composable
+internal fun JellyfinUnavailableHeaderNotice(
+    onRetry: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        modifier = modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        color = MaterialTheme.colorScheme.errorContainer,
+        contentColor = MaterialTheme.colorScheme.onErrorContainer,
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Icon(
+                Icons.Rounded.ErrorOutline,
+                contentDescription = null,
+                modifier = Modifier.size(20.dp),
+            )
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                Text(
+                    "Jellyfin unavailable",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                )
+                Text(
+                    "Showing saved library data. Downloaded items remain available offline.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            TextButton(onClick = onRetry) {
+                Text("Retry")
             }
         }
     }
@@ -1042,6 +1121,7 @@ private fun LocalThumbnail(uriString: String, modifier: Modifier = Modifier) {
 private fun ContinueWatchingRow(
     items: List<MediaItem>,
     posterUrlFor: (MediaItem) -> String?,
+    availabilityFor: (MediaItem) -> JellyfinItemAvailability,
     onClick: (MediaItem) -> Unit,
 ) {
     Column(
@@ -1055,7 +1135,7 @@ private fun ContinueWatchingRow(
         )
         LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             items(items, key = { it.id }) { item ->
-                ContinueWatchingCard(item, posterUrlFor(item)) { onClick(item) }
+                ContinueWatchingCard(item, posterUrlFor(item), availabilityFor(item)) { onClick(item) }
             }
         }
     }
@@ -1063,7 +1143,12 @@ private fun ContinueWatchingRow(
 
 /** Compact poster card for the "Continue watching" row: poster + resume progress bar + resume time. */
 @Composable
-private fun ContinueWatchingCard(item: MediaItem, posterUrl: String?, onClick: () -> Unit) {
+private fun ContinueWatchingCard(
+    item: MediaItem,
+    posterUrl: String?,
+    availability: JellyfinItemAvailability,
+    onClick: () -> Unit,
+) {
     Card(
         modifier = Modifier.width(CONTINUE_CARD_WIDTH.dp).clickable(onClick = onClick),
         shape = RoundedCornerShape(16.dp),
@@ -1118,6 +1203,7 @@ private fun ContinueWatchingCard(item: MediaItem, posterUrl: String?, onClick: (
                 overflow = TextOverflow.Ellipsis,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            ItemAvailabilityLabel(availability)
         }
     }
 }
@@ -1138,9 +1224,47 @@ private fun watchStateLabel(item: MediaItem): String? {
         else -> null
     }
 }
+@Composable
+private fun ItemAvailabilityLabel(
+    availability: JellyfinItemAvailability,
+    modifier: Modifier = Modifier,
+) {
+    if (availability == JellyfinItemAvailability.AVAILABLE) return
+    val downloaded = availability == JellyfinItemAvailability.DOWNLOADED
+    Surface(
+        modifier = modifier,
+        shape = RoundedCornerShape(10.dp),
+        color = if (downloaded) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.errorContainer,
+        contentColor = if (downloaded) MaterialTheme.colorScheme.onSecondaryContainer else MaterialTheme.colorScheme.onErrorContainer,
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(5.dp),
+        ) {
+            Icon(
+                if (downloaded) Icons.Rounded.Download else Icons.Rounded.ErrorOutline,
+                contentDescription = null,
+                modifier = Modifier.size(14.dp),
+            )
+            Text(
+                if (downloaded) "Downloaded · available offline" else "Unavailable · Jellyfin offline",
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
 
 @Composable
-private fun LibraryTile(item: MediaItem, posterUrl: String?, onClick: () -> Unit) {
+private fun LibraryTile(
+    item: MediaItem,
+    posterUrl: String?,
+    availability: JellyfinItemAvailability = JellyfinItemAvailability.AVAILABLE,
+    onClick: () -> Unit,
+) {
     Card(
         modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
         shape = RoundedCornerShape(24.dp),
@@ -1178,6 +1302,7 @@ private fun LibraryTile(item: MediaItem, posterUrl: String?, onClick: () -> Unit
                 overflow = TextOverflow.Ellipsis,
                 color = MaterialTheme.colorScheme.onSecondaryContainer,
             )
+            ItemAvailabilityLabel(availability)
         }
     }
 }
@@ -1187,6 +1312,7 @@ private fun MediaCard(
     item: MediaItem,
     posterUrl: String?,
     localThumbnailUri: String?,
+    availability: JellyfinItemAvailability = JellyfinItemAvailability.AVAILABLE,
     compact: Boolean = false,
     highlighted: Boolean = false,
     onClick: () -> Unit,
@@ -1255,6 +1381,7 @@ private fun MediaCard(
                     color = secondaryTextColor,
                 )
             }
+            ItemAvailabilityLabel(availability)
         }
     }
 }
@@ -1321,6 +1448,9 @@ fun MediaDetailScreen(
         return
     }
     val download = state.downloadFor(media.id)
+    val availability = state.availabilityFor(media)
+    val serverUnavailable = media.sourceId == MediaSourceIds.JELLYFIN &&
+        state.jellyfinLibraryStatus == JellyfinLibraryStatus.UNAVAILABLE
 
     Column(
         modifier = Modifier.fillMaxSize(),
@@ -1336,6 +1466,7 @@ fun MediaDetailScreen(
                     item = media,
                     posterUrl = viewModel.posterUrl(media, POSTER_DETAIL_WIDTH_PX),
                     compact = compact,
+                    availability = availability,
                 )
             }
             media.overview?.takeIf(String::isNotBlank)?.let { overview ->
@@ -1347,6 +1478,7 @@ fun MediaDetailScreen(
                 item(key = "detail-watch-state") {
                     WatchStateAction(
                         item = media,
+                        enabled = !serverUnavailable,
                         onToggle = { viewModel.markWatched(media, !media.played) },
                     )
                 }
@@ -1355,6 +1487,7 @@ fun MediaDetailScreen(
                         item = media,
                         download = download,
                         viewModel = viewModel,
+                        serverUnavailable = serverUnavailable,
                     )
                 }
             }
@@ -1362,7 +1495,9 @@ fun MediaDetailScreen(
 
         DetailPlaybackDock(
             item = media,
+            availability = availability,
             downloadCompleted = download?.completed == true,
+            serverUnavailable = serverUnavailable,
             onPlay = {
                 viewModel.clearDownloadSelection()
                 onChooseTv()
@@ -1376,7 +1511,12 @@ fun MediaDetailScreen(
 }
 
 @Composable
-private fun DetailHero(item: MediaItem, posterUrl: String?, compact: Boolean) {
+private fun DetailHero(
+    item: MediaItem,
+    availability: JellyfinItemAvailability,
+    posterUrl: String?,
+    compact: Boolean,
+) {
     ElevatedCard(
         shape = RoundedCornerShape(32.dp),
         modifier = Modifier.fillMaxWidth(),
@@ -1427,6 +1567,7 @@ private fun DetailHero(item: MediaItem, posterUrl: String?, compact: Boolean) {
                             )
                         }
                     }
+                    ItemAvailabilityLabel(availability)
                     Text(
                         item.title,
                         style = if (compact) MaterialTheme.typography.headlineSmall else MaterialTheme.typography.headlineMedium,
@@ -1550,9 +1691,14 @@ private fun DetailAboutCard(itemId: String, overview: String) {
 }
 
 @Composable
-private fun WatchStateAction(item: MediaItem, onToggle: () -> Unit) {
+private fun WatchStateAction(
+    item: MediaItem,
+    enabled: Boolean,
+    onToggle: () -> Unit,
+) {
     Card(
         onClick = onToggle,
+        enabled = enabled,
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(24.dp),
         colors = CardDefaults.cardColors(
@@ -1588,7 +1734,7 @@ private fun WatchStateAction(item: MediaItem, onToggle: () -> Unit) {
                     fontWeight = FontWeight.Bold,
                 )
                 Text(
-                    if (item.played) "Tap to mark this as unwatched" else "Keep your Jellyfin history up to date",
+                    if (!enabled) "Jellyfin is unavailable. Watch state will sync after reconnecting." else if (item.played) "Tap to mark this as unwatched" else "Keep your Jellyfin history up to date",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -1603,6 +1749,7 @@ private fun OfflineDetailCard(
     item: MediaItem,
     download: com.adsamcik.streamferry.ui.state.DownloadUiItem?,
     viewModel: MainViewModel,
+    serverUnavailable: Boolean,
 ) {
     var selectedFormat by remember(item.id) { mutableStateOf<DownloadFormat>(DownloadFormat.Original) }
     var formatMenuExpanded by remember(item.id) { mutableStateOf(false) }
@@ -1634,7 +1781,11 @@ private fun OfflineDetailCard(
                         color = MaterialTheme.colorScheme.onSecondaryContainer,
                     )
                     Text(
-                        if (download?.completed == true) "Ready when your server isn't" else "Take it with you",
+                        when {
+                            download?.completed == true -> "Ready when your server isn't"
+                            serverUnavailable -> "Jellyfin unavailable — reconnect to download"
+                            else -> "Take it with you"
+                        },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.78f),
                     )
@@ -1644,18 +1795,21 @@ private fun OfflineDetailCard(
             when {
                 download == null -> {
                     Text(
-                        "Save a copy that can be played on a TV without reaching your Jellyfin server.",
+                        if (serverUnavailable) "Jellyfin is unavailable. Reconnect to download an offline copy." else
+                            "Save a copy that can be played on a TV without reaching your Jellyfin server.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSecondaryContainer,
                     )
                     DownloadFormatPicker(
                         selectedFormat = selectedFormat,
+                        enabled = !serverUnavailable,
                         expanded = formatMenuExpanded,
                         onExpandedChange = { formatMenuExpanded = it },
                         onFormatSelected = { selectedFormat = it },
                     )
                     Button(
                         onClick = { viewModel.downloadSelected(selectedFormat) },
+                        enabled = !serverUnavailable,
                         modifier = Modifier.fillMaxWidth().height(52.dp),
                         shape = RoundedCornerShape(19.dp),
                     ) {
@@ -1679,12 +1833,14 @@ private fun OfflineDetailCard(
                     Text(download.statusText, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
                     DownloadFormatPicker(
                         selectedFormat = selectedFormat,
+                        enabled = !serverUnavailable,
                         expanded = formatMenuExpanded,
                         onExpandedChange = { formatMenuExpanded = it },
                         onFormatSelected = { selectedFormat = it },
                     )
                     OutlinedButton(
                         onClick = { viewModel.downloadSelected(selectedFormat) },
+                        enabled = !serverUnavailable,
                         shape = RoundedCornerShape(18.dp),
                     ) { Text("Retry download") }
                 }
@@ -1710,12 +1866,13 @@ private fun OfflineDetailCard(
 @Composable
 private fun DownloadFormatPicker(
     selectedFormat: DownloadFormat,
+    enabled: Boolean = true,
     expanded: Boolean,
     onExpandedChange: (Boolean) -> Unit,
     onFormatSelected: (DownloadFormat) -> Unit,
 ) {
     Box {
-        OutlinedButton(onClick = { onExpandedChange(true) }, shape = RoundedCornerShape(18.dp)) {
+        OutlinedButton(onClick = { onExpandedChange(true) }, enabled = enabled, shape = RoundedCornerShape(18.dp)) {
             Text("Quality: ${selectedFormat.label}")
         }
         DropdownMenu(expanded = expanded, onDismissRequest = { onExpandedChange(false) }) {
@@ -1735,7 +1892,9 @@ private fun DownloadFormatPicker(
 @Composable
 private fun DetailPlaybackDock(
     item: MediaItem,
+    availability: JellyfinItemAvailability,
     downloadCompleted: Boolean,
+    serverUnavailable: Boolean,
     onPlay: () -> Unit,
     onPlayOffline: () -> Unit,
 ) {
@@ -1750,6 +1909,8 @@ private fun DetailPlaybackDock(
         label = "detail-play-press",
     )
     val resumeAt = item.resumePositionSeconds?.takeIf { it > 0L }
+    val offlinePreferred = serverUnavailable && downloadCompleted
+    val onlinePlayable = !serverUnavailable && availability != JellyfinItemAvailability.UNAVAILABLE
 
     Surface(
         modifier = Modifier.fillMaxWidth(),
@@ -1786,7 +1947,8 @@ private fun DetailPlaybackDock(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 Button(
-                    onClick = onPlay,
+                    onClick = if (offlinePreferred) onPlayOffline else onPlay,
+                    enabled = offlinePreferred || onlinePlayable,
                     interactionSource = interactionSource,
                     modifier = Modifier
                         .weight(1f)
@@ -1798,18 +1960,27 @@ private fun DetailPlaybackDock(
                     shape = RoundedCornerShape(22.dp),
                 ) {
                     Icon(
-                        if (resumeAt != null) Icons.Rounded.PlayArrow else Icons.Rounded.Cast,
+                        when {
+                            offlinePreferred -> Icons.Rounded.Download
+                            resumeAt != null -> Icons.Rounded.PlayArrow
+                            else -> Icons.Rounded.Cast
+                        },
                         contentDescription = null,
                         modifier = Modifier.size(22.dp),
                     )
                     Text(
-                        if (resumeAt != null) "  Resume on TV" else "  Play on TV",
+                        when {
+                            offlinePreferred -> if (resumeAt != null) "  Resume offline" else "  Play offline"
+                            !onlinePlayable -> "  Unavailable"
+                            resumeAt != null -> "  Resume on TV"
+                            else -> "  Play on TV"
+                        },
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold,
                         maxLines = 1,
                     )
                 }
-                if (downloadCompleted) {
+                if (downloadCompleted && !offlinePreferred) {
                     OutlinedButton(
                         onClick = onPlayOffline,
                         modifier = Modifier.height(60.dp),
