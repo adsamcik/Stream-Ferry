@@ -10,6 +10,7 @@ import com.adsamcik.streamferry.logging.LogEntry
 import com.adsamcik.streamferry.physical.PhysicalTv
 import com.adsamcik.streamferry.playback.PlaybackAttemptDescriptor
 import com.adsamcik.streamferry.playback.PlaybackPhase
+import com.adsamcik.streamferry.playback.PlaybackQueue
 import com.adsamcik.streamferry.playback.RecoveryBudget
 import com.adsamcik.streamferry.playback.RecoveryBudgetStatus
 import com.adsamcik.streamferry.playback.RecoveryBudgetUsage
@@ -94,6 +95,13 @@ data class AppUiState(
 
     // ----- playback -----
     val playback: PlaybackUiState? = null,
+    /**
+     * The item actually active on the TV. It deliberately remains separate from [selectedItem], so
+     * opening another title while browsing cannot change the now-playing controls or autoplay target.
+     */
+    val nowPlayingItem: MediaItem? = null,
+    /** Session-scoped FIFO playlist. Entries retain their own ids so the same media can be queued twice. */
+    val playlist: PlaybackQueue = PlaybackQueue(),
 
     /** Latest app-wide renderer-confirmed checkpoint, displayed at either gallery root. */
     val smartResume: SmartResumeUiState? = null,

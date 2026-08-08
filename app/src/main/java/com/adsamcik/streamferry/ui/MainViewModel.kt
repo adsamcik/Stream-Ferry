@@ -36,6 +36,8 @@ import com.adsamcik.streamferry.physical.PhysicalTvReconnectMatch
 import com.adsamcik.streamferry.physical.PhysicalTvReconnectPolicy
 import com.adsamcik.streamferry.physical.PhysicalTvResumeMatcher
 import com.adsamcik.streamferry.playback.PlaybackStatus
+import com.adsamcik.streamferry.playback.PlaybackQueue
+import com.adsamcik.streamferry.playback.PlaylistEntry
 import com.adsamcik.streamferry.playback.PlaybackFailureCause
 import com.adsamcik.streamferry.playback.PlaybackFailureStage
 import com.adsamcik.streamferry.playback.PlaybackPhase
@@ -121,9 +123,11 @@ class MainViewModel(
     private var scanJob: Job? = null
     @Volatile private var reconnecting = false
     @Volatile private var playbackStarting = false
-    // True while we're auto-advancing to the next episode (end-of-media -> resolve next -> play). Guards
-    // the status->null "ended" branch so it doesn't bounce to the gallery during the hand-off.
+    // True while an end-of-media or explicit queue skip is handing off to the next item. Guards the
+    // status->null "ended" branch so the mini-player and playback screen do not flicker away mid-handoff.
     @Volatile private var autoAdvancing = false
+    /** Monotonic session-local id: duplicate media entries remain independently removable/repeatable. */
+    private var playlistEntrySequence = 0L
     private var lastPlaybackPositionSeconds: Long = 0L
     // What to re-play on reconnect (Jellyfin online OR an on-device / downloaded local file). Set after a
     // successful play()/playLocal(), cleared on stop / a new play.
@@ -191,15 +195,16 @@ class MainViewModel(
                     startTerminalProtocolFallback(status)
                 }
                 _state.update { cur ->
-                    // While reconnecting OR auto-advancing to the next episode, a transient null status
-                    // must NOT bounce the user to the gallery — keep the playback screen for the hand-off.
-                    val ended = status == null && cur.route == Route.PLAYBACK &&
-                        !playbackStarting && !reconnecting && !autoAdvancing
+                    // A hand-off can briefly publish null while the old renderer tears down. Keep the
+                    // now-playing presentation mounted until the replacement has begun.
+                    val retainingPlayback = playbackStarting || reconnecting || autoAdvancing
+                    val ended = status == null && cur.route == Route.PLAYBACK && !retainingPlayback
                     val ui = status?.toUi()?.copy(reconnecting = reconnecting)
-                        ?: cur.playback?.takeIf { playbackStarting || reconnecting }
+                        ?: cur.playback?.takeIf { retainingPlayback }
                             ?.copy(reconnecting = reconnecting)
                     cur.copy(
                         playback = ui,
+                        nowPlayingItem = if (ui == null && !retainingPlayback) null else cur.nowPlayingItem,
                         route = if (ended) Route.GALLERY else cur.route,
                     )
                 }
@@ -826,7 +831,15 @@ class MainViewModel(
         // has since selected a different item, the summary item is kept.
         viewModelScope.launch {
             activeSource().item(item.id).onSuccess { full ->
-                _state.update { st -> if (st.selectedItem?.id == item.id) st.copy(selectedItem = withLocalResume(full)) else st }
+                _state.update { st ->
+                    if (st.selectedItem?.id != item.id) st else {
+                        val detailed = withLocalResume(full)
+                        st.copy(
+                            selectedItem = detailed,
+                            nowPlayingItem = if (st.nowPlayingItem?.id == item.id) detailed else st.nowPlayingItem,
+                        )
+                    }
+                }
             }
         }
     }
@@ -1075,10 +1088,21 @@ class MainViewModel(
         container.logger.event("discovery", "A saved TV endpoint association was unlinked")
     }
 
-    fun play() = viewModelScope.launch {
+    fun play() = startPlayback(
+        requestedItem = _state.value.selectedItem,
+        downloadId = _state.value.selectedDownloadId,
+    )
+
+    /** Starts a gallery selection or queue entry without changing the item currently open for browsing. */
+    private fun startPlayback(
+        requestedItem: MediaItem?,
+        downloadId: String?,
+        onResult: (Boolean) -> Unit = {},
+    ): Job = viewModelScope.launch {
         if (!container.permissions.hasLocalNetworkAccess()) {
             onLocalNetworkPermissionDenied()
             _state.update { it.copy(playbackStartingTargetId = null) }
+            onResult(false)
             return@launch
         }
         // A fresh, user-initiated play supersedes any in-flight auto-reconnect.
@@ -1103,16 +1127,17 @@ class MainViewModel(
         val s = _state.value
         val physicalTv = s.selectedPhysicalTv ?: run {
             _state.update { it.copy(playbackStartingTargetId = null) }
+            onResult(false)
             return@launch
         }
         val target = physicalTv.selectEndpoint() ?: run {
             _state.update { it.copy(playbackStartingTargetId = null) }
+            onResult(false)
             return@launch
         }
         val resumeDeviceContext = smartResumeDeviceContext(physicalTv, target)
-        _state.update { it.copy(selectedTarget = target) }
+        _state.update { it.copy(selectedTarget = target, nowPlayingItem = requestedItem) }
         val controller = if (target.protocol == Protocol.CAST) container.castController else container.dlnaController
-        val downloadId = s.selectedDownloadId
         // Navigate to the playback screen only AFTER the proxy service enters the foreground (via the
         // onForegrounded callback below), so the screen's recomposition can't queue ahead of onStartCommand
         // on the main thread and blow the startForegroundService() deadline
@@ -1120,12 +1145,12 @@ class MainViewModel(
         val pendingPlayback = PlaybackUiState(
             targetName = physicalTv.displayName,
             protocol = target.protocol.name,
-            mediaTitle = s.selectedItem?.title ?: downloadId?.let { itemId ->
+            mediaTitle = requestedItem?.title ?: downloadId?.let { itemId ->
                 activeDownloadOwner()?.let { owner ->
                     downloadTitles[DownloadIdentity(owner, itemId)] ?: container.downloader.titleFor(itemId, owner)
                 }
             }.orEmpty(),
-            durationSeconds = s.selectedItem?.runtimeSeconds,
+            durationSeconds = requestedItem?.runtimeSeconds,
             phase = PlaybackPhase.CONNECTING,
             adaptiveNote = "Connecting to the TV…",
             volumeSupported = false,
@@ -1140,6 +1165,7 @@ class MainViewModel(
             }
         }
         playbackStarting = true
+        var started = false
         runCatching {
             if (downloadId != null) {
                 val owner = activeDownloadOwner() ?: error("The Jellyfin account for this download is unavailable.")
@@ -1170,7 +1196,7 @@ class MainViewModel(
                 currentResumeKey = resumeKey
                 currentDurationSeconds = entry.runtimeSeconds
             } else {
-                val item = s.selectedItem ?: error("Nothing selected to play.")
+                val item = requestedItem ?: error("Nothing selected to play.")
                 if (item.sourceId == MediaSourceIds.LOCAL) {
                     // On-device file: served via the proxy from a content:// fd. Resumes where you left
                     // off and auto-reconnects, the same as an online session.
@@ -1198,14 +1224,13 @@ class MainViewModel(
                     check(s.availabilityFor(item) != JellyfinItemAvailability.UNAVAILABLE) {
                         "Jellyfin is unavailable. Download this item to play it offline."
                     }
-                    // Arm seamless autoplay-next: for an eligible series episode the engine holds the TV
-                    // connection at end-of-media so the next episode loads without a reconnect.
-                    val autoAdvance = container.playbackPreferences.autoPlayNextEpisode &&
-                        item.type.equals("Episode", ignoreCase = true) && item.seriesId != null
+                    // Keep an online connection alive only when episode autoplay or this session's playlist
+                    // has a concrete next item ready for a seamless hand-off.
+                    val autoAdvance = shouldAutoAdvance(item, s.playlist)
                     reconnectContext = ReconnectContext.Online(item, physicalTv, target)
                     container.playbackEngine.play(
                         item, controller, target,
-                        streamPreferences(),
+                        streamPreferences(item),
                         autoAdvance = autoAdvance,
                         smartResumeSeed = onlineSmartResumeSeed(item),
                         smartResumeDeviceContext = resumeDeviceContext,
@@ -1215,6 +1240,7 @@ class MainViewModel(
             }
         }.onSuccess {
             smartResumeOverrideSeconds = null
+            started = true
         }.onFailure { e ->
             if (e is CancellationException) {
                 throw e
@@ -1265,6 +1291,7 @@ class MainViewModel(
                 }
                 if (switched) {
                     smartResumeOverrideSeconds = null
+                    started = true
                     container.logger.event("playback", "Initial playback recovered through the TV's alternate protocol")
                 } else if (context != null) {
                     // Keep raw/redacted transport detail in diagnostics; the main UI stays concise.
@@ -1287,22 +1314,38 @@ class MainViewModel(
         }
         playbackStarting = false
         _state.update { it.copy(selectedDownloadId = null, playbackStartingTargetId = null) }
+        onResult(started)
     }
 
     /**
-     * A genuine end-of-media finished. If autoplay-next is enabled and the finished item is a Jellyfin
-     * series episode with a following episode, play it on the same TV; otherwise fall through to the
-     * gallery (the status->null "ended" handler). [autoAdvancing] suppresses that gallery bounce during
-     * the hand-off; play().join() holds it until the next episode is loaded (or the attempt fails).
+     * A genuine end-of-media finished. An explicit playlist always wins over episode-autoplay. Online
+     * items reuse the renderer when possible; downloaded/local entries fall back to a normal fresh start.
      */
     private fun onEndOfMedia() {
-        val current = _state.value.selectedItem
+        if (autoAdvancing) {
+            container.logger.event("playlist", "Ignoring duplicate end-of-media signal during a hand-off")
+            return
+        }
+        val snapshot = _state.value
+        snapshot.playlist.next?.let { next ->
+            autoAdvancing = true
+            viewModelScope.launch {
+                try {
+                    advancePlaylist(next, currentEnded = true, trigger = "Autoplaying queued item")
+                } finally {
+                    autoAdvancing = false
+                }
+            }
+            return
+        }
+
+        val current = snapshot.nowPlayingItem
         val eligible = container.playbackPreferences.autoPlayNextEpisode &&
             current != null &&
             current.sourceId == MediaSourceIds.JELLYFIN &&
             current.type.equals("Episode", ignoreCase = true) &&
             current.seriesId != null &&
-            _state.value.selectedTarget != null
+            snapshot.selectedTarget != null
         if (!eligible) return
         autoAdvancing = true
         viewModelScope.launch {
@@ -1312,29 +1355,115 @@ class MainViewModel(
                     .getOrNull()
                 if (next != null) {
                     container.logger.event("playback", "Autoplaying next episode")
-                    _state.update { it.copy(selectedItem = next) }
+                    _state.update { it.copy(nowPlayingItem = next, selectedDownloadId = null) }
                     val target = _state.value.selectedTarget
                     val previousContext = reconnectContext
-                    // Prefer a SEAMLESS hand-off that reuses the live TV connection (the engine held it open
-                    // at end-of-media). Fall back to a full play (reconnect) only if there's no live session.
                     val seamless = target != null && runCatching {
-                        container.playbackEngine.playNext(next, streamPreferences(), onlineSmartResumeSeed(next))
+                        container.playbackEngine.playNext(
+                            next,
+                            streamPreferences(next),
+                            onlineSmartResumeSeed(next),
+                            autoAdvance = shouldAutoAdvance(next, _state.value.playlist),
+                        )
                     }.onFailure { e -> if (isSessionExpired(e)) handleSessionExpired() }.getOrDefault(false)
                     if (seamless && target != null && previousContext != null) {
                         reconnectContext = ReconnectContext.Online(next, previousContext.physicalTv, target)
                     } else {
-                        play().join() // no live session to reuse — full (re)connect
+                        startPlayback(next, null).join()
                     }
                 } else {
-                    // Series finished (no next episode): stop (releasing the held connection) and go home.
                     runCatching { container.playbackEngine.stop() }
-                    _state.update { it.copy(route = Route.GALLERY, playback = null) }
+                    _state.update { it.copy(route = Route.GALLERY, playback = null, nowPlayingItem = null) }
                     loadContinueWatching()
                 }
             } finally {
                 autoAdvancing = false
             }
         }
+    }
+
+    /** Advance to [entry], retaining it on a failed start so a transient outage never silently drops it. */
+    private suspend fun advancePlaylist(
+        entry: PlaylistEntry,
+        currentEnded: Boolean,
+        trigger: String,
+    ) {
+        val snapshot = _state.value
+        if (snapshot.playlist.next?.entryId != entry.entryId) return
+        val item = entry.item
+        val availability = snapshot.availabilityFor(item)
+        if (availability == JellyfinItemAvailability.UNAVAILABLE) {
+            val message = "${item.title} is unavailable while Jellyfin is offline. Reconnect or download it first."
+            container.logger.event("playlist", "Queued item unavailable: ${item.title}")
+            _state.update { current ->
+                val withMessage = current.copy(errorMessage = message)
+                if (currentEnded) {
+                    withMessage.copy(
+                        playback = null,
+                        nowPlayingItem = null,
+                        route = if (current.route == Route.PLAYBACK) Route.GALLERY else current.route,
+                    )
+                } else {
+                    withMessage
+                }
+            }
+            if (currentEnded) runCatching { container.playbackEngine.stop() }
+            return
+        }
+
+        val shouldUseOfflineCopy = availability == JellyfinItemAvailability.DOWNLOADED &&
+            snapshot.jellyfinLibraryStatus == com.adsamcik.streamferry.domain.JellyfinLibraryStatus.UNAVAILABLE
+        val remaining = snapshot.playlist.remove(entry.entryId)
+        val target = snapshot.selectedTarget
+        val previousContext = reconnectContext
+        val canReuseConnection = !shouldUseOfflineCopy && item.sourceId == MediaSourceIds.JELLYFIN &&
+            previousContext is ReconnectContext.Online && target != null
+        if (canReuseConnection) {
+            val seamless = runCatching {
+                container.playbackEngine.playNext(
+                    item,
+                    streamPreferences(item),
+                    onlineSmartResumeSeed(item),
+                    autoAdvance = shouldAutoAdvance(item, remaining),
+                )
+            }.onFailure { error ->
+                if (isSessionExpired(error)) handleSessionExpired()
+            }.getOrDefault(false)
+            if (seamless) {
+                reconnectContext = ReconnectContext.Online(item, previousContext.physicalTv, target)
+                _state.update { current ->
+                    if (current.playlist.next?.entryId != entry.entryId) current else current.copy(
+                        nowPlayingItem = item,
+                        playlist = current.playlist.remove(entry.entryId),
+                        selectedDownloadId = null,
+                        errorMessage = null,
+                    )
+                }
+                refreshAutoAdvancePolicy()
+                container.logger.event("playlist", "$trigger seamlessly: ${item.title}")
+                return
+            }
+        }
+
+        // Local/downloaded items, or an already-released renderer, need a fresh start. Remove only after
+        // success, which keeps a failed request visible and retryable in the playlist.
+        startPlayback(
+            requestedItem = item,
+            downloadId = if (shouldUseOfflineCopy) item.id else null,
+            onResult = { started ->
+                if (started) {
+                    _state.update { current ->
+                        if (current.playlist.entries.none { it.entryId == entry.entryId }) current else current.copy(
+                            playlist = current.playlist.remove(entry.entryId),
+                            nowPlayingItem = item,
+                            errorMessage = null,
+                        )
+                    }
+                    refreshAutoAdvancePolicy()
+                    container.logger.event("playlist", "$trigger: ${item.title}")
+                }
+            },
+        ).join()
     }
 
     /** Resume the app-wide renderer-confirmed checkpoint through the normal target picker. */
@@ -1501,6 +1630,56 @@ class MainViewModel(
     /** Clear any pending offline-cast selection (used when starting a normal online cast). */
     fun clearDownloadSelection() = _state.update { it.copy(selectedDownloadId = null) }
 
+    /** Queue a playable item without changing the gallery/detail selection or interrupting current playback. */
+    fun enqueue(item: MediaItem) {
+        val queuedItem = withLocalResume(item)
+        val snapshot = _state.value
+        val reason = when {
+            queuedItem.isFolder -> "Open this title and choose a specific episode or movie to add."
+            snapshot.availabilityFor(queuedItem) == JellyfinItemAvailability.UNAVAILABLE ->
+                "${queuedItem.title} is unavailable while Jellyfin is offline."
+            else -> null
+        }
+        if (reason != null) {
+            _state.update { it.copy(errorMessage = reason) }
+            return
+        }
+        val entryId = ++playlistEntrySequence
+        _state.update { current ->
+            current.copy(playlist = current.playlist.enqueue(entryId, queuedItem), errorMessage = null)
+        }
+        refreshAutoAdvancePolicy()
+    }
+
+    fun enqueueSelected() {
+        _state.value.selectedItem?.let(::enqueue)
+    }
+
+    fun removePlaylistEntry(entryId: Long) {
+        _state.update { current -> current.copy(playlist = current.playlist.remove(entryId)) }
+        refreshAutoAdvancePolicy()
+    }
+
+    fun clearPlaylist() {
+        _state.update { current -> current.copy(playlist = current.playlist.clear()) }
+        refreshAutoAdvancePolicy()
+    }
+
+    /** Skip to the first queued item, saving any local resume point before replacing the renderer stream. */
+    fun skipToNextPlaylistItem() {
+        if (autoAdvancing) return
+        val next = _state.value.playlist.next ?: return
+        autoAdvancing = true
+        viewModelScope.launch {
+            try {
+                saveResumeNow()
+                advancePlaylist(next, currentEnded = false, trigger = "Skipped to queued item")
+            } finally {
+                autoAdvancing = false
+            }
+        }
+    }
+
     fun togglePlayPause() = viewModelScope.launch {
         try {
             container.playbackEngine.togglePlayPause()
@@ -1587,7 +1766,7 @@ class MainViewModel(
 
     /** Run [remember] with the current show's memory key (series id for episodes, else item id). No-op if none. */
     private inline fun rememberShowLanguage(remember: (showKey: String) -> Unit) {
-        showLanguageKey(_state.value.selectedItem)?.let(remember)
+        showLanguageKey(_state.value.nowPlayingItem)?.let(remember)
     }
 
     /** Pin a specific streaming quality (bitrate), or return to Auto (null). Re-resolves the stream. */
@@ -1634,6 +1813,7 @@ class MainViewModel(
         fun update(list: List<MediaItem>) = list.map { if (it.id == itemId) it.withWatched(played) else it }
         st.copy(
             selectedItem = st.selectedItem?.let { if (it.id == itemId) it.withWatched(played) else it },
+            nowPlayingItem = st.nowPlayingItem?.let { if (it.id == itemId) it.withWatched(played) else it },
             items = update(st.items),
             searchResults = update(st.searchResults),
             libraries = update(st.libraries),
@@ -1782,10 +1962,9 @@ class MainViewModel(
                 context.item,
                 controllerFor(endpoint),
                 endpoint,
-                streamPreferences(),
+                streamPreferences(context.item),
                 resumePositionOverrideSeconds = resumeAtSeconds,
-                autoAdvance = container.playbackPreferences.autoPlayNextEpisode &&
-                    context.item.type.equals("Episode", ignoreCase = true) && context.item.seriesId != null,
+                autoAdvance = shouldAutoAdvance(context.item, _state.value.playlist),
                 smartResumeSeed = onlineSmartResumeSeed(context.item),
                 smartResumeDeviceContext = deviceContext,
                 recoveryContinuation = recoveryContinuation,
@@ -1812,7 +1991,7 @@ class MainViewModel(
         pendingResumeDeviceContext = null
         saveResumeNow()
         runCatching { container.playbackEngine.stop() }
-        _state.update { it.copy(route = Route.GALLERY) }
+        _state.update { it.copy(route = Route.GALLERY, playback = null, nowPlayingItem = null) }
         // Persist the playback session's events now so they're in a report even if the app is later
         // killed, and refresh the resume row from the server's updated position.
         container.flushDiagnostics()
@@ -2209,6 +2388,27 @@ class MainViewModel(
     val preferredAudioLanguage: String get() = container.playbackPreferences.preferredAudioLanguage
     fun setPreferredAudioLanguage(code: String) { container.playbackPreferences.preferredAudioLanguage = code }
 
+    /** Keep an online renderer alive at end-of-media only when a real next item can reuse it. */
+    private fun shouldAutoAdvance(item: MediaItem?, playlist: PlaybackQueue): Boolean =
+        item?.sourceId == MediaSourceIds.JELLYFIN && (
+            playlist.isNotEmpty ||
+                (container.playbackPreferences.autoPlayNextEpisode &&
+                    item.type.equals("Episode", ignoreCase = true) && item.seriesId != null)
+            )
+
+    /** Push playlist changes down to an already-playing online renderer. */
+    private fun refreshAutoAdvancePolicy() {
+        val snapshot = _state.value
+        val shouldHold = shouldAutoAdvance(snapshot.nowPlayingItem, snapshot.playlist)
+        viewModelScope.launch {
+            runCatching { container.playbackEngine.setAutoAdvance(shouldHold) }
+                .onFailure { error ->
+                    if (error is CancellationException) throw error
+                    container.logger.w("playlist", "Couldn't update next-item hand-off policy", error)
+                }
+        }
+    }
+
     /** Preferred subtitle language (ISO code, "" = none/off). Auto-enabled at play unless a show overrides it. */
     val preferredSubtitleLanguage: String get() = container.playbackPreferences.preferredSubtitleLanguage
     fun setPreferredSubtitleLanguage(code: String) { container.playbackPreferences.preferredSubtitleLanguage = code }
@@ -2238,10 +2438,10 @@ class MainViewModel(
     }
 
     /** Build the per-play stream preferences from the persisted playback settings. */
-    private fun streamPreferences(): StreamPreferences {
+    private fun streamPreferences(item: MediaItem? = _state.value.nowPlayingItem): StreamPreferences {
         // Resolve the desired languages for THIS item: a per-show memory (last used for the series/movie)
         // wins over the global preferred language; with neither, the server default / no-subtitles apply.
-        val showKey = showLanguageKey(_state.value.selectedItem)
+        val showKey = showLanguageKey(item)
         val rememberedAudio = showKey?.let { container.showLanguageStore.audioLanguage(it) }
         val rememberedSubtitle = showKey?.let { container.showLanguageStore.subtitle(it) } ?: SubtitleMemory.None
         val audioLanguage = LanguagePreferenceResolver.resolveAudio(
@@ -2293,6 +2493,7 @@ class MainViewModel(
                 selectedPhysicalTv = null,
                 selectedTarget = null,
                 playback = null,
+                nowPlayingItem = null,
                 isScanningTargets = false,
                 errorMessage = "Local-network access is required to find a TV or stream to it. Enable it in App settings and try again.",
             )

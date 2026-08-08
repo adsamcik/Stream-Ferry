@@ -310,6 +310,8 @@ class PlaybackEngine(
     // if it is still current, so a stale "finished" from a just-stopped stream can't kill a newer session
     // that won the mutex first (e.g. when the user immediately starts a different item).
     @Volatile private var playGeneration = 0L
+    /** Generation that reached a genuine end-of-media. Late renderer events for it must not revive playback. */
+    @Volatile private var completedGeneration: Long? = null
     /** Pure ledger for attempt ordering, stale-work rejection, and the finite recovery budget. */
     @Volatile private var recoverySession = PlaybackRecoverySession()
     @Volatile private var pendingRecoveryKind: RecoveryAttemptKind? = null
@@ -470,6 +472,7 @@ class PlaybackEngine(
         this@PlaybackEngine.smartResumeDeviceContext = smartResumeDeviceContext
         smartResume.prepare(smartResumeSeed, smartResumeDeviceContext)
         playGeneration++
+        completedGeneration = null
         recoverySession = recoveryContinuation?.let { recoverySession.continueFrom(it) } ?: recoverySession.startSession()
         pendingRecoveryKind = recoveryContinuation?.reservedKind
         connectionLost = false
@@ -551,14 +554,20 @@ class PlaybackEngine(
      * stream fails to load (after tearing the session down), so the caller surfaces it like a play error.
      * [prefs] is the caller-resolved per-item stream preference (same series ⇒ same language memory).
      */
-    suspend fun playNext(item: MediaItem, prefs: StreamPreferences, smartResumeSeed: SmartResumeSeed? = null): Boolean = withContext(Dispatchers.Default) {
+    suspend fun playNext(
+        item: MediaItem,
+        prefs: StreamPreferences,
+        smartResumeSeed: SmartResumeSeed? = null,
+        autoAdvance: Boolean = false,
+    ): Boolean = withContext(Dispatchers.Default) {
         mutex.withLock {
             requireLocalNetworkAccess()
             val tgt = target
             val sel = selectedTarget
             if (tgt == null || sel == null) return@withLock false // no live session — caller falls back to full play
             autoAdvanceTimeoutJob?.cancel(); autoAdvanceTimeoutJob = null
-            playGeneration++ // supersede the ended session (its pending end-of-media stop/timeout is now stale)
+            playGeneration++
+            completedGeneration = null // supersede the ended session (its pending end-of-media stop/timeout is now stale)
             recoverySession = recoverySession.startSession()
             smartResume.prepare(smartResumeSeed, smartResumeDeviceContext)
             connectionLost = false
@@ -579,7 +588,8 @@ class PlaybackEngine(
             playbackStarted = false
             this@PlaybackEngine.item = item
             this@PlaybackEngine.prefs = prefs
-            lastNote = "Loading the next episode…"
+            this@PlaybackEngine.autoAdvance = autoAdvance
+            lastNote = "Loading the next item…"
             publishStatus()
             val startPos = item.resumePositionSeconds ?: 0L
             try {
@@ -627,6 +637,11 @@ class PlaybackEngine(
             logger.event("playback", "Autoplay-next didn't start within ${AUTO_ADVANCE_HOLD_MS / 1000}s; stopping")
             stopIfCurrent(gen, "autoplay-next timed out")
         }
+    }
+
+    /** Update the seamless hand-off policy when the user changes the active playlist. */
+    suspend fun setAutoAdvance(enabled: Boolean) = mutex.withLock {
+        autoAdvance = enabled && target != null && item != null && completedGeneration != playGeneration
     }
 
     suspend fun togglePlayPause() {
@@ -734,6 +749,7 @@ class PlaybackEngine(
         this@PlaybackEngine.smartResumeDeviceContext = smartResumeDeviceContext
         smartResume.prepare(smartResumeSeed, smartResumeDeviceContext)
         playGeneration++
+        completedGeneration = null
         recoverySession = recoveryContinuation?.let { recoverySession.continueFrom(it) } ?: recoverySession.startSession()
         pendingRecoveryKind = recoveryContinuation?.reservedKind
         this@PlaybackEngine.target = target
@@ -893,7 +909,8 @@ class PlaybackEngine(
      * the on-device stream at [startPos]. Mirrors [reloadStream]/[playNext] for the offline path.
      */
     private suspend fun reloadLocalInPlace(startPos: Long, reason: String) {
-        playGeneration++ // supersede the current stream (its stray end-of-media/watchdog is now stale)
+        playGeneration++
+        completedGeneration = null // supersede the current stream (its stray end-of-media/watchdog is now stale)
         val wasReloading = isReloadingStream
         isReloadingStream = true
         connectionLost = false
@@ -1877,6 +1894,10 @@ class PlaybackEngine(
             logger.w(TAG, "Ignoring event from a replaced playback controller")
             return
         }
+        if (completedGeneration == playGeneration) {
+            logger.trace(TAG, "Ignoring late renderer event after end-of-media")
+            return
+        }
         when (event) {
             is PlaybackTargetEvent.Connected -> {
                 recoverySession = recoverySession.transition(PlaybackPhase.PREPARING)
@@ -1930,9 +1951,19 @@ class PlaybackEngine(
                 if (isReloadingStream) {
                     logger.w(TAG, "Ignoring end-of-media during a stream reload (seek/bitrate switch)")
                 } else {
+                    // Cast may repeat its finished/idle event, and a delayed poll may still say "playing".
+                    // Latch this exact generation before publishing so neither can resurrect the UI/session.
+                    completedGeneration = playGeneration
+                    isPlaying = false
+                    isBuffering = false
+                    seekSettleTargetSeconds = null
                     recoverySession = recoverySession.transition(PlaybackPhase.COMPLETED)
+                    lastNote = "Finished"
                     logger.event("playback", "End of media reached at ${absolutePositionSeconds}s")
                     smartResume.complete(smartResumeDeviceContext)
+                    // Publish before handing off so the mini-player, notification, and media session stop
+                    // advertising stale playback while a next item is being resolved.
+                    publishStatus()
                     // Signal a genuine end-of-media so the ViewModel can autoplay the next episode (a
                     // user-stop tears down eventsJob first, so this never fires for a deliberate stop).
                     _endOfMedia.tryEmit(Unit)
@@ -2122,6 +2153,7 @@ class PlaybackEngine(
         startupWatchdogJob?.cancel(); startupWatchdogJob = null
         autoAdvanceTimeoutJob?.cancel(); autoAdvanceTimeoutJob = null
         autoAdvance = false
+        completedGeneration = null
         // cancelAndJoin (not cancel): wait for the event collector to fully stop, so it can't write a new
         // fallbackJob AFTER we clear it below and leak an orphan reload onto the next play session.
         runCatching { eventsJob?.cancelAndJoin() }; eventsJob = null
