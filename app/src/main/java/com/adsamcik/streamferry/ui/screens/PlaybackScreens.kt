@@ -36,6 +36,7 @@ import androidx.compose.material.icons.automirrored.rounded.VolumeDown
 import androidx.compose.material.icons.automirrored.rounded.VolumeUp
 import androidx.compose.material.icons.rounded.Audiotrack
 import androidx.compose.material.icons.rounded.Cast
+import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Forward30
 import androidx.compose.material.icons.rounded.SkipNext
 import androidx.compose.material.icons.rounded.GraphicEq
@@ -52,6 +53,7 @@ import androidx.compose.material.icons.rounded.Stop
 import androidx.compose.material.icons.rounded.Subtitles
 import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material.icons.rounded.Tv
+import androidx.compose.material.icons.rounded.VideoLibrary
 import androidx.compose.material3.Button
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
@@ -64,6 +66,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.FilledTonalIconButton
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
@@ -131,6 +134,7 @@ import com.adsamcik.streamferry.playback.PlaybackPhase
 import com.adsamcik.streamferry.ui.MainViewModel
 import com.adsamcik.streamferry.ui.components.ExpressiveLoadingIndicator
 import com.adsamcik.streamferry.ui.state.AppUiState
+import com.adsamcik.streamferry.ui.state.JellyfinItemAvailability
 import com.adsamcik.streamferry.ui.state.PlaybackUiState
 import com.adsamcik.streamferry.ui.theme.StreamFerryTheme
 import kotlinx.coroutines.delay
@@ -522,10 +526,11 @@ fun PlaybackScreen(state: AppUiState, viewModel: MainViewModel) {
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val wide = maxWidth >= 700.dp
         val compactHeight = maxHeight < 610.dp
-        val title = state.selectedItem?.title
-        val chapters = state.selectedItem?.chapters.orEmpty()
+        val nowPlaying = state.nowPlayingItem
+        val title = nowPlaying?.title ?: p.mediaTitle
+        val chapters = nowPlaying?.chapters.orEmpty()
         val previewUrlFor: (Int) -> String? = { index ->
-            state.selectedItem?.let { viewModel.chapterImageUrl(it, index, CHAPTER_PREVIEW_WIDTH_PX) }
+            nowPlaying?.let { viewModel.chapterImageUrl(it, index, CHAPTER_PREVIEW_WIDTH_PX) }
         }
 
         if (p.isTerminal) {
@@ -533,7 +538,7 @@ fun PlaybackScreen(state: AppUiState, viewModel: MainViewModel) {
                 modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(if (compactHeight) 8.dp else 12.dp),
             ) {
-                NowPlayingHero(p, mediaTitle = title ?: p.mediaTitle, compact = compactHeight || !wide)
+                NowPlayingHero(p, mediaTitle = title, compact = compactHeight || !wide)
                 TerminalPlaybackCard(
                     message = p.errorMessage ?: "Stream Ferry ran out of safe automatic options.",
                     onRetry = viewModel::retryPlayback,
@@ -541,6 +546,7 @@ fun PlaybackScreen(state: AppUiState, viewModel: MainViewModel) {
                     onStop = viewModel::stopPlayback,
                     compact = compactHeight || !wide,
                 )
+                PlaylistCard(state, viewModel)
                 if (p.attemptHistory.isNotEmpty()) PlaybackAttemptHistory(p.attemptHistory)
             }
         } else if (wide) {
@@ -552,16 +558,18 @@ fun PlaybackScreen(state: AppUiState, viewModel: MainViewModel) {
                     modifier = Modifier.weight(0.43f).fillMaxHeight().verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(if (compactHeight) 8.dp else 12.dp),
                 ) {
-                    NowPlayingHero(p, mediaTitle = title ?: p.mediaTitle, compact = compactHeight)
+                    NowPlayingHero(p, mediaTitle = title, compact = compactHeight)
                     p.errorMessage?.let {
                         PlaybackIssueBanner(it, onOpenOptions = { showOptions = true }, compact = compactHeight)
                     }
                     PlaybackQuickActions(
                         p = p,
                         viewModel = viewModel,
+                        hasQueuedItem = state.playlist.isNotEmpty,
                         onOpenOptions = { showOptions = true },
                         onStop = viewModel::stopPlayback,
                     )
+                    PlaylistCard(state, viewModel)
                 }
                 Column(
                     modifier = Modifier.weight(0.57f).fillMaxHeight().verticalScroll(rememberScrollState()),
@@ -582,7 +590,7 @@ fun PlaybackScreen(state: AppUiState, viewModel: MainViewModel) {
                 modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(if (compactHeight) 6.dp else 10.dp),
             ) {
-                NowPlayingHero(p, mediaTitle = title ?: p.mediaTitle, compact = true)
+                NowPlayingHero(p, mediaTitle = title, compact = true)
                 p.errorMessage?.let {
                     PlaybackIssueBanner(it, onOpenOptions = { showOptions = true }, compact = true)
                 }
@@ -597,9 +605,11 @@ fun PlaybackScreen(state: AppUiState, viewModel: MainViewModel) {
                 PlaybackQuickActions(
                     p = p,
                     viewModel = viewModel,
+                    hasQueuedItem = state.playlist.isNotEmpty,
                     onOpenOptions = { showOptions = true },
                     onStop = viewModel::stopPlayback,
                 )
+                PlaylistCard(state, viewModel)
             }
         }
 
@@ -720,6 +730,7 @@ private fun TerminalPlaybackCard(
 private fun PlaybackQuickActions(
     p: PlaybackUiState,
     viewModel: MainViewModel,
+    hasQueuedItem: Boolean,
     onOpenOptions: () -> Unit,
     onStop: () -> Unit,
 ) {
@@ -757,6 +768,15 @@ private fun PlaybackQuickActions(
                     modifier = Modifier.weight(1f),
                 )
             }
+            if (hasQueuedItem) {
+                QuickControlButton(
+                    icon = Icons.Rounded.SkipNext,
+                    label = "Next",
+                    contentDescription = "Skip to the next playlist item",
+                    onClick = viewModel::skipToNextPlaylistItem,
+                    modifier = Modifier.weight(1f),
+                )
+            }
             QuickControlButton(
                 icon = Icons.Rounded.Tune,
                 label = "Options",
@@ -772,6 +792,102 @@ private fun PlaybackQuickActions(
                 danger = true,
                 modifier = Modifier.weight(1f),
             )
+        }
+    }
+}
+
+@Composable
+private fun PlaylistCard(state: AppUiState, viewModel: MainViewModel) {
+    val entries = state.playlist.entries
+    var expanded by rememberSaveable { mutableStateOf(false) }
+    val visibleEntries = if (expanded) entries else entries.take(4)
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(24.dp),
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Icon(Icons.Rounded.VideoLibrary, contentDescription = null)
+                Column(Modifier.weight(1f)) {
+                    Text("Playlist", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
+                    Text(
+                        if (entries.isEmpty()) "Nothing queued yet" else "${entries.size} ${if (entries.size == 1) "item" else "items"} up next",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                if (entries.isNotEmpty()) {
+                    TextButton(onClick = viewModel::clearPlaylist) { Text("Clear") }
+                }
+            }
+            if (entries.isEmpty()) {
+                Text(
+                    "Keep browsing, then use Add to playlist on a video, episode, or movie.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            } else {
+                visibleEntries.forEachIndexed { index, entry ->
+                    val availability = state.availabilityFor(entry.item)
+                    val availabilityLabel = when (availability) {
+                        JellyfinItemAvailability.DOWNLOADED -> "Downloaded · available offline"
+                        JellyfinItemAvailability.UNAVAILABLE -> "Unavailable until Jellyfin reconnects"
+                        JellyfinItemAvailability.AVAILABLE -> entry.item.subtitle ?: "Ready after the current item"
+                    }
+                    val availabilityColor = if (availability == JellyfinItemAvailability.UNAVAILABLE) {
+                        MaterialTheme.colorScheme.error
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        Text(
+                            "${index + 1}",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                            Text(
+                                entry.item.title,
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                availabilityLabel,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = availabilityColor,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                        IconButton(onClick = { viewModel.removePlaylistEntry(entry.entryId) }) {
+                            Icon(Icons.Rounded.Close, contentDescription = "Remove ${entry.item.title} from playlist")
+                        }
+                    }
+                }
+                if (entries.size > visibleEntries.size) {
+                    TextButton(onClick = { expanded = true }, modifier = Modifier.align(Alignment.End)) {
+                        Text("Show ${entries.size - visibleEntries.size} more")
+                    }
+                } else if (expanded && entries.size > 4) {
+                    TextButton(onClick = { expanded = false }, modifier = Modifier.align(Alignment.End)) {
+                        Text("Show less")
+                    }
+                }
+            }
         }
     }
 }

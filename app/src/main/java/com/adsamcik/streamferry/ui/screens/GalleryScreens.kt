@@ -46,6 +46,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
+import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Cast
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Close
@@ -249,6 +250,7 @@ fun GalleryScreen(state: AppUiState, viewModel: MainViewModel, compact: Boolean 
                                 compact = true,
                                 highlighted = indexScrubbing && indexedSection == sectionKey(item.title),
                                 onClick = { viewModel.onItemClicked(item) },
+                                onAddToPlaylist = playlistAddAction(state, viewModel, item),
                             )
                         }
                     }
@@ -294,6 +296,7 @@ fun GalleryScreen(state: AppUiState, viewModel: MainViewModel, compact: Boolean 
                                 availability = state.availabilityFor(item),
                                 highlighted = indexScrubbing && indexedSection == sectionKey(item.title),
                                 onClick = { viewModel.onItemClicked(item) },
+                                onAddToPlaylist = playlistAddAction(state, viewModel, item),
                             )
                         }
                     }
@@ -577,6 +580,7 @@ private fun LibraryHome(
                         availability = state.availabilityFor(item),
                         compact = compact,
                         onClick = { viewModel.onItemClicked(item) },
+                        onAddToPlaylist = playlistAddAction(state, viewModel, item),
                     )
                 }
             }
@@ -760,6 +764,19 @@ private fun EmptyLibraryPrompt(state: AppUiState, viewModel: MainViewModel, isLo
 
 private fun MediaItem.localThumbnailUri(): String? =
     if (sourceId == MediaSourceIds.LOCAL && !isFolder) id else null
+
+/** A quick queue affordance appears only while a playback session is available to return to. */
+private fun playlistAddAction(
+    state: AppUiState,
+    viewModel: MainViewModel,
+    item: MediaItem,
+): (() -> Unit)? = if (
+    state.playback != null && !item.isFolder && state.availabilityFor(item) != JellyfinItemAvailability.UNAVAILABLE
+) {
+    { viewModel.enqueue(item) }
+} else {
+    null
+}
 
 /** Expressive root-level source selector. Source changes stay out of nested folder navigation. */
 @Composable
@@ -1297,6 +1314,7 @@ private fun MediaCard(
     compact: Boolean = false,
     highlighted: Boolean = false,
     onClick: () -> Unit,
+    onAddToPlaylist: (() -> Unit)? = null,
 ) {
     val containerColor by animateColorAsState(
         targetValue = if (highlighted) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainer,
@@ -1342,6 +1360,18 @@ private fun MediaCard(
                     }
                     // Jellyfin watch state: a watched check, an unwatched-count badge, or a progress bar.
                     WatchStateOverlay(item)
+                    onAddToPlaylist?.let { addToPlaylist ->
+                        FilledTonalIconButton(
+                            onClick = addToPlaylist,
+                            modifier = Modifier.align(Alignment.TopStart).padding(6.dp).size(36.dp),
+                        ) {
+                            Icon(
+                                Icons.Rounded.Add,
+                                contentDescription = "Add ${item.title} to playlist",
+                                modifier = Modifier.size(20.dp),
+                            )
+                        }
+                    }
                 }
             }
             Text(
@@ -1479,6 +1509,8 @@ fun MediaDetailScreen(
             availability = availability,
             downloadCompleted = download?.completed == true,
             serverUnavailable = serverUnavailable,
+            playlistCount = state.playlist.entries.size,
+            onAddToPlaylist = { viewModel.enqueue(media) },
             onPlay = {
                 viewModel.clearDownloadSelection()
                 onChooseTv()
@@ -1876,6 +1908,8 @@ private fun DetailPlaybackDock(
     availability: JellyfinItemAvailability,
     downloadCompleted: Boolean,
     serverUnavailable: Boolean,
+    playlistCount: Int,
+    onAddToPlaylist: () -> Unit,
     onPlay: () -> Unit,
     onPlayOffline: () -> Unit,
 ) {
@@ -1971,6 +2005,18 @@ private fun DetailPlaybackDock(
                         Text("  Offline", maxLines = 1)
                     }
                 }
+            }
+            OutlinedButton(
+                onClick = onAddToPlaylist,
+                enabled = offlinePreferred || onlinePlayable,
+                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                shape = RoundedCornerShape(18.dp),
+            ) {
+                Icon(Icons.Rounded.VideoLibrary, contentDescription = null, modifier = Modifier.size(19.dp))
+                Text(
+                    if (playlistCount == 0) "  Add to playlist" else "  Add to playlist · $playlistCount queued",
+                    maxLines = 1,
+                )
             }
         }
     }

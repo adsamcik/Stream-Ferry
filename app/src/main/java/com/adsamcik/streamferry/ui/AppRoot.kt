@@ -35,6 +35,7 @@ import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Settings
+import androidx.compose.material.icons.rounded.SkipNext
 import androidx.compose.material.icons.rounded.Tv
 import androidx.compose.material.icons.rounded.VideoLibrary
 import androidx.compose.material3.AlertDialog
@@ -82,6 +83,7 @@ import com.adsamcik.streamferry.core.volume.NightVolumePolicy
 import com.adsamcik.streamferry.diagnostics.ReportShare
 import com.adsamcik.streamferry.domain.JellyfinLibraryStatus
 import com.adsamcik.streamferry.domain.MediaSourceIds
+import com.adsamcik.streamferry.playback.PlaybackPhase
 import com.adsamcik.streamferry.ui.navigation.NavigationStatePolicy
 import com.adsamcik.streamferry.ui.navigation.NavigationStatePolicy.TopLevelDestination
 import com.adsamcik.streamferry.ui.screens.AboutScreen
@@ -448,7 +450,10 @@ private fun MiniPlayer(
     compact: Boolean = false,
 ) {
     val playback = state.playback ?: return
-    val title = state.selectedItem?.title?.takeIf(String::isNotBlank) ?: "Now playing"
+    val title = state.nowPlayingItem?.title?.takeIf(String::isNotBlank)
+        ?: playback.mediaTitle.takeIf(String::isNotBlank)
+        ?: "Now playing"
+    val queueSize = state.playlist.entries.size
     val duration = playback.durationSeconds?.takeIf { it > 0 }
     val progress = duration?.let { (playback.positionSeconds.toFloat() / it).coerceIn(0f, 1f) }
     val animatedProgress by animateFloatAsState(
@@ -459,9 +464,18 @@ private fun MiniPlayer(
     val effectsMotion = MaterialTheme.motionScheme.defaultEffectsSpec<Float>()
     val playbackState = when {
         playback.isTerminal -> "Playback needs attention"
+        playback.phase == PlaybackPhase.COMPLETED -> if (queueSize > 0) {
+            "Finished · $queueSize up next"
+        } else {
+            "Finished on ${playback.targetName}"
+        }
         playback.reconnecting -> "Reconnecting to ${playback.targetName}"
         playback.isBuffering -> "Buffering on ${playback.targetName}"
-        playback.isPlaying -> "Playing on ${playback.targetName}"
+        playback.isPlaying -> if (queueSize > 0) {
+            "Playing on ${playback.targetName} · $queueSize up next"
+        } else {
+            "Playing on ${playback.targetName}"
+        }
         else -> "Paused on ${playback.targetName}"
     }
 
@@ -505,6 +519,17 @@ private fun MiniPlayer(
                         label = "mini player state",
                     ) { status ->
                         Text(status, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                }
+                if (!playback.isTerminal && state.playlist.next != null) {
+                    FilledIconButton(
+                        onClick = viewModel::skipToNextPlaylistItem,
+                        modifier = Modifier.size(if (compact) 40.dp else 48.dp),
+                    ) {
+                        Icon(
+                            Icons.Rounded.SkipNext,
+                            contentDescription = "Play next: ${state.playlist.next?.item?.title}",
+                        )
                     }
                 }
                 if (playback.isTerminal) {

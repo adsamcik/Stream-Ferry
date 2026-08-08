@@ -1884,6 +1884,7 @@ class MainViewModel(
     /** User-requested device change leaves recovery intentionally and returns to one physical-TV picker. */
     fun changeTv() = viewModelScope.launch {
         val ctx = reconnectContext
+        val replayItem = (ctx as? ReconnectContext.Online)?.item ?: _state.value.nowPlayingItem
         cancelReconnect()
         smartResumeOverrideSeconds = lastPlaybackPositionSeconds
         if (ctx is ReconnectContext.Local && ctx.downloadId != null) {
@@ -1891,6 +1892,9 @@ class MainViewModel(
         }
         _state.update {
             it.copy(
+                // The user may have opened other gallery details while casting. The picker must replay the
+                // item that is actually active on the TV, not whichever detail page was opened most recently.
+                selectedItem = replayItem ?: it.selectedItem,
                 route = Route.TARGET_PICKER,
                 playback = null,
                 selectedPhysicalTv = null,
