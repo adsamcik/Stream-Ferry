@@ -532,31 +532,59 @@ class JellyfinClient(
 
     // ----- JellyfinApi: reporting / cleanup -----
 
-    override suspend fun reportPlaying(playSessionId: String?, itemId: String) = report(
+    override suspend fun reportPlaying(playSessionId: String?, itemId: String) =
+        reportPlaying(playSessionId, itemId, mediaSourceId = null, positionTicks = 0L)
+
+    override suspend fun reportPlaying(
+        playSessionId: String?,
+        itemId: String,
+        mediaSourceId: String?,
+        positionTicks: Long,
+    ) = report(
         path("Sessions", "Playing"),
         buildJsonObject {
             put("ItemId", itemId)
+            mediaSourceId?.takeIf { it.isNotBlank() }?.let { put("MediaSourceId", it) }
             playSessionId?.let { put("PlaySessionId", it) }
+            put("PositionTicks", positionTicks.coerceAtLeast(0L))
         },
     )
 
     override suspend fun reportProgress(playSessionId: String?, itemId: String, positionTicks: Long, isPaused: Boolean) =
-        report(
-            path("Sessions", "Playing", "Progress"),
-            buildJsonObject {
-                put("ItemId", itemId)
-                playSessionId?.let { put("PlaySessionId", it) }
-                put("PositionTicks", positionTicks)
-                put("IsPaused", isPaused)
-            },
-        )
+        reportProgress(playSessionId, itemId, mediaSourceId = null, positionTicks, isPaused)
 
-    override suspend fun reportStopped(playSessionId: String?, itemId: String, positionTicks: Long) = report(
+    override suspend fun reportProgress(
+        playSessionId: String?,
+        itemId: String,
+        mediaSourceId: String?,
+        positionTicks: Long,
+        isPaused: Boolean,
+    ) = report(
+        path("Sessions", "Playing", "Progress"),
+        buildJsonObject {
+            put("ItemId", itemId)
+            mediaSourceId?.takeIf { it.isNotBlank() }?.let { put("MediaSourceId", it) }
+            playSessionId?.let { put("PlaySessionId", it) }
+            put("PositionTicks", positionTicks.coerceAtLeast(0L))
+            put("IsPaused", isPaused)
+        },
+    )
+
+    override suspend fun reportStopped(playSessionId: String?, itemId: String, positionTicks: Long) =
+        reportStopped(playSessionId, itemId, mediaSourceId = null, positionTicks)
+
+    override suspend fun reportStopped(
+        playSessionId: String?,
+        itemId: String,
+        mediaSourceId: String?,
+        positionTicks: Long,
+    ) = report(
         path("Sessions", "Playing", "Stopped"),
         buildJsonObject {
             put("ItemId", itemId)
+            mediaSourceId?.takeIf { it.isNotBlank() }?.let { put("MediaSourceId", it) }
             playSessionId?.let { put("PlaySessionId", it) }
-            put("PositionTicks", positionTicks)
+            put("PositionTicks", positionTicks.coerceAtLeast(0L))
         },
     )
 
@@ -565,12 +593,12 @@ class JellyfinClient(
             .addQueryParameter("deviceId", deviceId)
             .apply { playSessionId?.let { addQueryParameter("playSessionId", it) } }
             .build()
-        runCatching { exec(Request.Builder().url(url).delete().header("Authorization", authHeaderValue()).build()) }
+        exec(Request.Builder().url(url).delete().header("Authorization", authHeaderValue()).build())
         Unit
     }
 
     private suspend fun report(segments: List<String>, body: JsonObject) = withContext(Dispatchers.IO) {
-        runCatching { exec(post(segments, body)) }
+        exec(post(segments, body))
         Unit
     }
 

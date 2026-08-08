@@ -34,19 +34,39 @@ class DefaultPlaybackSessionCoordinator(
     private val _active = MutableStateFlow<ProxySession?>(null)
     override val active = _active.asStateFlow()
 
-    private var currentInfo: PlaybackInfo? = null
-    private var lastPositionSeconds: Long = 0L
+    private data class ReportingSession(
+        val token: Long,
+        val info: PlaybackInfo,
+        val positionSeconds: Long,
+    )
+
+    private val reportStateLock = Any()
+    private var nextReportToken = 0L
+    private var reportingSession: ReportingSession? = null
     private val mutex = Mutex()
 
-    /** Record the latest known absolute playback position (used for progress + stop reporting). */
-    fun notePosition(seconds: Long) {
-        if (seconds >= 0) lastPositionSeconds = seconds
+    /** Opaque identity for the active remote playback report; null for local/offline streams. */
+    fun activeReportToken(): Long? = synchronized(reportStateLock) { reportingSession?.token }
+
+    /**
+     * Record the latest renderer-confirmed absolute position. A stale callback may only update the session
+     * whose [expectedToken] it belongs to, never a later item reusing the same TV connection.
+     */
+    fun notePosition(seconds: Long, expectedToken: Long? = null) {
+        if (seconds < 0) return
+        synchronized(reportStateLock) {
+            val active = reportingSession ?: return
+            if (expectedToken != null && active.token != expectedToken) return
+            reportingSession = active.copy(positionSeconds = seconds)
+        }
     }
 
-    /** Report progress to Jellyfin for the active session at the last known position. */
-    suspend fun reportProgress(isPaused: Boolean) {
-        val info = currentInfo ?: return
-        runCatching { reporter.reportProgress(info, lastPositionSeconds, isPaused) }
+    /** Report progress for the exact active session; queued work from a prior item is rejected by token. */
+    suspend fun reportProgress(isPaused: Boolean, expectedToken: Long? = null) = mutex.withLock {
+        val active = reportingSnapshot(expectedToken) ?: return@withLock
+        runBoundedRemoteCleanup("report progress") {
+            reporter.reportProgress(active.info, active.positionSeconds, isPaused)
+        }
     }
 
     /** @return the phone proxy URL the TV should load (host:port + /session/{id}/stream). */
@@ -54,6 +74,7 @@ class DefaultPlaybackSessionCoordinator(
         info: PlaybackInfo,
         upstream: UpstreamSource,
         phoneLanIp: String,
+        initialPositionSeconds: Long = 0L,
     ): Pair<ProxySession, String> = mutex.withLock {
         val hostPort = proxy.start(phoneLanIp)
         val session = sessions.create(
@@ -64,9 +85,9 @@ class DefaultPlaybackSessionCoordinator(
             isHls = upstream.isHls,
             totalLength = upstream.totalLength,
         )
-        currentInfo = info
+        val reporting = beginReporting(info, initialPositionSeconds)
         _active.value = session
-        reporter.reportStart(info)
+        reporter.reportStart(info, reporting.positionSeconds)
         val url = "http://$hostPort/session/${session.id}/stream"
         logger.event("session", "Session started (online); proxy URL issued to TV (redacted)")
         session to url
@@ -90,8 +111,7 @@ class DefaultPlaybackSessionCoordinator(
             isHls = false,
             localFilePath = filePath,
         )
-        currentInfo = null
-        lastPositionSeconds = 0
+        clearReportingSession()
         _active.value = session
         val url = "http://$hostPort/session/${session.id}/stream"
         logger.event("session", "Session started (offline/local); proxy URL issued to TV")
@@ -112,8 +132,7 @@ class DefaultPlaybackSessionCoordinator(
             isHls = false,
         )
         proxy.registerClientTranscode(session.id, source)
-        currentInfo = null
-        lastPositionSeconds = 0
+        clearReportingSession()
         _active.value = session
         val url = "http://$hostPort/session/${session.id}/stream"
         logger.event("session", "Session started (on-device transcode); playlist URL issued to TV")
@@ -121,20 +140,42 @@ class DefaultPlaybackSessionCoordinator(
     }
 
     override suspend fun stop(reason: String) = mutex.withLock {
-        val info = currentInfo
+        val reporting = takeReportingSession()
         val session = _active.value
         // End renderer access first. A remote Jellyfin report can wait or fail, but it must never keep
         // an opaque proxy URL, accepted renderer socket, or upstream relay alive.
         session?.let { sessions.revoke(it.id) }
         proxy.stop()
         _active.value = null
-        currentInfo = null
 
-        if (info != null && session != null) {
-            runBoundedRemoteCleanup("report stopped") { reporter.reportStopped(info, lastPositionSeconds) }
-            runBoundedRemoteCleanup("stop transcode") { reporter.stopTranscode(info) }
+        if (reporting != null && session != null) {
+            runBoundedRemoteCleanup("report stopped") {
+                reporter.reportStopped(reporting.info, reporting.positionSeconds)
+            }
+            runBoundedRemoteCleanup("stop transcode") { reporter.stopTranscode(reporting.info) }
         }
         logger.event("session", "Session stopped ($reason); local proxy revoked before remote cleanup")
+    }
+
+    private fun beginReporting(info: PlaybackInfo, initialPositionSeconds: Long): ReportingSession =
+        synchronized(reportStateLock) {
+            ReportingSession(
+                token = ++nextReportToken,
+                info = info,
+                positionSeconds = initialPositionSeconds.coerceAtLeast(0L),
+            ).also { reportingSession = it }
+        }
+
+    private fun clearReportingSession() = synchronized(reportStateLock) {
+        reportingSession = null
+    }
+
+    private fun takeReportingSession(): ReportingSession? = synchronized(reportStateLock) {
+        reportingSession.also { reportingSession = null }
+    }
+
+    private fun reportingSnapshot(expectedToken: Long?): ReportingSession? = synchronized(reportStateLock) {
+        reportingSession?.takeIf { expectedToken == null || it.token == expectedToken }
     }
 
     private suspend fun runBoundedRemoteCleanup(label: String, block: suspend () -> Unit) {

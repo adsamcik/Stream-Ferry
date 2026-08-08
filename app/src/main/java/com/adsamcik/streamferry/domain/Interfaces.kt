@@ -96,6 +96,8 @@ data class PlaybackInfo(
     val audioTracks: List<MediaTrack> = emptyList(),
     /** Selectable subtitle tracks reported by the server (empty if none). "Off" is implicit, not a track. */
     val subtitleTracks: List<MediaTrack> = emptyList(),
+    /** Jellyfin library item id used by session reports; distinct from [mediaSourceId] for multi-version media. */
+    val itemId: String = mediaSourceId,
 )
 
 /**
@@ -383,6 +385,8 @@ interface PlaybackSessionCoordinator {
 
 interface JellyfinPlaybackReporter {
     suspend fun reportStart(info: PlaybackInfo)
+    /** Start reporting at the exact resume point rather than pretending resumed media began at zero. */
+    suspend fun reportStart(info: PlaybackInfo, initialPositionSeconds: Long) = reportStart(info)
     suspend fun reportProgress(info: PlaybackInfo, positionSeconds: Long, isPaused: Boolean)
     suspend fun reportStopped(info: PlaybackInfo, positionSeconds: Long)
     /** Ensure server-side transcode/HLS session is torn down (§8 cleanup). */

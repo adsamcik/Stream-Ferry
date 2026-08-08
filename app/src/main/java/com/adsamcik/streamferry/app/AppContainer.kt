@@ -226,7 +226,7 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
         HttpJellyfinRepository(jellyfinClient, logger, httpClient)
     }
     private val reporter: DefaultJellyfinPlaybackReporter by lazy {
-        DefaultJellyfinPlaybackReporter(jellyfinClient, deviceId, logger)
+        DefaultJellyfinPlaybackReporter(jellyfinClient, deviceId, logger, jellyfinConnectionMonitor)
     }
     private val coordinator: DefaultPlaybackSessionCoordinator by lazy {
         DefaultPlaybackSessionCoordinator(sessionRegistry, proxyServer, reporter, logger)

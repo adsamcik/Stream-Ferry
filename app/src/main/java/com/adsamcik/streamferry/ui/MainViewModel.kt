@@ -7,6 +7,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.adsamcik.streamferry.app.AppContainer
 import com.adsamcik.streamferry.core.redaction.LogRedactor
+import com.adsamcik.streamferry.core.resilience.UpstreamRetry
 import com.adsamcik.streamferry.core.language.LanguagePreferenceResolver
 import com.adsamcik.streamferry.core.language.SubtitleMemory
 import com.adsamcik.streamferry.core.stream.Protocol
@@ -40,6 +41,7 @@ import com.adsamcik.streamferry.playback.PlaybackQueue
 import com.adsamcik.streamferry.playback.PlaylistEntry
 import com.adsamcik.streamferry.playback.PlaybackFailureCause
 import com.adsamcik.streamferry.playback.PlaybackFailureStage
+import com.adsamcik.streamferry.playback.PlaybackCompletion
 import com.adsamcik.streamferry.playback.PlaybackPhase
 import com.adsamcik.streamferry.playback.PlaybackPreparationException
 import com.adsamcik.streamferry.playback.PlaybackRecoveryContinuation
@@ -77,6 +79,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.coroutines.cancellation.CancellationException
+import java.io.IOException
 
 /**
  * Single app-shell ViewModel exposing immutable [AppUiState] via [StateFlow]. The UI calls intent
@@ -252,7 +255,7 @@ class MainViewModel(
         // finish (not a user stop); if enabled and the finished item is a series episode with a next one,
         // play it on the same TV.
         viewModelScope.launch {
-            container.playbackEngine.endOfMedia.collect { onEndOfMedia() }
+            container.playbackEngine.endOfMedia.collect { completion -> onEndOfMedia(completion) }
         }
         // Rehydrate a non-secret scope first, so a previous Jellyfin gallery and completed downloads are
         // useful immediately when the server is down. Live restoration below independently verifies the
@@ -1321,12 +1324,20 @@ class MainViewModel(
      * A genuine end-of-media finished. An explicit playlist always wins over episode-autoplay. Online
      * items reuse the renderer when possible; downloaded/local entries fall back to a normal fresh start.
      */
-    private fun onEndOfMedia() {
+    private fun onEndOfMedia(completion: PlaybackCompletion) {
+        val snapshot = _state.value
+        // For online media the engine carries an immutable item identity, so a delayed event can never mark
+        // a newer item that reused the same TV. Local/downloaded sessions use the current app item instead.
+        val completedItem = completion.item?.takeIf { completion.isJellyfinSession } ?: snapshot.nowPlayingItem
+        if (completedItem?.sourceId == MediaSourceIds.JELLYFIN) {
+            synchronizeJellyfinWatchState(completedItem, played = true, origin = "playback completion")
+        }
+        if (!completion.isJellyfinSession) clearCompletedLocalResume()
+
         if (autoAdvancing) {
             container.logger.event("playlist", "Ignoring duplicate end-of-media signal during a hand-off")
             return
         }
-        val snapshot = _state.value
         snapshot.playlist.next?.let { next ->
             autoAdvancing = true
             viewModelScope.launch {
@@ -1339,35 +1350,35 @@ class MainViewModel(
             return
         }
 
-        val current = snapshot.nowPlayingItem
-        val eligible = container.playbackPreferences.autoPlayNextEpisode &&
-            current != null &&
-            current.sourceId == MediaSourceIds.JELLYFIN &&
-            current.type.equals("Episode", ignoreCase = true) &&
-            current.seriesId != null &&
-            snapshot.selectedTarget != null
-        if (!eligible) return
+        val current = completedItem ?: return
+        if (!container.playbackPreferences.autoPlayNextEpisode ||
+            current.sourceId != MediaSourceIds.JELLYFIN ||
+            !current.type.equals("Episode", ignoreCase = true) ||
+            snapshot.selectedTarget == null
+        ) return
+        val seriesId = current.seriesId ?: return
         autoAdvancing = true
         viewModelScope.launch {
             try {
-                val next = runCatching { container.jellyfinClient.nextEpisode(current!!.seriesId!!, current.id) }
+                val next = runCatching { container.jellyfinClient.nextEpisode(seriesId, current.id) }
                     .onFailure { e -> if (isSessionExpired(e)) handleSessionExpired() }
                     .getOrNull()
                 if (next != null) {
                     container.logger.event("playback", "Autoplaying next episode")
                     _state.update { it.copy(nowPlayingItem = next, selectedDownloadId = null) }
-                    val target = _state.value.selectedTarget
                     val previousContext = reconnectContext
-                    val seamless = target != null && runCatching {
-                        container.playbackEngine.playNext(
-                            next,
-                            streamPreferences(next),
-                            onlineSmartResumeSeed(next),
-                            autoAdvance = shouldAutoAdvance(next, _state.value.playlist),
-                        )
-                    }.onFailure { e -> if (isSessionExpired(e)) handleSessionExpired() }.getOrDefault(false)
-                    if (seamless && target != null && previousContext != null) {
-                        reconnectContext = ReconnectContext.Online(next, previousContext.physicalTv, target)
+                    val seamlessTarget = _state.value.selectedTarget?.takeIf {
+                        runCatching {
+                            container.playbackEngine.playNext(
+                                next,
+                                streamPreferences(next),
+                                onlineSmartResumeSeed(next),
+                                autoAdvance = shouldAutoAdvance(next, _state.value.playlist),
+                            )
+                        }.onFailure { e -> if (isSessionExpired(e)) handleSessionExpired() }.getOrDefault(false)
+                    }
+                    if (seamlessTarget != null && previousContext != null) {
+                        reconnectContext = ReconnectContext.Online(next, previousContext.physicalTv, seamlessTarget)
                     } else {
                         startPlayback(next, null).join()
                     }
@@ -1798,17 +1809,32 @@ class MainViewModel(
      * cascades to the child episodes server-side. Updates the UI optimistically, then reconciles the
      * current folder + Continue Watching from the server (so folder/series rollups are accurate).
      */
-    fun markWatched(item: MediaItem, played: Boolean) = viewModelScope.launch {
-        if (item.sourceId != MediaSourceIds.JELLYFIN) return@launch
-        runCatching { container.jellyfinClient.markPlayed(item.id, played) }
-            .onSuccess {
-                applyWatchedOptimistically(item.id, played)
-                refreshWatchStateFromServer()
-            }
-            .onFailure { e -> if (isSessionExpired(e)) handleSessionExpired() }
+    fun markWatched(item: MediaItem, played: Boolean) {
+        synchronizeJellyfinWatchState(item, played, origin = "manual watch-state change")
     }
 
-    /** Immediately reflect a watched/unwatched change across every list + the open detail item. */
+    /** Send an authoritative native Jellyfin watched mutation, then reconcile every local representation. */
+    private fun synchronizeJellyfinWatchState(item: MediaItem, played: Boolean, origin: String) {
+        if (item.sourceId != MediaSourceIds.JELLYFIN) return
+        viewModelScope.launch {
+            runCatching { container.jellyfinClient.markPlayed(item.id, played) }
+                .onSuccess {
+                    container.jellyfinConnectionMonitor.markOnline()
+                    applyWatchedOptimistically(item.id, played)
+                    refreshWatchStateFromServer()
+                    container.logger.event("jellyfin", "$origin synced for ${item.id}")
+                }
+                .onFailure { error ->
+                    when {
+                        isSessionExpired(error) -> handleSessionExpired()
+                        isJellyfinConnectivityFailure(error) -> container.jellyfinConnectionMonitor.markUnavailable()
+                        else -> container.logger.w("jellyfin", "$origin failed", error)
+                    }
+                }
+        }
+    }
+
+    /** Immediately reflect a watched/unwatched change across every visible list + the open detail item. */
     private fun applyWatchedOptimistically(itemId: String, played: Boolean) = _state.update { st ->
         fun update(list: List<MediaItem>) = list.map { if (it.id == itemId) it.withWatched(played) else it }
         st.copy(
@@ -1817,6 +1843,11 @@ class MainViewModel(
             items = update(st.items),
             searchResults = update(st.searchResults),
             libraries = update(st.libraries),
+            playlist = st.playlist.copy(
+                entries = st.playlist.entries.map { entry ->
+                    if (entry.item.id == itemId) entry.copy(item = entry.item.withWatched(played)) else entry
+                },
+            ),
             // A watched item leaves Continue Watching; an unwatched one is reconciled by the refresh below.
             continueWatching = if (played) st.continueWatching.filterNot { it.id == itemId } else st.continueWatching,
         )
@@ -1824,14 +1855,42 @@ class MainViewModel(
 
     /** Reconcile watch state from the server after a change (folder/series rollups, resume row). */
     private fun refreshWatchStateFromServer() {
-        val target = _state.value.galleryTarget()
-        // This is intentionally silent: keep the current rows mounted and atomically replace them only if
-        // this exact source/folder is still current when the server responds.
+        val snapshot = _state.value
+        val target = snapshot.galleryTarget()
+        if (target.sourceId != MediaSourceIds.JELLYFIN) return
+        // Keep current rows mounted and atomically replace them only if this exact source/folder is still
+        // current when the server responds. A watched change can affect roots, a folder, the resume row,
+        // and an active search simultaneously, so refresh each representation from the authoritative server.
         launchGalleryLoad(target)
-        if (target.folderId != null) {
-            viewModelScope.launch { loadContinueWatching(target.sourceId) }
+        viewModelScope.launch { loadContinueWatching(target.sourceId) }
+        refreshActiveSearchResults(target.sourceId, snapshot.searchQuery)
+    }
+
+    private fun refreshActiveSearchResults(sourceId: String, query: String) {
+        if (query.isBlank()) return
+        viewModelScope.launch {
+            val result = sourceFor(sourceId).search(query.trim())
+            result.onSuccess { results ->
+                _state.update { current ->
+                    if (current.activeSourceId == sourceId && current.searchQuery == query) {
+                        current.copy(searchResults = results)
+                    } else {
+                        current
+                    }
+                }
+            }.onFailure { error ->
+                if (_state.value.activeSourceId == sourceId && _state.value.searchQuery == query && isSessionExpired(error)) {
+                    handleSessionExpired()
+                }
+            }
         }
     }
+
+    private fun isJellyfinConnectivityFailure(error: Throwable): Boolean =
+        generateSequence(error) { it.cause }.any { cause ->
+            cause is IOException ||
+                (cause is JellyfinHttpException && !cause.isUnauthorized && UpstreamRetry.isRetryableStatus(cause.code))
+        }
 
     private fun MediaItem.withWatched(played: Boolean): MediaItem = copy(
         played = played,
@@ -1999,8 +2058,9 @@ class MainViewModel(
         // Persist the playback session's events now so they're in a report even if the app is later
         // killed, and refresh the resume row from the server's updated position.
         container.flushDiagnostics()
-        // The server now has an updated resume point for what we just watched — refresh the row.
-        loadContinueWatching()
+        // The server now has an updated resume point for what we just watched — reconcile every cached
+        // gallery representation rather than only the Continue Watching row.
+        refreshWatchStateFromServer()
     }
 
     // ----- auto-reconnect after an unexpected renderer disconnect -----
@@ -2342,6 +2402,13 @@ class MainViewModel(
     /** Persist the latest position immediately (on stop), then clear the session resume key. */
     private fun saveResumeNow() {
         currentResumeKey?.let { container.resumeStore.save(it, lastPlaybackPositionSeconds, currentDurationSeconds) }
+        currentResumeKey = null
+        currentDurationSeconds = null
+    }
+
+    /** A genuine local/download completion is not resumable; discard any checkpoint from its last status tick. */
+    private fun clearCompletedLocalResume() {
+        currentResumeKey?.let { container.resumeStore.remove(it) }
         currentResumeKey = null
         currentDurationSeconds = null
     }

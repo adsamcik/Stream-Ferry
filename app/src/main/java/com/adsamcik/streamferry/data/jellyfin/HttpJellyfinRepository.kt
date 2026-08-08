@@ -77,6 +77,7 @@ class HttpJellyfinRepository(
                 sourceBitrateBps = response.sourceBitrateBps,
                 audioTracks = response.audioTracks,
                 subtitleTracks = response.subtitleTracks,
+                itemId = itemId,
             )
         }.onFailure { logger.e("jellyfin", "PlaybackInfo request failed (${it.javaClass.simpleName})", it) }
     }

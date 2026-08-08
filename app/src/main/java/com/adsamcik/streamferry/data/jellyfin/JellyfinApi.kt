@@ -57,9 +57,35 @@ interface JellyfinApi {
     /** Skippable media segments (intro/outro/recap/…) for an item; empty when none/unsupported. */
     suspend fun mediaSegments(itemId: String): List<com.adsamcik.streamferry.core.segments.MediaSegment> = emptyList()
 
-    // Reporting / cleanup (§8).
+    // Reporting / cleanup (§8). The legacy overloads keep simple fakes/source-compatible callers working.
     suspend fun reportPlaying(playSessionId: String?, itemId: String)
     suspend fun reportProgress(playSessionId: String?, itemId: String, positionTicks: Long, isPaused: Boolean)
     suspend fun reportStopped(playSessionId: String?, itemId: String, positionTicks: Long)
+
+    /** Full start payload: Jellyfin distinguishes the library item from the selected media source/version. */
+    suspend fun reportPlaying(
+        playSessionId: String?,
+        itemId: String,
+        mediaSourceId: String?,
+        positionTicks: Long,
+    ) = reportPlaying(playSessionId, itemId)
+
+    /** Full progress payload with the selected media source/version retained for the server session. */
+    suspend fun reportProgress(
+        playSessionId: String?,
+        itemId: String,
+        mediaSourceId: String?,
+        positionTicks: Long,
+        isPaused: Boolean,
+    ) = reportProgress(playSessionId, itemId, positionTicks, isPaused)
+
+    /** Full stop payload with the selected media source/version retained for the server session. */
+    suspend fun reportStopped(
+        playSessionId: String?,
+        itemId: String,
+        mediaSourceId: String?,
+        positionTicks: Long,
+    ) = reportStopped(playSessionId, itemId, positionTicks)
+
     suspend fun stopActiveEncoding(playSessionId: String?, deviceId: String)
 }

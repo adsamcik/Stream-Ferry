@@ -135,6 +135,13 @@ data class PlaybackStatus(
 /** A skippable segment surfaced to the UI: a button [label] and the position to seek to on skip. */
 data class SkipSegment(val label: String, val targetSeconds: Long)
 
+/** Immutable identity of a genuinely completed renderer session. */
+data class PlaybackCompletion(
+    val item: MediaItem?,
+    /** True only when the completed stream had an active Jellyfin playback session. */
+    val isJellyfinSession: Boolean,
+)
+
 /** Parameters of a LOCAL (offline / downloaded) playback, kept so the on-device stream can be reloaded. */
 private data class LocalPlaybackParams(
     val filePath: String,
@@ -188,13 +195,15 @@ class PlaybackEngine(
     private val _status = MutableStateFlow<PlaybackStatus?>(null)
     val status: StateFlow<PlaybackStatus?> = _status.asStateFlow()
     // Emits once when a genuine end-of-media is reached (not a reload/user-stop), so the ViewModel can
-    // autoplay the next episode. extraBufferCapacity so a tryEmit from the event thread never drops it.
-    private val _endOfMedia = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
-    val endOfMedia: SharedFlow<Unit> = _endOfMedia.asSharedFlow()
+    // sync the exact completed item before considering autoplay. extraBufferCapacity keeps event threads nonblocking.
+    private val _endOfMedia = MutableSharedFlow<PlaybackCompletion>(extraBufferCapacity = 1)
+    val endOfMedia: SharedFlow<PlaybackCompletion> = _endOfMedia.asSharedFlow()
 
     @Volatile private var target: PlaybackTargetController? = null
     @Volatile private var selectedTarget: DiscoveredTarget? = null
     @Volatile private var item: MediaItem? = null
+    /** Coordinator token for this online item; makes asynchronous progress reports session-safe. */
+    @Volatile private var reportingSessionToken: Long? = null
     @Volatile private var prefs: StreamPreferences = StreamPreferences()
 
     @Volatile private var adaptive: AdaptiveBitrateController? = null
@@ -845,7 +854,7 @@ class PlaybackEngine(
         streamStartSeconds = 0
         reportedPositionSeconds = startPos
         seekSettleTargetSeconds = null
-        coordinator.notePosition(reportedPositionSeconds)
+        noteJellyfinPosition(reportedPositionSeconds)
         val streamForTv: RendererStream
         val url: String
         if (transcodeTarget != null) {
@@ -957,7 +966,7 @@ class PlaybackEngine(
             reportedPositionSeconds = pos
             seekSettleTargetSeconds = pos
             seekSettleUntilMs = clock() + SEEK_SETTLE_WINDOW_MS
-            coordinator.notePosition(pos)
+            noteJellyfinPosition(pos)
             reportJellyfinProgressSoon()
             publishStatus()
         }
@@ -1384,9 +1393,10 @@ class PlaybackEngine(
         seekSettleTargetSeconds = null // fresh stream: don't let a prior seek's hold suppress its statuses
 
         val (_, url) = preparePlaybackSource("Couldn't establish the phone-hosted Jellyfin gateway.") {
-            coordinator.startAndBuildUrl(info, upstream, phoneIp)
+            coordinator.startAndBuildUrl(info, upstream, phoneIp, initialPositionSeconds = positionSeconds)
         }
-        coordinator.notePosition(positionSeconds)
+        reportingSessionToken = coordinator.activeReportToken()
+        noteJellyfinPosition(positionSeconds)
         // Hand the start position to load() so the renderer begins AT it (Cast sets it in the load request;
         // DLNA seeks once playing) for a direct-play file or a full-timeline HLS transcode — no separate,
         // racy post-load seek. A progressive transcode already starts at the position server-side (load 0).
@@ -1463,7 +1473,7 @@ class PlaybackEngine(
     private suspend fun reloadStream(positionSeconds: Long, requestedBitrate: Long?, reason: String, armWatchdog: Boolean = false) {
         // The coordinator reports a terminal position while replacing the Jellyfin session. Record the
         // requested resume point first so a seek, bitrate switch, or recovery cannot save stale progress.
-        coordinator.notePosition(positionSeconds)
+        noteJellyfinPosition(positionSeconds)
         val wasReloading = isReloadingStream
         isReloadingStream = true
         try {
@@ -1775,10 +1785,16 @@ class PlaybackEngine(
         publishStatus()
     }
 
+    /** Record a position only for the exact online session that produced it. */
+    private fun noteJellyfinPosition(positionSeconds: Long) {
+        reportingSessionToken?.let { token -> coordinator.notePosition(positionSeconds, expectedToken = token) }
+    }
+
     /** Queue an immediate lifecycle update; the periodic monitor remains the steady-state heartbeat. */
     private fun reportJellyfinProgressSoon() {
+        val token = reportingSessionToken ?: return
         val paused = !isPlaying
-        scope.launch { coordinator.reportProgress(isPaused = paused) }
+        scope.launch { coordinator.reportProgress(isPaused = paused, expectedToken = token) }
     }
 
     private suspend fun monitorLoop() {
@@ -1797,7 +1813,9 @@ class PlaybackEngine(
                 continue
             }
             val now = clock()
-            runCatching { coordinator.reportProgress(isPaused = !isPlaying) }
+            reportingSessionToken?.let { token ->
+                runCatching { coordinator.reportProgress(isPaused = !isPlaying, expectedToken = token) }
+            }
             // A transient failure here must never silently kill adaptation for the rest of the session.
             runCatching {
                 lastThroughputBps = a.averageThroughputBps(now)
@@ -1921,7 +1939,7 @@ class PlaybackEngine(
                 recoverySession = recoverySession.transition(if (event.isPlaying) PlaybackPhase.PLAYING else PlaybackPhase.PAUSED)
                 // Evidence the stream actually started playing on the TV — cancels the startup watchdog.
                 if (event.isPlaying || event.positionSeconds > 0) markPlaybackStarted()
-                coordinator.notePosition(absolutePositionSeconds)
+                noteJellyfinPosition(absolutePositionSeconds)
                 smartResume.onRendererStatus(
                     absolutePositionSeconds,
                     item?.runtimeSeconds ?: localPlayback?.runtimeSeconds,
@@ -1960,13 +1978,17 @@ class PlaybackEngine(
                     recoverySession = recoverySession.transition(PlaybackPhase.COMPLETED)
                     lastNote = "Finished"
                     logger.event("playback", "End of media reached at ${absolutePositionSeconds}s")
+                    noteJellyfinPosition(absolutePositionSeconds)
+                    reportJellyfinProgressSoon()
                     smartResume.complete(smartResumeDeviceContext)
                     // Publish before handing off so the mini-player, notification, and media session stop
                     // advertising stale playback while a next item is being resolved.
                     publishStatus()
-                    // Signal a genuine end-of-media so the ViewModel can autoplay the next episode (a
-                    // user-stop tears down eventsJob first, so this never fires for a deliberate stop).
-                    _endOfMedia.tryEmit(Unit)
+                    // Signal a genuine end-of-media so the ViewModel can sync the exact completed Jellyfin
+                    // item and then consider autoplay (a user-stop tears down eventsJob first).
+                    _endOfMedia.tryEmit(
+                        PlaybackCompletion(item = item, isJellyfinSession = currentInfo != null),
+                    )
                     val gen = playGeneration
                     if (autoAdvance) {
                         // Keep the TV connection (+ proxy + foreground service) alive so the next episode
@@ -2168,6 +2190,7 @@ class PlaybackEngine(
             runCatching { it.disconnect() }
         }
         runCatching { coordinator.stop(reason) }
+        reportingSessionToken = null
         runCatching { serviceController.stop() }
         target = null
         selectedTarget = null
