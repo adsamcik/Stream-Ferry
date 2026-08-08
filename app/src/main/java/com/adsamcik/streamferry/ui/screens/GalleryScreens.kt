@@ -10,8 +10,6 @@ import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.slideInVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -35,8 +33,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyGridState
@@ -110,7 +108,6 @@ import com.adsamcik.streamferry.ui.state.JellyfinItemAvailability
 import com.adsamcik.streamferry.ui.state.Route
 import com.adsamcik.streamferry.ui.theme.StreamFerryTheme
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.delay
 import android.graphics.Bitmap
 import android.net.Uri
 import android.util.Size
@@ -138,6 +135,13 @@ fun GalleryScreen(state: AppUiState, viewModel: MainViewModel, compact: Boolean 
         state.searchQuery,
         saver = LazyGridState.Saver,
     ) { LazyGridState() }
+    // A lazy layout only retains its anchor if the state lives above the content branch. This keeps
+    // a long Jellyfin series at its current season across metadata updates and configuration changes.
+    val seasonListState = rememberSaveable(
+        state.activeSourceId,
+        state.currentFolder?.id,
+        saver = LazyListState.Saver,
+    ) { LazyListState() }
     val scope = rememberCoroutineScope()
     // First grid index for each A–Z/# section, in display (server SortName) order.
     val firstIndexBySection = remember(entries) {
@@ -170,6 +174,7 @@ fun GalleryScreen(state: AppUiState, viewModel: MainViewModel, compact: Boolean 
             isLocalSource = isLocalSource,
             needsJellyfinLogin = needsJellyfinLogin,
             compact = compact,
+            gridState = gridState,
             searchOpen = searchOpen,
             onOpenSearch = { searchOpen = true },
             onCloseSearch = {
@@ -219,6 +224,7 @@ fun GalleryScreen(state: AppUiState, viewModel: MainViewModel, compact: Boolean 
             entries.isEmpty() -> EmptyLibraryPrompt(state, viewModel, isLocalSource)
             showingSeasons -> SeasonList(
                 seasons = entries,
+                state = seasonListState,
                 compact = compact,
                 posterUrlFor = { viewModel.posterUrl(it, POSTER_CARD_WIDTH_PX) },
                 availabilityFor = state::availabilityFor,
@@ -234,7 +240,7 @@ fun GalleryScreen(state: AppUiState, viewModel: MainViewModel, compact: Boolean 
                         contentPadding = PaddingValues(top = 8.dp, bottom = 12.dp),
                         modifier = Modifier.fillMaxSize(),
                     ) {
-                        items(entries, key = { it.id }) { item ->
+                        items(entries, key = { it.id }, contentType = { "media" }) { item ->
                             MediaCard(
                                 item = item,
                                 posterUrl = viewModel.posterUrl(item, POSTER_CARD_WIDTH_PX),
@@ -280,7 +286,7 @@ fun GalleryScreen(state: AppUiState, viewModel: MainViewModel, compact: Boolean 
                         contentPadding = PaddingValues(bottom = 12.dp),
                         modifier = Modifier.weight(1f).fillMaxHeight(),
                     ) {
-                        items(entries, key = { it.id }) { item ->
+                        items(entries, key = { it.id }, contentType = { "media" }) { item ->
                             MediaCard(
                                 item = item,
                                 posterUrl = viewModel.posterUrl(item, POSTER_CARD_WIDTH_PX),
@@ -311,17 +317,19 @@ fun GalleryScreen(state: AppUiState, viewModel: MainViewModel, compact: Boolean 
 @Composable
 private fun SeasonList(
     seasons: List<MediaItem>,
+    state: LazyListState,
     compact: Boolean,
     posterUrlFor: (MediaItem) -> String?,
     availabilityFor: (MediaItem) -> JellyfinItemAvailability,
     onSeasonClick: (MediaItem) -> Unit,
 ) {
     LazyColumn(
+        state = state,
         modifier = Modifier.fillMaxSize(),
         verticalArrangement = Arrangement.spacedBy(10.dp),
         contentPadding = PaddingValues(top = 8.dp, bottom = 20.dp),
     ) {
-        item(key = "season-list-heading") {
+        item(key = "season-list-heading", contentType = "heading") {
             Row(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 4.dp),
                 verticalAlignment = Alignment.Bottom,
@@ -339,51 +347,22 @@ private fun SeasonList(
                 )
             }
         }
-        itemsIndexed(seasons, key = { _, season -> season.id }) { index, season ->
-            AnimatedSeasonEntry(
+        // Lazy rows are composed and discarded as they move through the viewport. Never gate a row's
+        // measured height behind an enter animation: that makes re-entering rows look like paged data
+        // and invalidates the scroll anchor on a long series.
+        items(
+            items = seasons,
+            key = { it.id },
+            contentType = { "season" },
+        ) { season ->
+            SeasonListCard(
                 season = season,
-                index = index,
-                compact = compact,
                 posterUrl = posterUrlFor(season),
                 availability = availabilityFor(season),
+                compact = compact,
                 onClick = { onSeasonClick(season) },
             )
         }
-    }
-}
-
-@Composable
-private fun AnimatedSeasonEntry(
-    season: MediaItem,
-    index: Int,
-    compact: Boolean,
-    posterUrl: String?,
-    availability: JellyfinItemAvailability,
-    onClick: () -> Unit,
-) {
-    var visible by remember(season.id) { mutableStateOf(false) }
-    LaunchedEffect(season.id) {
-        delay(index.coerceAtMost(8) * SEASON_STAGGER_MS)
-        visible = true
-    }
-    AnimatedVisibility(
-        visible = visible,
-        enter = fadeIn(animationSpec = tween(SEASON_FADE_MS)) +
-            slideInVertically(
-                animationSpec = spring(
-                    dampingRatio = Spring.DampingRatioMediumBouncy,
-                    stiffness = Spring.StiffnessMediumLow,
-                ),
-                initialOffsetY = { it / 3 },
-            ),
-    ) {
-        SeasonListCard(
-            season = season,
-            posterUrl = posterUrl,
-            availability = availability,
-            compact = compact,
-            onClick = onClick,
-        )
     }
 }
 
@@ -512,6 +491,7 @@ private fun LibraryHome(
     isLocalSource: Boolean,
     needsJellyfinLogin: Boolean,
     compact: Boolean,
+    gridState: LazyGridState,
     searchOpen: Boolean,
     onOpenSearch: () -> Unit,
     onCloseSearch: () -> Unit,
@@ -524,6 +504,7 @@ private fun LibraryHome(
         state.jellyfinLibraryStatus == JellyfinLibraryStatus.UNAVAILABLE
 
     LazyVerticalGrid(
+        state = gridState,
         columns = if (compact) GridCells.Fixed(2) else GridCells.Adaptive(minSize = 150.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -580,7 +561,7 @@ private fun LibraryHome(
             entries.isEmpty() -> item(span = { GridItemSpan(maxLineSpan) }) {
                 EmptyLibraryPrompt(state, viewModel, isLocalSource)
             }
-            else -> items(entries, key = { it.id }) { item ->
+            else -> items(entries, key = { it.id }, contentType = { "media" }) { item ->
                 if (compact && item.isFolder) {
                     LibraryTile(
                         item = item,
