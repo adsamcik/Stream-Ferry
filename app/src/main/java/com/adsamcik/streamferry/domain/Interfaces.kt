@@ -311,6 +311,8 @@ sealed interface PlaybackTargetEvent {
         val qualifiedFormatEvidence: Boolean = false,
     ) : PlaybackTargetEvent
     data object Ended : PlaybackTargetEvent
+    /** The renderer stopped before a credible natural completion; close without watched/autoplay effects. */
+    data object Stopped : PlaybackTargetEvent
     data object Disconnected : PlaybackTargetEvent
 }
 

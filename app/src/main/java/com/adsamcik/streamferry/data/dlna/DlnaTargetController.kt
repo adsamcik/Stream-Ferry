@@ -1,6 +1,7 @@
 package com.adsamcik.streamferry.data.dlna
 
 import com.adsamcik.streamferry.core.dlna.DidlLite
+import com.adsamcik.streamferry.core.dlna.DlnaTerminalStatePolicy
 import com.adsamcik.streamferry.core.http.BoundedBody
 import com.adsamcik.streamferry.core.dlna.SecureXml
 import com.adsamcik.streamferry.core.dlna.RendererDescriptionParser
@@ -99,6 +100,8 @@ class DlnaTargetController(
     // poll loop applies it), because a Seek before the transport has started is widely rejected/ignored.
     // Cleared after it is applied so we never re-seek a later user scrub.
     @Volatile private var pendingResumeSeconds: Long = 0L
+    /** Duration of the stream whose URI was most recently accepted by the renderer. */
+    @Volatile private var loadedDurationSeconds: Long? = null
     /** Last AVTransport state seen by the poll loop (PLAYING/TRANSITIONING/STOPPED/…), for diagnostics. */
     @Volatile private var lastTransportState: String? = null
 
@@ -412,7 +415,6 @@ class DlnaTargetController(
         logger.event("connect", "DLNA connect -> ${target.displayName}")
         logger.trace(TAG, "DLNA connect -> ${target.displayName} @ ${renderer.avTransport.controlUrl}")
         connected = renderer
-        startPolling()
         _events.tryEmit(PlaybackTargetEvent.Connected)
     }
 
@@ -462,6 +464,7 @@ class DlnaTargetController(
                 "dlna",
                 "DLNA SetAVTransportURI sent (${stream.mimeType}, byteSeek=${stream.isByteSeekable}, proxy URL only)",
             )
+            loadedDurationSeconds = durationSeconds?.takeIf { it > 0 }
             // A new stream was loaded (initial play OR a seek/bitrate-switch reload). Restart the poll
             // loop so position + end-of-media tracking continues for the new stream — the previous loop
             // breaks when the old stream goes STOPPED during the reload teardown.
@@ -515,6 +518,7 @@ class DlnaTargetController(
 
     override suspend fun disconnect() {
         stopPolling()
+        loadedDurationSeconds = null
         connected = null
         _events.tryEmit(PlaybackTargetEvent.Disconnected)
     }
@@ -544,6 +548,7 @@ class DlnaTargetController(
         stopPolling()
         pollJob = pollScope.launch {
             var everPlayed = false
+            var furthestPositionSeconds = 0L
             var consecutiveFailures = 0
             // Idea 8: poll fast while actively playing (need timely position + end/error detection), and
             // back off while paused/idle (position isn't moving) to cut SOAP chatter + battery.
@@ -592,6 +597,7 @@ class DlnaTargetController(
                     runCatching { seekTo(target) }.onFailure { logger.w("dlna", "DLNA resume seek failed", it) }
                 }
                 if (position != null) {
+                    furthestPositionSeconds = maxOf(furthestPositionSeconds, position)
                     _events.tryEmit(PlaybackTargetEvent.StatusChanged(position, isPlaying = state == "PLAYING"))
                 }
                 // The renderer couldn't decode the media: UPnP reports CurrentTransportStatus=ERROR_OCCURRED
@@ -604,14 +610,29 @@ class DlnaTargetController(
                     break
                 }
                 if (state == "PLAYING" || state == "TRANSITIONING") everPlayed = true
-                if (everPlayed && (state == "STOPPED" || state == "NO_MEDIA_PRESENT")) {
+                val terminalOutcome = DlnaTerminalStatePolicy.classify(
+                    everPlayed = everPlayed,
+                    transportState = state,
+                    furthestPositionSeconds = furthestPositionSeconds,
+                    durationSeconds = loadedDurationSeconds,
+                )
+                if (terminalOutcome != DlnaTerminalStatePolicy.Outcome.NONE) {
                     // Don't emit end-of-media if this poll has been cancelled (a reload is tearing the
                     // old stream down) — the STOPPED is the teardown, not a real finish. tryEmit isn't a
                     // suspension point, so without this guard a cancelled mid-iteration poll could still
                     // emit a stale Ended that stops the freshly-reloaded stream.
                     if (isActive) {
-                        logger.event("dlna", "DLNA end-of-media")
-                        _events.tryEmit(PlaybackTargetEvent.Ended)
+                        when (terminalOutcome) {
+                            DlnaTerminalStatePolicy.Outcome.COMPLETED -> {
+                                logger.event("dlna", "DLNA end-of-media near ${loadedDurationSeconds}s")
+                                _events.tryEmit(PlaybackTargetEvent.Ended)
+                            }
+                            DlnaTerminalStatePolicy.Outcome.STOPPED -> {
+                                logger.event("dlna", "DLNA renderer stopped at ${furthestPositionSeconds}s")
+                                _events.tryEmit(PlaybackTargetEvent.Stopped)
+                            }
+                            DlnaTerminalStatePolicy.Outcome.NONE -> Unit
+                        }
                     }
                     break
                 }

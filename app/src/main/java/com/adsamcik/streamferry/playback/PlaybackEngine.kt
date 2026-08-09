@@ -2015,6 +2015,15 @@ class PlaybackEngine(
                     }
                 }
             }
+            is PlaybackTargetEvent.Stopped -> {
+                isPlaying = false
+                isBuffering = false
+                seekSettleTargetSeconds = null
+                logger.event("playback", "Renderer stopped playback at ${absolutePositionSeconds}s")
+                publishStatus()
+                val gen = playGeneration
+                scope.launch { stopIfCurrent(gen, "renderer stopped") }
+            }
             is PlaybackTargetEvent.Disconnected -> {
                 isPlaying = false
                 smartResume.checkpoint(SmartResumeCheckpointKind.DISCONNECTED)
