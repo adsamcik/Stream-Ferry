@@ -40,6 +40,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -99,7 +101,9 @@ class DlnaTargetController(
     // SetAVTransportURI, so we issue a REL_TIME Seek — but only once the renderer is actually PLAYING (the
     // poll loop applies it), because a Seek before the transport has started is widely rejected/ignored.
     // Cleared after it is applied so we never re-seek a later user scrub.
-    @Volatile private var pendingResumeSeconds: Long = 0L
+    @Volatile private var pendingResumeSeek: PendingDlnaResumeSeek? = null
+    /** Orders the deferred load-time seek against explicit user/media-session seeks; the newest intent wins. */
+    private val seekMutex = Mutex()
     /** Duration of the stream whose URI was most recently accepted by the renderer. */
     @Volatile private var loadedDurationSeconds: Long? = null
     /** Last AVTransport state seen by the poll loop (PLAYING/TRANSITIONING/STOPPED/…), for diagnostics. */
@@ -437,7 +441,10 @@ class DlnaTargetController(
                 durationSecs = durationSeconds,
             )
             // Remember any resume position; the poll loop issues the Seek once the renderer reports PLAYING.
-            pendingResumeSeconds = startPositionSeconds.coerceAtLeast(0)
+            val boundedStart = startPositionSeconds.coerceAtLeast(0).let { requested ->
+                durationSeconds?.takeIf { it > 0 }?.let(requested::coerceAtMost) ?: requested
+            }
+            pendingResumeSeek = boundedStart.takeIf { it > 0 }?.let(::PendingDlnaResumeSeek)
             val setUri = {
                 soap(r.avTransport, "SetAVTransportURI", buildString {
                     append("<InstanceID>0</InstanceID>")
@@ -485,7 +492,14 @@ class DlnaTargetController(
 
     override suspend fun diagnosticStatus(): String =
         "dlna transport=${lastTransportState ?: "?"} connected=${connected != null}"
-    override suspend fun seekTo(positionSeconds: Long) = controlThenPoll(
+    override suspend fun seekTo(positionSeconds: Long) = seekMutex.withLock {
+        // An explicit user/media-session seek supersedes a still-pending load-time resume. Serializing this
+        // update with the deferred command guarantees an older resume can never execute after this seek.
+        pendingResumeSeek = null
+        seekRendererToUnlocked(positionSeconds)
+    }
+
+    private suspend fun seekRendererToUnlocked(positionSeconds: Long) = controlThenPoll(
         "Seek",
         "<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>${DidlLite.formatDuration(positionSeconds)}</Target>",
     )
@@ -530,6 +544,7 @@ class DlnaTargetController(
 
     override suspend fun disconnect() {
         stopPolling()
+        pendingResumeSeek = null
         loadedDurationSeconds = null
         connected = null
         _events.tryEmit(PlaybackTargetEvent.Disconnected)
@@ -548,6 +563,7 @@ class DlnaTargetController(
      */
     override suspend fun prepareReload() {
         stopPolling()
+        pendingResumeSeek = null
         avAction("Stop", "<InstanceID>0</InstanceID>")
     }
 
@@ -602,13 +618,43 @@ class DlnaTargetController(
                 // A direct-play resume/reload asked to start at a position: now that the renderer is
                 // actually PLAYING (transport ready + the proxy advertises the entity length so a byte
                 // seek is honoured), issue the REL_TIME Seek exactly once.
-                if (state == "PLAYING" && pendingResumeSeconds > 0) {
-                    val target = pendingResumeSeconds
-                    pendingResumeSeconds = 0
-                    logger.event("dlna", "DLNA resume: seeking to ${target}s now that playback started")
-                    runCatching { seekTo(target) }.onFailure { logger.w("dlna", "DLNA resume seek failed", it) }
+                var suppressPreSeekPosition = false
+                val pendingResume = pendingResumeSeek
+                if (state == "PLAYING" && pendingResume != null) {
+                    val target = pendingResume.positionSeconds
+                    logger.event(
+                        "dlna",
+                        "DLNA resume: seeking to ${target}s now that playback started " +
+                            "(attempt ${pendingResume.failedAttempts + 1}/${DlnaResumeSeekPolicy.MAX_ATTEMPTS})",
+                    )
+                    seekMutex.withLock {
+                        // The user may have issued a newer seek while this poll was reading transport state.
+                        // In that case the explicit seek cleared/replaced this exact object; do nothing.
+                        if (pendingResumeSeek === pendingResume) {
+                            runCatching { seekRendererToUnlocked(target) }
+                                .onSuccess {
+                                    pendingResumeSeek = null
+                                    // The position read above predates this seek. Do not emit it and make the
+                                    // phone briefly claim resume restarted at zero; the next poll confirms it.
+                                    suppressPreSeekPosition = true
+                                }
+                                .onFailure { failure ->
+                                    val retry = DlnaResumeSeekPolicy.afterFailure(pendingResume)
+                                    pendingResumeSeek = retry
+                                    logger.w("dlna", "DLNA resume seek failed", failure)
+                                    if (retry == null) {
+                                        _events.tryEmit(
+                                            PlaybackTargetEvent.ControlError(
+                                                "The TV started the video but couldn't resume at ${DidlLite.formatDuration(target)}. " +
+                                                    "Try seeking again.",
+                                            ),
+                                        )
+                                    }
+                                }
+                        }
+                    }
                 }
-                if (position != null) {
+                if (position != null && !suppressPreSeekPosition) {
                     furthestPositionSeconds = maxOf(furthestPositionSeconds, position)
                     _events.tryEmit(PlaybackTargetEvent.StatusChanged(position, isPlaying = state == "PLAYING"))
                 }

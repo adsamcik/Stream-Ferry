@@ -284,6 +284,7 @@ class PlaybackEngine(
     // Set true when an active renderer connection drops unexpectedly; surfaced in the status so the
     // ViewModel can auto-reconnect + resume. Cleared on each new play() and on teardown.
     @Volatile private var connectionLost = false
+    @Volatile private var controlErrorMessage: String? = null
     @Volatile private var lastThroughputBps = 0L
     @Volatile private var lastNote = "Measuring link speed…"
     // True when the user has pinned a specific quality rung; adaptation is paused until they pick Auto.
@@ -676,6 +677,7 @@ class PlaybackEngine(
         val t = target ?: return
         t.play()
         isPlaying = true
+        controlErrorMessage = null
         reportJellyfinProgressSoon()
         publishStatus()
     }
@@ -689,6 +691,7 @@ class PlaybackEngine(
         val t = target ?: return
         t.pause()
         isPlaying = false
+        controlErrorMessage = null
         smartResume.checkpoint(SmartResumeCheckpointKind.PAUSED)
         reportJellyfinProgressSoon()
         publishStatus()
@@ -991,6 +994,7 @@ class PlaybackEngine(
                 reason = "seek",
                 playWhenReady = isPlaying,
             )
+            controlErrorMessage = null
             adaptive?.let { it.noteApplied(it.currentIndex, clock()) } // reset window; don't change quality
         } else {
             // The proxy advertises the entity length (direct play) / the HLS playlist is full-timeline, so
@@ -1001,6 +1005,7 @@ class PlaybackEngine(
             reportedPositionSeconds = pos
             armRendererStartSettle(pos)
             noteJellyfinPosition(pos)
+            controlErrorMessage = null
             reportJellyfinProgressSoon()
             publishStatus()
         }
@@ -2094,6 +2099,11 @@ class PlaybackEngine(
                 logger.trace(TAG, "Buffering ${if (event.isBuffering) "started" else "ended"} at ${absolutePositionSeconds}s")
                 publishStatus()
             }
+            is PlaybackTargetEvent.ControlError -> {
+                controlErrorMessage = event.redactedMessage
+                logger.w("playback", event.redactedMessage)
+                publishStatus()
+            }
             is PlaybackTargetEvent.Error -> handlePlaybackFailure(
                 event.kind,
                 event.redactedMessage,
@@ -2369,6 +2379,7 @@ class PlaybackEngine(
         playbackStarted = false
         startupBytesServed = 0
         connectionLost = false
+        controlErrorMessage = null
         streamStartSeconds = 0
         reportedPositionSeconds = 0
         seekSettleTargetSeconds = null
@@ -2455,7 +2466,7 @@ class PlaybackEngine(
             volume = volume,
             volumeSupported = sel.discoveryMetadata.volumeControlAvailable && volumeSynchronized,
             title = item?.title ?: localPlayback?.title.orEmpty(),
-            errorMessage = error,
+            errorMessage = error ?: controlErrorMessage,
             phase = recovery.phase,
             attemptGeneration = recovery.generation,
             attemptHistory = recovery.attempts,

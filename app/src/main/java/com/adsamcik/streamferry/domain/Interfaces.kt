@@ -299,6 +299,8 @@ sealed interface PlaybackTargetEvent {
     data class StatusChanged(val positionSeconds: Long, val isPlaying: Boolean) : PlaybackTargetEvent
     /** The renderer started/stopped rebuffering (a stall). Feeds the adaptive-bitrate controller. */
     data class BufferingChanged(val isBuffering: Boolean) : PlaybackTargetEvent
+    /** A transport command failed without making the playable stream itself terminal (for example resume seek). */
+    data class ControlError(val redactedMessage: String) : PlaybackTargetEvent
     /**
      * The renderer reported a playback failure. [kind] drives recovery (see PlaybackRecovery).
      * [qualifiedFormatEvidence] is true only when the renderer supplied an explicit decode or
