@@ -3,12 +3,15 @@ package com.adsamcik.streamferry.data.download
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.IBinder
 import com.adsamcik.streamferry.R
+import com.adsamcik.streamferry.app.ACTION_OPEN_DOWNLOADS
+import com.adsamcik.streamferry.app.MainActivity
 import com.adsamcik.streamferry.app.StreamFerryApplication
 import com.adsamcik.streamferry.app.startForegroundCompat
 import com.adsamcik.streamferry.data.download.MediaDownloader.DownloadState
@@ -126,6 +129,7 @@ class DownloadService : Service() {
             .setContentText(text)
             .setSmallIcon(android.R.drawable.stat_sys_download)
             .setOngoing(true)
+            .setContentIntent(downloadsContentIntent())
         if (fraction != null) {
             builder.setProgress(100, (fraction * 100).toInt(), false)
         } else {
@@ -133,6 +137,15 @@ class DownloadService : Service() {
         }
         return builder.build()
     }
+
+    private fun downloadsContentIntent(): PendingIntent = PendingIntent.getActivity(
+        this,
+        NOTIF_ID,
+        Intent(this, MainActivity::class.java)
+            .setAction(ACTION_OPEN_DOWNLOADS)
+            .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+    )
 
     private fun aggregateFraction(states: Map<DownloadIdentity, DownloadState>, owner: DownloadOwner): Float? {
         val fractions = states

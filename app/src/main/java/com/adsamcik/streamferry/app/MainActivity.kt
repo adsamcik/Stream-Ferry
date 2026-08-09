@@ -1,5 +1,6 @@
 package com.adsamcik.streamferry.app
 
+import android.content.Intent
 import android.os.Bundle
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -41,6 +42,7 @@ class MainActivity : FragmentActivity() {
         enableEdgeToEdge()
         container.initializeCastContext()
         viewModel.onLocalNetworkPermissionResult(container.permissions.hasLocalNetworkAccess())
+        handleLaunchIntent(intent)
         setContent {
             val state by viewModel.state.collectAsStateWithLifecycle()
             StreamFerryTheme(themeMode = state.themeMode) {
@@ -77,6 +79,19 @@ class MainActivity : FragmentActivity() {
         // The battery-optimization request is handled by a system activity. Re-read its result when
         // control returns so the Settings toggle immediately reflects the user's choice.
         viewModel.refreshBackgroundPlaybackStatus()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleLaunchIntent(intent)
+    }
+
+    private fun handleLaunchIntent(launchIntent: Intent?) {
+        if (launchIntent?.action != ACTION_OPEN_DOWNLOADS) return
+        // Consume the action so activity recreation does not unexpectedly navigate back to Downloads.
+        launchIntent.action = null
+        viewModel.openDownloads()
     }
 
     override fun onStop() {
