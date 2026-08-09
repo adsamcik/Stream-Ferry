@@ -523,7 +523,10 @@ class PlaybackEngine(
             eventsJob = scope.launch { target.events.collect { onTargetEvent(target, it) } }
             target.connect(selectedTarget)
             synchronizeVolumeFromTargetLocked()
-            val startPos = resumePositionOverrideSeconds ?: item.resumePositionSeconds ?: 0L
+            val startPos = PlaybackPositionPolicy.clamp(
+                resumePositionOverrideSeconds ?: item.resumePositionSeconds ?: 0L,
+                item.runtimeSeconds,
+            )
             startPlaybackWithFallback(startPos, requestedBitrate = prefs.maxBitrateBps)
             // Now that the first resolve has revealed the media's tracks, honor the user's preferred /
             // per-show-remembered audio & subtitle language (re-resolves once only when it differs from
@@ -605,7 +608,7 @@ class PlaybackEngine(
             this@PlaybackEngine.autoAdvance = autoAdvance
             lastNote = "Loading the next item…"
             publishStatus()
-            val startPos = item.resumePositionSeconds ?: 0L
+            val startPos = PlaybackPositionPolicy.clamp(item.resumePositionSeconds ?: 0L, item.runtimeSeconds)
             try {
                 // Reuse the reload mechanism (prepareReload + coordinator.stop) so the target connection is
                 // preserved (many DLNA renderers also need a Stop before a new URI), then resolve + load the
@@ -658,13 +661,19 @@ class PlaybackEngine(
         autoAdvance = enabled && target != null && item != null && completedGeneration != playGeneration
     }
 
-    suspend fun togglePlayPause() {
-        if (isPlaying) pause() else resume()
+    suspend fun togglePlayPause() = mutex.withLock {
+        // Decide while holding the same lock that executes the command. Two rapid UI/key events then
+        // alternate deterministically instead of both observing one stale pre-command state.
+        if (isPlaying) pauseLocked() else resumeLocked()
     }
 
     suspend fun resume() = mutex.withLock {
+        resumeLocked()
+    }
+
+    private suspend fun resumeLocked() {
         requireLocalNetworkAccess()
-        val t = target ?: return@withLock
+        val t = target ?: return
         t.play()
         isPlaying = true
         reportJellyfinProgressSoon()
@@ -672,8 +681,12 @@ class PlaybackEngine(
     }
 
     suspend fun pause() = mutex.withLock {
+        pauseLocked()
+    }
+
+    private suspend fun pauseLocked() {
         requireLocalNetworkAccess()
-        val t = target ?: return@withLock
+        val t = target ?: return
         t.pause()
         isPlaying = false
         smartResume.checkpoint(SmartResumeCheckpointKind.PAUSED)
@@ -780,7 +793,7 @@ class PlaybackEngine(
             eventsJob = scope.launch { target.events.collect { onTargetEvent(target, it) } }
             target.connect(selectedTarget)
             synchronizeVolumeFromTargetLocked()
-            loadLocalStreamLocked(resumePositionSeconds.coerceAtLeast(0))
+            loadLocalStreamLocked(PlaybackPositionPolicy.clamp(resumePositionSeconds, runtimeSeconds))
             monitorJob = scope.launch { monitorLoop() }
         } catch (e: CancellationException) {
             withContext(NonCancellable) { stopInternalLocked("downloaded playback start cancelled") }
@@ -833,6 +846,7 @@ class PlaybackEngine(
                 logger.event("transcode", "Probed local video duration: ${effectiveRuntimeSeconds}s (caller had none)")
             }
         }
+        val boundedStartPos = PlaybackPositionPolicy.clamp(startPos, effectiveRuntimeSeconds)
         this@PlaybackEngine.item = MediaItem(
             id = "local", title = params.title, year = null, runtimeSeconds = effectiveRuntimeSeconds,
             overview = null, resumePositionSeconds = null, isFolder = false,
@@ -857,7 +871,7 @@ class PlaybackEngine(
         currentIsTranscoding = transcodeTarget != null
         onDeviceTranscodeTarget = transcodeTarget // null for direct play; set for on-device transcode
         streamStartSeconds = 0
-        reportedPositionSeconds = startPos
+        reportedPositionSeconds = boundedStartPos
         seekSettleTargetSeconds = null
         noteJellyfinPosition(reportedPositionSeconds)
         val streamForTv: RendererStream
@@ -903,15 +917,25 @@ class PlaybackEngine(
                 codec = transcodeTarget?.videoCodec?.name?.lowercase() ?: localSourceProfile?.videoCodec,
                 container = localSourceProfile?.container,
                 capabilitySummary = "hls=${sel.capabilities.supportsHls};hevc=${sel.capabilities.supportsHevc}",
-                startPositionSeconds = startPos,
+                startPositionSeconds = boundedStartPos,
                 reason = "local stream load",
                 automaticRecovery = pendingRecoveryKind,
             ),
         )
         val attemptGeneration = recoverySession.generation
         pendingRecoveryKind = null
-        tgt.load(url, streamForTv, params.title, effectiveRuntimeSeconds, startPositionSeconds = reportedPositionSeconds)
-        requestPlaybackAfterLoad(tgt)
+        // Arm before load as well as after it: Cast can synchronously deliver an initial position callback
+        // while the load result is being awaited, and that pre-position status must not snap resume to zero.
+        armRendererStartSettle(reportedPositionSeconds)
+        tgt.load(
+            url,
+            streamForTv,
+            params.title,
+            effectiveRuntimeSeconds,
+            startPositionSeconds = reportedPositionSeconds,
+            playWhenReady = true,
+        )
+        armRendererStartSettle(reportedPositionSeconds)
         armStartupWatchdog(attemptGeneration)
         publishStatus()
         logger.event("playback", "Playing ${params.title} -> ${sel.displayName} (${sel.protocol})")
@@ -946,13 +970,14 @@ class PlaybackEngine(
     suspend fun seekTo(absoluteSeconds: Long) = mutex.withLock {
         requireLocalNetworkAccess()
         val t = target ?: return@withLock
-        val pos = absoluteSeconds.coerceAtLeast(0)
+        val duration = currentInfo?.runtimeSeconds ?: item?.runtimeSeconds ?: localPlayback?.runtimeSeconds
+        val pos = PlaybackPositionPolicy.clamp(absoluteSeconds, duration)
         smartResume.noteSeekRequested(pos)
         // Only a progressive (non-HLS) transcode is a non-seekable live stream that must be re-resolved at
         // the new position server-side. A direct-play file AND a full-timeline HLS transcode are seekable,
         // so the renderer seeks within the existing stream (matching what the TV's own controls do) — a
         // server-side re-resolve of a full-timeline stream would reload it and play from 0 ("restart").
-        val serverSideSeek = currentIsTranscoding && !currentIsHls
+        val serverSideSeek = PlaybackPositionPolicy.requiresServerReload(currentIsTranscoding, currentIsHls)
         logger.event("playback", "Seek -> ${pos}s (${if (serverSideSeek) "server-side re-resolve" else "renderer seek"})")
         if (serverSideSeek) {
             // Optimistically reflect the seek target so a transient status from the torn-down old stream
@@ -960,7 +985,12 @@ class PlaybackEngine(
             streamStartSeconds = pos
             reportedPositionSeconds = 0
             publishStatus()
-            reloadStream(pos, requestedBitrate = adaptive?.currentBitrateBps, reason = "seek")
+            reloadStream(
+                pos,
+                requestedBitrate = adaptive?.currentBitrateBps,
+                reason = "seek",
+                playWhenReady = isPlaying,
+            )
             adaptive?.let { it.noteApplied(it.currentIndex, clock()) } // reset window; don't change quality
         } else {
             // The proxy advertises the entity length (direct play) / the HLS playlist is full-timeline, so
@@ -969,8 +999,7 @@ class PlaybackEngine(
             // jump. Afterwards, guard against an older status poll snapping the confirmed target back.
             t.seekTo(pos)
             reportedPositionSeconds = pos
-            seekSettleTargetSeconds = pos
-            seekSettleUntilMs = clock() + SEEK_SETTLE_WINDOW_MS
+            armRendererStartSettle(pos)
             noteJellyfinPosition(pos)
             reportJellyfinProgressSoon()
             publishStatus()
@@ -1351,8 +1380,16 @@ class PlaybackEngine(
      * Cast's load request already has autoplay enabled. A follow-up play command can race that load and
      * conceal its failure, while DLNA renderers still require their separate Play request.
      */
-    private suspend fun requestPlaybackAfterLoad(renderer: PlaybackTargetController) {
-        if (renderer.protocol != Protocol.CAST) runCatching { renderer.play() }
+    private fun notePlaybackLoadIntent(playWhenReady: Boolean) {
+        // Controllers own load-time autoplay now. Keeping this helper makes the intent explicit at call sites
+        // without issuing a second Play that can race Cast load or hide a rejected DLNA Play command.
+        if (!playWhenReady) logger.trace(TAG, "Loaded replacement stream paused at the requested position")
+    }
+
+    private fun armRendererStartSettle(positionSeconds: Long) {
+        if (positionSeconds <= 0L) return
+        seekSettleTargetSeconds = positionSeconds
+        seekSettleUntilMs = clock() + SEEK_SETTLE_WINDOW_MS
     }
 
     /**
@@ -1381,6 +1418,7 @@ class PlaybackEngine(
         requestedBitrate: Long?,
         initialiseAdaptive: Boolean,
         armWatchdog: Boolean = false,
+        playWhenReady: Boolean = true,
     ) {
         requireLocalNetworkAccess()
         val item = this.item ?: error("No media selected")
@@ -1466,7 +1504,7 @@ class PlaybackEngine(
         // requested position (its own t=0 == media position). A direct-play file AND a full-timeline HLS
         // transcode (Jellyfin VOD HLS lists 0..end regardless of startTimeTicks) are seekable, so the
         // renderer positions itself within them and the stream's t=0 is media 0.
-        val serverSideStart = upstream.isTranscoding && !upstream.isHls
+        val serverSideStart = PlaybackPositionPolicy.requiresServerReload(upstream.isTranscoding, upstream.isHls)
         streamStartSeconds = if (serverSideStart) positionSeconds else 0L
         reportedPositionSeconds = if (serverSideStart) 0L else positionSeconds
         seekSettleTargetSeconds = null // fresh stream: don't let a prior seek's hold suppress its statuses
@@ -1479,7 +1517,7 @@ class PlaybackEngine(
         // Hand the start position to load() so the renderer begins AT it (Cast sets it in the load request;
         // DLNA seeks once playing) for a direct-play file or a full-timeline HLS transcode — no separate,
         // racy post-load seek. A progressive transcode already starts at the position server-side (load 0).
-        val loadStart = if (serverSideStart) 0L else positionSeconds
+        val loadStart = PlaybackPositionPolicy.rendererLoadPosition(positionSeconds, serverSideStart)
         logger.event(
             "playback",
             "Loading ${if (upstream.isTranscoding) "transcode" else "direct-play"} " +
@@ -1506,8 +1544,17 @@ class PlaybackEngine(
         )
         val attemptGeneration = recoverySession.generation
         pendingRecoveryKind = null
-        target.load(url, upstream.rendererStream, item.title, info.runtimeSeconds, startPositionSeconds = loadStart)
-        requestPlaybackAfterLoad(target)
+        if (!serverSideStart) armRendererStartSettle(loadStart)
+        target.load(
+            url,
+            upstream.rendererStream,
+            item.title,
+            info.runtimeSeconds,
+            startPositionSeconds = loadStart,
+            playWhenReady = playWhenReady,
+        )
+        notePlaybackLoadIntent(playWhenReady)
+        if (!serverSideStart) armRendererStartSettle(loadStart)
         // Watch for the TV silently never starting (ideas 1+7). Only for a fresh start / recovery reload —
         // not a seek or bitrate switch, where playback is already established.
         if (armWatchdog) armStartupWatchdog(attemptGeneration)
@@ -1549,7 +1596,13 @@ class PlaybackEngine(
      * whole teardown→reload so the renderer's transient "finished" on the old stream isn't mistaken for
      * end-of-media. [armWatchdog] re-arms the startup watchdog for recovery reloads (not seeks/switches).
      */
-    private suspend fun reloadStream(positionSeconds: Long, requestedBitrate: Long?, reason: String, armWatchdog: Boolean = false) {
+    private suspend fun reloadStream(
+        positionSeconds: Long,
+        requestedBitrate: Long?,
+        reason: String,
+        armWatchdog: Boolean = false,
+        playWhenReady: Boolean = true,
+    ) {
         // The coordinator reports a terminal position while replacing the Jellyfin session. Record the
         // requested resume point first so a seek, bitrate switch, or recovery cannot save stale progress.
         noteJellyfinPosition(positionSeconds)
@@ -1564,7 +1617,13 @@ class PlaybackEngine(
             // stale end-of-media that survives the reload window and stops the new stream.
             runCatching { target?.prepareReload() }
             runCatching { coordinator.stop(reason) }
-            resolveAndLoad(positionSeconds, requestedBitrate = requestedBitrate, initialiseAdaptive = false, armWatchdog = armWatchdog)
+            resolveAndLoad(
+                positionSeconds,
+                requestedBitrate = requestedBitrate,
+                initialiseAdaptive = false,
+                armWatchdog = armWatchdog,
+                playWhenReady = playWhenReady,
+            )
         } finally {
             isReloadingStream = wasReloading
         }

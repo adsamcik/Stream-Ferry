@@ -273,6 +273,7 @@ class CastTargetController(
         title: String,
         durationSeconds: Long?,
         startPositionSeconds: Long,
+        playWhenReady: Boolean,
     ) = withContext(Dispatchers.Main) {
         val activeClient = requireActiveMediaClient()
         registerMediaCallback()
@@ -306,13 +307,13 @@ class CastTargetController(
         // dropped by the receiver, which then autoplays from 0 (the "TV plays from the start" bug).
         val request = MediaLoadRequestData.Builder()
             .setMediaInfo(mediaInfo)
-            .setAutoplay(true)
+            .setAutoplay(playWhenReady)
             .setCurrentTime(startPositionSeconds.coerceAtLeast(0) * 1000L)
             .build()
         logger.trace(
             TAG,
             "Cast load: type=${stream.mimeType} hlsFormat=${stream.hlsSegmentFormat} " +
-                "title=$title dur=${durationSeconds}s start=${startPositionSeconds}s url=$proxyUrl",
+                "title=$title dur=${durationSeconds}s start=${startPositionSeconds}s autoplay=$playWhenReady url=$proxyUrl",
         )
         awaitMediaCommand("load", activeClient.client.load(request), activeClient)
         startPositionHeartbeat(activeClient)

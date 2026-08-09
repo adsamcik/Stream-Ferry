@@ -418,7 +418,14 @@ class DlnaTargetController(
         _events.tryEmit(PlaybackTargetEvent.Connected)
     }
 
-    override suspend fun load(proxyUrl: String, stream: RendererStream, title: String, durationSeconds: Long?, startPositionSeconds: Long) =
+    override suspend fun load(
+        proxyUrl: String,
+        stream: RendererStream,
+        title: String,
+        durationSeconds: Long?,
+        startPositionSeconds: Long,
+        playWhenReady: Boolean,
+    ) =
         withContext(Dispatchers.IO) {
             requireLocalNetworkAccess()
             val r = connected ?: error("Not connected")
@@ -469,6 +476,7 @@ class DlnaTargetController(
             // loop so position + end-of-media tracking continues for the new stream — the previous loop
             // breaks when the old stream goes STOPPED during the reload teardown.
             startPolling()
+            if (playWhenReady) play()
         }
 
     override suspend fun play() = controlThenPoll("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")

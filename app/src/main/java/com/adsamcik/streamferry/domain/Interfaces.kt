@@ -335,6 +335,8 @@ interface PlaybackTargetController {
      *   is responsible for starting AT this offset (Cast sets it in the load request; DLNA seeks once the
      *   renderer is playing), so callers must NOT issue a separate post-load seek — that races the load and
      *   is silently dropped, leaving the TV playing from the start.
+     * @param playWhenReady whether the renderer should start after loading. False is used when a paused
+     *   progressive transcode is reloaded for an absolute seek, so seeking never unexpectedly resumes it.
      */
     suspend fun load(
         proxyUrl: String,
@@ -342,6 +344,7 @@ interface PlaybackTargetController {
         title: String,
         durationSeconds: Long?,
         startPositionSeconds: Long = 0,
+        playWhenReady: Boolean = true,
     )
     suspend fun play()
     suspend fun pause()
