@@ -1598,7 +1598,24 @@ class PlaybackEngine(
             recoverySession = reserved
             pendingRecoveryKind = RecoveryAttemptKind.FORMAT_COMPATIBILITY
             forceTranscodeFallback = true
-            resolveAndLoad(positionSeconds, requestedBitrate = requestedBitrate, initialiseAdaptive = true, armWatchdog = true)
+            val wasReloading = isReloadingStream
+            isReloadingStream = true
+            try {
+                // The optimistic load may already have started a proxy, coordinator session, and DLNA
+                // polling before the renderer rejected Play. Fully retire that attempt before replacing
+                // its URI; otherwise stale events can stop the fallback or snap its resume position.
+                proxy.stop()
+                runCatching { target?.prepareReload() }
+                runCatching { coordinator.stop("startup direct-play fallback") }
+                resolveAndLoad(
+                    positionSeconds,
+                    requestedBitrate = requestedBitrate,
+                    initialiseAdaptive = true,
+                    armWatchdog = true,
+                )
+            } finally {
+                isReloadingStream = wasReloading
+            }
         }
     }
 
