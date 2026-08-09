@@ -1199,7 +1199,9 @@ private fun SeekScrubber(
         else chapterIndexForPosition(chapters.map { it.startSeconds }, scrubSeconds)
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        BoxWithConstraints(Modifier.fillMaxWidth().height(34.dp)) {
+        // The wave remains visually compact, while the pointer/semantics surface meets Android's
+        // 48 dp minimum touch target for taps, drags, switch access, and motor accessibility.
+        BoxWithConstraints(Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
             val density = LocalDensity.current
             val trackWidthPx = constraints.maxWidth.toFloat()
             val tickColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f)
