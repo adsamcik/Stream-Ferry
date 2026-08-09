@@ -80,6 +80,7 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import com.adsamcik.streamferry.app.StreamFerryApplication
 import com.adsamcik.streamferry.core.volume.NightVolumePolicy
+import com.adsamcik.streamferry.diagnostics.ReportExport
 import com.adsamcik.streamferry.diagnostics.ReportShare
 import com.adsamcik.streamferry.domain.JellyfinLibraryStatus
 import com.adsamcik.streamferry.domain.MediaSourceIds
@@ -618,21 +619,21 @@ private fun ErrorBanner(
 private fun CrashAlertDialog(count: Int, reportText: () -> String, onDismiss: () -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    var exportError by remember { mutableStateOf<String?>(null) }
     val saveLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("text/plain"),
     ) { uri ->
         uri?.let { target ->
             scope.launch {
-                runCatching {
-                    withContext(Dispatchers.IO) {
-                        context.contentResolver.openOutputStream(target)?.use { output ->
-                            output.write(reportText().toByteArray())
-                        }
+                val result = withContext(Dispatchers.IO) {
+                    ReportExport.writeUtf8(reportText()) {
+                        context.contentResolver.openOutputStream(target)
                     }
                 }
-                onDismiss()
+                if (result.isSuccess) onDismiss()
+                else exportError = "Couldn't save the crash report. Choose another location and try again."
             }
-        } ?: onDismiss()
+        }
     }
     val plural = if (count == 1) "" else "s"
     AlertDialog(
@@ -644,14 +645,16 @@ private fun CrashAlertDialog(count: Int, reportText: () -> String, onDismiss: ()
                 Button(
                     onClick = {
                         scope.launch {
-                            val text = withContext(Dispatchers.IO) { reportText() }
-                            if (text.isNotBlank()) {
+                            val result = runCatching {
+                                val text = withContext(Dispatchers.IO) { reportText() }
+                                check(text.isNotBlank()) { "The crash report is empty." }
                                 val shareIntent = withContext(Dispatchers.IO) {
                                     ReportShare.createIntent(context, text, "Stream Ferry crash report")
                                 }
                                 context.startActivity(Intent.createChooser(shareIntent, "Share crash report"))
                             }
-                            onDismiss()
+                            if (result.isSuccess) onDismiss()
+                            else exportError = "Couldn't open the crash-report share sheet. Try saving it instead."
                         }
                     },
                     modifier = Modifier.fillMaxWidth(),
@@ -660,6 +663,14 @@ private fun CrashAlertDialog(count: Int, reportText: () -> String, onDismiss: ()
                     onClick = { saveLauncher.launch("stream-ferry-crash.txt") },
                     modifier = Modifier.fillMaxWidth(),
                 ) { Text("Save to a file…") }
+                exportError?.let { message ->
+                    Text(
+                        message,
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.semantics { liveRegion = LiveRegionMode.Assertive },
+                    )
+                }
             }
         },
         confirmButton = {},

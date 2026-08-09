@@ -1,6 +1,7 @@
 package com.adsamcik.streamferry.ui.screens
 
 import android.content.res.Configuration
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
@@ -43,6 +44,8 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
@@ -86,6 +89,8 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.graphics.graphicsLayer
@@ -118,6 +123,10 @@ import androidx.compose.foundation.Image
 import androidx.compose.runtime.produceState
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.input.ImeAction
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -126,6 +135,15 @@ fun GalleryScreen(state: AppUiState, viewModel: MainViewModel, compact: Boolean 
     val searchActive = state.searchQuery.isNotBlank()
     val atRoot = state.folderStack.isEmpty()
     var searchOpen by rememberSaveable { mutableStateOf(false) }
+    val focusManager = LocalFocusManager.current
+    val keyboard = LocalSoftwareKeyboardController.current
+    fun closeSearch() {
+        focusManager.clearFocus()
+        keyboard?.hide()
+        viewModel.clearSearch()
+        searchOpen = false
+    }
+    BackHandler(enabled = compact && (searchActive || searchOpen)) { closeSearch() }
     val entries = when {
         searchActive -> state.searchResults
         atRoot -> state.libraries
@@ -180,10 +198,7 @@ fun GalleryScreen(state: AppUiState, viewModel: MainViewModel, compact: Boolean 
             gridState = gridState,
             searchOpen = searchOpen,
             onOpenSearch = { searchOpen = true },
-            onCloseSearch = {
-                viewModel.clearSearch()
-                searchOpen = false
-            },
+            onCloseSearch = { closeSearch() },
         )
         return
     }
@@ -194,8 +209,7 @@ fun GalleryScreen(state: AppUiState, viewModel: MainViewModel, compact: Boolean 
                 title = if (searchActive) "Search results" else (state.currentFolder?.title ?: "Library"),
                 contextLabel = activeSourceName,
                 onBack = {
-                    if (searchActive) viewModel.clearSearch() else viewModel.popFolder()
-                    searchOpen = false
+                    if (searchActive || searchOpen) closeSearch() else viewModel.popFolder()
                 },
                 onSearch = { searchOpen = true },
                 searchVisible = searchActive || searchOpen,
@@ -209,8 +223,7 @@ fun GalleryScreen(state: AppUiState, viewModel: MainViewModel, compact: Boolean 
                     compact = true,
                     label = searchLabel,
                     onClose = {
-                        viewModel.clearSearch()
-                        searchOpen = false
+                        closeSearch()
                     },
                 )
             }
@@ -618,23 +631,74 @@ private fun LibrarySearchField(
     label: String = "Search library",
     onClose: (() -> Unit)? = null,
 ) {
-    val searchActive = state.searchQuery.isNotBlank()
-    OutlinedTextField(
+    val focusManager = LocalFocusManager.current
+    val keyboard = LocalSoftwareKeyboardController.current
+    LibrarySearchTextField(
         value = state.searchQuery,
         onValueChange = viewModel::onSearchQueryChanged,
+        label = label,
+        compact = compact,
+        onClear = viewModel::clearSearch,
+        onClose = onClose,
+        onImeSearch = {
+            focusManager.clearFocus()
+            keyboard?.hide()
+        },
+    )
+}
+
+/** Stateless search field so focus, IME submission, and close behavior can be instrumented. */
+@Composable
+internal fun LibrarySearchTextField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    label: String,
+    compact: Boolean,
+    onClear: () -> Unit,
+    onClose: (() -> Unit)?,
+    onImeSearch: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val searchActive = value.isNotBlank()
+    val focusRequester = remember { FocusRequester() }
+    val focusManager = LocalFocusManager.current
+    val keyboard = LocalSoftwareKeyboardController.current
+
+    LaunchedEffect(compact) {
+        if (compact && onClose != null) {
+            focusRequester.requestFocus()
+            keyboard?.show()
+        }
+    }
+
+    fun close() {
+        focusManager.clearFocus()
+        keyboard?.hide()
+        onClose?.invoke()
+    }
+
+    OutlinedTextField(
+        value = value,
+        onValueChange = onValueChange,
         label = { Text(label) },
         leadingIcon = { Icon(Icons.Rounded.Search, contentDescription = null) },
         singleLine = true,
         shape = RoundedCornerShape(20.dp),
+        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+        keyboardActions = KeyboardActions(onSearch = { onImeSearch() }),
         trailingIcon = {
             when {
-                compact && onClose != null -> IconButton(onClick = onClose) {
+                compact && onClose != null -> IconButton(onClick = { close() }) {
                     Icon(Icons.Rounded.Close, contentDescription = "Close search")
                 }
-                searchActive -> TextButton(onClick = viewModel::clearSearch) { Text("Clear") }
+                searchActive -> TextButton(onClick = onClear) { Text("Clear") }
             }
         },
-        modifier = Modifier.fillMaxWidth().padding(bottom = if (compact) 8.dp else 0.dp),
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(bottom = if (compact) 8.dp else 0.dp)
+            .focusRequester(focusRequester)
+            .testTag("library-search-field"),
     )
 }
 

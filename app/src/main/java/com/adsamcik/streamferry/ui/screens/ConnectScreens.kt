@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.WindowInsets
@@ -22,6 +23,8 @@ import androidx.compose.foundation.relocation.BringIntoViewRequester
 import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.selection.toggleable
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
@@ -51,11 +54,16 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusDirection
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.tooling.preview.Preview
@@ -132,6 +140,18 @@ fun WelcomeScreen(loggedIn: Boolean, onContinue: () -> Unit, onLocalOnly: () -> 
 
 @Composable
 fun ServerSetupScreen(state: AppUiState, viewModel: MainViewModel) {
+    val focusManager = LocalFocusManager.current
+    val keyboard = LocalSoftwareKeyboardController.current
+    val canSubmit = state.serverUrlInput.isNotBlank() &&
+        state.connectionState != ConnectionState.TESTING &&
+        (!state.needsHttpApproval || state.allowHttp)
+    fun submit() {
+        if (!canSubmit) return
+        focusManager.clearFocus()
+        keyboard?.hide()
+        viewModel.testConnectionAndContinue()
+    }
+
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text(
             "Enter your Jellyfin server address. https is recommended; http is allowed only for a LAN server you approve.",
@@ -146,6 +166,11 @@ fun ServerSetupScreen(state: AppUiState, viewModel: MainViewModel) {
             leadingIcon = { Icon(Icons.Rounded.Dns, contentDescription = null) },
             singleLine = true,
             shape = RoundedCornerShape(16.dp),
+            keyboardOptions = KeyboardOptions(
+                keyboardType = KeyboardType.Uri,
+                imeAction = ImeAction.Done,
+            ),
+            keyboardActions = KeyboardActions(onDone = { submit() }),
             modifier = Modifier
                 .fillMaxWidth()
                 .keepFocusedFieldVisible(),
@@ -170,8 +195,18 @@ fun ServerSetupScreen(state: AppUiState, viewModel: MainViewModel) {
                         style = MaterialTheme.typography.bodyMedium,
                         fontWeight = FontWeight.Medium,
                     )
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Checkbox(checked = state.allowHttp, onCheckedChange = viewModel::onAllowHttpChanged)
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 48.dp)
+                            .toggleable(
+                                value = state.allowHttp,
+                                role = Role.Checkbox,
+                                onValueChange = viewModel::onAllowHttpChanged,
+                            ),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Checkbox(checked = state.allowHttp, onCheckedChange = null)
                         Text("Allow http for this LAN server", color = MaterialTheme.colorScheme.onErrorContainer)
                     }
                 }
@@ -193,10 +228,8 @@ fun ServerSetupScreen(state: AppUiState, viewModel: MainViewModel) {
         }
 
         Button(
-            onClick = { viewModel.testConnectionAndContinue() },
-            enabled = state.serverUrlInput.isNotBlank() &&
-                state.connectionState != ConnectionState.TESTING &&
-                (!state.needsHttpApproval || state.allowHttp),
+            onClick = { submit() },
+            enabled = canSubmit,
             modifier = Modifier.fillMaxWidth().height(54.dp),
             shape = RoundedCornerShape(18.dp),
         ) {
@@ -226,6 +259,18 @@ fun LoginScreen(state: AppUiState, viewModel: MainViewModel) {
     var username by rememberSaveable { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
     val quickConnect = state.quickConnect
+    val focusManager = LocalFocusManager.current
+    val keyboard = LocalSoftwareKeyboardController.current
+    val canLogin = username.isNotBlank() && !state.isBusy
+    fun dismissKeyboard() {
+        focusManager.clearFocus()
+        keyboard?.hide()
+    }
+    fun submitLogin() {
+        if (!canLogin) return
+        dismissKeyboard()
+        viewModel.login(username, password)
+    }
 
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         state.serverName?.let {
@@ -265,6 +310,10 @@ fun LoginScreen(state: AppUiState, viewModel: MainViewModel) {
                     label = { Text("Username") },
                     singleLine = true,
                     shape = RoundedCornerShape(16.dp),
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
+                    keyboardActions = KeyboardActions(
+                        onNext = { focusManager.moveFocus(FocusDirection.Down) },
+                    ),
                     modifier = Modifier
                         .fillMaxWidth()
                         .keepFocusedFieldVisible(),
@@ -276,14 +325,18 @@ fun LoginScreen(state: AppUiState, viewModel: MainViewModel) {
                     singleLine = true,
                     shape = RoundedCornerShape(16.dp),
                     visualTransformation = PasswordVisualTransformation(),
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                    keyboardOptions = KeyboardOptions(
+                        keyboardType = KeyboardType.Password,
+                        imeAction = ImeAction.Done,
+                    ),
+                    keyboardActions = KeyboardActions(onDone = { submitLogin() }),
                     modifier = Modifier
                         .fillMaxWidth()
                         .keepFocusedFieldVisible(),
                 )
                 Button(
-                    onClick = { viewModel.login(username, password) },
-                    enabled = username.isNotBlank() && !state.isBusy,
+                    onClick = { submitLogin() },
+                    enabled = canLogin,
                     modifier = Modifier.fillMaxWidth().height(54.dp),
                     shape = RoundedCornerShape(18.dp),
                 ) {
@@ -291,7 +344,10 @@ fun LoginScreen(state: AppUiState, viewModel: MainViewModel) {
                     Text("  Log in", style = MaterialTheme.typography.titleMedium)
                 }
                 OutlinedButton(
-                    onClick = viewModel::startQuickConnect,
+                    onClick = {
+                        dismissKeyboard()
+                        viewModel.startQuickConnect()
+                    },
                     enabled = !state.isBusy,
                     modifier = Modifier.fillMaxWidth().height(54.dp),
                     shape = RoundedCornerShape(18.dp),
