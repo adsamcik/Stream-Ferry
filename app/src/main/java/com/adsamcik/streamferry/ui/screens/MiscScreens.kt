@@ -37,6 +37,8 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -57,6 +59,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import com.adsamcik.streamferry.BuildConfig
+import com.adsamcik.streamferry.diagnostics.ReportExport
 import com.adsamcik.streamferry.diagnostics.ReportShare
 import com.adsamcik.streamferry.logging.LogEntry
 import com.adsamcik.streamferry.logging.LogLevel
@@ -92,6 +95,7 @@ fun DiagnosticsScreen(
     val context = LocalContext.current
     val clipboard = LocalClipboard.current
     val clipboardScope = rememberCoroutineScope()
+    val snackbarHostState = remember { SnackbarHostState() }
 
     val saveDiagnosticsLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("text/plain"),
@@ -99,11 +103,16 @@ fun DiagnosticsScreen(
         // Build the report + write the file off the main thread (file reads + I/O would jank the UI).
         uri?.let { target ->
             clipboardScope.launch {
-                runCatching {
-                    withContext(Dispatchers.IO) {
-                        context.contentResolver.openOutputStream(target)?.use { os -> os.write(diagnosticsText().toByteArray()) }
+                val result = withContext(Dispatchers.IO) {
+                    ReportExport.writeUtf8(diagnosticsText()) {
+                        context.contentResolver.openOutputStream(target)
                     }
                 }
+                snackbarHostState.showSnackbar(
+                    message = if (result.isSuccess) "Diagnostics report saved."
+                    else "Couldn't save the diagnostics report. Choose another location and try again.",
+                    withDismissAction = result.isFailure,
+                )
             }
         }
     }
@@ -112,11 +121,16 @@ fun DiagnosticsScreen(
     ) { uri ->
         uri?.let { target ->
             clipboardScope.launch {
-                runCatching {
-                    withContext(Dispatchers.IO) {
-                        context.contentResolver.openOutputStream(target)?.use { os -> os.write(crashReportText().toByteArray()) }
+                val result = withContext(Dispatchers.IO) {
+                    ReportExport.writeUtf8(crashReportText()) {
+                        context.contentResolver.openOutputStream(target)
                     }
                 }
+                snackbarHostState.showSnackbar(
+                    message = if (result.isSuccess) "Crash logs saved."
+                    else "Couldn't save the crash logs. Choose another location and try again.",
+                    withDismissAction = result.isFailure,
+                )
             }
         }
     }
@@ -140,11 +154,12 @@ fun DiagnosticsScreen(
         }
     }
 
-    LazyColumn(
-        modifier = Modifier.fillMaxSize(),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-        contentPadding = PaddingValues(bottom = 16.dp),
-    ) {
+    Box(Modifier.fillMaxSize()) {
+        LazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+            contentPadding = PaddingValues(bottom = 80.dp),
+        ) {
         item {
             OutlinedButton(onClick = onRefresh, modifier = Modifier.fillMaxWidth()) { Text("Refresh") }
         }
@@ -162,12 +177,19 @@ fun DiagnosticsScreen(
                         onClick = {
                             // Read crash files + build the report off the main thread, then share on main.
                             clipboardScope.launch {
-                                val text = withContext(Dispatchers.IO) { diagnosticsText() }
-                                if (text.isNotBlank()) {
+                                val result = runCatching {
+                                    val text = withContext(Dispatchers.IO) { diagnosticsText() }
+                                    check(text.isNotBlank()) { "The diagnostics report is empty." }
                                     val shareIntent = withContext(Dispatchers.IO) {
                                         ReportShare.createIntent(context, text, "Stream Ferry diagnostics report")
                                     }
                                     context.startActivity(Intent.createChooser(shareIntent, "Share report"))
+                                }
+                                if (result.isFailure) {
+                                    snackbarHostState.showSnackbar(
+                                        "Couldn't open the diagnostics share sheet. Try saving the report instead.",
+                                        withDismissAction = true,
+                                    )
                                 }
                             }
                         },
@@ -245,12 +267,19 @@ fun DiagnosticsScreen(
                         Button(
                             onClick = {
                                 clipboardScope.launch {
-                                    val text = withContext(Dispatchers.IO) { crashReportText() }
-                                    if (text.isNotBlank()) {
+                                    val result = runCatching {
+                                        val text = withContext(Dispatchers.IO) { crashReportText() }
+                                        check(text.isNotBlank()) { "The crash report is empty." }
                                         val shareIntent = withContext(Dispatchers.IO) {
                                             ReportShare.createIntent(context, text, "Stream Ferry crash report")
                                         }
                                         context.startActivity(Intent.createChooser(shareIntent, "Share crash report"))
+                                    }
+                                    if (result.isFailure) {
+                                        snackbarHostState.showSnackbar(
+                                            "Couldn't open the crash-log share sheet. Try saving the logs instead.",
+                                            withDismissAction = true,
+                                        )
                                     }
                                 }
                             },
@@ -365,7 +394,12 @@ fun DiagnosticsScreen(
                     },
                 )
             }
+            }
         }
+        SnackbarHost(
+            hostState = snackbarHostState,
+            modifier = Modifier.align(Alignment.BottomCenter).padding(16.dp),
+        )
     }
 }
 
