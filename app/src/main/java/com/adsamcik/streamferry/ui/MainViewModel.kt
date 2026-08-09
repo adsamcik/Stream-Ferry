@@ -55,6 +55,7 @@ import com.adsamcik.streamferry.playback.PlaybackFailureStage
 import com.adsamcik.streamferry.playback.PlaybackCompletion
 import com.adsamcik.streamferry.playback.PlaybackPhase
 import com.adsamcik.streamferry.playback.PlaybackPreparationException
+import com.adsamcik.streamferry.playback.PlaybackPositionPolicy
 import com.adsamcik.streamferry.playback.PlaybackRecoveryContinuation
 import com.adsamcik.streamferry.ui.navigation.GalleryBrowseTarget
 import com.adsamcik.streamferry.ui.navigation.GalleryLoadRequest
@@ -254,6 +255,11 @@ class MainViewModel(
             container.playbackEngine.status.collect { status ->
                 if (status != null) {
                     lastPlaybackPositionSeconds = status.positionSeconds
+                    // The engine may have probed a missing SAF/MediaStore duration. Retain that authoritative
+                    // timeline so near-end local checkpoints are removed instead of resurfacing as resume.
+                    if (currentResumeKey != null && status.durationSeconds?.let { it > 0L } == true) {
+                        currentDurationSeconds = status.durationSeconds
+                    }
                     saveResumeThrottled(status.positionSeconds)
                     recordSuccessfulPhysicalEndpoint(status)
                 }
@@ -1384,6 +1390,8 @@ class MainViewModel(
         currentResumeKey = null
         currentDurationSeconds = null
         lastResumeSaveMs = 0L
+        // Never let an initial failure/alternate-protocol attempt inherit the previous item's position.
+        lastPlaybackPositionSeconds = 0L
         val requestedSmartResumePosition = smartResumeOverrideSeconds
         val s = _state.value
         val physicalTv = s.selectedPhysicalTv ?: run {
@@ -1441,50 +1449,62 @@ class MainViewModel(
                     "The downloaded copy is unavailable."
                 }
                 val resumeKey = DownloadIdentity(owner, downloadId).resumeKey
+                val resumeAt = PlaybackPositionPolicy.clamp(
+                    requestedSmartResumePosition ?: container.resumeStore.resumePosition(resumeKey) ?: 0L,
+                    entry.runtimeSeconds,
+                )
                 reconnectContext = ReconnectContext.Local(
                     file.absolutePath, entry.mimeType, entry.title, entry.runtimeSeconds,
                     physicalTv, target, downloadId, downloadedSmartResumeSeed(entry),
                 )
+                // Install ownership before the renderer starts. Early status, immediate Stop, and an
+                // alternate-protocol recovery must all checkpoint this exact download, never the prior item.
+                currentResumeKey = resumeKey
+                currentDurationSeconds = entry.runtimeSeconds
+                lastPlaybackPositionSeconds = resumeAt
                 container.playbackEngine.playLocal(
                     filePath = file.absolutePath,
                     contentType = entry.mimeType,
                     title = entry.title,
                     runtimeSeconds = entry.runtimeSeconds,
                     allowClientTranscode = container.playbackPreferences.transcodeLocalOnDevice,
-                    resumePositionSeconds = requestedSmartResumePosition ?: container.resumeStore.resumePosition(resumeKey) ?: 0L,
+                    resumePositionSeconds = resumeAt,
                     smartResumeSeed = downloadedSmartResumeSeed(entry),
                     smartResumeDeviceContext = resumeDeviceContext,
                     target = controller,
                     selectedTarget = target,
                     onForegrounded = goToPlayback,
                 )
-                currentResumeKey = resumeKey
-                currentDurationSeconds = entry.runtimeSeconds
             } else {
                 val item = requestedItem ?: error("Nothing selected to play.")
                 if (item.sourceId == MediaSourceIds.LOCAL) {
                     // On-device file: served via the proxy from a content:// fd. Resumes where you left
                     // off and auto-reconnects, the same as an online session.
                     val mime = container.localMediaSource.mimeTypeFor(item.id)
+                    val resumeAt = PlaybackPositionPolicy.clamp(
+                        requestedSmartResumePosition ?: container.resumeStore.resumePosition(item.id) ?: 0L,
+                        item.runtimeSeconds,
+                    )
                     reconnectContext = ReconnectContext.Local(
                         item.id, mime, item.title, item.runtimeSeconds,
                         physicalTv, target, null, localSmartResumeSeed(item),
                     )
+                    currentResumeKey = item.id
+                    currentDurationSeconds = item.runtimeSeconds
+                    lastPlaybackPositionSeconds = resumeAt
                     container.playbackEngine.playLocal(
                         filePath = item.id,
                         contentType = mime,
                         title = item.title,
                         runtimeSeconds = item.runtimeSeconds,
                         allowClientTranscode = container.playbackPreferences.transcodeLocalOnDevice,
-                        resumePositionSeconds = requestedSmartResumePosition ?: container.resumeStore.resumePosition(item.id) ?: 0L,
+                        resumePositionSeconds = resumeAt,
                         smartResumeSeed = localSmartResumeSeed(item),
                         smartResumeDeviceContext = resumeDeviceContext,
                         target = controller,
                         selectedTarget = target,
                         onForegrounded = goToPlayback,
                     )
-                    currentResumeKey = item.id
-                    currentDurationSeconds = item.runtimeSeconds
                 } else {
                     check(s.availabilityFor(item) != JellyfinItemAvailability.UNAVAILABLE) {
                         "Jellyfin is unavailable. Download this item to play it offline."
@@ -1500,15 +1520,20 @@ class MainViewModel(
                     onlineOwnerForAttempt = owner
                     onlinePlaybackOwner = owner
                     val autoAdvance = shouldAutoAdvance(item, s.playlist)
+                    val resumeAt = PlaybackPositionPolicy.clamp(
+                        requestedSmartResumePosition
+                            ?: durableOnlineResumePosition(item, owner)
+                            ?: 0L,
+                        item.runtimeSeconds,
+                    )
+                    lastPlaybackPositionSeconds = resumeAt
                     reconnectContext = ReconnectContext.Online(item, physicalTv, target, owner)
                     container.playbackEngine.play(
                         item, controller, target,
                         streamPreferences(item),
                         // Prefer the exact, atomic renderer checkpoint for this item/account. Jellyfin's
                         // server resume remains the fallback and is refreshed by the next heartbeat.
-                        resumePositionOverrideSeconds = requestedSmartResumePosition
-                            ?: durableOnlineResumePosition(item, owner)
-                            ?: 0L,
+                        resumePositionOverrideSeconds = resumeAt,
                         autoAdvance = autoAdvance,
                         smartResumeSeed = onlineSmartResumeSeed(item, owner),
                         smartResumeDeviceContext = resumeDeviceContext,
