@@ -5,7 +5,10 @@ import android.media.MediaCodecInfo.CodecProfileLevel
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.net.Uri
+import android.system.Os
+import android.system.OsConstants
 import com.adsamcik.streamferry.core.stream.MediaProfile
+import java.io.File
 
 /**
  * Probes a local video's first video+audio tracks into a [MediaProfile] (via [MediaExtractor]) so the
@@ -111,6 +114,29 @@ object LocalMediaProbe {
         } finally {
             runCatching { extractor.release() }
         }
+    }
+
+    /**
+     * Prove that a local source can satisfy byte-range requests before advertising DLNA seek support.
+     * Plain files are random-access by definition. A content provider must expose a known-size descriptor
+     * that accepts `lseek`; pipes/cloud streams remain conservatively non-seekable.
+     */
+    fun isByteSeekable(context: Context, uriString: String): Boolean = when {
+        uriString.startsWith("content://") -> runCatching {
+            context.contentResolver.openFileDescriptor(Uri.parse(uriString), "r")?.use { descriptor ->
+                if (descriptor.statSize <= 0L) return@use false
+                val original = Os.lseek(descriptor.fileDescriptor, 0L, OsConstants.SEEK_CUR)
+                val probe = (descriptor.statSize - 1L).coerceAtLeast(0L)
+                Os.lseek(descriptor.fileDescriptor, probe, OsConstants.SEEK_SET)
+                Os.lseek(descriptor.fileDescriptor, original, OsConstants.SEEK_SET)
+                true
+            } ?: false
+        }.getOrDefault(false)
+
+        uriString.startsWith("file://") ->
+            Uri.parse(uriString).path?.let(::File)?.isFile == true
+
+        else -> File(uriString).isFile
     }
 
     /** Open [uriString] on [extractor], handling both a `content://`/`file://` URI and a bare filesystem path. */

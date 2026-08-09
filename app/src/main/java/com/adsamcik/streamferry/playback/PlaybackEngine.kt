@@ -835,18 +835,17 @@ class PlaybackEngine(
         } else {
             null // default: hand the TV the file and let it decode (direct play), like a native gallery share
         }
-        // An on-device transcode is served as a VOD HLS playlist whose segments are planned from the total
-        // runtime; a null/zero duration (a SAF-picked file, or a MediaStore entry with no DURATION) yields
-        // an EMPTY playlist and the TV hangs in LOADING. Probe the file's real duration when we don't have
-        // one. If it still can't be determined, an HLS transcode is impossible, so fall back to direct play.
+        // Every local mode needs a real timeline for the phone scrubber, lock-screen absolute seek, resume,
+        // and VOD HLS planning. Probe it whenever the caller lacks one, including direct play (the old code
+        // only did this for on-device transcode and silently disabled seeking for SAF-picked direct files).
         var effectiveRuntimeSeconds = params.runtimeSeconds?.takeIf { it > 0 }
-        if (transcodeTarget != null && effectiveRuntimeSeconds == null) {
+        if (effectiveRuntimeSeconds == null) {
             effectiveRuntimeSeconds = LocalMediaProbe.probeDurationSeconds(appContext, params.filePath)
-            if (effectiveRuntimeSeconds == null) {
+            if (effectiveRuntimeSeconds != null) {
+                logger.event("playback", "Probed local video duration: ${effectiveRuntimeSeconds}s (caller had none)")
+            } else if (transcodeTarget != null) {
                 logger.w("transcode", "Couldn't determine local video duration; on-device transcode isn't possible — direct-playing as-is")
                 transcodeTarget = null
-            } else {
-                logger.event("transcode", "Probed local video duration: ${effectiveRuntimeSeconds}s (caller had none)")
             }
         }
         val boundedStartPos = PlaybackPositionPolicy.clamp(startPos, effectiveRuntimeSeconds)
@@ -894,11 +893,11 @@ class PlaybackEngine(
             url = preparePlaybackSource("Couldn't start the local media gateway.") {
                 coordinator.startLocalAndBuildUrl(params.filePath, params.contentType, phoneIp).second
             }
-            // A file-backed local resource has a known byte range. SAF descriptors may not, so
-            // keep their DLNA metadata conservative rather than advertising a range we cannot prove.
+            // Advertise DLNA byte seeking for plain files and for SAF/MediaStore descriptors only after
+            // proving they have a stable size and support lseek. Cloud-backed pipes remain conservative.
             streamForTv = RendererStream(
                 mimeType = params.contentType,
-                isByteSeekable = !params.filePath.startsWith("content://") && File(params.filePath).isFile,
+                isByteSeekable = LocalMediaProbe.isByteSeekable(appContext, params.filePath),
             )
         }
         // Track byte flow + early TV bail-out so the startup watchdog can catch a local file the TV
