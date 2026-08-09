@@ -43,6 +43,9 @@ class MediaSessionController(
     private val appContext = context.applicationContext
     private val notificationManager = appContext.getSystemService(NotificationManager::class.java)
     @Volatile private var remoteVolumeEnabled = false
+    @Volatile private var playPauseEnabled = false
+    @Volatile private var skipEnabled = false
+    @Volatile private var timelineSeekEnabled = false
     private val remoteVolumeProvider = volumeProvider()
 
     private val session = MediaSession(appContext, "StreamFerry").apply {
@@ -51,12 +54,12 @@ class MediaSessionController(
         // the main thread (e.g. from a Dispatchers.IO flow collector) -> NullPointerException.
         setCallback(
             object : MediaSession.Callback() {
-                override fun onPlay() = transport.onPlay()
-                override fun onPause() = transport.onPause()
+                override fun onPlay() { if (playPauseEnabled) transport.onPlay() }
+                override fun onPause() { if (playPauseEnabled) transport.onPause() }
                 override fun onStop() = transport.onStop()
-                override fun onSeekTo(pos: Long) = transport.onSeekTo(pos / 1000)
-                override fun onFastForward() = transport.onSkip(SKIP_SECONDS)
-                override fun onRewind() = transport.onSkip(-SKIP_SECONDS)
+                override fun onSeekTo(pos: Long) { if (timelineSeekEnabled) transport.onSeekTo(pos / 1000) }
+                override fun onFastForward() { if (skipEnabled) transport.onSkip(SKIP_SECONDS) }
+                override fun onRewind() { if (skipEnabled) transport.onSkip(-SKIP_SECONDS) }
                 override fun onCustomAction(action: String, extras: android.os.Bundle?) = dispatch(action)
             },
             Handler(Looper.getMainLooper()),
@@ -92,12 +95,16 @@ class MediaSessionController(
 
     /** Reflect the latest engine status into the session + notification. */
     fun update(status: PlaybackStatus?) {
+        val controls = status?.let { PlaybackControlPolicy.evaluate(it.phase, it.durationSeconds) }
+        playPauseEnabled = controls?.canPlayPause == true
+        skipEnabled = controls?.canSkip == true
+        timelineSeekEnabled = controls?.canSeekTimeline == true
         remoteVolumeEnabled = status?.volumeSupported == true
         if (remoteVolumeEnabled) {
             remoteVolumeProvider.setCurrentVolume((status!!.volume * MAX_VOLUME).roundToInt().coerceIn(0, MAX_VOLUME))
         }
         if (status == null) {
-            session.setPlaybackState(stateOf(PlaybackState.STATE_STOPPED, 0, false))
+            session.setPlaybackState(stateOf(PlaybackState.STATE_STOPPED, 0, false, canPlayPause = false, canSkip = false, canSeek = false))
             session.isActive = false
             return
         }
@@ -118,12 +125,23 @@ class MediaSessionController(
             .build()
         session.setMetadata(metadata)
         val playerState = when {
+            controls?.isTransitioning == true -> PlaybackState.STATE_CONNECTING
             status.isBuffering -> PlaybackState.STATE_BUFFERING
             status.isPlaying -> PlaybackState.STATE_PLAYING
             else -> PlaybackState.STATE_PAUSED
         }
-        session.setPlaybackState(stateOf(playerState, status.positionSeconds * 1000, status.isPlaying))
+        session.setPlaybackState(
+            stateOf(
+                playerState,
+                status.positionSeconds * 1000,
+                status.isPlaying,
+                canPlayPause = playPauseEnabled,
+                canSkip = skipEnabled,
+                canSeek = timelineSeekEnabled,
+            ),
+        )
         val phase = when {
+            controls?.isTransitioning == true -> PlaybackNotificationFactory.Phase.PREPARING
             status.isBuffering -> PlaybackNotificationFactory.Phase.BUFFERING
             status.isPlaying -> PlaybackNotificationFactory.Phase.PLAYING
             else -> PlaybackNotificationFactory.Phase.PAUSED
@@ -132,6 +150,8 @@ class MediaSessionController(
             title = title,
             targetName = targetName,
             phase = phase,
+            canPlayPause = playPauseEnabled,
+            canSkip = skipEnabled,
         )
         runCatching { notificationManager.notify(PlaybackNotificationFactory.NOTIFICATION_ID, lastNotification) }
     }
@@ -145,11 +165,11 @@ class MediaSessionController(
     /** Route a notification/media action (sent to the service) to the engine. */
     fun dispatch(action: String?) {
         when (action) {
-            PlaybackNotificationFactory.ACTION_PLAY -> transport.onPlay()
-            PlaybackNotificationFactory.ACTION_PAUSE -> transport.onPause()
+            PlaybackNotificationFactory.ACTION_PLAY -> if (playPauseEnabled) transport.onPlay()
+            PlaybackNotificationFactory.ACTION_PAUSE -> if (playPauseEnabled) transport.onPause()
             PlaybackNotificationFactory.ACTION_STOP -> transport.onStop()
-            PlaybackNotificationFactory.ACTION_FFWD -> transport.onSkip(SKIP_SECONDS)
-            PlaybackNotificationFactory.ACTION_RWND -> transport.onSkip(-SKIP_SECONDS)
+            PlaybackNotificationFactory.ACTION_FFWD -> if (skipEnabled) transport.onSkip(SKIP_SECONDS)
+            PlaybackNotificationFactory.ACTION_RWND -> if (skipEnabled) transport.onSkip(-SKIP_SECONDS)
         }
     }
 
@@ -158,7 +178,14 @@ class MediaSessionController(
         session.release()
     }
 
-    private fun stateOf(state: Int, positionMs: Long, playing: Boolean): PlaybackState =
+    private fun stateOf(
+        state: Int,
+        positionMs: Long,
+        playing: Boolean,
+        canPlayPause: Boolean = false,
+        canSkip: Boolean = false,
+        canSeek: Boolean = false,
+    ): PlaybackState =
         notificationFactory.addSystemControls(
             PlaybackState.Builder()
                 .setState(
@@ -167,12 +194,19 @@ class MediaSessionController(
                     if (playing) 1f else 0f,
                     SystemClock.elapsedRealtime(),
                 )
-                .setActions(
-                    PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE or PlaybackState.ACTION_PLAY_PAUSE or
-                        PlaybackState.ACTION_STOP or PlaybackState.ACTION_SEEK_TO or
-                        PlaybackState.ACTION_FAST_FORWARD or PlaybackState.ACTION_REWIND,
-                ),
+                .setActions(playbackActions(canPlayPause, canSkip, canSeek)),
+            canSkip = canSkip,
         ).build()
+
+    private fun playbackActions(canPlayPause: Boolean, canSkip: Boolean, canSeek: Boolean): Long {
+        var actions = PlaybackState.ACTION_STOP
+        if (canPlayPause) {
+            actions = actions or PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE or PlaybackState.ACTION_PLAY_PAUSE
+        }
+        if (canSkip) actions = actions or PlaybackState.ACTION_FAST_FORWARD or PlaybackState.ACTION_REWIND
+        if (canSeek) actions = actions or PlaybackState.ACTION_SEEK_TO
+        return actions
+    }
 
     companion object {
         private const val MAX_VOLUME = 20

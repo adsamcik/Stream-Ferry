@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -71,6 +72,7 @@ import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -89,8 +91,12 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
@@ -101,6 +107,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.ProgressBarRangeInfo
 import androidx.compose.ui.semantics.contentDescription
@@ -110,6 +117,10 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.setProgress
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
@@ -130,7 +141,9 @@ import com.adsamcik.streamferry.domain.DiscoveredTarget
 import com.adsamcik.streamferry.domain.MediaChapter
 import com.adsamcik.streamferry.physical.PhysicalTv
 import com.adsamcik.streamferry.playback.PlaybackAttemptDescriptor
+import com.adsamcik.streamferry.playback.PlaybackControlPolicy
 import com.adsamcik.streamferry.playback.PlaybackPhase
+import com.adsamcik.streamferry.playback.PlaybackTimecode
 import com.adsamcik.streamferry.ui.MainViewModel
 import com.adsamcik.streamferry.ui.components.ExpressiveLoadingIndicator
 import com.adsamcik.streamferry.ui.state.AppUiState
@@ -643,7 +656,7 @@ private fun PlaybackTimelineControls(
     p.skipSegmentLabel?.let { label ->
         SkipSegmentButton(label, onSkip = viewModel::skipSegment, compact = compact)
     }
-    TransportControls(p, positionProvider, viewModel, compact = compact)
+    TransportControls(p, viewModel, compact = compact)
     if (p.volumeSupported) VolumeControl(p, viewModel, compact = true)
 }
 
@@ -1188,15 +1201,23 @@ private fun SeekScrubber(
     onSeek: (Long) -> Unit,
 ) {
     val duration = p.durationSeconds?.takeIf { it > 0 }
-    val seekable = duration != null
+    val controls = PlaybackControlPolicy.evaluate(p.phase, duration)
+    val seekable = controls.canSeekTimeline
     var dragging by remember { mutableStateOf(false) }
     var dragFraction by remember { mutableFloatStateOf(0f) }
+    var showExactSeek by rememberSaveable { mutableStateOf(false) }
     val position = positionProvider() // one read (subscribes THIS composable to the smooth-position tick)
     val playFraction = duration?.let { (position.toFloat() / it).coerceIn(0f, 1f) } ?: 0f
     val shown = if (dragging) dragFraction else playFraction
     val scrubSeconds = duration?.let { (shown * it).toLong() } ?: 0L
     val chapterIdx = if (chapters.isEmpty()) null
         else chapterIndexForPosition(chapters.map { it.startSeconds }, scrubSeconds)
+
+    LaunchedEffect(seekable) {
+        // If recovery/reload begins while the keyboard dialog is open, dismiss its stale command instead
+        // of letting IME Done queue a seek against a stream that is currently being replaced.
+        if (!seekable) showExactSeek = false
+    }
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         // The wave remains visually compact, while the pointer/semantics surface meets Android's
@@ -1227,7 +1248,7 @@ private fun SeekScrubber(
                         }
                     }
                     .then(
-                        if (seekable) Modifier.pointerInput(duration) {
+                        if (seekable && duration != null) Modifier.pointerInput(duration) {
                             detectHorizontalDragGestures(
                                 onDragStart = { o -> dragging = true; dragFraction = (o.x / size.width).coerceIn(0f, 1f) },
                                 onHorizontalDrag = { c, _ -> dragFraction = (c.position.x / size.width).coerceIn(0f, 1f) },
@@ -1237,7 +1258,7 @@ private fun SeekScrubber(
                         } else Modifier,
                     )
                     .then(
-                        if (seekable) Modifier.pointerInput(duration) {
+                        if (seekable && duration != null) Modifier.pointerInput(duration) {
                             detectTapGestures { o -> onSeek(((o.x / size.width).coerceIn(0f, 1f) * duration).toLong()) }
                         } else Modifier,
                     ),
@@ -1291,11 +1312,22 @@ private fun SeekScrubber(
                 }
             }
         }
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
             Text(
                 formatClock(if (dragging) scrubSeconds else position),
                 style = MaterialTheme.typography.labelLarge,
             )
+            TextButton(
+                onClick = { showExactSeek = true },
+                enabled = seekable,
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+            ) {
+                Text("Jump to…")
+            }
             Text(
                 duration?.let { formatClock(it) } ?: "live",
                 style = MaterialTheme.typography.labelLarge,
@@ -1303,6 +1335,86 @@ private fun SeekScrubber(
             )
         }
     }
+    if (showExactSeek && seekable && duration != null) {
+        ExactSeekDialog(
+            currentSeconds = position.coerceIn(0L, duration),
+            durationSeconds = duration,
+            onDismiss = { showExactSeek = false },
+            onSeek = { exact ->
+                showExactSeek = false
+                onSeek(exact)
+            },
+        )
+    }
+}
+
+@Composable
+private fun ExactSeekDialog(
+    currentSeconds: Long,
+    durationSeconds: Long,
+    onDismiss: () -> Unit,
+    onSeek: (Long) -> Unit,
+) {
+    val initial = formatClock(currentSeconds)
+    var input by remember {
+        mutableStateOf(TextFieldValue(initial, selection = TextRange(0, initial.length)))
+    }
+    var invalid by remember { mutableStateOf(false) }
+    val focusRequester = remember { FocusRequester() }
+    val keyboard = LocalSoftwareKeyboardController.current
+    val dismiss = {
+        keyboard?.hide()
+        onDismiss()
+    }
+    val submit = {
+        val exact = PlaybackTimecode.parse(input.text, durationSeconds)
+        if (exact == null) {
+            invalid = true
+        } else {
+            keyboard?.hide()
+            onSeek(exact)
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        focusRequester.requestFocus()
+        keyboard?.show()
+    }
+    AlertDialog(
+        onDismissRequest = dismiss,
+        modifier = Modifier.imePadding(),
+        title = { Text("Jump to exact time") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = input,
+                    onValueChange = { updated ->
+                        if (updated.text.length <= 12 && updated.text.all { it.isDigit() || it == ':' }) {
+                            input = updated
+                            invalid = false
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth().focusRequester(focusRequester),
+                    label = { Text("Time") },
+                    placeholder = { Text("MM:SS or HH:MM:SS") },
+                    supportingText = {
+                        Text(
+                            if (invalid) "Enter a valid time from 0:00 to ${formatClock(durationSeconds)}."
+                            else "Seconds, MM:SS, and HH:MM:SS are supported.",
+                        )
+                    },
+                    isError = invalid,
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii, imeAction = ImeAction.Done),
+                    keyboardActions = KeyboardActions(onDone = { submit() }),
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = submit, enabled = input.text.isNotBlank()) { Text("Jump") }
+        },
+        dismissButton = { TextButton(onClick = dismiss) { Text("Cancel") } },
+    )
 }
 
 /** Floating thumbnail preview shown above the scrubber while seeking. Fixed size for stable placement. */
@@ -1411,11 +1523,11 @@ private fun WaveBar(fraction: Float, playing: Boolean, indeterminate: Boolean, m
 @Composable
 private fun TransportControls(
     p: PlaybackUiState,
-    positionProvider: () -> Long,
     viewModel: MainViewModel,
     compact: Boolean = false,
 ) {
     val duration = p.durationSeconds?.takeIf { it > 0 }
+    val controls = PlaybackControlPolicy.evaluate(p.phase, duration)
     val interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
     val pressed by interactionSource.collectIsPressedAsState()
     val playScale by animateFloatAsState(
@@ -1434,8 +1546,8 @@ private fun TransportControls(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         FilledTonalIconButton(
-            onClick = { viewModel.seekTo((positionProvider() - 30).coerceAtLeast(0)) },
-            enabled = duration != null,
+            onClick = { viewModel.skipBy(-30) },
+            enabled = controls.canSkip,
             modifier = Modifier.size(sideSize),
             shape = RoundedCornerShape(if (compact) 18.dp else 20.dp),
         ) {
@@ -1443,6 +1555,7 @@ private fun TransportControls(
         }
         FilledIconButton(
             onClick = { viewModel.togglePlayPause() },
+            enabled = controls.canPlayPause,
             interactionSource = interactionSource,
             modifier = Modifier.size(playSize).graphicsLayer {
                 scaleX = playScale
@@ -1450,15 +1563,23 @@ private fun TransportControls(
             },
             shape = CircleShape,
         ) {
-            Icon(
-                if (p.isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
-                contentDescription = if (p.isPlaying) "Pause" else "Play",
-                modifier = Modifier.size(if (compact) 40.dp else 48.dp),
-            )
+            if (controls.isTransitioning) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(if (compact) 32.dp else 38.dp),
+                    strokeWidth = 3.dp,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.55f),
+                )
+            } else {
+                Icon(
+                    if (p.isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
+                    contentDescription = if (p.isPlaying) "Pause" else "Play",
+                    modifier = Modifier.size(if (compact) 40.dp else 48.dp),
+                )
+            }
         }
         FilledTonalIconButton(
-            onClick = { duration?.let { viewModel.seekTo((positionProvider() + 30).coerceAtMost(it)) } },
-            enabled = duration != null,
+            onClick = { viewModel.skipBy(30) },
+            enabled = controls.canSkip,
             modifier = Modifier.size(sideSize),
             shape = RoundedCornerShape(if (compact) 18.dp else 20.dp),
         ) {

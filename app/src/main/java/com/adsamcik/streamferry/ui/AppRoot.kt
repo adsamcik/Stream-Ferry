@@ -85,6 +85,7 @@ import com.adsamcik.streamferry.diagnostics.ReportShare
 import com.adsamcik.streamferry.domain.JellyfinLibraryStatus
 import com.adsamcik.streamferry.domain.MediaSourceIds
 import com.adsamcik.streamferry.playback.PlaybackPhase
+import com.adsamcik.streamferry.playback.PlaybackControlPolicy
 import com.adsamcik.streamferry.ui.navigation.NavigationStatePolicy
 import com.adsamcik.streamferry.ui.navigation.NavigationStatePolicy.TopLevelDestination
 import com.adsamcik.streamferry.ui.screens.AboutScreen
@@ -456,6 +457,7 @@ private fun MiniPlayer(
         ?: "Now playing"
     val queueSize = state.playlist.entries.size
     val duration = playback.durationSeconds?.takeIf { it > 0 }
+    val controls = PlaybackControlPolicy.evaluate(playback.phase, duration)
     val progress = duration?.let { (playback.positionSeconds.toFloat() / it).coerceIn(0f, 1f) }
     val animatedProgress by animateFloatAsState(
         targetValue = progress ?: 0f,
@@ -525,6 +527,7 @@ private fun MiniPlayer(
                 if (!playback.isTerminal && state.playlist.next != null) {
                     FilledIconButton(
                         onClick = viewModel::skipToNextPlaylistItem,
+                        enabled = controls.canPlayPause,
                         modifier = Modifier.size(if (compact) 40.dp else 48.dp),
                     ) {
                         Icon(
@@ -543,6 +546,7 @@ private fun MiniPlayer(
                 } else {
                     FilledIconButton(
                         onClick = { viewModel.togglePlayPause() },
+                        enabled = controls.canPlayPause,
                         modifier = Modifier.size(if (compact) 40.dp else 48.dp),
                     ) {
                         AnimatedContent(

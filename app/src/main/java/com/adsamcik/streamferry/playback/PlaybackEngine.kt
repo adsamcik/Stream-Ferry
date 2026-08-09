@@ -697,8 +697,12 @@ class PlaybackEngine(
         publishStatus()
     }
 
-    /** Seek by a relative amount (used by media-button / notification skip actions). */
-    suspend fun skip(deltaSeconds: Long) = seekTo(absolutePositionSeconds + deltaSeconds)
+    /** Seek by a relative amount (used by UI, keyboard/media-button, and notification skip actions). */
+    suspend fun skip(deltaSeconds: Long) = mutex.withLock {
+        // Compute inside the command lock. Rapid presses then accumulate (+30, +30, +30 = +90) instead
+        // of every queued action reading the same stale pre-command position.
+        seekToLocked(absolutePositionSeconds + deltaSeconds)
+    }
 
     suspend fun setVolume(level: Float) = mutex.withLock {
         requireLocalNetworkAccess()
@@ -970,8 +974,12 @@ class PlaybackEngine(
     }
 
     suspend fun seekTo(absoluteSeconds: Long) = mutex.withLock {
+        seekToLocked(absoluteSeconds)
+    }
+
+    private suspend fun seekToLocked(absoluteSeconds: Long) {
         requireLocalNetworkAccess()
-        val t = target ?: return@withLock
+        val t = target ?: return
         val duration = currentInfo?.runtimeSeconds ?: item?.runtimeSeconds ?: localPlayback?.runtimeSeconds
         val pos = PlaybackPositionPolicy.clamp(absoluteSeconds, duration)
         smartResume.noteSeekRequested(pos)

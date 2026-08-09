@@ -41,6 +41,8 @@ internal class PlaybackNotificationFactory(
         title: String,
         targetName: String?,
         phase: Phase,
+        canPlayPause: Boolean = phase != Phase.PREPARING,
+        canSkip: Boolean = phase != Phase.PREPARING,
     ): Notification {
         val playing = phase == Phase.PLAYING
         val playPause = if (playing) {
@@ -48,32 +50,38 @@ internal class PlaybackNotificationFactory(
         } else {
             action(R.drawable.ic_notification_play, R.string.play, ACTION_PLAY, REQUEST_PLAY)
         }
-        val style = Notification.MediaStyle()
-            .setMediaSession(sessionToken)
-            .setShowActionsInCompactView(0, 1, 2)
+        val style = Notification.MediaStyle().setMediaSession(sessionToken)
+        if (canPlayPause && canSkip) style.setShowActionsInCompactView(0, 1, 2)
+        else style.setShowActionsInCompactView(0)
 
         return baseBuilder(appContext)
             .setContentTitle(title)
             .setContentText(statusText(targetName, phase))
             .setStyle(style)
-            .addAction(
-                action(
-                    R.drawable.ic_notification_rewind,
-                    R.string.notif_rewind_30,
-                    ACTION_RWND,
-                    REQUEST_REWIND,
-                ),
-            )
-            .addAction(playPause)
-            .addAction(
-                action(
-                    R.drawable.ic_notification_forward,
-                    R.string.notif_forward_30,
-                    ACTION_FFWD,
-                    REQUEST_FORWARD,
-                ),
-            )
-            .addAction(action(R.drawable.ic_notification_stop, R.string.stop, ACTION_STOP, REQUEST_STOP))
+            .apply {
+                if (canSkip) {
+                    addAction(
+                        action(
+                            R.drawable.ic_notification_rewind,
+                            R.string.notif_rewind_30,
+                            ACTION_RWND,
+                            REQUEST_REWIND,
+                        ),
+                    )
+                }
+                if (canPlayPause) addAction(playPause)
+                if (canSkip) {
+                    addAction(
+                        action(
+                            R.drawable.ic_notification_forward,
+                            R.string.notif_forward_30,
+                            ACTION_FFWD,
+                            REQUEST_FORWARD,
+                        ),
+                    )
+                }
+                addAction(action(R.drawable.ic_notification_stop, R.string.stop, ACTION_STOP, REQUEST_STOP))
+            }
             .apply { contentIntent?.let(::setContentIntent) }
             .build()
     }
@@ -82,15 +90,18 @@ internal class PlaybackNotificationFactory(
      * Adds the ordered custom controls consumed by Android's modern media carousel. Play/pause and
      * seeking remain standard session actions; rewind, forward, and stop occupy the remaining slots.
      */
-    fun addSystemControls(builder: PlaybackState.Builder): PlaybackState.Builder =
-        builder
-            .addCustomAction(
-                customAction(ACTION_RWND, R.string.notif_rewind_30, R.drawable.ic_notification_rewind),
-            )
-            .addCustomAction(
-                customAction(ACTION_FFWD, R.string.notif_forward_30, R.drawable.ic_notification_forward),
-            )
-            .addCustomAction(customAction(ACTION_STOP, R.string.stop, R.drawable.ic_notification_stop))
+    fun addSystemControls(builder: PlaybackState.Builder, canSkip: Boolean): PlaybackState.Builder =
+        builder.apply {
+            if (canSkip) {
+                addCustomAction(
+                    customAction(ACTION_RWND, R.string.notif_rewind_30, R.drawable.ic_notification_rewind),
+                )
+                addCustomAction(
+                    customAction(ACTION_FFWD, R.string.notif_forward_30, R.drawable.ic_notification_forward),
+                )
+            }
+            addCustomAction(customAction(ACTION_STOP, R.string.stop, R.drawable.ic_notification_stop))
+        }
 
     private fun statusText(targetName: String?, phase: Phase): String {
         if (phase == Phase.PREPARING || targetName.isNullOrBlank()) {

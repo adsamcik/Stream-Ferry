@@ -2173,6 +2173,16 @@ class MainViewModel(
         }
     }
 
+    fun skipBy(deltaSeconds: Long) = viewModelScope.launch {
+        try {
+            container.playbackEngine.skip(deltaSeconds)
+        } catch (c: CancellationException) {
+            throw c
+        } catch (e: Exception) {
+            handlePlaybackControlFailure("seek", e)
+        }
+    }
+
     /** Pin the transcode video codec (e.g. "hevc"), or return to automatic (null). Re-resolves the stream. */
     fun selectPreferredCodec(codec: String?) = viewModelScope.launch {
         try {
