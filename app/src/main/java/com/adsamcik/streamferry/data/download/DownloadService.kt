@@ -100,10 +100,11 @@ class DownloadService : Service() {
     private fun handleTimeout() {
         // The system capped this foreground service's runtime. Stop cleanly — the `.part` files and the
         // persisted queue mean every unfinished download resumes automatically on the next app open.
-        runCatching {
-            (application as? StreamFerryApplication)?.logger
-                ?.event("download", "Download service paused by system runtime limit; will resume later")
-        }
+        val container = (application as? StreamFerryApplication)?.container
+        runCatching { container?.downloader?.pauseAll() }
+            .onFailure { container?.logger?.w("download", "Couldn't pause downloads at the service runtime limit", it) }
+        container?.logger?.event("download", "Download service paused by system runtime limit; will resume later")
+        observerJob?.cancel()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
@@ -143,6 +144,7 @@ class DownloadService : Service() {
     }
 
     private fun stopService() {
+        runCatching { (application as? StreamFerryApplication)?.container?.downloader?.pauseAll() }
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }

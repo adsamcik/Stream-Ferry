@@ -12,6 +12,7 @@ import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.logging.DiagnosticsLogger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
@@ -20,6 +21,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runInterruptible
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
@@ -157,7 +159,15 @@ class MediaDownloader(
         }
         // Always untrack our own job on any terminal state (complete/fail/cancel, even if never started),
         // so a slot can't leak and block a future re-download.
-        job.invokeOnCompletion { jobs.remove(identity, job) }
+        job.invokeOnCompletion {
+            jobs.remove(identity, job)
+            // A lazily-created job can be paused before its coroutine reaches the cancellation handler.
+            // Clean that case here while preserving the persisted queue and partial file.
+            if (pauseRequests.remove(identity)) {
+                clearState(identity)
+                titles.remove(identity)
+            }
+        }
         if (jobs.putIfAbsent(identity, job) != null) {
             job.cancel() // another download for this item already owns the slot
             return
@@ -247,9 +257,7 @@ class MediaDownloader(
      * Unlike [cancelAllAndJoin], it preserves the queue and `.part`/validator files for a later resume.
      */
     suspend fun pauseAllAndJoin() {
-        val active = jobs.entries.toList()
-        active.forEach { (identity, _) -> pauseRequests.add(identity) }
-        active.forEach { (_, job) -> job.cancel() }
+        val active = requestPauseAll()
         active.forEach { (_, job) -> runCatching { job.join() } }
         active.forEach { (identity, _) ->
             // A job that was cancelled before its coroutine started never reaches the handler above.
@@ -258,6 +266,22 @@ class MediaDownloader(
             clearState(identity)
             titles.remove(identity)
         }
+    }
+
+    /**
+     * Mark every active download as resumable and request cancellation immediately, without waiting for
+     * its coroutine to unwind. Foreground-service timeout callbacks use this non-suspending form because
+     * Android requires the service to stop within a short deadline.
+     */
+    fun pauseAll() {
+        requestPauseAll()
+    }
+
+    private fun requestPauseAll(): List<Map.Entry<DownloadIdentity, Job>> {
+        val active = jobs.entries.toList()
+        active.forEach { (identity, _) -> pauseRequests.add(identity) }
+        active.forEach { (_, job) -> job.cancel() }
+        return active
     }
 
     suspend fun delete(itemId: String, owner: DownloadOwner? = null) {
@@ -393,14 +417,17 @@ class MediaDownloader(
             .apply { upstream.authHeader?.let { header("Authorization", it) } }
             .build()
 
-        fun openPinned(request: Request): okhttp3.Response {
+        suspend fun openPinned(request: Request): okhttp3.Response {
             var current = request
             repeat(MAX_DOWNLOAD_REDIRECTS + 1) {
                 ensureOwnerActive(owner)
                 if (!originPolicy.isTrusted(current.url)) {
                     throw IOException("Refusing a download request outside the configured Jellyfin origin.")
                 }
-                val response = pinnedHttpClient.newCall(current).execute()
+                // Make both connection setup and response-header reads promptly cancellable. This matters
+                // when Android times out the data-sync foreground service: pauseAll() must not leave a
+                // blocked application-scope OkHttp call running after foreground protection is removed.
+                val response = runInterruptible(Dispatchers.IO) { pinnedHttpClient.newCall(current).execute() }
                 if (!response.isRedirect) return response
                 val redirect = response.header("Location")?.let { originPolicy.resolve(it, current.url) }
                 response.close()
@@ -467,29 +494,34 @@ class MediaDownloader(
             downloaded = startAt
             setState(identity, DownloadState.Running(downloaded, expectedTotal))
             val body = r.body ?: error("Empty response")
-            body.byteStream().use { ins ->
-                val fos = FileOutputStream(part, /* append = */ resumed)
-                // Opening in non-append mode truncated the file: record the validator + total for *these*
-                // bytes (after the truncate) so a future resume can verify the same file version.
-                if (!resumed) {
-                    runCatching { meta.writeText((newValidator ?: "") + "\n" + (total ?: -1L)) }
-                }
-                fos.buffered().use { out ->
-                    val buf = ByteArray(64 * 1024)
-                    var lastEmit = downloaded
-                    while (true) {
-                        coroutineContext.ensureActive() // cooperative cancellation
-                        ensureOwnerActive(owner)
-                        val n = ins.read(buf)
-                        if (n < 0) break
-                        out.write(buf, 0, n)
-                        downloaded += n
-                        if (downloaded - lastEmit >= PROGRESS_EMIT_BYTES) {
-                            lastEmit = downloaded
-                            setState(identity, DownloadState.Running(downloaded, total))
-                        }
+            val downloadContext = coroutineContext
+            // One interruptible region covers the full socket/file copy, avoiding per-chunk dispatcher
+            // overhead while still interrupting a blocked read as soon as pauseAll() cancels the job.
+            runInterruptible(Dispatchers.IO) {
+                body.byteStream().use { ins ->
+                    val fos = FileOutputStream(part, /* append = */ resumed)
+                    // Opening in non-append mode truncated the file: record the validator + total for *these*
+                    // bytes (after the truncate) so a future resume can verify the same file version.
+                    if (!resumed) {
+                        runCatching { meta.writeText((newValidator ?: "") + "\n" + (total ?: -1L)) }
                     }
-                    out.flush()
+                    fos.buffered().use { out ->
+                        val buf = ByteArray(64 * 1024)
+                        var lastEmit = downloaded
+                        while (true) {
+                            downloadContext.ensureActive()
+                            ensureOwnerActive(owner)
+                            val n = ins.read(buf)
+                            if (n < 0) break
+                            out.write(buf, 0, n)
+                            downloaded += n
+                            if (downloaded - lastEmit >= PROGRESS_EMIT_BYTES) {
+                                lastEmit = downloaded
+                                setState(identity, DownloadState.Running(downloaded, total))
+                            }
+                        }
+                        out.flush()
+                    }
                 }
             }
         }
