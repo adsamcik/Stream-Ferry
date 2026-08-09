@@ -5,7 +5,6 @@ import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
-import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import com.adsamcik.streamferry.ui.theme.StreamFerryTheme
 import org.junit.Assert.assertTrue
@@ -29,6 +28,8 @@ class QuickConnectCodeCardTest {
         composeRule.onNodeWithTag("quick-connect-code").assertTextEquals("ABCD12")
         composeRule.onNodeWithTag("quick-connect-copy").assertHasClickAction().performClick()
         composeRule.runOnIdle { assertTrue(copied) }
-        composeRule.onNodeWithText("Code copied").assertIsDisplayed()
+        composeRule.onNodeWithTag("quick-connect-copy-feedback")
+            .assertTextEquals("Code copied securely")
+            .assertIsDisplayed()
     }
 }
