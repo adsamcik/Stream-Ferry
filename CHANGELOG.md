@@ -12,6 +12,40 @@ there is **no telemetry** and nothing leaves the device unless you share a repor
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-09
+
+### Added
+- Added offline Jellyfin gallery browsing backed by account-scoped downloads and a durable library
+  cache, so downloaded shows and episodes remain discoverable without a server connection.
+- Added a resilient playback queue with playlist browsing, queue controls, and seamless autoplay of
+  the next episode over the existing TV connection.
+- Added durable Jellyfin played/unplayed and favorite controls, including queued mutations that are
+  reconciled when connectivity returns.
+- Added precise playback navigation with a validated **Jump to time** dialog, cumulative skip controls,
+  and exact resume from persisted renderer checkpoints.
+
+### Changed
+- Improved physical-TV routing by grouping confidently matched Cast and DLNA endpoints, remembering
+  successful routes, and synchronizing the TV's current volume before showing controls.
+- Refined keyboard, focus, touch-target, and back-navigation behavior across setup, search, gallery,
+  downloads, dialogs, and playback controls.
+- Made download progress notifications open the Downloads screen directly and added explicit
+  confirmation before deleting failed downloads or forgetting saved servers.
+- Removed unused playback-policy implementations so the shipped behavior has one authoritative path.
+
+### Fixed
+- Made play, pause, seek, and timestamp resume reliable across Cast, DLNA, direct play, HLS, progressive
+  server transcodes, local files, downloaded media, and on-device transcoding.
+- Preserved paused state during progressive-transcode seeks, bounded DLNA resume retries, and retired
+  failed renderer/proxy sessions before automatic transcode fallback.
+- Fixed stale or cross-item resume checkpoints and synchronized Jellyfin playback progress and terminal
+  state more reliably.
+- Stabilized gallery loading, season scrolling, media-source selection, and offline/online transitions.
+- Made download queue persistence and metadata replacement crash-safe, and pause downloads cleanly when
+  Android stops the foreground service.
+- Surfaced renderer-control, secure-storage, diagnostic-export, and media-access failures instead of
+  silently ignoring them.
+
 ## [0.4.2] - 2026-08-02
 
 ### Fixed
@@ -403,7 +437,14 @@ there is **no telemetry** and nothing leaves the device unless you share a repor
   policy, redaction), the Android app skeleton and Compose UI, CI + release pipelines, and
   documentation.
 
-[Unreleased]: https://github.com/adamnova/video-bridge/compare/v0.2.32...HEAD
+[Unreleased]: https://github.com/adamnova/video-bridge/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/adamnova/video-bridge/compare/v0.4.2...v0.5.0
+[0.4.2]: https://github.com/adamnova/video-bridge/compare/v0.4.1...v0.4.2
+[0.4.1]: https://github.com/adamnova/video-bridge/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/adamnova/video-bridge/compare/v0.3.2...v0.4.0
+[0.3.2]: https://github.com/adamnova/video-bridge/compare/v0.3.1...v0.3.2
+[0.3.1]: https://github.com/adamnova/video-bridge/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/adamnova/video-bridge/compare/v0.2.32...v0.3.0
 [0.2.32]: https://github.com/adamnova/video-bridge/releases/tag/v0.2.32
 [0.2.31]: https://github.com/adamnova/video-bridge/releases/tag/v0.2.31
 [0.2.30]: https://github.com/adamnova/video-bridge/releases/tag/v0.2.30
