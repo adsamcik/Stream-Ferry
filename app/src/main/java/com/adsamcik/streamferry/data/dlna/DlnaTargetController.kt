@@ -504,15 +504,19 @@ class DlnaTargetController(
     }
 
     override suspend fun setVolume(level: Float) = withContext(Dispatchers.IO) {
-        val endpoint = connected?.renderingControl ?: return@withContext // RenderingControl not available
+        val renderer = checkNotNull(connected) { "Not connected to a DLNA renderer" }
+        val endpoint = checkNotNull(renderer.renderingControl) { "DLNA renderer does not support volume control" }
         val percent = (level.coerceIn(0f, 1f) * 100).toInt()
-        runCatching {
+        try {
             soap(
                 endpoint,
                 "SetVolume",
                 "<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredVolume>$percent</DesiredVolume>"
             )
-        }.onFailure { logger.w(TAG, "DLNA SetVolume failed", it) }
+        } catch (e: Exception) {
+            logger.w(TAG, "DLNA SetVolume failed", e)
+            throw e
+        }
         Unit
     }
 
@@ -667,9 +671,13 @@ class DlnaTargetController(
     }
 
     private suspend fun avAction(action: String, body: String) = withContext(Dispatchers.IO) {
-        val r = connected ?: return@withContext
-        runCatching { soap(r.avTransport, action, body) }
-            .onFailure { logger.w(TAG, "DLNA $action failed", it) }
+        val renderer = checkNotNull(connected) { "Not connected to a DLNA renderer" }
+        try {
+            soap(renderer.avTransport, action, body)
+        } catch (e: Exception) {
+            logger.w(TAG, "DLNA $action failed", e)
+            throw e
+        }
         Unit
     }
 
