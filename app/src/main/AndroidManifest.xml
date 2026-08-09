@@ -53,11 +53,11 @@
 
     <!--
       OPTIONAL, user-elective (off by default): the local-video source uses the SAF picker (no
-      permission) by default. Only if the user explicitly chooses "show all my videos" do we request
-      this at runtime to read the device video library; denial falls back to the SAF picker. See
-      docs/MANIFEST_PERMISSIONS.md.
+      permission) by default. If the user opts into the device library, Android may grant either the
+      complete library or only user-selected videos; denial falls back to the SAF picker.
     -->
     <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED" />
 
     <application
         android:name=".app.StreamFerryApplication"

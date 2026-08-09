@@ -816,8 +816,12 @@ class MainViewModel(
     /** Whether the elective media-library permission is currently granted. */
     fun mediaPermissionGranted(): Boolean = container.permissions.hasReadMediaVideo()
 
-    /** Runtime permission to request for the optional "all device videos" local gallery. */
-    val readMediaVideoPermission: String = AndroidNetworkPermissionManager.PERMISSION_READ_MEDIA_VIDEO
+    /** Whether either full-library or Android 14 selected-video access is currently granted. */
+    fun mediaAccessGranted(): Boolean = container.permissions.hasAnyMediaVideoAccess()
+
+    /** Runtime permissions that let Android return either full-library or selected-video access. */
+    val readMediaVideoPermissions: Array<String>
+        get() = AndroidNetworkPermissionManager.MEDIA_VIDEO_PERMISSIONS.copyOf()
 
     /** Re-reads the system setting after returning from the battery-optimization prompt. */
     fun refreshBackgroundPlaybackStatus() {
@@ -858,7 +862,7 @@ class MainViewModel(
 
     /** The user granted (or denied) the elective media-library permission; refresh on grant. */
     fun onMediaPermissionResult(granted: Boolean) {
-        if (granted) reloadIfLocalActive()
+        if (granted || container.permissions.hasAnyMediaVideoAccess()) reloadIfLocalActive()
     }
 
     private fun reloadIfLocalActive() {

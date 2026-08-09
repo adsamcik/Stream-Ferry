@@ -217,7 +217,13 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
     val smartResumeTracker: SmartResumeSessionTracker by lazy { SmartResumeSessionTracker(smartResumeStore) }
     val jellyfinMediaSource: MediaSource by lazy { JellyfinMediaSource(mediaRepository) }
     val localMediaSource: LocalMediaSource by lazy {
-        LocalMediaSource(appContext, localSourceStore, logger, hasMediaPermission = { permissions.hasReadMediaVideo() })
+        LocalMediaSource(
+            appContext,
+            localSourceStore,
+            logger,
+            hasAllMediaAccess = { permissions.hasReadMediaVideo() },
+            hasSelectedMediaAccess = { permissions.hasSelectedMediaVideo() },
+        )
     }
     /** All browsable sources, in display order (Jellyfin first, then on-device). */
     val mediaSources: List<MediaSource> by lazy { listOf(jellyfinMediaSource, localMediaSource) }

@@ -954,8 +954,8 @@ private fun LocalAccessActions(viewModel: MainViewModel) {
     val filesPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) {
         viewModel.onLocalFilesPicked(it)
     }
-    val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
-        viewModel.onMediaPermissionResult(it)
+    val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { grants ->
+        viewModel.onMediaPermissionResult(grants.values.any { it })
     }
     Row(
         horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -971,8 +971,10 @@ private fun LocalAccessActions(viewModel: MainViewModel) {
         ) { Text("Add individual videos") }
         if (!viewModel.mediaPermissionGranted()) {
             OutlinedButton(
-                onClick = { permissionLauncher.launch(viewModel.readMediaVideoPermission) },
-            ) { Text("Allow access to all videos") }
+                onClick = { permissionLauncher.launch(viewModel.readMediaVideoPermissions) },
+            ) {
+                Text(if (viewModel.mediaAccessGranted()) "Manage video access" else "Allow access to videos")
+            }
         }
     }
 }

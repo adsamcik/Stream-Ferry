@@ -46,6 +46,11 @@ class AndroidNetworkPermissionManager(context: Context) : NetworkPermissionManag
     /** Elective: whether the user has granted access to the device video library (local-media gallery). */
     fun hasReadMediaVideo(): Boolean = isGranted(PERMISSION_READ_MEDIA_VIDEO)
 
+    /** Android 14+ partial access to only the videos selected in the system permission dialog. */
+    fun hasSelectedMediaVideo(): Boolean = isGranted(PERMISSION_READ_MEDIA_VISUAL_USER_SELECTED)
+
+    fun hasAnyMediaVideoAccess(): Boolean = hasReadMediaVideo() || hasSelectedMediaVideo()
+
     /**
      * Whether the app is exempt from battery optimization ("unrestricted"). When false, aggressive OEM
      * power management (esp. Samsung "deep sleep") can suspend the app's network with the screen off,
@@ -96,6 +101,14 @@ class AndroidNetworkPermissionManager(context: Context) : NetworkPermissionManag
 
         /** Elective media-library permission backing the optional "all device videos" local gallery. */
         const val PERMISSION_READ_MEDIA_VIDEO = "android.permission.READ_MEDIA_VIDEO"
+        const val PERMISSION_READ_MEDIA_VISUAL_USER_SELECTED =
+            "android.permission.READ_MEDIA_VISUAL_USER_SELECTED"
+
+        /** Request both so Android 14 can report full-library and selected-video outcomes explicitly. */
+        val MEDIA_VIDEO_PERMISSIONS: Array<String> = arrayOf(
+            PERMISSION_READ_MEDIA_VIDEO,
+            PERMISSION_READ_MEDIA_VISUAL_USER_SELECTED,
+        )
 
         /** Permissions the UI should request before attempting TV playback. */
         val PLAYBACK_PERMISSIONS: Array<String> = arrayOf(

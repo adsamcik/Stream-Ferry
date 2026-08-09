@@ -33,7 +33,8 @@ class LocalMediaSource(
     context: Context,
     private val store: LocalSourceStore,
     private val logger: DiagnosticsLogger,
-    private val hasMediaPermission: () -> Boolean,
+    private val hasAllMediaAccess: () -> Boolean,
+    private val hasSelectedMediaAccess: () -> Boolean,
 ) : MediaSource {
 
     private val appContext = context.applicationContext
@@ -51,7 +52,7 @@ class LocalMediaSource(
 
     /** True when the user has granted any local access (folders, files, or the media permission). */
     fun hasAnyAccess(): Boolean =
-        hasMediaPermission() || store.folders().isNotEmpty() || store.files().isNotEmpty()
+        hasMediaAccess() || store.folders().isNotEmpty() || store.files().isNotEmpty()
 
     /** Persist a folder (tree) grant from the SAF `OpenDocumentTree` picker. */
     fun addFolder(treeUri: Uri) {
@@ -78,7 +79,7 @@ class LocalMediaSource(
     override suspend fun roots(): Result<List<MediaItem>> = runCatching {
         withContext(Dispatchers.IO) {
             val out = ArrayList<MediaItem>()
-            if (hasMediaPermission()) out.add(folderItem(MEDIASTORE_ALL, "All device videos"))
+            if (hasMediaAccess()) out.add(folderItem(MEDIASTORE_ALL, mediaStoreRootTitle()))
             for (folder in store.folders()) {
                 val docUri = treeDocumentUri(Uri.parse(folder))
                 out.add(folderItem(docUri.toString(), displayName(docUri) ?: lastSegmentName(Uri.parse(folder))))
@@ -96,7 +97,7 @@ class LocalMediaSource(
 
     override suspend fun item(itemId: String): Result<MediaItem> = runCatching {
         withContext(Dispatchers.IO) {
-            if (itemId == MEDIASTORE_ALL) return@withContext folderItem(MEDIASTORE_ALL, "All device videos")
+            if (itemId == MEDIASTORE_ALL) return@withContext folderItem(MEDIASTORE_ALL, mediaStoreRootTitle())
             val uri = Uri.parse(itemId)
             val mime = resolver.getType(uri)
             if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
@@ -112,7 +113,7 @@ class LocalMediaSource(
             val needle = query.trim().lowercase()
             if (needle.isEmpty()) return@withContext emptyList<MediaItem>()
             val all = ArrayList<MediaItem>()
-            if (hasMediaPermission()) all.addAll(mediaStoreVideos())
+            if (hasMediaAccess()) all.addAll(mediaStoreVideos())
             for (folder in store.folders()) {
                 runCatching { all.addAll(enumerateRecursive(treeDocumentUri(Uri.parse(folder)), depth = 3)) }
             }
@@ -177,6 +178,11 @@ class LocalMediaSource(
     }
 
     // ----- MediaStore -----
+
+    private fun hasMediaAccess(): Boolean = hasAllMediaAccess() || hasSelectedMediaAccess()
+
+    private fun mediaStoreRootTitle(): String =
+        if (hasAllMediaAccess()) "All device videos" else "Selected device videos"
 
     private fun mediaStoreVideos(): List<MediaItem> {
         val out = ArrayList<MediaItem>()
