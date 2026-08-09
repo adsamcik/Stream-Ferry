@@ -29,6 +29,7 @@ import androidx.compose.material.icons.rounded.Cast
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Dns
 import androidx.compose.material.icons.rounded.Lock
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -40,6 +41,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -392,6 +394,7 @@ private fun QuickConnectPanelPreview() {
 
 @Composable
 fun ServersScreen(state: AppUiState, viewModel: MainViewModel) {
+    var forgetCandidateId by rememberSaveable { mutableStateOf<String?>(null) }
     Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
         Text(
             "Your Jellyfin servers",
@@ -487,7 +490,7 @@ fun ServersScreen(state: AppUiState, viewModel: MainViewModel) {
                         if (!server.active) {
                             Button(onClick = { viewModel.switchServer(server.id) }) { Text("Use server") }
                         }
-                        OutlinedButton(onClick = { viewModel.forgetServer(server.id) }) { Text("Forget") }
+                        OutlinedButton(onClick = { forgetCandidateId = server.id }) { Text("Forget") }
                     }
                 }
             }
@@ -500,5 +503,32 @@ fun ServersScreen(state: AppUiState, viewModel: MainViewModel) {
             Icon(Icons.Rounded.Add, contentDescription = null)
             Text("Add a server", modifier = Modifier.padding(start = 8.dp))
         }
+    }
+
+    val forgetting = forgetCandidateId?.let { id -> state.servers.firstOrNull { it.id == id } }
+    if (forgetting != null) {
+        AlertDialog(
+            onDismissRequest = { forgetCandidateId = null },
+            title = { Text("Forget ${forgetting.name}?") },
+            text = {
+                Text(
+                    buildString {
+                        if (forgetting.active) append("Active playback from this server will stop. ")
+                        append("Its saved address, sign-in, and pending watch-state changes will be removed from this phone.")
+                    },
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        viewModel.forgetServer(forgetting.id)
+                        forgetCandidateId = null
+                    },
+                ) { Text("Forget server") }
+            },
+            dismissButton = {
+                TextButton(onClick = { forgetCandidateId = null }) { Text("Cancel") }
+            },
+        )
     }
 }
