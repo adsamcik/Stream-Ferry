@@ -1,6 +1,15 @@
 package com.adsamcik.streamferry.data.security
 
 import android.content.Context
+import android.content.SharedPreferences
+
+/** A secure value could not be encrypted or durably committed to app-private storage. */
+class SecureStorageException(message: String, cause: Throwable? = null) : IllegalStateException(message, cause)
+
+internal interface SecureValueCipher {
+    fun encrypt(plaintext: String): String
+    fun decrypt(stored: String): String?
+}
 
 /**
  * App-private string preferences whose VALUES are encrypted at rest with an Android Keystore
@@ -9,17 +18,18 @@ import android.content.Context
  * `base_url`); only the values are encrypted. A value that can't be decrypted (corrupt, or written by
  * an older/incompatible scheme) reads back as null, so the caller treats it as absent.
  */
-class SecurePreferences(
-    context: Context,
-    fileName: String,
-    keyAlias: String,
+class SecurePreferences internal constructor(
+    private val prefs: SharedPreferences,
+    private val cipher: SecureValueCipher,
 ) {
-    private val prefs = context.applicationContext.getSharedPreferences(fileName, Context.MODE_PRIVATE)
-    private val cipher = KeystoreCipher(keyAlias)
+    constructor(context: Context, fileName: String, keyAlias: String) : this(
+        context.applicationContext.getSharedPreferences(fileName, Context.MODE_PRIVATE),
+        KeystoreCipher(keyAlias),
+    )
 
     fun putString(key: String, value: String) {
-        val encrypted = cipher.encrypt(value) ?: return
-        prefs.edit().putString(key, encrypted).apply()
+        val encrypted = cipher.encrypt(value)
+        commit("save secure app data") { putString(key, encrypted) }
     }
 
     fun getString(key: String): String? {
@@ -28,10 +38,19 @@ class SecurePreferences(
     }
 
     fun remove(key: String) {
-        prefs.edit().remove(key).apply()
+        commit("remove secure app data") { remove(key) }
     }
 
     fun clear() {
-        prefs.edit().clear().apply()
+        commit("clear secure app data") { clear() }
+    }
+
+    private inline fun commit(action: String, mutation: SharedPreferences.Editor.() -> SharedPreferences.Editor) {
+        val committed = try {
+            prefs.edit().mutation().commit()
+        } catch (cause: Exception) {
+            throw SecureStorageException("Couldn't $action.", cause)
+        }
+        if (!committed) throw SecureStorageException("Couldn't $action.")
     }
 }

@@ -35,6 +35,7 @@ import com.adsamcik.streamferry.domain.JellyfinLibraryStatus
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.domain.MediaSource
 import com.adsamcik.streamferry.domain.MediaSourceIds
+import com.adsamcik.streamferry.data.security.SecureStorageException
 import com.adsamcik.streamferry.domain.UserSession
 import com.adsamcik.streamferry.domain.isJellyfinEpisode
 import com.adsamcik.streamferry.domain.withJellyfinProgressReset
@@ -498,22 +499,35 @@ class MainViewModel(
         // the UI cannot keep polling or display a code from the previous server while the switch queues.
         cancelQuickConnect()
         viewModelScope.launch {
-            stopOnlinePlaybackForJellyfinSessionTransition("switching servers")
-            pauseDownloadsForAuthTransition()
-            val session = container.authRepository.switchServer(serverId)
-            val cached = container.authRepository.cachedSession.value
-            when {
-                session != null -> {
-                    container.jellyfinConnectionMonitor.markOnline()
-                    openLibraries()
+            try {
+                stopOnlinePlaybackForJellyfinSessionTransition("switching servers")
+                pauseDownloadsForAuthTransition()
+                val session = container.authRepository.switchServer(serverId)
+                val cached = container.authRepository.cachedSession.value
+                when {
+                    session != null -> {
+                        container.jellyfinConnectionMonitor.markOnline()
+                        openLibraries()
+                    }
+                    cached != null -> {
+                        container.jellyfinConnectionMonitor.markUnavailable()
+                        _state.update { it.copy(hasCachedJellyfinSession = true, loggedIn = false) }
+                        openLibraries()
+                    }
+                    else -> _state.update {
+                        it.copy(route = Route.SERVER_SETUP, loggedIn = false, errorMessage = "Sign in to that server to continue.")
+                    }
                 }
-                cached != null -> {
-                    container.jellyfinConnectionMonitor.markUnavailable()
-                    _state.update { it.copy(hasCachedJellyfinSession = true, loggedIn = false) }
-                    openLibraries()
-                }
-                else -> _state.update {
-                    it.copy(route = Route.SERVER_SETUP, loggedIn = false, errorMessage = "Sign in to that server to continue.")
+            } catch (c: CancellationException) {
+                throw c
+            } catch (e: SecureStorageException) {
+                container.logger.e("security", "Couldn't persist active server", e)
+                _state.update {
+                    it.copy(
+                        loggedIn = container.authRepository.currentUser.value != null,
+                        hasCachedJellyfinSession = container.authRepository.cachedSession.value != null,
+                        errorMessage = SECURE_STORAGE_ERROR,
+                    )
                 }
             }
         }
@@ -522,13 +536,26 @@ class MainViewModel(
     fun forgetServer(serverId: String) {
         cancelQuickConnect()
         viewModelScope.launch {
-            if (activeJellyfinSession()?.serverId == serverId) {
-                stopOnlinePlaybackForJellyfinSessionTransition("removing the active server")
-                pauseDownloadsForAuthTransition()
+            try {
+                if (activeJellyfinSession()?.serverId == serverId) {
+                    stopOnlinePlaybackForJellyfinSessionTransition("removing the active server")
+                    pauseDownloadsForAuthTransition()
+                }
+                container.authRepository.deleteServerProfile(serverId)
+                withContext(Dispatchers.IO) { container.jellyfinWatchMutationStore.removeServer(serverId) }
+                _state.update { it.copy(servers = container.authRepository.servers()) }
+            } catch (c: CancellationException) {
+                throw c
+            } catch (e: SecureStorageException) {
+                container.logger.e("security", "Couldn't remove saved server credentials", e)
+                _state.update {
+                    it.copy(
+                        loggedIn = container.authRepository.currentUser.value != null,
+                        hasCachedJellyfinSession = container.authRepository.cachedSession.value != null,
+                        errorMessage = SECURE_STORAGE_ERROR,
+                    )
+                }
             }
-            container.authRepository.deleteServerProfile(serverId)
-            withContext(Dispatchers.IO) { container.jellyfinWatchMutationStore.removeServer(serverId) }
-            _state.update { it.copy(servers = container.authRepository.servers()) }
         }
     }
 
@@ -573,11 +600,15 @@ class MainViewModel(
                             it.copy(connectionState = ConnectionState.IDLE, needsHttpApproval = true, isBusy = false, errorMessage = null)
                         }
                     } else {
+                        if (e is SecureStorageException) {
+                            container.logger.e("security", "Couldn't persist Jellyfin server", e)
+                        }
                         _state.update {
                             it.copy(
                                 connectionState = ConnectionState.FAILED,
                                 isBusy = false,
-                                errorMessage = e.message ?: "Couldn't connect to that server.",
+                                errorMessage = if (e is SecureStorageException) SECURE_STORAGE_ERROR
+                                else e.message ?: "Couldn't connect to that server.",
                             )
                         }
                     }
@@ -598,8 +629,17 @@ class MainViewModel(
                 _state.update { it.copy(isBusy = false, loggedIn = true) }
                 openLibraries()
             },
-            onFailure = {
-                _state.update { it.copy(isBusy = false, errorMessage = "Login failed. Check your username and password.") }
+            onFailure = { error ->
+                if (error is SecureStorageException) {
+                    container.logger.e("security", "Couldn't persist Jellyfin login", error)
+                }
+                _state.update {
+                    it.copy(
+                        isBusy = false,
+                        errorMessage = if (error is SecureStorageException) SECURE_STORAGE_ERROR
+                        else "Login failed. Check your username and password.",
+                    )
+                }
             },
         )
     }
@@ -669,8 +709,15 @@ class MainViewModel(
                 },
                 onFailure = { e ->
                     if (e is CancellationException) throw e
+                    if (e is SecureStorageException) {
+                        container.logger.e("security", "Couldn't persist Quick Connect login", e)
+                    }
                     _state.update {
-                        it.copy(quickConnect = null, errorMessage = "Quick Connect sign-in failed. Please try again.")
+                        it.copy(
+                            quickConnect = null,
+                            errorMessage = if (e is SecureStorageException) SECURE_STORAGE_ERROR
+                            else "Quick Connect sign-in failed. Please try again.",
+                        )
                     }
                 },
             )
@@ -688,14 +735,21 @@ class MainViewModel(
     fun logout() {
         cancelQuickConnect()
         viewModelScope.launch {
-            stopOnlinePlaybackForJellyfinSessionTransition("signing out")
-            // Signing out has always stopped local playback too; retain that behavior after the online
-            // teardown above (the second stop is idempotent when the active session was online).
-            runCatching { container.playbackEngine.stop() }
-            pauseDownloadsForAuthTransition()
-            container.authRepository.logout()
-            container.jellyfinConnectionMonitor.reset()
-            _state.value = AppUiState()
+            try {
+                stopOnlinePlaybackForJellyfinSessionTransition("signing out")
+                // Signing out has always stopped local playback too; retain that behavior after the online
+                // teardown above (the second stop is idempotent when the active session was online).
+                runCatching { container.playbackEngine.stop() }
+                pauseDownloadsForAuthTransition()
+                container.authRepository.logout()
+                container.jellyfinConnectionMonitor.reset()
+                _state.value = AppUiState()
+            } catch (c: CancellationException) {
+                throw c
+            } catch (e: SecureStorageException) {
+                container.logger.e("security", "Couldn't remove saved login", e)
+                _state.update { it.copy(isBusy = false, loggedIn = false, errorMessage = SECURE_STORAGE_ERROR) }
+            }
         }
     }
 
@@ -3482,6 +3536,11 @@ class MainViewModel(
                 cancelWatchStateMutationsForSessionTransition()
                 watchStateMaterializationMutex.withLock { container.deleteAllData() }
                 _state.value = AppUiState() // reset to a clean welcome state
+            } catch (c: CancellationException) {
+                throw c
+            } catch (e: SecureStorageException) {
+                container.logger.e("security", "Couldn't clear secure app data", e)
+                _state.update { it.copy(isBusy = false, loggedIn = false, errorMessage = SECURE_STORAGE_ERROR) }
             } finally {
                 deletingAllData = false
             }
@@ -3548,6 +3607,8 @@ class MainViewModel(
         const val DLNA_SCAN_MS = 6_000L
         const val QUICK_CONNECT_POLL_MS = 3_000L
         const val LIBRARY_ERROR = "Couldn't load your library. Check the connection and try again."
+        const val SECURE_STORAGE_ERROR =
+            "Couldn't update secure storage. Check available device storage, restart the app, and try again."
         const val SEARCH_DEBOUNCE_MS = 350L
         const val RECONNECT_DELAY_MS = 2_000L
         const val RESUME_SAVE_INTERVAL_MS = 5_000L

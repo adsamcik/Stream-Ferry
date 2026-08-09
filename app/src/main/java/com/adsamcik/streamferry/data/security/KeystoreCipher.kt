@@ -12,14 +12,15 @@ import javax.crypto.spec.GCMParameterSpec
 /**
  * AES-256-GCM encryption backed directly by the Android Keystore — no third-party crypto library
  * (§13). The key is non-exportable and lives in the device Keystore (hardware-backed where available),
- * keyed by [alias]. [encrypt] returns Base64(iv || ciphertext+tag); [decrypt] returns null on ANY
- * failure (corrupt/truncated data, a format change, or a key the OS invalidated) so callers degrade
- * to "no stored value" (i.e. re-login) instead of crashing.
+ * keyed by [alias]. [encrypt] returns Base64(iv || ciphertext+tag) and throws [SecureStorageException]
+ * if a new secret cannot be protected; silently dropping a credential would make a successful login
+ * disappear on restart. [decrypt] still returns null for corrupt/obsolete stored data so callers can
+ * safely degrade to a re-login.
  *
  * GCM with a Keystore key uses a fresh random IV per [encrypt] call (the platform forbids a
  * caller-supplied IV here), so encrypting the same plaintext twice yields different ciphertexts.
  */
-class KeystoreCipher(private val alias: String) {
+internal class KeystoreCipher(private val alias: String) : SecureValueCipher {
 
     private fun secretKey(): SecretKey {
         val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
@@ -38,8 +39,8 @@ class KeystoreCipher(private val alias: String) {
         return generator.generateKey()
     }
 
-    /** Encrypt [plaintext]; returns Base64(iv || ciphertext) or null on failure. */
-    fun encrypt(plaintext: String): String? = runCatching {
+    /** Encrypt [plaintext], preserving the cause when Android Keystore cannot protect the value. */
+    override fun encrypt(plaintext: String): String = runCatching {
         val cipher = Cipher.getInstance(TRANSFORMATION)
         cipher.init(Cipher.ENCRYPT_MODE, secretKey())
         val iv = cipher.iv
@@ -48,10 +49,12 @@ class KeystoreCipher(private val alias: String) {
         System.arraycopy(iv, 0, blob, 0, iv.size)
         System.arraycopy(ciphertext, 0, blob, iv.size, ciphertext.size)
         Base64.encodeToString(blob, Base64.NO_WRAP)
-    }.getOrNull()
+    }.getOrElse { cause ->
+        throw SecureStorageException("Couldn't encrypt secure app data.", cause)
+    }
 
     /** Decrypt a value produced by [encrypt]; returns null on any failure. */
-    fun decrypt(stored: String): String? = runCatching {
+    override fun decrypt(stored: String): String? = runCatching {
         val blob = Base64.decode(stored, Base64.NO_WRAP)
         if (blob.size <= GCM_IV_BYTES) return null
         val iv = blob.copyOfRange(0, GCM_IV_BYTES)

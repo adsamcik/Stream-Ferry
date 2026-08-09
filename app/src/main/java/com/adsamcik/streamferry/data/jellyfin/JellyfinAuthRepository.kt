@@ -167,14 +167,23 @@ class JellyfinAuthRepository(
         // Persisting a token for the server that actually issued it is harmless if a later action wins the
         // race; the guarded installation below is what prevents it ever being attached to another origin.
         tokenStore.put(operation.serverId, auth.accessToken)
-        val session = installAuthIfCurrent(operation, auth) ?: throw SupersededAuthOperation()
-        persistenceMutex.withLock {
-            if (isCurrent(operation.generation, operation.serverId)) {
-                configStore.get(operation.serverId)?.let {
-                    configStore.upsert(it.copy(userId = auth.userId), makeActive = false)
+        try {
+            persistenceMutex.withLock {
+                if (isCurrent(operation.generation, operation.serverId)) {
+                    configStore.get(operation.serverId)?.let {
+                        configStore.upsert(it.copy(userId = auth.userId), makeActive = false)
+                    }
                 }
             }
+        } catch (failure: Exception) {
+            // Do not publish a session whose account identity could not be durably associated with the
+            // saved server. Best-effort rollback also avoids restoring the new token after a failed login.
+            runCatching { tokenStore.remove(operation.serverId) }
+                .exceptionOrNull()
+                ?.let(failure::addSuppressed)
+            throw failure
         }
+        val session = installAuthIfCurrent(operation, auth) ?: throw SupersededAuthOperation()
         if (isCurrent(operation.generation, operation.serverId)) logger.event("auth", "Login succeeded")
         return session
     }
