@@ -402,10 +402,6 @@ interface NetworkPermissionManager {
     fun localNetworkStatus(): String
 }
 
-interface CompatibilityTestRunner {
-    suspend fun runTinyResourceTest(proxyUrl: String): Result<Unit>
-}
-
 interface StreamSelectionService {
     fun select(caps: TargetCapabilities, media: MediaProfile, prefs: StreamPreferences): StreamDecision
 }
