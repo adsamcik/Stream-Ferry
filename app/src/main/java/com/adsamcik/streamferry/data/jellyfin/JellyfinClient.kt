@@ -448,10 +448,14 @@ class JellyfinClient(
             PlaybackInfoResponse.serializer(),
             exec(post(path("Items", itemId, "PlaybackInfo"), body)),
         )
-        val source = response.mediaSources.firstOrNull()
+        val source = response.mediaSources.selectPlayableSource(requireTranscode)
             ?: run {
-                logger.w("jellyfin", "PlaybackInfo returned no media sources")
-                error("PlaybackInfo returned no media sources")
+                logger.w(
+                    "jellyfin",
+                    "PlaybackInfo returned no usable media source (count=${response.mediaSources.size}, " +
+                        "forcedTranscode=$requireTranscode)",
+                )
+                error("PlaybackInfo returned no usable media source")
             }
         val msId = source.id ?: itemId
         val resolved = resolveUpstream(itemId, source, response.playSessionId, requireTranscode)
@@ -516,9 +520,15 @@ class JellyfinClient(
         playSessionId: String?,
         requireTranscode: Boolean,
     ): UpstreamSource {
-        val canDirect = (source.supportsDirectStream ?: false) || (source.supportsDirectPlay ?: false)
-        val transcodingUrl = source.transcodingUrl
+        val canDirect = source.isDirectlyPlayable()
+        val transcodingUrl = source.transcodingUrl?.takeIf { it.isNotBlank() }
         val useTranscode = (requireTranscode || !canDirect) && transcodingUrl != null
+        check(!requireTranscode || useTranscode) {
+            "Jellyfin did not provide the required transcode URL."
+        }
+        check(canDirect || useTranscode) {
+            "Jellyfin media source is neither directly playable nor transcodable."
+        }
         logger.event(
             "jellyfin",
             "Playback decision=${if (useTranscode) "transcode" else "direct"} " +
@@ -1195,6 +1205,23 @@ private data class MediaSourceDto(
     @SerialName("DirectStreamUrl") val directStreamUrl: String? = null,
     @SerialName("MediaStreams") val mediaStreams: List<MediaStreamDto> = emptyList(),
 )
+
+/**
+ * Jellyfin may return unavailable alternate files before the playable source. Prefer a direct source
+ * when the caller allows it; otherwise require an actual transcode URL instead of manufacturing a
+ * direct-stream request for a source the server explicitly said it cannot serve.
+ */
+private fun List<MediaSourceDto>.selectPlayableSource(requireTranscode: Boolean): MediaSourceDto? =
+    if (requireTranscode) {
+        firstOrNull { it.hasTranscodeUrl() }
+    } else {
+        firstOrNull { it.isDirectlyPlayable() } ?: firstOrNull { it.hasTranscodeUrl() }
+    }
+
+private fun MediaSourceDto.isDirectlyPlayable(): Boolean =
+    !directStreamUrl.isNullOrBlank() || supportsDirectStream == true || supportsDirectPlay == true
+
+private fun MediaSourceDto.hasTranscodeUrl(): Boolean = !transcodingUrl.isNullOrBlank()
 
 @Serializable
 private data class MediaStreamDto(
