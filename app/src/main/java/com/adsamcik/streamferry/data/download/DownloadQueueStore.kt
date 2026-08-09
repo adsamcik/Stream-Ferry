@@ -133,21 +133,17 @@ class DownloadQueueStore private constructor(filesDir: File) {
     }
 
     suspend fun clear() = mutex.withLock {
-        withContext(Dispatchers.IO) { runCatching { queueFile.delete() }; Unit }
+        withContext(Dispatchers.IO) { CrashSafeTextFile.delete(queueFile) }
     }
 
     private fun loadUnlocked(): List<PendingDownload> {
-        if (!queueFile.isFile) return emptyList()
-        return runCatching { json.decodeFromString(serializer, queueFile.readText()) }.getOrDefault(emptyList())
+        return CrashSafeTextFile.readRecovering(queueFile) { json.decodeFromString(serializer, it) }
+            ?: emptyList()
     }
 
     private fun writeUnlocked(entries: List<PendingDownload>) {
-        if (entries.isEmpty()) {
-            runCatching { queueFile.delete() }
-        } else {
-            dir.mkdirs()
-            queueFile.writeText(json.encodeToString(serializer, entries))
-        }
+        dir.mkdirs()
+        CrashSafeTextFile.write(queueFile, json.encodeToString(serializer, entries))
     }
 
     companion object {

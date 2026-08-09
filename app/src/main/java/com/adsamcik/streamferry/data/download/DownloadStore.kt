@@ -85,7 +85,7 @@ class DownloadStore private constructor(filesDir: File) {
             dir.mkdirs()
             val updated = (loadPlayableUnlocked().filterNot { it.identity == entry.identity } + entry)
                 .sortedBy { it.title.lowercase() }
-            indexFile.writeText(json.encodeToString(serializer, updated))
+            writeIndex(updated)
         }
     }
 
@@ -96,7 +96,7 @@ class DownloadStore private constructor(filesDir: File) {
             current.firstOrNull { it.identity == identity }?.let { runCatching { fileFor(it).delete() } }
             runCatching { partFileFor(itemId, owner).delete() }
             runCatching { partMetaFileFor(itemId, owner).delete() }
-            indexFile.writeText(json.encodeToString(serializer, current.filterNot { it.identity == identity }))
+            writeIndex(current.filterNot { it.identity == identity })
         }
     }
 
@@ -115,8 +115,8 @@ class DownloadStore private constructor(filesDir: File) {
     }
 
     private fun loadUnlocked(): List<DownloadEntry> {
-        if (!indexFile.isFile) return emptyList()
-        return runCatching { json.decodeFromString(serializer, indexFile.readText()) }.getOrDefault(emptyList())
+        return CrashSafeTextFile.readRecovering(indexFile) { json.decodeFromString(serializer, it) }
+            ?: emptyList()
     }
 
     /**
@@ -129,9 +129,14 @@ class DownloadStore private constructor(filesDir: File) {
         if (playable.size != current.size) {
             // The entry is already omitted even if a transient rewrite failure prevents persistence; the
             // next read will retry cleanup.
-            runCatching { indexFile.writeText(json.encodeToString(serializer, playable)) }
+            runCatching { writeIndex(playable) }
         }
         return playable
+    }
+
+    private fun writeIndex(entries: List<DownloadEntry>) {
+        dir.mkdirs()
+        CrashSafeTextFile.write(indexFile, json.encodeToString(serializer, entries))
     }
 
     private fun hasPlayableFile(entry: DownloadEntry): Boolean {
