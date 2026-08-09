@@ -599,7 +599,7 @@ class LocalProxyServer(
     /** Copy a (segment/key/subtitle) body downstream through the bounded buffer; abort if the TV leaves. */
     private fun copyTo(input: InputStream, out: OutputStream) {
         input.use { ins ->
-            val buf = ByteArray(MemoryBufferPolicy.PASS_THROUGH_CHUNK_BYTES)
+            val buf = ByteArray(MemoryBufferPolicy.COPY_CHUNK_BYTES)
             while (true) {
                 val n = ins.read(buf)
                 if (n < 0) break
@@ -650,7 +650,7 @@ class LocalProxyServer(
         if (head) return
         RandomAccessFile(file, "r").use { raf ->
             raf.seek(start)
-            val buf = ByteArray(MemoryBufferPolicy.PASS_THROUGH_CHUNK_BYTES)
+            val buf = ByteArray(MemoryBufferPolicy.COPY_CHUNK_BYTES)
             var remaining = endInclusive - start + 1
             while (remaining > 0) {
                 val toRead = minOf(remaining, buf.size.toLong()).toInt()
@@ -712,7 +712,7 @@ class LocalProxyServer(
             if (head) return
             FileInputStream(pfd.fileDescriptor).channel.use { channel ->
                 channel.position(start)
-                val buf = ByteArray(MemoryBufferPolicy.PASS_THROUGH_CHUNK_BYTES)
+                val buf = ByteArray(MemoryBufferPolicy.COPY_CHUNK_BYTES)
                 val bb = ByteBuffer.wrap(buf)
                 var remaining = endInclusive - start + 1
                 while (remaining > 0) {
@@ -858,7 +858,7 @@ class LocalProxyServer(
     ) {
         val policy = ResilientStreamPolicy(rangeStart, rangeEndInclusive)
         val watchdog = ThroughputWatchdog()
-        val buf = ByteArray(MemoryBufferPolicy.PASS_THROUGH_CHUNK_BYTES)
+        val buf = ByteArray(MemoryBufferPolicy.COPY_CHUNK_BYTES)
         var response: Response? = initialResp
         try {
             while (true) {
@@ -956,7 +956,7 @@ class LocalProxyServer(
                         return StreamResult.UPSTREAM_STALLED
                     }
                     sinceFlush += writable
-                    if (sinceFlush >= MemoryBufferPolicy.PASS_THROUGH_DEFAULT_BUFFER_BYTES) {
+                    if (sinceFlush >= MemoryBufferPolicy.FLUSH_INTERVAL_BYTES) {
                         out.flush() // apply backpressure; downstream (TV) paces us
                         sinceFlush = 0
                     }

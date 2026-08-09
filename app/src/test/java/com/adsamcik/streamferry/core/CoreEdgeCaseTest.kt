@@ -178,28 +178,10 @@ class CoreEdgeCaseTest {
 
     // ----------------------------- MemoryBufferPolicy --------------------------
 
-    @Test fun windowBytesForZeroBitrateIsDefault() {
-        assertEquals(
-            MemoryBufferPolicy.PREBUFFER_DEFAULT_BYTES.toLong(),
-            MemoryBufferPolicy.windowBytesFor(0),
-        )
-    }
-
-    @Test fun windowBytesForModerateBitrateUnclamped() {
-        // 1 Mbps * 8s = 1,000,000 bytes, well under the hard cap.
-        assertEquals(1_000_000L, MemoryBufferPolicy.windowBytesFor(1_000_000, 8))
-    }
-
-    @Test fun passThroughHardCapAtLeastDefault() {
+    @Test fun passThroughFlushIntervalExceedsItsReusableCopyChunk() {
         assertTrue(
-            MemoryBufferPolicy.PASS_THROUGH_HARD_BUFFER_BYTES >=
-                MemoryBufferPolicy.PASS_THROUGH_DEFAULT_BUFFER_BYTES,
+            MemoryBufferPolicy.FLUSH_INTERVAL_BYTES >= MemoryBufferPolicy.COPY_CHUNK_BYTES,
         )
-    }
-
-    @Test fun seekWindowInclusiveUpperBoundary() {
-        assertTrue(MemoryBufferPolicy.seekServeableFromWindow(1999, 1000, 1000))
-        assertFalse(MemoryBufferPolicy.seekServeableFromWindow(2000, 1000, 1000))
     }
 
     // --------------------------- StreamSelectionService ------------------------

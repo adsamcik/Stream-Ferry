@@ -1,6 +1,5 @@
 package com.adsamcik.streamferry.core
 
-import com.adsamcik.streamferry.core.buffer.MemoryBufferPolicy
 import com.adsamcik.streamferry.core.dlna.DidlLite
 import com.adsamcik.streamferry.core.dlna.SecureXml
 import com.adsamcik.streamferry.core.dlna.SsdpCandidateRejection
@@ -11,38 +10,10 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
-import kotlin.test.assertIs
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 class CorePolicyTest {
-
-    // --- Memory buffer policy ---
-    @Test fun prebufferClamped() {
-        assertEquals(MemoryBufferPolicy.PREBUFFER_HARD_BYTES.toLong(),
-            MemoryBufferPolicy.clampPrebufferBytes(Long.MAX_VALUE))
-        assertEquals(0L, MemoryBufferPolicy.clampPrebufferBytes(-5))
-    }
-
-    @Test fun highBitrateWindowCappedByHardLimit() {
-        // 80 Mbps 4K stream * 8s would exceed the hard cap -> clamped.
-        val w = MemoryBufferPolicy.windowBytesFor(80_000_000, 8)
-        assertEquals(MemoryBufferPolicy.PREBUFFER_HARD_BYTES.toLong(), w)
-    }
-
-    @Test fun memoryPressureDegrades() {
-        assertIs<MemoryBufferPolicy.PressureDecision.DegradeToPassThrough>(
-            MemoryBufferPolicy.onMemoryPressure(0.05, 16_000_000))
-        assertIs<MemoryBufferPolicy.PressureDecision.Shrink>(
-            MemoryBufferPolicy.onMemoryPressure(0.2, 16_000_000))
-        assertIs<MemoryBufferPolicy.PressureDecision.KeepCurrent>(
-            MemoryBufferPolicy.onMemoryPressure(0.8, 16_000_000))
-    }
-
-    @Test fun seekWindowMembership() {
-        assertTrue(MemoryBufferPolicy.seekServeableFromWindow(1500, 1000, 1000))
-        assertFalse(MemoryBufferPolicy.seekServeableFromWindow(5000, 1000, 1000))
-    }
 
     // --- HLS rewriter ---
     @Test fun rewritesSegmentAndKeyUris() {
