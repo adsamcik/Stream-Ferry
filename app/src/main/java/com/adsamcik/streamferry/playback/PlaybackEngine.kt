@@ -1003,9 +1003,10 @@ class PlaybackEngine(
      */
     suspend fun selectAudioTrack(index: Int?) = mutex.withLock {
         if (currentInfo == null || audioSelection == index) return@withLock
-        audioSelection = index
         logger.event("playback", "Audio track -> ${index ?: "default"}; re-resolving")
-        reloadStreamPreservingPosition("audio track change")
+        reloadSelectionTransaction(audioSelection, index, { audioSelection = it }) {
+            reloadStreamPreservingPosition("audio track change")
+        }
     }
 
     /**
@@ -1015,9 +1016,10 @@ class PlaybackEngine(
      */
     suspend fun selectSubtitleTrack(index: Int?) = mutex.withLock {
         if (currentInfo == null || subtitleSelection == index) return@withLock
-        subtitleSelection = index
         logger.event("playback", "Subtitle -> ${index?.let { "track $it (burned in)" } ?: "off"}; re-resolving")
-        reloadStreamPreservingPosition("subtitle change")
+        reloadSelectionTransaction(subtitleSelection, index, { subtitleSelection = it }) {
+            reloadStreamPreservingPosition("subtitle change")
+        }
     }
 
     /**
@@ -1040,12 +1042,24 @@ class PlaybackEngine(
         val index = BitrateLadder.indexAtOrBelow(a.ladder, bitrateBps)
         val target = a.ladder[index]
         val wasManual = manualQuality
+        val previousNote = lastNote
+        val previousStreamStart = streamStartSeconds
+        val previousReportedPosition = reportedPositionSeconds
         manualQuality = true
         if (!wasManual || target != a.currentBitrateBps) {
             logger.event("quality", "Quality cap -> ${target / 1000} kbps (manual Jellyfin override)")
             // An override must re-resolve even when the selected rung matches the current displayed rate:
             // direct play can have that rate without Jellyfin having applied the requested output cap.
-            reloadStream(absolutePositionSeconds, requestedBitrate = target, reason = "manual quality override")
+            try {
+                reloadStream(absolutePositionSeconds, requestedBitrate = target, reason = "manual quality override")
+            } catch (failure: Throwable) {
+                manualQuality = wasManual
+                lastNote = previousNote
+                streamStartSeconds = previousStreamStart
+                reportedPositionSeconds = previousReportedPosition
+                publishStatus()
+                throw failure
+            }
             a.noteApplied(index, clock())
         }
         lastNote = "Manual quality selected — adaptation paused"
@@ -1060,6 +1074,10 @@ class PlaybackEngine(
     suspend fun selectMaxVideoHeight(height: Int?) = mutex.withLock {
         if (currentInfo == null || height !in setOf(null, 2160, 1080, 720, 480)) return@withLock
         if (manualMaxVideoHeight == height) return@withLock
+        val previousHeight = manualMaxVideoHeight
+        val previousStreamStart = streamStartSeconds
+        val previousReportedPosition = reportedPositionSeconds
+        val previousNote = lastNote
         manualMaxVideoHeight = height
         val label = height?.let { "${it}p" } ?: "Auto"
         lastNote = "Resolution -> $label; reloading stream…"
@@ -1068,7 +1086,16 @@ class PlaybackEngine(
         streamStartSeconds = pos
         reportedPositionSeconds = 0
         publishStatus()
-        reloadStream(pos, requestedBitrate = adaptive?.currentBitrateBps, reason = "manual resolution", armWatchdog = true)
+        try {
+            reloadStream(pos, requestedBitrate = adaptive?.currentBitrateBps, reason = "manual resolution", armWatchdog = true)
+        } catch (failure: Throwable) {
+            manualMaxVideoHeight = previousHeight
+            streamStartSeconds = previousStreamStart
+            reportedPositionSeconds = previousReportedPosition
+            lastNote = previousNote
+            publishStatus()
+            throw failure
+        }
     }
 
     /**
@@ -1084,6 +1111,10 @@ class PlaybackEngine(
             if (onDeviceTranscodeTarget == null) return@withLock // direct-play local file: nothing to transcode
             val requested = codec?.let { parseVideoCodec(it) }?.takeIf { it in localTranscodeCodecOptions }
             if (forcedLocalCodec == requested) return@withLock
+            val previousCodec = forcedLocalCodec
+            val previousFallbacks = localCodecFallbacksTried.toSet()
+            val previousStreamStart = streamStartSeconds
+            val previousReportedPosition = reportedPositionSeconds
             forcedLocalCodec = requested
             localCodecFallbacksTried.clear() // a manual pick supersedes any in-progress auto-fallback
             logger.event("quality", "Local transcode codec -> ${requested?.name?.lowercase() ?: "auto"}; reloading on-device")
@@ -1091,14 +1122,17 @@ class PlaybackEngine(
             streamStartSeconds = pos // hold the position so a torn-down status can't flash it to 0
             reportedPositionSeconds = 0
             publishStatus()
-            runCatching { reloadLocalInPlace(pos, "local codec change") }
-                .onFailure {
-                    if (it !is CancellationException) {
-                        logger.e("playback", "On-device codec switch failed", it)
-                        terminalFailureSurfaced = true
-                        publishStatus(error = "Couldn't switch the on-device codec.")
-                    }
-                }
+            try {
+                reloadLocalInPlace(pos, "local codec change")
+            } catch (failure: Throwable) {
+                forcedLocalCodec = previousCodec
+                localCodecFallbacksTried.clear()
+                localCodecFallbacksTried.addAll(previousFallbacks)
+                streamStartSeconds = previousStreamStart
+                reportedPositionSeconds = previousReportedPosition
+                publishStatus()
+                throw failure
+            }
             return@withLock
         }
         if (currentInfo == null) return@withLock
@@ -1108,9 +1142,10 @@ class PlaybackEngine(
             return@withLock
         }
         if (preferredCodec == requested) return@withLock
-        preferredCodec = requested
         logger.event("quality", "Preferred codec -> ${requested ?: "auto"}; re-resolving")
-        reloadStreamPreservingPosition("codec change")
+        reloadSelectionTransaction(preferredCodec, requested, { preferredCodec = it }) {
+            reloadStreamPreservingPosition("codec change")
+        }
     }
 
     private fun parseVideoCodec(codec: String): VideoCodec? = when (codec.lowercase()) {
@@ -1130,6 +1165,29 @@ class PlaybackEngine(
         reportedPositionSeconds = 0
         publishStatus()
         reloadStream(pos, requestedBitrate = adaptive?.currentBitrateBps, reason = reason)
+    }
+
+    /** Apply a UI selection only if its replacement stream loads; restore it on failure/cancellation. */
+    private suspend fun <T> reloadSelectionTransaction(
+        previous: T,
+        requested: T,
+        apply: (T) -> Unit,
+        reload: suspend () -> Unit,
+    ) {
+        val previousStreamStart = streamStartSeconds
+        val previousReportedPosition = reportedPositionSeconds
+        val previousNote = lastNote
+        apply(requested)
+        try {
+            reload()
+        } catch (failure: Throwable) {
+            apply(previous)
+            streamStartSeconds = previousStreamStart
+            reportedPositionSeconds = previousReportedPosition
+            lastNote = previousNote
+            publishStatus()
+            throw failure
+        }
     }
 
     /**
@@ -1222,6 +1280,11 @@ class PlaybackEngine(
         val applyAudio = audioIdx != null && audioIdx != defaultAudioIndex()
         val applySub = subIdx != null && subIdx != subtitleSelection
         if (!applyAudio && !applySub) return
+        val previousAudio = audioSelection
+        val previousSubtitle = subtitleSelection
+        val previousStreamStart = streamStartSeconds
+        val previousReportedPosition = reportedPositionSeconds
+        val previousNote = lastNote
         if (applyAudio) audioSelection = audioIdx
         if (applySub) subtitleSelection = subIdx
         logger.event(
@@ -1229,7 +1292,18 @@ class PlaybackEngine(
             "Applying preferred language (audio=${prefs.preferredAudioLanguage ?: "-"}, " +
                 "subtitle=${prefs.preferredSubtitleLanguage ?: "-"}); re-resolving",
         )
-        reloadStreamPreservingPosition("preferred language")
+        try {
+            reloadStreamPreservingPosition("preferred language")
+        } catch (failure: Throwable) {
+            audioSelection = previousAudio
+            subtitleSelection = previousSubtitle
+            languagePreferenceApplied = false
+            streamStartSeconds = previousStreamStart
+            reportedPositionSeconds = previousReportedPosition
+            lastNote = previousNote
+            publishStatus()
+            throw failure
+        }
     }
 
     /** Stable-ish identity for the learned-capability store: protocol + the TV's model/name. */

@@ -2054,29 +2054,37 @@ class MainViewModel(
 
     /** Switch the audio track (null = server default). Re-resolves the stream, so recover an expired token. */
     fun selectAudioTrack(index: Int?) = viewModelScope.launch {
-        runCatching { container.playbackEngine.selectAudioTrack(index) }
-            .onFailure { e -> if (isSessionExpired(e)) handleSessionExpired() }
-        // Remember the chosen audio LANGUAGE for this show, so the next episode auto-selects it. Only when
-        // the track carries a language (an untagged track can't be re-matched by language next time).
-        rememberShowLanguage { key ->
-            _state.value.playback?.audioTracks?.firstOrNull { it.index == index }?.language
-                ?.let { container.showLanguageStore.rememberAudio(key, it) }
+        try {
+            container.playbackEngine.selectAudioTrack(index)
+            // Remember the chosen audio LANGUAGE only after the replacement stream loaded successfully.
+            rememberShowLanguage { key ->
+                _state.value.playback?.audioTracks?.firstOrNull { it.index == index }?.language
+                    ?.let { container.showLanguageStore.rememberAudio(key, it) }
+            }
+        } catch (c: CancellationException) {
+            throw c
+        } catch (e: Exception) {
+            handlePlaybackControlFailure("change audio track", e)
         }
     }
 
     /** Enable subtitles at [index] (burned in) or disable them (null). Re-resolves the stream. */
     fun selectSubtitleTrack(index: Int?) = viewModelScope.launch {
-        runCatching { container.playbackEngine.selectSubtitleTrack(index) }
-            .onFailure { e -> if (isSessionExpired(e)) handleSessionExpired() }
-        // Remember the subtitle choice for this show: OFF when disabled, else the chosen language (an
-        // untagged subtitle track is left as-is, since it can't be re-matched by language next time).
-        rememberShowLanguage { key ->
-            if (index == null) {
-                container.showLanguageStore.rememberSubtitle(key, null) // remembered OFF
-            } else {
-                _state.value.playback?.subtitleTracks?.firstOrNull { it.index == index }?.language
-                    ?.let { container.showLanguageStore.rememberSubtitle(key, it) }
+        try {
+            container.playbackEngine.selectSubtitleTrack(index)
+            // Remember OFF/language only after the replacement stream loaded successfully.
+            rememberShowLanguage { key ->
+                if (index == null) {
+                    container.showLanguageStore.rememberSubtitle(key, null)
+                } else {
+                    _state.value.playback?.subtitleTracks?.firstOrNull { it.index == index }?.language
+                        ?.let { container.showLanguageStore.rememberSubtitle(key, it) }
+                }
             }
+        } catch (c: CancellationException) {
+            throw c
+        } catch (e: Exception) {
+            handlePlaybackControlFailure("change subtitles", e)
         }
     }
 
@@ -2087,26 +2095,46 @@ class MainViewModel(
 
     /** Pin a specific streaming quality (bitrate), or return to Auto (null). Re-resolves the stream. */
     fun selectQuality(bitrateBps: Long?) = viewModelScope.launch {
-        runCatching { container.playbackEngine.selectQuality(bitrateBps) }
-            .onFailure { e -> if (isSessionExpired(e)) handleSessionExpired() }
+        try {
+            container.playbackEngine.selectQuality(bitrateBps)
+        } catch (c: CancellationException) {
+            throw c
+        } catch (e: Exception) {
+            handlePlaybackControlFailure("change playback quality", e)
+        }
+    }
+
+    /** Override the stream resolution for this playback only; null returns to the saved automatic cap. */
+    fun selectMaxVideoHeight(height: Int?) = viewModelScope.launch {
+        try {
+            container.playbackEngine.selectMaxVideoHeight(height)
+        } catch (c: CancellationException) {
+            throw c
+        } catch (e: Exception) {
+            handlePlaybackControlFailure("change video resolution", e)
+        }
     }
 
     /** Pin the transcode video codec (e.g. "hevc"), or return to automatic (null). Re-resolves the stream. */
-    /** Override the stream resolution for this playback only; null returns to the saved automatic cap. */
-    fun selectMaxVideoHeight(height: Int?) = viewModelScope.launch {
-        runCatching { container.playbackEngine.selectMaxVideoHeight(height) }
-            .onFailure { e -> if (isSessionExpired(e)) handleSessionExpired() }
-    }
-
     fun selectPreferredCodec(codec: String?) = viewModelScope.launch {
-        runCatching { container.playbackEngine.selectPreferredCodec(codec) }
-            .onFailure { e -> if (isSessionExpired(e)) handleSessionExpired() }
+        try {
+            container.playbackEngine.selectPreferredCodec(codec)
+        } catch (c: CancellationException) {
+            throw c
+        } catch (e: Exception) {
+            handlePlaybackControlFailure("change video codec", e)
+        }
     }
 
     /** Skip the intro/outro/recap segment covering the current position (the "Skip" button). */
     fun skipSegment() = viewModelScope.launch {
-        runCatching { container.playbackEngine.skipActiveSegment() }
-            .onFailure { e -> if (isSessionExpired(e)) handleSessionExpired() }
+        try {
+            container.playbackEngine.skipActiveSegment()
+        } catch (c: CancellationException) {
+            throw c
+        } catch (e: Exception) {
+            handlePlaybackControlFailure("skip the segment", e)
+        }
     }
 
     /** Mark a Jellyfin episode or movie watched/unwatched using its native per-user state. */
