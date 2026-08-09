@@ -30,6 +30,7 @@ import com.adsamcik.streamferry.data.jellyfin.JellyfinAuthRepository
 import com.adsamcik.streamferry.data.jellyfin.JellyfinClient
 import com.adsamcik.streamferry.data.jellyfin.JellyfinMediaLibraryRepository
 import com.adsamcik.streamferry.data.jellyfin.JellyfinMediaSource
+import com.adsamcik.streamferry.data.jellyfin.JellyfinWatchMutationStore
 import com.adsamcik.streamferry.data.language.ShowLanguageStore
 import com.adsamcik.streamferry.data.local.LocalMediaSource
 import com.adsamcik.streamferry.data.local.LocalSourceStore
@@ -212,6 +213,7 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
     val localSourceStore: LocalSourceStore by lazy { LocalSourceStore(appContext) }
     val resumeStore: ResumeStore by lazy { ResumeStore(appContext) }
     val smartResumeStore: SmartResumeStore by lazy { SmartResumeStore(appContext) }
+    val jellyfinWatchMutationStore: JellyfinWatchMutationStore by lazy { JellyfinWatchMutationStore(appContext) }
     val smartResumeTracker: SmartResumeSessionTracker by lazy { SmartResumeSessionTracker(smartResumeStore) }
     val jellyfinMediaSource: MediaSource by lazy { JellyfinMediaSource(mediaRepository) }
     val localMediaSource: LocalMediaSource by lazy {
@@ -485,6 +487,7 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
         downloadStore.clear()
         runCatching { resumeStore.clear() }
         runCatching { smartResumeStore.clear() }
+        runCatching { jellyfinWatchMutationStore.clear() }
         runCatching { crashReporter.clear() } // crash reports are app data too
         runCatching { diagnosticsEventLog.clear() } // persisted event log is app data too
         runCatching { diagnosticsPreferences.clear() }

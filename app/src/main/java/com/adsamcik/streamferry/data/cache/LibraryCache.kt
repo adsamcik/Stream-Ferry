@@ -23,13 +23,49 @@ import java.util.Locale
  */
 class LibraryCache(
     context: Context,
+    // Production uses Android AtomicFile. The seam keeps filesystem transformation tests deterministic
+    // under Robolectric, whose Android-35 AtomicFile shadow does not commit the staged .new file.
+    private val fileWriter: ((File, String) -> Unit)? = null,
+    // Keep this last so existing LibraryCache(context) { clock } calls remain source-compatible.
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
-
     private val root = File(context.applicationContext.filesDir, DIR)
     private val json = Json { ignoreUnknownKeys = true }
     private val legacyListSerializer = ListSerializer(MediaItem.serializer())
     private val mutex = Mutex()
+    /** A remote request captures its sequence before touching Jellyfin; its late response cannot roll back a newer item. */
+    @ConsistentCopyVisibility
+    data class RemoteWriteToken internal constructor(
+        internal val scope: String,
+        internal val sequence: Long,
+    )
+
+    /** Identifies the one in-memory stale-response overlay installed by [patchItem]. */
+    @ConsistentCopyVisibility
+    data class ItemPatchToken internal constructor(
+        internal val scope: String,
+        internal val itemId: String,
+        internal val generation: Long,
+    )
+
+    private data class ItemPatchOverlay(
+        val token: ItemPatchToken,
+        val transform: (MediaItem) -> MediaItem,
+        // The highest request sequence that had already started when Jellyfin accepted the action. A
+        // response beginning afterwards is authoritative and may retire this short-lived overlay.
+        var confirmedAfterRemoteSequence: Long? = null,
+    )
+
+    /**
+     * Process-lifetime stale-response guards for locally materialized watch-state changes. An overlay remains
+     * mandatory while the server action is ambiguous. Once confirmed, only a remote request that began after
+     * confirmation may retire it; older in-flight responses are still transformed. Per-item write sequences
+     * then stop an even later old response from overwriting the reconciled cache/index.
+     */
+    private val itemPatchOverlays = mutableMapOf<String, MutableMap<String, ItemPatchOverlay>>()
+    private val patchGenerationByScope = mutableMapOf<String, Long>()
+    private val remoteWriteSequenceByScope = mutableMapOf<String, Long>()
+    private val lastCommittedRemoteWriteByScopeAndItem = mutableMapOf<String, MutableMap<String, Long>>()
 
     /**
      * A cached list together with the instant at which it was successfully fetched. This is deliberately
@@ -63,25 +99,51 @@ class LibraryCache(
     )
 
     /**
-     * Replace one cached list and fold its items into the scope-wide search index. Existing indexed
-     * items from other browsed lists are retained: a cached search should cover everything the user has
-     * already visited, not only the most recently opened folder.
+     * Capture a remote request before it starts. Pass the resulting [RemoteWriteToken] to [put] if that
+     * request succeeds so cache writes can be ordered against watch-state patches and each other.
      */
-    suspend fun put(scope: String, key: String, items: List<MediaItem>) = mutex.withLock {
+    suspend fun beginRemoteWrite(scope: String): RemoteWriteToken = mutex.withLock {
+        val sequence = (remoteWriteSequenceByScope[scope] ?: 0L) + 1L
+        remoteWriteSequenceByScope[scope] = sequence
+        RemoteWriteToken(scope = scope, sequence = sequence)
+    }
+
+    /** Compatibility path for locally seeded/test data, which has no in-flight remote request to order. */
+    suspend fun put(scope: String, key: String, items: List<MediaItem>): List<MediaItem> =
+        putInternal(scope = scope, key = key, items = items, remoteWrite = null)
+
+    /** Store a remote response while preserving newer per-item responses and a relevant pending patch. */
+    suspend fun put(remoteWrite: RemoteWriteToken, key: String, items: List<MediaItem>): List<MediaItem> =
+        putInternal(scope = remoteWrite.scope, key = key, items = items, remoteWrite = remoteWrite)
+
+    private suspend fun putInternal(
+        scope: String,
+        key: String,
+        items: List<MediaItem>,
+        remoteWrite: RemoteWriteToken?,
+    ): List<MediaItem> = mutex.withLock {
         withContext(Dispatchers.IO) {
-            runCatching {
-                val dir = scopeDir(scope)
-                writeAtomically(
-                    fileFor(scope, key),
-                    json.encodeToString(
-                        StoredRecord.serializer(),
-                        StoredRecord(cachedAtMillis = clock(), items = items),
-                    ),
-                )
+            val dir = scopeDir(scope)
+            // If a newer response already established an item, retain that indexed version instead of
+            // allowing an older request (possibly from another list key) to regress the shared search index.
+            val orderedItems = remoteWrite?.let { reconcileOlderRemoteItems(scope, dir, it, items) } ?: items
+            val patchedItems = applyItemPatchOverlays(scope, orderedItems, remoteWrite)
+            val wrote = runCatching {
+                writeRecord(fileFor(scope, key), StoredRecord(cachedAtMillis = clock(), items = patchedItems))
                 val prior = indexForLookup(dir)
-                writeIndex(dir, mergeById(prior, items))
+                writeIndex(dir, mergeById(prior, patchedItems))
+                true
+            }.getOrDefault(false)
+            if (wrote && remoteWrite != null) {
+                val committed = lastCommittedRemoteWriteByScopeAndItem.getOrPut(scope) { mutableMapOf() }
+                patchedItems.forEach { item ->
+                    if (remoteWrite.sequence >= (committed[item.id] ?: 0L)) {
+                        committed[item.id] = remoteWrite.sequence
+                    }
+                }
             }
-            Unit
+            // Return exactly what was stored so callers also cannot publish a stale in-flight response.
+            patchedItems
         }
     }
 
@@ -155,6 +217,10 @@ class LibraryCache(
 
     suspend fun clear() = mutex.withLock {
         withContext(Dispatchers.IO) {
+            itemPatchOverlays.clear()
+            patchGenerationByScope.clear()
+            remoteWriteSequenceByScope.clear()
+            lastCommittedRemoteWriteByScopeAndItem.clear()
             runCatching { root.deleteRecursively() }
             Unit
         }
@@ -162,6 +228,96 @@ class LibraryCache(
 
     private fun scopeDir(scope: String) = File(root, safe(scope))
 
+    /**
+     * Rewrite every cached representation of one item inside [scope], including the offline search index,
+     * and install an in-memory guard for a response that was already in flight. The returned token must be
+     * confirmed only after Jellyfin accepts the absolute action; a later authoritative response then retires
+     * the guard naturally instead of pinning future playback progress forever.
+     *
+     * Unlike regular cache refreshes, a write failure is surfaced to the caller. A caller must not acknowledge
+     * a durable watch-state journal entry while stale on-disk metadata could still resurrect old progress.
+     */
+    suspend fun patchItem(
+        scope: String,
+        itemId: String,
+        transform: (MediaItem) -> MediaItem,
+    ): ItemPatchToken = mutex.withLock {
+        withContext(Dispatchers.IO) {
+            val generation = (patchGenerationByScope[scope] ?: 0L) + 1L
+            patchGenerationByScope[scope] = generation
+            val token = ItemPatchToken(scope = scope, itemId = itemId, generation = generation)
+            itemPatchOverlays.getOrPut(scope) { mutableMapOf() }[itemId] = ItemPatchOverlay(token, transform)
+
+            val dir = scopeDir(scope)
+            recordFiles(dir).forEach { file ->
+                val record = readRecord(file) ?: return@forEach
+                val patchedItems = applyItemPatchOverlays(scope, record.items)
+                if (patchedItems != record.items) {
+                    // A local watch-state edit is not a server refresh. Preserve the source record's age so
+                    // stale-while-revalidate behaviour remains honest while offline.
+                    writeRecord(file, StoredRecord(cachedAtMillis = record.cachedAtMillis, items = patchedItems))
+                }
+            }
+
+            // The index can outlive individual browse files after an interrupted cleanup. Patch it
+            // independently so index-only offline item lookup/search cannot resurrect old progress.
+            val index = readIndex(dir)
+            val patchedIndex = index?.let { applyItemPatchOverlays(scope, it) }
+            if (patchedIndex != null && patchedIndex != index) writeIndex(dir, patchedIndex)
+            token
+        }
+    }
+
+    /** Permit only requests begun after this call to replace the matching in-memory patch. */
+    suspend fun confirmItemPatch(token: ItemPatchToken): Boolean = mutex.withLock {
+        val overlay = itemPatchOverlays[token.scope]?.get(token.itemId) ?: return@withLock false
+        if (overlay.token != token) return@withLock false
+        overlay.confirmedAfterRemoteSequence = remoteWriteSequenceByScope[token.scope] ?: 0L
+        true
+    }
+
+    /** True while [token]'s stale-response guard remains installed; used to retire matching UI overlays safely. */
+    suspend fun isItemPatchActive(token: ItemPatchToken): Boolean = mutex.withLock {
+        itemPatchOverlays[token.scope]?.get(token.itemId)?.token == token
+    }
+
+    private fun reconcileOlderRemoteItems(
+        scope: String,
+        dir: File,
+        remoteWrite: RemoteWriteToken,
+        items: List<MediaItem>,
+    ): List<MediaItem> {
+        val committed = lastCommittedRemoteWriteByScopeAndItem[scope] ?: return items
+        if (items.none { remoteWrite.sequence < (committed[it.id] ?: 0L) }) return items
+        val indexed = indexForLookup(dir).associateBy { it.id }
+        return items.map { item ->
+            if (remoteWrite.sequence < (committed[item.id] ?: 0L)) indexed[item.id] ?: item else item
+        }
+    }
+
+    private fun applyItemPatchOverlays(
+        scope: String,
+        items: List<MediaItem>,
+        remoteWrite: RemoteWriteToken? = null,
+    ): List<MediaItem> {
+        val overlays = itemPatchOverlays[scope] ?: return items
+        val retire = mutableListOf<String>()
+        val patched = items.map { item ->
+            val overlay = overlays[item.id] ?: return@map item
+            val confirmationBarrier = overlay.confirmedAfterRemoteSequence
+            if (remoteWrite != null && confirmationBarrier != null && remoteWrite.sequence > confirmationBarrier) {
+                // This request began only after the server accepted the action. Its result is now the source
+                // of truth (including a later real playback progress update), so retire the temporary guard.
+                retire += item.id
+                item
+            } else {
+                overlay.transform(item)
+            }
+        }
+        retire.forEach { itemId -> overlays.remove(itemId) }
+        if (overlays.isEmpty()) itemPatchOverlays.remove(scope)
+        return patched
+    }
     private fun fileFor(scope: String, key: String) = File(scopeDir(scope), safe(key) + ".json")
 
     private fun readRecord(file: File): Record? {
@@ -217,10 +373,18 @@ class LibraryCache(
     }
 
     private fun writeIndex(dir: File, items: List<MediaItem>) {
-        writeAtomically(
+        writeCacheFile(
             File(dir, INDEX_FILE),
             json.encodeToString(StoredIndex.serializer(), StoredIndex(items = items)),
         )
+    }
+
+    private fun writeRecord(file: File, record: StoredRecord) {
+        writeCacheFile(file, json.encodeToString(StoredRecord.serializer(), record))
+    }
+
+    private fun writeCacheFile(file: File, text: String) {
+        fileWriter?.invoke(file, text) ?: writeAtomically(file, text)
     }
 
     /** AtomicFile preserves the previous complete JSON if a process dies during a cache update. */
@@ -240,7 +404,6 @@ class LibraryCache(
             throw t
         }
     }
-
     private fun MediaItem.matches(needle: String): Boolean =
         listOf(title, subtitle, overview, type)
             .any { value -> value?.lowercase(Locale.ROOT)?.contains(needle) == true }

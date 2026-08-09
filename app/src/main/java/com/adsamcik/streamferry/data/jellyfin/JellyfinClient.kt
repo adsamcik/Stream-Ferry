@@ -361,9 +361,42 @@ class JellyfinClient(
      */
     suspend fun markPlayed(itemId: String, played: Boolean): Unit = withContext(Dispatchers.IO) {
         val uid = userId ?: error("Not authenticated")
-        val segments = path("Users", uid, "PlayedItems", itemId)
-        exec(if (played) postNoBody(segments) else delete(segments))
+        val currentApi = path("UserPlayedItems", itemId)
+        try {
+            exec(
+                if (played) postNoBody(currentApi, "userId" to uid)
+                else delete(currentApi, "userId" to uid),
+                logTerminalFailure = false,
+            )
+        } catch (error: JellyfinHttpException) {
+            // Jellyfin 10.9+ exposes a user-parameterized endpoint. Keep older servers usable, but never
+            // replay authentication, validation, or server errors against a second route.
+            if (error.code !in LEGACY_USER_SCOPED_FALLBACK_CODES) throw error
+            logger.event("library", "UserPlayedItems API unavailable; retrying legacy watched-state route")
+            val legacyApi = path("Users", uid, "PlayedItems", itemId)
+            exec(if (played) postNoBody(legacyApi) else delete(legacyApi))
+        }
         logger.event("library", "Marked item ${if (played) "played" else "unplayed"}")
+    }
+    /**
+     * Clear this user's resume point and mark the item unwatched. The User Data API is deliberately
+     * used instead of a playback-stop report: it works for an arbitrary library item, not only a
+     * currently active play session.
+     */
+    suspend fun resetProgress(itemId: String): Unit = withContext(Dispatchers.IO) {
+        val uid = userId ?: error("Not authenticated")
+        val body = resetProgressUserDataPayload()
+        val currentApi = post(path("UserItems", itemId, "UserData"), body, "userId" to uid)
+        try {
+            exec(currentApi, logTerminalFailure = false)
+        } catch (error: JellyfinHttpException) {
+            // Jellyfin 10.9 introduced /UserItems. Keep the reset action usable for an older server,
+            // but never retry authentication/validation/server errors against another route.
+            if (error.code !in LEGACY_USER_SCOPED_FALLBACK_CODES) throw error
+            logger.event("library", "UserData API unavailable; retrying legacy progress reset")
+            exec(post(path("Users", uid, "Items", itemId, "UserData"), body))
+        }
+        logger.event("library", "Reset item progress")
     }
 
     suspend fun searchItems(searchTerm: String, limit: Int): ItemsPage =
@@ -648,19 +681,24 @@ class JellyfinClient(
             .build()
     }
 
-    private fun postNoBody(segments: List<String>): Request =
-        Request.Builder().url(httpUrl(segments))
+    private fun postNoBody(segments: List<String>, vararg query: Pair<String, String>): Request =
+        Request.Builder().url(httpUrl(segments).withQuery(*query))
             .header("Authorization", authHeaderValue())
             .header("Accept", "application/json")
             .post(ByteArray(0).toRequestBody(jsonMedia))
             .build()
 
-    private fun delete(segments: List<String>): Request =
-        Request.Builder().url(httpUrl(segments))
+    private fun delete(segments: List<String>, vararg query: Pair<String, String>): Request =
+        Request.Builder().url(httpUrl(segments).withQuery(*query))
             .header("Authorization", authHeaderValue())
             .header("Accept", "application/json")
             .delete()
             .build()
+
+    private fun HttpUrl.withQuery(vararg query: Pair<String, String>): HttpUrl =
+        if (query.isEmpty()) this else newBuilder().apply {
+            query.forEach { (key, value) -> addQueryParameter(key, value) }
+        }.build()
 
     /** Like [runCatching] but never swallows coroutine cancellation (rethrows [CancellationException]). */
     private inline fun <T> catchingNonCancel(block: () -> T): Result<T> =
@@ -679,7 +717,7 @@ class JellyfinClient(
      * Suspends (not blocks) for backoff and cancels the in-flight call on coroutine cancellation, so a
      * logout / cancelled Quick Connect poll aborts promptly instead of hanging on a flapping server.
      */
-    private suspend fun exec(request: Request): String {
+    private suspend fun exec(request: Request, logTerminalFailure: Boolean = true): String {
         var attempt = 0
         while (true) {
             val outcome = runCatching { execOnce(request) }
@@ -697,7 +735,8 @@ class JellyfinClient(
                 // diagnostics regardless of caller — browsing, search, or starting playback. A 401 is
                 // routine session-expiry / offline-cache control flow handled by callers, so don't log
                 // it as a failure here.
-                if (error is JellyfinHttpException && !error.isUnauthorized) {
+                if (error is JellyfinHttpException && !error.isUnauthorized &&
+                    (logTerminalFailure || error.code !in LEGACY_USER_SCOPED_FALLBACK_CODES)) {
                     logger.w("jellyfin", "request failed: ${error.message}")
                 } else if (error is JellyfinHttpException && error.isUnauthorized) {
                     logger.event("jellyfin", "request unauthorized (status=401) — session expired")
@@ -1000,6 +1039,8 @@ class JellyfinClient(
         // Codecs used for attached cover-art/thumbnail streams (not the real video feed).
         private val IMAGE_CODECS = setOf("mjpeg", "png", "gif", "bmp", "jpeg", "jpg", "webp")
         private const val HLS_MIME = "application/vnd.apple.mpegurl"
+        /** Jellyfin servers before 10.9 used user-scoped legacy routes for UserData and watched state. */
+        private val LEGACY_USER_SCOPED_FALLBACK_CODES = setOf(404, 405)
         /** Same-origin GET/HEAD redirects are explicit and bounded; other methods never replay. */
         private const val MAX_API_REDIRECTS = 3
         private const val MAX_DISCOVERY_REDIRECTS = 3
@@ -1012,6 +1053,15 @@ class JellyfinHttpException(val code: Int, val serverReason: String? = null) :
     RuntimeException("Jellyfin request failed with HTTP $code" + (serverReason?.let { " ($it)" } ?: "")) {
     /** A 401 means the stored access token was revoked/expired — the user must re-authenticate. */
     val isUnauthorized: Boolean get() = code == 401
+}
+
+/**
+ * The UserData patch used by Reset progress. Explicitly mark it unplayed as well as clearing ticks;
+ * Jellyfin otherwise may retain a completed state for an episode that should start from the beginning.
+ */
+internal fun resetProgressUserDataPayload(): JsonObject = buildJsonObject {
+    put("PlaybackPositionTicks", 0L)
+    put("Played", false)
 }
 
 /**

@@ -30,13 +30,14 @@ class CachingMediaLibraryRepository(
         if (!isLiveSession()) {
             return cachedItem(requestScope, itemId)
         }
+        val remoteWrite = cache.beginRemoteWrite(requestScope)
         val result = delegate.item(itemId)
         if (scope() != requestScope) return Result.failure(OfflineCacheScopeChangedException())
         return result.fold(
             onSuccess = { item ->
-                cache.put(requestScope, itemKey(itemId), listOf(item))
+                val cached = cache.put(remoteWrite, itemKey(itemId), listOf(item))
                 connectionMonitor?.markOnline()
-                Result.success(item)
+                Result.success(cached.singleOrNull() ?: item)
             },
             onFailure = { error ->
                 if (isConnectivityFailure(error)) {
@@ -60,13 +61,14 @@ class CachingMediaLibraryRepository(
             return if (scope() == requestScope) Result.success(local)
             else Result.failure(OfflineCacheScopeChangedException())
         }
+        val remoteWrite = cache.beginRemoteWrite(requestScope)
         val result = delegate.search(query)
         if (scope() != requestScope) return Result.failure(OfflineCacheScopeChangedException())
         return result.fold(
             onSuccess = { remote ->
-                cache.put(requestScope, searchKey(query), remote)
+                val cached = cache.put(remoteWrite, searchKey(query), remote)
                 connectionMonitor?.markOnline()
-                Result.success(mergeById(remote, local))
+                Result.success(mergeById(cached, local))
             },
             onFailure = { error ->
                 if (isConnectivityFailure(error)) {
@@ -90,13 +92,14 @@ class CachingMediaLibraryRepository(
         // logout or a server/account switch; never publish it into, or fall back from, another account.
         val requestScope = scope()
         if (!isLiveSession()) return cachedList(requestScope, key)
+        val remoteWrite = cache.beginRemoteWrite(requestScope)
         val result = fetch()
         if (scope() != requestScope) return Result.failure(OfflineCacheScopeChangedException())
         return result.fold(
             onSuccess = { items ->
-                cache.put(requestScope, key, items)
+                val cached = cache.put(remoteWrite, key, items)
                 connectionMonitor?.markOnline()
-                Result.success(items)
+                Result.success(cached)
             },
             onFailure = { error ->
                 // Do not conceal an expired/revoked token or a definitive 4xx/removed item behind stale

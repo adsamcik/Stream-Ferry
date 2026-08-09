@@ -274,6 +274,24 @@ class JellyfinAuthRepository(
             ?: Result.failure(JellyfinServerUnavailableException())
     }
 
+    /**
+     * Execute an authenticated request only while the singleton [client] remains bound to [expected].
+     * Holding the same mutex as server switching/logout prevents a suspended request from picking up a
+     * different server's URL or token before it builds its HTTP request.
+     *
+     * @return false when the expected verified session was superseded before the request began.
+     */
+    suspend fun runWithActiveSession(expected: UserSession, action: suspend () -> Unit): Boolean =
+        authOperationMutex.withLock {
+            if (currentSessionForActiveProfile() != expected || client.userId != expected.userId) {
+                return@withLock false
+            }
+            action()
+            // Nothing else can rebind the client while the mutex is held, but retain this check as a
+            // fail-closed boundary if future session management gains another mutation path.
+            _currentUser.value == expected && client.userId == expected.userId
+        }
+
     /** Caller holds [authOperationMutex], keeping the mutable client bound to this saved profile. */
     private suspend fun restoreSessionLocked(expectedServerId: String?): UserSession? {
         val cached = restoreCachedSessionLocked(expectedServerId) ?: return null

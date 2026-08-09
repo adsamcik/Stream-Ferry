@@ -55,6 +55,7 @@ import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.PhoneAndroid
 import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.RemoveDone
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.VideoLibrary
@@ -102,6 +103,7 @@ import com.adsamcik.streamferry.data.download.DownloadFormat
 import com.adsamcik.streamferry.domain.JellyfinLibraryStatus
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.domain.MediaSourceIds
+import com.adsamcik.streamferry.domain.isJellyfinEpisode
 import com.adsamcik.streamferry.ui.MainViewModel
 import com.adsamcik.streamferry.ui.components.ExpressiveLoadingIndicator
 import com.adsamcik.streamferry.ui.state.AppUiState
@@ -1462,6 +1464,15 @@ fun MediaDetailScreen(
     val availability = state.availabilityFor(media)
     val serverUnavailable = media.sourceId == MediaSourceIds.JELLYFIN &&
         state.jellyfinLibraryStatus == JellyfinLibraryStatus.UNAVAILABLE
+    val activePlaybackForMedia = state.playback != null && state.nowPlayingItem?.id == media.id
+    val watchStateActionEnabled = state.loggedIn && !serverUnavailable && !activePlaybackForMedia
+    val watchStateUpdating = media.id in state.watchStateMutationItemIds
+    val watchStateUnavailableReason = when {
+        !state.loggedIn -> "Reconnect to Jellyfin to change watch state."
+        serverUnavailable -> "Jellyfin is unavailable. Reconnect to change watch state."
+        activePlaybackForMedia -> "Stop playback before changing its watch state."
+        else -> null
+    }
 
     Column(
         modifier = Modifier.fillMaxSize(),
@@ -1485,14 +1496,30 @@ fun MediaDetailScreen(
                     DetailAboutCard(media.id, overview)
                 }
             }
-            if (media.sourceId != MediaSourceIds.LOCAL) {
+            // Jellyfin applies series/season watched changes to every child. Keep the manual action on
+            // playable leaf media so it cannot collide with a child episode currently being reported.
+            if (media.sourceId == MediaSourceIds.JELLYFIN && !media.isFolder) {
                 item(key = "detail-watch-state") {
                     WatchStateAction(
                         item = media,
-                        enabled = !serverUnavailable,
+                        enabled = watchStateActionEnabled,
+                        updating = watchStateUpdating,
+                        disabledMessage = watchStateUnavailableReason,
                         onToggle = { viewModel.markWatched(media, !media.played) },
                     )
                 }
+                if (media.isJellyfinEpisode()) {
+                    item(key = "detail-reset-progress") {
+                        ResetProgressAction(
+                            enabled = watchStateActionEnabled,
+                            updating = watchStateUpdating,
+                            disabledMessage = watchStateUnavailableReason,
+                            onReset = { viewModel.resetEpisodeProgress(media) },
+                        )
+                    }
+                }
+            }
+            if (media.sourceId != MediaSourceIds.LOCAL) {
                 item(key = "detail-offline") {
                     OfflineDetailCard(
                         item = media,
@@ -1707,11 +1734,13 @@ private fun DetailAboutCard(itemId: String, overview: String) {
 private fun WatchStateAction(
     item: MediaItem,
     enabled: Boolean,
+    updating: Boolean,
+    disabledMessage: String?,
     onToggle: () -> Unit,
 ) {
     Card(
         onClick = onToggle,
-        enabled = enabled,
+        enabled = enabled && !updating,
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(24.dp),
         colors = CardDefaults.cardColors(
@@ -1742,12 +1771,23 @@ private fun WatchStateAction(
             }
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 Text(
-                    if (item.played) "Watched" else "Mark as watched",
+                    when {
+                        updating -> "Updating watch state…"
+                        item.played && item.isJellyfinEpisode() -> "Mark episode as unwatched"
+                        item.played -> "Mark as unwatched"
+                        item.isJellyfinEpisode() -> "Mark episode as watched"
+                        else -> "Mark as watched"
+                    },
                     style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.Bold,
                 )
                 Text(
-                    if (!enabled) "Jellyfin is unavailable. Watch state will sync after reconnecting." else if (item.played) "Tap to mark this as unwatched" else "Keep your Jellyfin history up to date",
+                    when {
+                        updating -> "Saving this change to Jellyfin…"
+                        !enabled -> disabledMessage ?: "Reconnect to Jellyfin to change watch state."
+                        item.played -> "Tap to mark this as unwatched"
+                        else -> "Keep your Jellyfin history up to date"
+                    },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -1756,6 +1796,57 @@ private fun WatchStateAction(
         }
     }
 }
+
+@Composable
+private fun ResetProgressAction(
+    enabled: Boolean,
+    updating: Boolean,
+    disabledMessage: String?,
+    onReset: () -> Unit,
+) {
+    Card(
+        onClick = onReset,
+        enabled = enabled && !updating,
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(24.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            Surface(
+                modifier = Modifier.size(44.dp),
+                shape = CircleShape,
+                color = MaterialTheme.colorScheme.secondaryContainer,
+                contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(Icons.Rounded.Refresh, contentDescription = null)
+                }
+            }
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(
+                    if (updating) "Resetting progress…" else "Reset progress",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                )
+                Text(
+                    when {
+                        updating -> "Starting this episode over in Jellyfin…"
+                        !enabled -> disabledMessage ?: "Reconnect to Jellyfin to reset progress."
+                        else -> "Start this episode again from the beginning"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Icon(Icons.AutoMirrored.Rounded.KeyboardArrowRight, contentDescription = null)
+        }
+    }
+}
+
 
 @Composable
 private fun OfflineDetailCard(

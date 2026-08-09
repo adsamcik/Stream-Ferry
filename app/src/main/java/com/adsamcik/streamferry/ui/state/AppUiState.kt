@@ -64,6 +64,8 @@ data class AppUiState(
     val items: List<MediaItem> = emptyList(),       // children of the current folder
     val galleryLoading: Boolean = false,
     val selectedItem: MediaItem? = null,
+    /** Item ids with a server-side watched/progress mutation in flight; controls are disabled to avoid races. */
+    val watchStateMutationItemIds: Set<String> = emptySet(),
 
     // ----- library search -----
     val searchQuery: String = "",

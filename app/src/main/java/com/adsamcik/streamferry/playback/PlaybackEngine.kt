@@ -140,6 +140,8 @@ data class PlaybackCompletion(
     val item: MediaItem?,
     /** True only when the completed stream had an active Jellyfin playback session. */
     val isJellyfinSession: Boolean,
+    /** Exact renderer session; lets consumers reject a buffered event after a newer play begins. */
+    val generation: Long,
 )
 
 /** Parameters of a LOCAL (offline / downloaded) playback, kept so the on-device stream can be reloaded. */
@@ -329,6 +331,9 @@ class PlaybackEngine(
 
     /** Persist the latest renderer-confirmed position when the app leaves the foreground. */
     fun checkpointSmartResumeLifecycle() = smartResume.checkpoint(SmartResumeCheckpointKind.LIFECYCLE)
+
+    /** Whether an asynchronous completion still belongs to the currently active renderer session. */
+    fun isCurrentPlaybackGeneration(generation: Long): Boolean = playGeneration == generation
     /** Redacted snapshot for UI diagnostics and for coordinator-owned recovery decisions. */
     fun recoverySnapshot(): PlaybackRecoverySession = recoverySession
 
@@ -1970,8 +1975,10 @@ class PlaybackEngine(
                     logger.w(TAG, "Ignoring end-of-media during a stream reload (seek/bitrate switch)")
                 } else {
                     // Cast may repeat its finished/idle event, and a delayed poll may still say "playing".
-                    // Latch this exact generation before publishing so neither can resurrect the UI/session.
-                    completedGeneration = playGeneration
+                    // Capture and latch this exact generation before publishing so delayed consumers cannot
+                    // mistake this completion for a newer stream that has reused the same TV connection.
+                    val completedPlayGeneration = playGeneration
+                    completedGeneration = completedPlayGeneration
                     isPlaying = false
                     isBuffering = false
                     seekSettleTargetSeconds = null
@@ -1987,9 +1994,13 @@ class PlaybackEngine(
                     // Signal a genuine end-of-media so the ViewModel can sync the exact completed Jellyfin
                     // item and then consider autoplay (a user-stop tears down eventsJob first).
                     _endOfMedia.tryEmit(
-                        PlaybackCompletion(item = item, isJellyfinSession = currentInfo != null),
+                        PlaybackCompletion(
+                            item = item,
+                            isJellyfinSession = currentInfo != null,
+                            generation = completedPlayGeneration,
+                        ),
                     )
-                    val gen = playGeneration
+                    val gen = completedPlayGeneration
                     if (autoAdvance) {
                         // Keep the TV connection (+ proxy + foreground service) alive so the next episode
                         // loads WITHOUT a reconnect. The ViewModel resolves the next episode and calls
