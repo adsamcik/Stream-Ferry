@@ -22,7 +22,6 @@ import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.Tv
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
-import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -86,22 +85,27 @@ fun DownloadsScreen(state: AppUiState, viewModel: MainViewModel, onCast: () -> U
                     },
                     onCancel = { viewModel.cancelDownload(item.itemId) },
                     onDelete = { deleteCandidate = item.itemId },
-                    onDismissFailure = { viewModel.deleteDownload(item.itemId) },
                 )
             }
         }
     }
 
     val deleting = deleteCandidate?.let { id ->
-        state.downloads.firstOrNull { it.itemId == id && it.completed }
+        state.downloads.firstOrNull { it.itemId == id && (it.completed || it.failed) }
     }
     if (deleting != null) {
+        val deletingFailure = deleting.failed
         AlertDialog(
             onDismissRequest = { deleteCandidate = null },
-            title = { Text("Delete offline copy?") },
+            title = { Text(if (deletingFailure) "Delete failed download?" else "Delete offline copy?") },
             text = {
                 Text(
-                    "${deleting.title} will be removed from this phone. The original media is not changed.",
+                    if (deletingFailure) {
+                        "Any saved progress and retry request for ${deleting.title} will be removed. " +
+                            "The original media is not changed."
+                    } else {
+                        "${deleting.title} will be removed from this phone. The original media is not changed."
+                    },
                 )
             },
             confirmButton = {
@@ -111,7 +115,7 @@ fun DownloadsScreen(state: AppUiState, viewModel: MainViewModel, onCast: () -> U
                         deleteCandidate = null
                     },
                 ) {
-                    Text("Delete")
+                    Text(if (deletingFailure) "Delete download" else "Delete")
                 }
             },
             dismissButton = {
@@ -165,7 +169,6 @@ private fun DownloadRow(
     onPlay: () -> Unit,
     onCancel: () -> Unit,
     onDelete: () -> Unit,
-    onDismissFailure: () -> Unit,
 ) {
     val progress = item.fraction?.coerceIn(0f, 1f)
     val targetContainerColor = when {
@@ -298,11 +301,12 @@ private fun DownloadRow(
                 }
 
                 item.failed -> {
-                    FilledTonalButton(
-                        onClick = onDismissFailure,
+                    OutlinedButton(
+                        onClick = onDelete,
                         modifier = Modifier.fillMaxWidth(),
                     ) {
-                        Text("Dismiss")
+                        Icon(Icons.Rounded.Delete, contentDescription = null)
+                        Text("Delete failed download", modifier = Modifier.padding(start = 8.dp))
                     }
                 }
 
