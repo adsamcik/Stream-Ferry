@@ -2373,7 +2373,11 @@ class PlaybackEngine(
         // this idempotently while it clears its bookkeeping and performs bounded remote cleanup.
         proxy.stop()
         target?.let {
-            runCatching { it.stop() }
+            if (PlaybackTeardownPolicy.shouldSendRendererStop(connectionLost)) {
+                runCatching { it.stop() }
+            } else {
+                logger.event("playback", "Skipping renderer Stop because the TV connection is already lost")
+            }
             runCatching { it.disconnect() }
         }
         runCatching { coordinator.stop(reason) }

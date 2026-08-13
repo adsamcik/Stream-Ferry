@@ -87,6 +87,7 @@ import com.adsamcik.streamferry.domain.MediaSourceIds
 import com.adsamcik.streamferry.playback.PlaybackPhase
 import com.adsamcik.streamferry.playback.PlaybackControlPolicy
 import com.adsamcik.streamferry.ui.navigation.NavigationStatePolicy
+import com.adsamcik.streamferry.ui.navigation.NavigationStatePolicy.PlaybackBackBehavior
 import com.adsamcik.streamferry.ui.navigation.NavigationStatePolicy.TopLevelDestination
 import com.adsamcik.streamferry.ui.screens.AboutScreen
 import com.adsamcik.streamferry.ui.screens.DiagnosticsScreen
@@ -696,8 +697,17 @@ private fun backActionFor(state: AppUiState, viewModel: MainViewModel): (() -> U
         }
         viewModel.navigate(target)
     })
-    // Back returns to browsing while the session continues. Stop remains an explicit playback action.
-    Route.PLAYBACK -> ({ viewModel.navigate(Route.GALLERY) })
+    Route.PLAYBACK -> when (
+        NavigationStatePolicy.playbackBackBehavior(
+            isReconnecting = state.playback?.reconnecting == true,
+            isTerminal = state.playback?.isTerminal == true,
+        )
+    ) {
+        // Back returns to browsing while a real TV session continues.
+        PlaybackBackBehavior.BACKGROUND -> ({ viewModel.navigate(Route.GALLERY) })
+        // A disconnected/failed TV has nothing useful to keep in the background.
+        PlaybackBackBehavior.STOP -> viewModel::stopPlayback
+    }
     Route.DOWNLOADS -> ({
         val safeOrigin = NavigationStatePolicy.sanitizeDownloadsOrigin(
             state.downloadsBackRoute,

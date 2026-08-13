@@ -2,6 +2,7 @@ package com.adsamcik.streamferry.ui.navigation
 
 import com.adsamcik.streamferry.domain.MediaSourceIds
 import com.adsamcik.streamferry.ui.navigation.NavigationStatePolicy.Availability
+import com.adsamcik.streamferry.ui.navigation.NavigationStatePolicy.PlaybackBackBehavior
 import com.adsamcik.streamferry.ui.navigation.NavigationStatePolicy.TopLevelDestination
 import com.adsamcik.streamferry.ui.state.Route
 import kotlin.test.Test
@@ -10,6 +11,22 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class NavigationStatePolicyTest {
+
+    @Test
+    fun `playback back only preserves a connected non-terminal session`() {
+        assertEquals(
+            PlaybackBackBehavior.BACKGROUND,
+            NavigationStatePolicy.playbackBackBehavior(isReconnecting = false, isTerminal = false),
+        )
+        assertEquals(
+            PlaybackBackBehavior.STOP,
+            NavigationStatePolicy.playbackBackBehavior(isReconnecting = true, isTerminal = false),
+        )
+        assertEquals(
+            PlaybackBackBehavior.STOP,
+            NavigationStatePolicy.playbackBackBehavior(isReconnecting = false, isTerminal = true),
+        )
+    }
 
     @Test
     fun `downloads captures stable origins without creating a self loop`() {

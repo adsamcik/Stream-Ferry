@@ -5,6 +5,11 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class PlaybackControlPolicyTest {
+    @Test fun `teardown never waits for a known disconnected renderer`() {
+        assertTrue(PlaybackTeardownPolicy.shouldSendRendererStop(connectionLost = false))
+        assertFalse(PlaybackTeardownPolicy.shouldSendRendererStop(connectionLost = true))
+    }
+
     @Test fun `playing paused and buffering sessions remain controllable`() {
         listOf(PlaybackPhase.PLAYING, PlaybackPhase.PAUSED, PlaybackPhase.BUFFERING).forEach { phase ->
             val controls = PlaybackControlPolicy.evaluate(phase, durationSeconds = 3_600L)

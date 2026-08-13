@@ -186,6 +186,9 @@ class MainViewModel(
     private var scanJob: Job? = null
     @Volatile private var reconnecting = false
     @Volatile private var playbackStarting = false
+    // User stop dismisses Now Playing immediately while renderer/proxy cleanup finishes. Ignore any stale
+    // status emitted by a canceled reconnect during that short teardown window.
+    @Volatile private var playbackStopping = false
     // True while an end-of-media or explicit queue skip is handing off to the next item. Guards the
     // status->null "ended" branch so the mini-player and playback screen do not flicker away mid-handoff.
     @Volatile private var autoAdvancing = false
@@ -253,6 +256,7 @@ class MainViewModel(
         // Live playback status from the engine (position, buffering, adaptive bitrate, throughput).
         viewModelScope.launch {
             container.playbackEngine.status.collect { status ->
+                if (playbackStopping) return@collect
                 if (status != null) {
                     lastPlaybackPositionSeconds = status.positionSeconds
                     // The engine may have probed a missing SAF/MediaStore duration. Retain that authoritative
@@ -2896,20 +2900,34 @@ class MainViewModel(
         }
     }
 
-    fun stopPlayback() = viewModelScope.launch {
-        cancelReconnect()
-        onlinePlaybackOwner = null
-        reconnectContext = null
-        pendingResumeDeviceContext = null
-        saveResumeNow()
-        runCatching { container.playbackEngine.stop() }
-        _state.update { it.copy(route = Route.GALLERY, playback = null, nowPlayingItem = null) }
-        // Persist the playback session's events now so they're in a report even if the app is later
-        // killed, and refresh the resume row from the server's updated position.
-        container.flushDiagnostics()
-        // The server now has an updated resume point for what we just watched — reconcile every cached
-        // gallery representation rather than only the Continue Watching row.
-        refreshGalleryAfterPlaybackReport()
+    fun stopPlayback() {
+        if (playbackStopping) return
+        playbackStopping = true
+        viewModelScope.launch {
+            cancelReconnect()
+            onlinePlaybackOwner = null
+            reconnectContext = null
+            pendingResumeDeviceContext = null
+            saveResumeNow()
+            // Leaving a disconnected TV must feel like leaving, even if best-effort cleanup still has remote
+            // reporting to finish. The status collector is suppressed until teardown completes.
+            _state.update { it.copy(route = Route.GALLERY, playback = null, nowPlayingItem = null) }
+            try {
+                container.playbackEngine.stop()
+            } catch (c: CancellationException) {
+                throw c
+            } catch (error: Exception) {
+                container.logger.w("playback", "Playback cleanup after user stop failed", error)
+            } finally {
+                playbackStopping = false
+            }
+            // Persist the playback session's events now so they're in a report even if the app is later
+            // killed, and refresh the resume row from the server's updated position.
+            container.flushDiagnostics()
+            // The server now has an updated resume point for what we just watched — reconcile every cached
+            // gallery representation rather than only the Continue Watching row.
+            refreshGalleryAfterPlaybackReport()
+        }
     }
 
     // ----- auto-reconnect after an unexpected renderer disconnect -----

@@ -8,6 +8,8 @@ internal object NavigationStatePolicy {
 
     enum class TopLevelDestination { LIBRARY, SETTINGS }
 
+    enum class PlaybackBackBehavior { BACKGROUND, STOP }
+
     data class Availability(
         val hasActivePlayback: Boolean = false,
         val hasSelectedItem: Boolean = false,
@@ -30,6 +32,14 @@ internal object NavigationStatePolicy {
             TopLevelDestination.SETTINGS
         else -> TopLevelDestination.LIBRARY
     }
+
+    /**
+     * Back normally leaves an active TV session running behind the mini-player. Once the renderer is
+     * disconnected, however, there is no playback to preserve; leaving Now Playing should also dismiss
+     * recovery (or its terminal error) and release the local session.
+     */
+    fun playbackBackBehavior(isReconnecting: Boolean, isTerminal: Boolean): PlaybackBackBehavior =
+        if (isReconnecting || isTerminal) PlaybackBackBehavior.STOP else PlaybackBackBehavior.BACKGROUND
 
     /** Reopening Downloads keeps its previous safe origin instead of pointing Back at itself. */
     fun captureDownloadsOrigin(

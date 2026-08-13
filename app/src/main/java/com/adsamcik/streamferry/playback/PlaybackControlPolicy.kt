@@ -34,3 +34,8 @@ object PlaybackControlPolicy {
         )
     }
 }
+
+/** Teardown decisions kept pure so a known-dead renderer can never delay local session cleanup. */
+internal object PlaybackTeardownPolicy {
+    fun shouldSendRendererStop(connectionLost: Boolean): Boolean = !connectionLost
+}
