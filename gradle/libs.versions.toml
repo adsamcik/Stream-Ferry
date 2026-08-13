@@ -12,7 +12,7 @@ activityCompose = "1.13.0"
 # The alpha BOM is required for the official Material 3 Expressive theme, motion scheme, and
 # morphing loading indicator. Keep the whole Compose stack aligned instead of pinning Material 3
 # independently against an older Compose runtime.
-composeBom = "2026.07.01"
+composeBom = "2026.08.00"
 
 # Google Cast Sender SDK (Google Play services).
 castFramework = "22.3.1"
@@ -30,7 +30,7 @@ serialization = "1.11.0"
 coil = "2.7.0"
 
 # On-device hardware transcoding (AndroidX Media3 Transformer; resolves from google()).
-media3 = "1.10.1"
+media3 = "1.11.0"
 
 # Testing.
 junit = "4.13.2"
