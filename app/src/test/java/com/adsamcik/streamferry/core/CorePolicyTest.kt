@@ -5,6 +5,7 @@ import com.adsamcik.streamferry.core.dlna.SecureXml
 import com.adsamcik.streamferry.core.dlna.SsdpCandidateRejection
 import com.adsamcik.streamferry.core.dlna.SsdpParser
 import com.adsamcik.streamferry.core.hls.HlsRewriter
+import com.adsamcik.streamferry.core.metadata.MetadataSanitizer
 import java.nio.charset.StandardCharsets
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -96,6 +97,17 @@ class CorePolicyTest {
             byteSeekable = true,
         )
         assertTrue(xml.contains("DLNA.ORG_OP=01"))
+    }
+
+    @Test fun didlBoundsTitleBeforeXmlEscaping() {
+        val xml = DidlLite.build(
+            proxyUrl = "http://10.0.0.5/stream",
+            title = "&".repeat(10_000),
+            mimeType = "video/mp4",
+        )
+
+        val encodedTitle = xml.substringAfter("<dc:title>").substringBefore("</dc:title>")
+        assertEquals("&amp;".repeat(MetadataSanitizer.MAX_RECEIVER_TITLE_UTF8_BYTES), encodedTitle)
     }
 
     // --- SSDP parsing ---

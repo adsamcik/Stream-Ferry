@@ -1,5 +1,7 @@
 package com.adsamcik.streamferry.core.dlna
 
+import com.adsamcik.streamferry.core.metadata.MetadataSanitizer
+
 /**
  * DIDL-Lite metadata for AVTransport SetAVTransportURI (§11).
  *
@@ -24,6 +26,7 @@ object DidlLite {
         dlnaProfile: String? = null,
         durationSecs: Long? = null,
     ): String {
+        val safeTitle = MetadataSanitizer.receiverTitle(title)
         val protocolInfo = buildString {
             append("http-get:*:").append(mimeType).append(':')
             if (dlnaProfile != null) {
@@ -41,7 +44,7 @@ object DidlLite {
             """xmlns:dc="http://purl.org/dc/elements/1.1/" """ +
             """xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">""" +
             """<item id="0" parentID="-1" restricted="1">""" +
-            """<dc:title>${escape(title)}</dc:title>""" +
+            """<dc:title>${escape(safeTitle)}</dc:title>""" +
             """<upnp:class>object.item.videoItem</upnp:class>""" +
             """<res protocolInfo="$protocolInfo"$durationAttr>${escape(proxyUrl)}</res>""" +
             """</item></DIDL-Lite>"""
