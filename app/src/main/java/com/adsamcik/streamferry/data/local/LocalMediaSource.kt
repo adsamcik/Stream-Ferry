@@ -1,6 +1,7 @@
 package com.adsamcik.streamferry.data.local
 
 import android.content.ContentUris
+import android.content.ContentResolver
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -35,10 +36,10 @@ class LocalMediaSource(
     private val logger: DiagnosticsLogger,
     private val hasAllMediaAccess: () -> Boolean,
     private val hasSelectedMediaAccess: () -> Boolean,
+    private val resolver: ContentResolver = context.applicationContext.contentResolver,
 ) : MediaSource {
 
     private val appContext = context.applicationContext
-    private val resolver get() = appContext.contentResolver
 
     override val id: String = MediaSourceIds.LOCAL
     override val displayName: String = "On this device"
@@ -68,8 +69,24 @@ class LocalMediaSource(
     }
 
     fun removeRoot(rootId: String) {
+        val tracked = rootId in store.folders() || rootId in store.files()
         store.removeFolder(rootId)
         store.removeFile(rootId)
+        if (!tracked) return
+
+        runCatching {
+            val rootUri = Uri.parse(rootId)
+            resolver.persistedUriPermissions
+                .filter { it.uri == rootUri }
+                .forEach { permission ->
+                    var flags = 0
+                    if (permission.isReadPermission) flags = flags or Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    if (permission.isWritePermission) flags = flags or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                    if (flags != 0) resolver.releasePersistableUriPermission(rootUri, flags)
+                }
+        }.onFailure {
+            logger.w("local", "Could not release a removed local-media permission")
+        }
     }
 
     private fun persist(uri: Uri) {
