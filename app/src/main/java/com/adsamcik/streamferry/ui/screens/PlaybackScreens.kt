@@ -38,6 +38,7 @@ import androidx.compose.material.icons.automirrored.rounded.VolumeUp
 import androidx.compose.material.icons.rounded.Audiotrack
 import androidx.compose.material.icons.rounded.Cast
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.Forward30
 import androidx.compose.material.icons.rounded.SkipNext
 import androidx.compose.material.icons.rounded.GraphicEq
@@ -149,6 +150,9 @@ import com.adsamcik.streamferry.ui.components.ExpressiveLoadingIndicator
 import com.adsamcik.streamferry.ui.state.AppUiState
 import com.adsamcik.streamferry.ui.state.JellyfinItemAvailability
 import com.adsamcik.streamferry.ui.state.PlaybackUiState
+import com.adsamcik.streamferry.ui.state.displayedIsPlaying
+import com.adsamcik.streamferry.ui.state.displayedPositionSeconds
+import com.adsamcik.streamferry.ui.state.displayedVolume
 import com.adsamcik.streamferry.ui.theme.StreamFerryTheme
 import kotlinx.coroutines.delay
 import kotlin.math.PI
@@ -542,6 +546,8 @@ fun PlaybackScreen(state: AppUiState, viewModel: MainViewModel) {
         val nowPlaying = state.nowPlayingItem
         val title = nowPlaying?.title ?: p.mediaTitle
         val chapters = nowPlaying?.chapters.orEmpty()
+        val showingControlIssue = p.errorMessage == null && p.controls.issue != null
+        val feedbackMessage = p.errorMessage ?: p.controls.issue?.message
         val previewUrlFor: (Int) -> String? = { index ->
             nowPlaying?.let { viewModel.chapterImageUrl(it, index, CHAPTER_PREVIEW_WIDTH_PX) }
         }
@@ -572,8 +578,13 @@ fun PlaybackScreen(state: AppUiState, viewModel: MainViewModel) {
                     verticalArrangement = Arrangement.spacedBy(if (compactHeight) 8.dp else 12.dp),
                 ) {
                     NowPlayingHero(p, mediaTitle = title, compact = compactHeight)
-                    p.errorMessage?.let {
-                        PlaybackIssueBanner(it, onOpenOptions = { showOptions = true }, compact = compactHeight)
+                    feedbackMessage?.let {
+                        PlaybackIssueBanner(
+                            message = it,
+                            onOpenOptions = if (showingControlIssue) null else ({ showOptions = true }),
+                            onDismiss = if (showingControlIssue) viewModel::dismissPlaybackControlIssue else null,
+                            compact = compactHeight,
+                        )
                     }
                     PlaybackQuickActions(
                         p = p,
@@ -604,8 +615,13 @@ fun PlaybackScreen(state: AppUiState, viewModel: MainViewModel) {
                 verticalArrangement = Arrangement.spacedBy(if (compactHeight) 6.dp else 10.dp),
             ) {
                 NowPlayingHero(p, mediaTitle = title, compact = true)
-                p.errorMessage?.let {
-                    PlaybackIssueBanner(it, onOpenOptions = { showOptions = true }, compact = true)
+                feedbackMessage?.let {
+                    PlaybackIssueBanner(
+                        message = it,
+                        onOpenOptions = if (showingControlIssue) null else ({ showOptions = true }),
+                        onDismiss = if (showingControlIssue) viewModel::dismissPlaybackControlIssue else null,
+                        compact = true,
+                    )
                 }
                 PlaybackTimelineControls(
                     p = p,
@@ -661,9 +677,13 @@ private fun PlaybackTimelineControls(
 }
 
 @Composable
-private fun PlaybackIssueBanner(message: String, onOpenOptions: () -> Unit, compact: Boolean) {
+private fun PlaybackIssueBanner(
+    message: String,
+    onOpenOptions: (() -> Unit)?,
+    onDismiss: (() -> Unit)?,
+    compact: Boolean,
+) {
     Card(
-        onClick = onOpenOptions,
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(if (compact) 18.dp else 22.dp),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
@@ -673,7 +693,11 @@ private fun PlaybackIssueBanner(message: String, onOpenOptions: () -> Unit, comp
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            Icon(Icons.Rounded.Tune, contentDescription = null, tint = MaterialTheme.colorScheme.onErrorContainer)
+            Icon(
+                Icons.Rounded.ErrorOutline,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onErrorContainer,
+            )
             Text(
                 message,
                 style = MaterialTheme.typography.bodySmall,
@@ -682,12 +706,16 @@ private fun PlaybackIssueBanner(message: String, onOpenOptions: () -> Unit, comp
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f),
             )
-            Text(
-                "Options",
-                style = MaterialTheme.typography.labelLarge,
-                fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.onErrorContainer,
-            )
+            onOpenOptions?.let { openOptions ->
+                IconButton(onClick = openOptions) {
+                    Icon(Icons.Rounded.Tune, contentDescription = "Playback options")
+                }
+            }
+            onDismiss?.let { dismiss ->
+                IconButton(onClick = dismiss) {
+                    Icon(Icons.Rounded.Close, contentDescription = "Dismiss playback message")
+                }
+            }
         }
     }
 }
@@ -1001,23 +1029,6 @@ private fun PlaybackOptionsSheet(
                     )
                 }
             }
-            p.errorMessage?.let { message ->
-                item(key = "playback-options-error") {
-                    Surface(
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(20.dp),
-                        color = MaterialTheme.colorScheme.errorContainer,
-                        contentColor = MaterialTheme.colorScheme.onErrorContainer,
-                    ) {
-                        Text(message, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(16.dp))
-                    }
-                }
-            }
-            if (p.audioTracks.size > 1 || p.subtitleTracks.isNotEmpty()) {
-                item(key = "playback-options-tracks") {
-                    TrackControls(p, viewModel)
-                }
-            }
             item(key = "playback-options-adaptive") {
                 TvOutputCard(
                     p = p,
@@ -1267,7 +1278,7 @@ private fun SeekScrubber(
                 Box(Modifier.fillMaxWidth().height(26.dp)) {
                     WaveBar(
                         fraction = shown,
-                        playing = p.isPlaying && !dragging,
+                        playing = p.displayedIsPlaying && !dragging,
                         indeterminate = duration == null,
                         modifier = Modifier.fillMaxSize(),
                     )
@@ -1528,6 +1539,8 @@ private fun TransportControls(
 ) {
     val duration = p.durationSeconds?.takeIf { it > 0 }
     val controls = PlaybackControlPolicy.evaluate(p.phase, duration)
+    val displayedPlaying = p.displayedIsPlaying
+    val awaitingTv = p.controls.playPause != null || controls.isTransitioning
     val interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
     val pressed by interactionSource.collectIsPressedAsState()
     val playScale by animateFloatAsState(
@@ -1563,16 +1576,22 @@ private fun TransportControls(
             },
             shape = CircleShape,
         ) {
-            if (controls.isTransitioning) {
-                CircularProgressIndicator(
-                    modifier = Modifier.size(if (compact) 32.dp else 38.dp),
-                    strokeWidth = 3.dp,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.55f),
-                )
-            } else {
+            Box(contentAlignment = Alignment.Center) {
+                if (awaitingTv) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(if (compact) 62.dp else 74.dp),
+                        strokeWidth = 3.dp,
+                        color = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.65f),
+                    )
+                }
                 Icon(
-                    if (p.isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
-                    contentDescription = if (p.isPlaying) "Pause" else "Play",
+                    if (displayedPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
+                    contentDescription = when {
+                        p.controls.playPause != null && displayedPlaying -> "Play requested; tap to pause"
+                        p.controls.playPause != null -> "Pause requested; tap to play"
+                        displayedPlaying -> "Pause"
+                        else -> "Play"
+                    },
                     modifier = Modifier.size(if (compact) 40.dp else 48.dp),
                 )
             }
@@ -1592,64 +1611,37 @@ private fun TransportControls(
 private fun VolumeControl(p: PlaybackUiState, viewModel: MainViewModel, compact: Boolean = false) {
     // Drive the device volume only when the user releases the slider — onValueChange fires ~60x/s during
     // a drag, which would flood a DLNA renderer (one blocking SOAP call each) and delay other commands.
-    // Local drag state keeps the thumb + percentage responsive while dragging.
+    // Local drag state keeps the thumb responsive while dragging.
     var dragging by remember { mutableStateOf(false) }
     var dragValue by remember { mutableFloatStateOf(p.volume) }
-    val shown = (if (dragging) dragValue else p.volume).coerceIn(0f, 1f)
+    val shown = (if (dragging) dragValue else p.displayedVolume).coerceIn(0f, 1f)
     Card(shape = RoundedCornerShape(if (compact) 18.dp else 22.dp), modifier = Modifier.fillMaxWidth()) {
         Row(
             Modifier.fillMaxWidth().padding(horizontal = if (compact) 12.dp else 16.dp, vertical = if (compact) 2.dp else 8.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Icon(Icons.AutoMirrored.Rounded.VolumeDown, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            Box(modifier = Modifier.size(36.dp), contentAlignment = Alignment.Center) {
+                if (p.controls.volume != null && !dragging) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(32.dp),
+                        strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.primary.copy(alpha = 0.65f),
+                    )
+                }
+                Icon(
+                    if (shown < 0.5f) Icons.AutoMirrored.Rounded.VolumeDown else Icons.AutoMirrored.Rounded.VolumeUp,
+                    contentDescription = "TV volume ${(shown * 100).roundToInt()} percent",
+                    modifier = Modifier.size(22.dp),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
             Slider(
                 value = shown,
                 onValueChange = { dragging = true; dragValue = it },
                 onValueChangeFinished = { dragging = false; viewModel.setVolume(dragValue) },
                 modifier = Modifier.weight(1f),
             )
-            Icon(Icons.AutoMirrored.Rounded.VolumeUp, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
-            Text(
-                "${(shown * 100).toInt()}%",
-                style = MaterialTheme.typography.labelLarge,
-                textAlign = TextAlign.End,
-                modifier = Modifier.width(44.dp),
-            )
-        }
-    }
-}
-
-@Composable
-private fun TrackControls(p: PlaybackUiState, viewModel: MainViewModel) {
-    // Only for online (Jellyfin) playback that reports selectable tracks. Audio shows only when there's a
-    // real choice (>1 track); subtitles always offer "Off" plus any languages the media carries.
-    val showAudio = p.audioTracks.size > 1
-    val showSubtitles = p.subtitleTracks.isNotEmpty()
-    if (!showAudio && !showSubtitles) return
-    Card(shape = RoundedCornerShape(22.dp), modifier = Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            if (showAudio) {
-                val current = p.audioTracks.firstOrNull { it.index == p.currentAudioIndex }
-                PickerRow(
-                    icon = Icons.Rounded.Audiotrack,
-                    label = "Audio",
-                    selectedLabel = current?.label ?: "Default",
-                    options = p.audioTracks.map { it.index to it.label },
-                    onSelect = { viewModel.selectAudioTrack(it) },
-                )
-            }
-            if (showSubtitles) {
-                val current = p.subtitleTracks.firstOrNull { it.index == p.currentSubtitleIndex }
-                PickerRow(
-                    icon = Icons.Rounded.Subtitles,
-                    label = "Subtitles",
-                    selectedLabel = current?.label ?: "Off",
-                    // "Off" (null) first, then each subtitle language. A chosen subtitle is burned in.
-                    options = listOf<Pair<Int?, String>>(null to "Off") + p.subtitleTracks.map { it.index to it.label },
-                    onSelect = { viewModel.selectSubtitleTrack(it) },
-                )
-            }
         }
     }
 }
@@ -1815,11 +1807,13 @@ private fun resolutionLabel(heightPx: Int): String = when {
  */
 @Composable
 private fun rememberSmoothPosition(p: PlaybackUiState): State<Long> {
-    val shown = remember { mutableLongStateOf(p.positionSeconds) }
-    LaunchedEffect(p.positionSeconds, p.isPlaying, p.isBuffering, p.durationSeconds) {
-        shown.longValue = p.positionSeconds
-        if (p.isPlaying && !p.isBuffering) {
-            val base = p.positionSeconds
+    val displayedPosition = p.displayedPositionSeconds
+    val displayedPlaying = p.displayedIsPlaying
+    val shown = remember { mutableLongStateOf(displayedPosition) }
+    LaunchedEffect(displayedPosition, displayedPlaying, p.isBuffering, p.durationSeconds) {
+        shown.longValue = displayedPosition
+        if (displayedPlaying && !p.isBuffering) {
+            val base = displayedPosition
             val startMs = SystemClock.elapsedRealtime()
             while (true) {
                 delay(250)

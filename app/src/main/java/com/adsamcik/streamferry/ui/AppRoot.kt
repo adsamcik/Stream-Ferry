@@ -40,6 +40,7 @@ import androidx.compose.material.icons.rounded.Tv
 import androidx.compose.material.icons.rounded.VideoLibrary
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.Icon
@@ -103,6 +104,8 @@ import com.adsamcik.streamferry.ui.screens.ServersScreen
 import com.adsamcik.streamferry.ui.screens.TargetPickerScreen
 import com.adsamcik.streamferry.ui.screens.WelcomeScreen
 import com.adsamcik.streamferry.ui.state.AppUiState
+import com.adsamcik.streamferry.ui.state.displayedIsPlaying
+import com.adsamcik.streamferry.ui.state.displayedPositionSeconds
 import com.adsamcik.streamferry.ui.state.Route
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -459,7 +462,8 @@ private fun MiniPlayer(
     val queueSize = state.playlist.entries.size
     val duration = playback.durationSeconds?.takeIf { it > 0 }
     val controls = PlaybackControlPolicy.evaluate(playback.phase, duration)
-    val progress = duration?.let { (playback.positionSeconds.toFloat() / it).coerceIn(0f, 1f) }
+    val displayedPlaying = playback.displayedIsPlaying
+    val progress = duration?.let { (playback.displayedPositionSeconds.toFloat() / it).coerceIn(0f, 1f) }
     val animatedProgress by animateFloatAsState(
         targetValue = progress ?: 0f,
         animationSpec = MaterialTheme.motionScheme.defaultEffectsSpec(),
@@ -550,15 +554,29 @@ private fun MiniPlayer(
                         enabled = controls.canPlayPause,
                         modifier = Modifier.size(if (compact) 40.dp else 48.dp),
                     ) {
-                        AnimatedContent(
-                            targetState = playback.isPlaying,
-                            transitionSpec = { fadeIn(effectsMotion).togetherWith(fadeOut(effectsMotion)) },
-                            label = "mini player play state",
-                        ) { isPlaying ->
-                            Icon(
-                                if (isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
-                                contentDescription = if (isPlaying) "Pause" else "Play",
-                            )
+                        Box(contentAlignment = Alignment.Center) {
+                            if (playback.controls.playPause != null) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(if (compact) 32.dp else 40.dp),
+                                    strokeWidth = 2.dp,
+                                    color = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.65f),
+                                )
+                            }
+                            AnimatedContent(
+                                targetState = displayedPlaying,
+                                transitionSpec = { fadeIn(effectsMotion).togetherWith(fadeOut(effectsMotion)) },
+                                label = "mini player play state",
+                            ) { isPlaying ->
+                                Icon(
+                                    if (isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
+                                    contentDescription = when {
+                                        playback.controls.playPause != null && isPlaying -> "Play requested; tap to pause"
+                                        playback.controls.playPause != null -> "Pause requested; tap to play"
+                                        isPlaying -> "Pause"
+                                        else -> "Play"
+                                    },
+                                )
+                            }
                         }
                     }
                 }

@@ -2205,13 +2205,26 @@ class MainViewModel(
             return
         }
         container.logger.w("playback", "Couldn't $operation on the TV", error)
-        val message = "Couldn't $operation on the TV. Please try again."
+        val message = "Couldn't $operation on the TV. Try again."
+        val commandId = ++playbackControlCommandSequence
         _state.update { current ->
-            current.copy(
-                errorMessage = message,
-                playback = current.playback?.copy(errorMessage = message),
-            )
+            current.copy(playback = current.playback?.let { playback ->
+                playback.copy(
+                    controls = PlaybackControlStatePolicy.fail(
+                        playback.controls,
+                        PlaybackControlKind.OPTIONS,
+                        commandId,
+                        message,
+                    ),
+                )
+            })
         }
+    }
+
+    fun dismissPlaybackControlIssue() = _state.update { current ->
+        current.copy(playback = current.playback?.let { playback ->
+            playback.copy(controls = PlaybackControlStatePolicy.clearIssue(playback.controls))
+        })
     }
 
     /** Switch the audio track (null = server default). Re-resolves the stream, so recover an expired token. */
