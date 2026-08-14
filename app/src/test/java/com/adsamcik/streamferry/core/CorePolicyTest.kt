@@ -31,6 +31,33 @@ class CorePolicyTest {
         assertTrue(out.contains("#EXTINF:6.0,"))
     }
 
+    @Test fun rejectsPlaylistWhenProxyUrlsExceedOutputBudget() {
+        val rewriter = HlsRewriter(
+            proxyBase = "http://10.0.0.5:5000/session/ID",
+            maxOutputChars = 128,
+        )
+        val playlist = buildString {
+            appendLine("#EXTM3U")
+            repeat(4) { appendLine("a") }
+        }
+
+        assertFailsWith<IllegalArgumentException> {
+            rewriter.rewrite(playlist) { "opaque-token" }
+        }
+    }
+
+    @Test fun appliesOutputBudgetWhileRewritingTagAttributes() {
+        val rewriter = HlsRewriter(
+            proxyBase = "http://10.0.0.5:5000/session/ID",
+            maxOutputChars = 128,
+        )
+        val playlist = "#EXT-X-MEDIA:URI=\"a\",URI=\"b\",URI=\"c\""
+
+        assertFailsWith<IllegalArgumentException> {
+            rewriter.rewrite(playlist) { "opaque-token" }
+        }
+    }
+
     // --- DIDL-Lite ---
     @Test fun didlEscapesAndUsesProxyUrlOnly() {
         val xml = DidlLite.build(
