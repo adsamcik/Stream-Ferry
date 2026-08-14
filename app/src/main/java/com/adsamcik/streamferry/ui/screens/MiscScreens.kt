@@ -180,7 +180,8 @@ fun DiagnosticsScreen(
                 Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("Report an issue", style = MaterialTheme.typography.titleMedium)
                     Text(
-                        "Everything here is redacted — no tokens, URLs, or IDs leave your device.",
+                        "Credentials and sensitive connection details are redacted. " +
+                            "Report details leave your device only when you choose to share them.",
                         style = MaterialTheme.typography.bodySmall,
                     )
                     Button(
