@@ -10,9 +10,21 @@ package com.adsamcik.streamferry.core.dlna
 class SsdpDiscoveryLimiter(
     val maxDescribes: Int = DEFAULT_MAX_DESCRIBES,
     val maxPerSource: Int = DEFAULT_MAX_PER_SOURCE,
+    val maxTraceKeys: Int = DEFAULT_MAX_TRACE_KEYS,
 ) {
     private var totalDescribes = 0
     private val perSource = HashMap<String, Int>()
+    private val traceKeys = HashSet<String>()
+
+    init {
+        require(maxDescribes > 0)
+        require(maxPerSource > 0)
+        require(maxTraceKeys > 0)
+    }
+
+    /** Probe the description budget without consuming it or retaining a new source address. */
+    fun hasDescribeCapacity(sourceIp: String): Boolean =
+        totalDescribes < maxDescribes && perSource.getOrDefault(sourceIp, 0) < maxPerSource
 
     /**
      * Whether a `describe()` for a renderer advertised from [sourceIp] is permitted this scan. Counts
@@ -20,16 +32,24 @@ class SsdpDiscoveryLimiter(
      * the per-source cap is a refinement against an unspoofed flood.
      */
     fun allowDescribe(sourceIp: String): Boolean {
-        if (totalDescribes >= maxDescribes) return false
+        if (!hasDescribeCapacity(sourceIp)) return false
         val used = perSource.getOrDefault(sourceIp, 0)
-        if (used >= maxPerSource) return false
         perSource[sourceIp] = used + 1
         totalDescribes += 1
+        return true
+    }
+
+    /** Retain and trace each diagnostic key at most once, up to a fixed per-scan cap. */
+    fun allowTrace(category: String, key: String): Boolean {
+        val combined = category + '\u0000' + key
+        if (combined in traceKeys || traceKeys.size >= maxTraceKeys) return false
+        traceKeys += combined
         return true
     }
 
     companion object {
         const val DEFAULT_MAX_DESCRIBES = 16
         const val DEFAULT_MAX_PER_SOURCE = 4
+        const val DEFAULT_MAX_TRACE_KEYS = 64
     }
 }

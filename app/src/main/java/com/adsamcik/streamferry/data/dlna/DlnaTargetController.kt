@@ -189,8 +189,6 @@ class DlnaTargetController(
             )
 
             val buf = ByteArray(SsdpParser.MAX_MESSAGE_LEN + 1)
-            val tracedUsns = HashSet<String>()
-            val tracedRejections = HashSet<String>()
             while (remainingMillis() > 0) {
                 s.soTimeout = minOf(remainingMillis(), SSDP_RECEIVE_SLICE_MS).coerceAtLeast(1).toInt()
                 val packet = DatagramPacket(buf, buf.size)
@@ -214,14 +212,14 @@ class DlnaTargetController(
                     continue
                 }
                 parsedPackets += 1
-                if (tracedUsns.add(msg.usn ?: msg.location ?: "?")) {
+                if (limiter.allowTrace("reply", msg.usn ?: msg.location ?: "?")) {
                     logger.trace(TAG, "SSDP <- mediaRenderer=${msg.isMediaRenderer()} usn=${msg.usn} loc=${msg.location}")
                 }
                 val rejection = msg.candidateRejection()
                 if (rejection != null) {
                     rejectionCounts[rejection] = rejectionCounts.getOrDefault(rejection, 0) + 1
                     val rejectionKey = (msg.usn ?: msg.location ?: msg.startLine) + "|" + rejection.name
-                    if (tracedRejections.add(rejectionKey)) {
+                    if (limiter.allowTrace("rejection", rejectionKey)) {
                         logger.trace(TAG, "SSDP candidate rejected: " + rejection.diagnostic)
                     }
                     continue
@@ -230,6 +228,13 @@ class DlnaTargetController(
                 val sourceIp = sourceAddress.hostAddress ?: "unknown"
                 val identity = msg.usn?.trim().orEmpty()
                 val location = msg.location?.trim().orEmpty()
+                if (!limiter.hasDescribeCapacity(sourceIp)) {
+                    floodLimitedCandidates += 1
+                    if (limiter.allowTrace("limit", sourceIp)) {
+                        logger.trace(TAG, "SSDP describe rate-limited (flood guard)")
+                    }
+                    continue
+                }
                 when (candidates.register(identity, location, sourceIp)) {
                     SsdpCandidateRegistry.Decision.DUPLICATE -> {
                         duplicateCandidates += 1
@@ -237,8 +242,15 @@ class DlnaTargetController(
                     }
                     SsdpCandidateRegistry.Decision.RENDERER_LIMIT -> {
                         rendererLimitedCandidates += 1
-                        if (tracedRejections.add(identity + "|candidate-limit")) {
+                        if (limiter.allowTrace("renderer-limit", identity)) {
                             logger.trace(TAG, "SSDP renderer candidate limit reached")
+                        }
+                        continue
+                    }
+                    SsdpCandidateRegistry.Decision.SCAN_LIMIT -> {
+                        floodLimitedCandidates += 1
+                        if (limiter.allowTrace("limit", "candidate-scan")) {
+                            logger.trace(TAG, "SSDP candidate scan limit reached")
                         }
                         continue
                     }
@@ -246,7 +258,9 @@ class DlnaTargetController(
                 }
                 if (!limiter.allowDescribe(sourceIp)) {
                     floodLimitedCandidates += 1
-                    logger.trace(TAG, "SSDP describe rate-limited (flood guard)")
+                    if (limiter.allowTrace("limit", sourceIp)) {
+                        logger.trace(TAG, "SSDP describe rate-limited (flood guard)")
+                    }
                     continue
                 }
                 descriptionJobs += async {
