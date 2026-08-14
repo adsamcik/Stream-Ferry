@@ -261,6 +261,11 @@ class PlaybackEngine(
     // (or a short window expires), so the phone reflects a seek immediately and holds it steadily.
     @Volatile private var seekSettleTargetSeconds: Long? = null
     @Volatile private var seekSettleUntilMs = 0L
+    // A load request carrying a non-zero start position is not complete until the renderer confirms it.
+    // Cast can acknowledge the request while starting elsewhere; DLNA applies it with a deferred seek.
+    // Keep one protocol-neutral, bounded correction intent so phone and TV cannot silently diverge.
+    @Volatile private var pendingRendererResumePosition: PendingRendererResumePosition? = null
+    private var rendererLoadGeneration = 0L
     // True while we are intentionally tearing down and reloading the upstream stream (an HLS seek or an
     // adaptive bitrate switch). During that window the renderer briefly reports the OLD stream as
     // "finished", which must NOT be treated as end-of-media (it would stop the freshly-reloaded stream).
@@ -932,6 +937,7 @@ class PlaybackEngine(
         pendingRecoveryKind = null
         // Arm before load as well as after it: Cast can synchronously deliver an initial position callback
         // while the load result is being awaited, and that pre-position status must not snap resume to zero.
+        armRendererResumeVerification(reportedPositionSeconds)
         armRendererStartSettle(reportedPositionSeconds)
         tgt.load(
             url,
@@ -980,6 +986,9 @@ class PlaybackEngine(
     private suspend fun seekToLocked(absoluteSeconds: Long) {
         requireLocalNetworkAccess()
         val t = target ?: return
+        // A user/media-session seek is newer than any load-time resume correction still waiting for a
+        // renderer status. Clear it before issuing the command so recovery can never fight the user.
+        pendingRendererResumePosition = null
         val duration = currentInfo?.runtimeSeconds ?: item?.runtimeSeconds ?: localPlayback?.runtimeSeconds
         val pos = PlaybackPositionPolicy.clamp(absoluteSeconds, duration)
         smartResume.noteSeekRequested(pos)
@@ -1404,6 +1413,17 @@ class PlaybackEngine(
         seekSettleUntilMs = clock() + SEEK_SETTLE_WINDOW_MS
     }
 
+    /** Start a fresh confirmation window for one renderer load, invalidating any older correction job. */
+    private fun armRendererResumeVerification(positionSeconds: Long) {
+        val generation = ++rendererLoadGeneration
+        pendingRendererResumePosition = positionSeconds.takeIf { it > 0L }?.let {
+            PendingRendererResumePosition(
+                loadGeneration = generation,
+                expectedPositionSeconds = it,
+            )
+        }
+    }
+
     /**
      * Remember a receiver limitation only after a controller supplied explicit decode/source-not-supported
      * evidence for a direct-play stream. A generic load exception, proxy failure, idle error, or watchdog
@@ -1556,6 +1576,7 @@ class PlaybackEngine(
         )
         val attemptGeneration = recoverySession.generation
         pendingRecoveryKind = null
+        armRendererResumeVerification(loadStart)
         if (!serverSideStart) armRendererStartSettle(loadStart)
         target.load(
             url,
@@ -2074,6 +2095,72 @@ class PlaybackEngine(
         seekTo(segments[idx].endSeconds)
     }
 
+    /**
+     * Confirm a non-zero load position using the renderer's first PLAYING status. A mismatching Cast load
+     * is corrected only after the new media is active, avoiding the load/seek race that drops an immediate
+     * post-load seek. The same backstop also verifies DLNA after its controller-owned deferred resume seek.
+     */
+    private fun verifyRendererResumePosition(
+        source: PlaybackTargetController,
+        event: PlaybackTargetEvent.StatusChanged,
+    ) {
+        val pending = pendingRendererResumePosition ?: return
+        when (val action = RendererResumePositionPolicy.evaluate(
+            pending,
+            reportedPositionSeconds = event.positionSeconds,
+            isPlaying = event.isPlaying,
+        )) {
+            RendererResumePositionAction.Wait -> Unit
+            RendererResumePositionAction.Confirmed -> {
+                if (pendingRendererResumePosition === pending) {
+                    pendingRendererResumePosition = null
+                    logger.event(
+                        "playback",
+                        "Renderer confirmed resume near ${pending.expectedPositionSeconds}s",
+                    )
+                }
+            }
+            is RendererResumePositionAction.Correct -> {
+                val correcting = RendererResumePositionPolicy.correctionStarted(pending)
+                if (pendingRendererResumePosition !== pending) return
+                pendingRendererResumePosition = correcting
+                logger.w(
+                    "playback",
+                    "Renderer started at ${event.positionSeconds}s instead of ${action.positionSeconds}s; " +
+                        "correcting resume (${correcting.correctionsIssued}/${RendererResumePositionPolicy.MAX_CORRECTIONS})",
+                )
+                scope.launch {
+                    mutex.withLock {
+                        if (source !== target || pendingRendererResumePosition !== correcting) return@withLock
+                        try {
+                            source.seekTo(action.positionSeconds)
+                        } catch (c: CancellationException) {
+                            throw c
+                        } catch (error: Exception) {
+                            logger.w("playback", "Renderer resume correction failed", error)
+                        }
+                        if (pendingRendererResumePosition === correcting) {
+                            pendingRendererResumePosition = RendererResumePositionPolicy.correctionFinished(correcting)
+                        }
+                    }
+                }
+            }
+            RendererResumePositionAction.GiveUp -> {
+                if (pendingRendererResumePosition === pending) {
+                    pendingRendererResumePosition = null
+                    controlErrorMessage =
+                        "The TV couldn't resume at ${pending.expectedPositionSeconds}s. Try seeking again."
+                    logger.w(
+                        "playback",
+                        "Renderer did not honor resume at ${pending.expectedPositionSeconds}s after " +
+                            "${pending.correctionsIssued} corrections",
+                    )
+                    publishStatus()
+                }
+            }
+        }
+    }
+
     private fun onTargetEvent(source: PlaybackTargetController, event: PlaybackTargetEvent) {
         if (source !== target) {
             logger.w(TAG, "Ignoring event from a replaced playback controller")
@@ -2090,6 +2177,7 @@ class PlaybackEngine(
                 publishStatus()
             }
             is PlaybackTargetEvent.StatusChanged -> {
+                verifyRendererResumePosition(source, event)
                 val incomingAbsolute = streamStartSeconds + event.positionSeconds
                 if (SeekSettle.shouldHold(
                         seekSettleTargetSeconds, incomingAbsolute, clock(), seekSettleUntilMs, SEEK_SETTLE_TOLERANCE_SECONDS,
@@ -2193,6 +2281,7 @@ class PlaybackEngine(
             }
             is PlaybackTargetEvent.Disconnected -> {
                 isPlaying = false
+                pendingRendererResumePosition = null
                 smartResume.checkpoint(SmartResumeCheckpointKind.DISCONNECTED)
                 // An unexpected drop of an ACTIVE session. A deliberate user stop cancels eventsJob
                 // BEFORE disconnecting the target (stopInternalLocked), so this handler never runs for a
@@ -2411,6 +2500,7 @@ class PlaybackEngine(
         streamStartSeconds = 0
         reportedPositionSeconds = 0
         seekSettleTargetSeconds = null
+        pendingRendererResumePosition = null
         manualQuality = false
         manualMaxVideoHeight = null
         lastThroughputBps = 0
