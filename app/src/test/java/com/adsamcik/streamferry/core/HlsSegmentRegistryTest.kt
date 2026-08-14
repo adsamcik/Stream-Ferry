@@ -57,4 +57,40 @@ class HlsSegmentRegistryTest {
         assertTrue(o1b != o1)
         assertEquals("u1", r.resolve(o1b))
     }
+
+    @Test fun batchRetainsEveryMappingItReturns() {
+        val r = HlsSegmentRegistry(maxEntries = 3)
+        val oldest = r.encode("oldest")
+        r.encode("unprotected-1")
+        r.encode("unprotected-2")
+
+        val batch = r.encodeBatch(listOf("oldest", "new-1", "new-2"))
+
+        assertEquals(oldest, batch.getValue("oldest"))
+        assertEquals(3, r.size())
+        batch.forEach { (url, opaque) -> assertEquals(url, r.resolve(opaque)) }
+    }
+
+    @Test fun oversizedBatchRejectsWithoutChangingExistingMappings() {
+        val r = HlsSegmentRegistry(maxEntries = 2)
+        val first = r.encode("first")
+        val second = r.encode("second")
+
+        kotlin.test.assertFailsWith<IllegalArgumentException> {
+            r.encodeBatch(listOf("new-1", "new-2", "new-3"))
+        }
+
+        assertEquals("first", r.resolve(first))
+        assertEquals("second", r.resolve(second))
+        assertEquals(2, r.size())
+    }
+
+    @Test fun batchDeduplicatesUrlsBeforeApplyingCapacity() {
+        val r = HlsSegmentRegistry(maxEntries = 1)
+
+        val batch = r.encodeBatch(listOf("same", "same"))
+
+        assertEquals(1, batch.size)
+        assertEquals("same", r.resolve(batch.getValue("same")))
+    }
 }

@@ -58,6 +58,21 @@ class CorePolicyTest {
         }
     }
 
+    @Test fun hlsUriPreflightUsesTheSamePlainAndAttributeReferencesAsRewrite() {
+        val rewriter = HlsRewriter("http://10.0.0.5:5000/session/ID")
+        val playlist = """
+            #EXTM3U
+            #EXT-X-KEY:METHOD=AES-128,URI="key"
+            segment
+            segment
+        """.trimIndent()
+
+        assertEquals(listOf("key", "segment"), rewriter.uriReferences(playlist, maxDistinct = 2))
+        assertFailsWith<IllegalArgumentException> {
+            rewriter.uriReferences("a\nb\nc\n", maxDistinct = 2)
+        }
+    }
+
     // --- DIDL-Lite ---
     @Test fun didlEscapesAndUsesProxyUrlOnly() {
         val xml = DidlLite.build(

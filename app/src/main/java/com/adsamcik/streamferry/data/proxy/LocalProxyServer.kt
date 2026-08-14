@@ -423,10 +423,16 @@ class LocalProxyServer(
                 val body = bodyBytes.toString(Charsets.UTF_8)
                 val proxyBase = "http://$boundAddress:$boundPort/session/${session.id}"
                 val rewritten = runCatching {
-                    HlsRewriter(proxyBase).rewrite(body) { uri ->
+                    val rewriter = HlsRewriter(proxyBase)
+                    val rawReferences = rewriter.uriReferences(body, registry.capacity)
+                    val resolvedByRaw = rawReferences.associateWith { uri ->
                         val nestedUrl = originPolicy.resolve(uri, resolvedResourceUrl)
                             ?: throw IllegalArgumentException("Untrusted HLS URI")
-                        registry.encode(nestedUrl.toString())
+                        nestedUrl.toString()
+                    }
+                    val encodedByUrl = registry.encodeBatch(resolvedByRaw.values)
+                    rewriter.rewrite(body) { uri ->
+                        encodedByUrl.getValue(resolvedByRaw.getValue(uri))
                     }
                 }.getOrElse {
                     writeStatus(out, 502, "Bad Gateway")

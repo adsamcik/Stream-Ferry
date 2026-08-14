@@ -27,7 +27,7 @@ class HlsSegmentRegistry(
     }
 
     private val byUrl = HashMap<String, String>()
-    private val byOpaque = object : LinkedHashMap<String, String>(64, 0.75f, false) {
+    private val byOpaque = object : LinkedHashMap<String, String>(64, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>): Boolean {
             val over = size > maxEntries
             if (over) byUrl.remove(eldest.value)
@@ -38,11 +38,41 @@ class HlsSegmentRegistry(
     /** Map [upstreamUrl] to a stable opaque token, creating one on first use. */
     @Synchronized
     fun encode(upstreamUrl: String): String {
-        byUrl[upstreamUrl]?.let { return it }
+        byUrl[upstreamUrl]?.let { opaque ->
+            byOpaque[opaque] // Promote a mapping that is still actively used.
+            return opaque
+        }
         val opaque = newOpaque()
         byOpaque[opaque] = upstreamUrl // may evict the eldest entry (and clean byUrl)
         byUrl[upstreamUrl] = opaque
         return opaque
+    }
+
+    /**
+     * Atomically maps one playlist's distinct resolved URLs. Existing mappings keep stable tokens and
+     * are promoted before missing mappings are inserted, so an accepted batch can never evict itself.
+     */
+    @Synchronized
+    fun encodeBatch(upstreamUrls: Iterable<String>): Map<String, String> {
+        val protectedUrls = LinkedHashSet<String>().apply { addAll(upstreamUrls) }
+        require(protectedUrls.size <= maxEntries) { "HLS playlist exceeds the URI mapping limit" }
+
+        val encoded = LinkedHashMap<String, String>(protectedUrls.size)
+        protectedUrls.forEach { upstreamUrl ->
+            byUrl[upstreamUrl]?.let { opaque ->
+                byOpaque[opaque] // Promote all protected existing mappings ahead of any insertion.
+                encoded[upstreamUrl] = opaque
+            }
+        }
+        protectedUrls.forEach { upstreamUrl ->
+            if (upstreamUrl !in encoded) {
+                val opaque = newOpaque()
+                byOpaque[opaque] = upstreamUrl // only older, unprotected entries can be evicted
+                byUrl[upstreamUrl] = opaque
+                encoded[upstreamUrl] = opaque
+            }
+        }
+        return encoded
     }
 
     /** Resolve an opaque token back to the real upstream URL, or null if unknown/evicted. */
@@ -52,10 +82,15 @@ class HlsSegmentRegistry(
     @Synchronized
     fun size(): Int = byOpaque.size
 
+    val capacity: Int get() = maxEntries
+
     private fun newOpaque(): String {
-        val bytes = ByteArray(OPAQUE_BYTES)
-        random.nextBytes(bytes)
-        return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
+        while (true) {
+            val bytes = ByteArray(OPAQUE_BYTES)
+            random.nextBytes(bytes)
+            val opaque = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
+            if (opaque !in byOpaque) return opaque
+        }
     }
 
     companion object {

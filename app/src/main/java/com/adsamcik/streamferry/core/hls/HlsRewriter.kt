@@ -41,6 +41,29 @@ class HlsRewriter(
         return output.toString()
     }
 
+    /** Returns the distinct URI references that [rewrite] will encode, in encounter order. */
+    fun uriReferences(playlist: String, maxDistinct: Int): List<String> {
+        require(maxDistinct >= 1) { "maxDistinct must be >= 1" }
+        val references = LinkedHashSet<String>()
+
+        fun add(rawUri: String) {
+            references += rawUri
+            if (references.size > maxDistinct) {
+                throw IllegalArgumentException("HLS playlist exceeds the URI mapping limit")
+            }
+        }
+
+        playlist.lineSequence().forEach { line ->
+            val trimmed = line.trim()
+            when {
+                trimmed.isEmpty() -> Unit
+                trimmed.startsWith("#") -> uriAttr.findAll(line).forEach { add(it.groupValues[1]) }
+                else -> add(trimmed)
+            }
+        }
+        return references.toList()
+    }
+
     private val uriAttr = Regex("URI=\"([^\"]*)\"")
 
     private fun appendRewrittenTagUris(
