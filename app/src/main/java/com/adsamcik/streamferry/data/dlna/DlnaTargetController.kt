@@ -111,6 +111,7 @@ class DlnaTargetController(
 
     private val pollScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var pollJob: Job? = null
+    private val pollSessionGate = DlnaPollSessionGate()
     // Signalled after a local control (seek/play/pause) so the status poll wakes early instead of waiting a
     // full interval — the phone then reflects the change within ~a SOAP round-trip. CONFLATED: a burst of
     // controls collapses to a single wake.
@@ -588,6 +589,7 @@ class DlnaTargetController(
      */
     private fun startPolling() {
         stopPolling()
+        val pollToken = pollSessionGate.begin()
         pollJob = pollScope.launch {
             var everPlayed = false
             var furthestPositionSeconds = 0L
@@ -606,10 +608,12 @@ class DlnaTargetController(
                 val info = runCatching { transportInfo(r) }
                     .onFailure { logger.trace(TAG, "GetTransportInfo failed: ${it.javaClass.simpleName}") }
                     .getOrNull()
+                if (!isActive || !pollSessionGate.isCurrent(pollToken)) break
                 val state = info?.state
                 val position = runCatching { positionSeconds(r) }
                     .onFailure { logger.trace(TAG, "GetPositionInfo failed: ${it.javaClass.simpleName}") }
                     .getOrNull()
+                if (!isActive || !pollSessionGate.isCurrent(pollToken)) break
                 if (state == null && position == null) {
                     // The renderer became unreachable (network blip / TV powered off). After a few
                     // consecutive failures treat it as an UNEXPECTED disconnect so the app auto-reconnects
@@ -617,7 +621,7 @@ class DlnaTargetController(
                     // isActive so a teardown-cancelled poll doesn't emit a stale event.
                     if (++consecutiveFailures >= MAX_POLL_FAILURES) {
                         logger.w("dlna", "DLNA renderer unreachable after $consecutiveFailures polls — treating as a disconnect")
-                        if (isActive) _events.tryEmit(PlaybackTargetEvent.Disconnected)
+                        emitPollEvent(pollToken, PlaybackTargetEvent.Disconnected)
                         break
                     }
                     continue
@@ -626,7 +630,7 @@ class DlnaTargetController(
                 if (state != null && state != lastState) {
                     logger.event("dlna", "DLNA transport state ${lastState ?: "?"} -> $state")
                     lastState = state
-                    lastTransportState = state
+                    pollSessionGate.commit(pollToken) { lastTransportState = state }
                 }
                 intervalMs = if (state == "PLAYING" || state == "TRANSITIONING") POLL_INTERVAL_MS else POLL_IDLE_INTERVAL_MS
                 // A direct-play resume/reload asked to start at a position: now that the renderer is
@@ -642,27 +646,37 @@ class DlnaTargetController(
                             "(attempt ${pendingResume.failedAttempts + 1}/${DlnaResumeSeekPolicy.MAX_ATTEMPTS})",
                     )
                     seekMutex.withLock {
+                        if (!isActive || !pollSessionGate.isCurrent(pollToken)) return@withLock
                         // The user may have issued a newer seek while this poll was reading transport state.
                         // In that case the explicit seek cleared/replaced this exact object; do nothing.
                         if (pendingResumeSeek === pendingResume) {
                             runCatching { seekRendererToUnlocked(target) }
                                 .onSuccess {
-                                    pendingResumeSeek = null
-                                    // The position read above predates this seek. Do not emit it and make the
-                                    // phone briefly claim resume restarted at zero; the next poll confirms it.
-                                    suppressPreSeekPosition = true
+                                    pollSessionGate.commit(pollToken) {
+                                        if (pendingResumeSeek === pendingResume) {
+                                            pendingResumeSeek = null
+                                            // The position read above predates this seek. Do not emit it and make the
+                                            // phone briefly claim resume restarted at zero; the next poll confirms it.
+                                            suppressPreSeekPosition = true
+                                        }
+                                    }
                                 }
                                 .onFailure { failure ->
                                     val retry = DlnaResumeSeekPolicy.afterFailure(pendingResume)
-                                    pendingResumeSeek = retry
-                                    logger.w("dlna", "DLNA resume seek failed", failure)
-                                    if (retry == null) {
-                                        _events.tryEmit(
-                                            PlaybackTargetEvent.ControlError(
-                                                "The TV started the video but couldn't resume at ${DidlLite.formatDuration(target)}. " +
-                                                    "Try seeking again.",
-                                            ),
-                                        )
+                                    pollSessionGate.commit(pollToken) {
+                                        if (pendingResumeSeek === pendingResume) pendingResumeSeek = retry
+                                    }
+                                    if (pollSessionGate.isCurrent(pollToken)) {
+                                        logger.w("dlna", "DLNA resume seek failed", failure)
+                                        if (retry == null) {
+                                            emitPollEvent(
+                                                pollToken,
+                                                PlaybackTargetEvent.ControlError(
+                                                    "The TV started the video but couldn't resume at ${DidlLite.formatDuration(target)}. " +
+                                                        "Try seeking again.",
+                                                ),
+                                            )
+                                        }
                                     }
                                 }
                         }
@@ -670,7 +684,7 @@ class DlnaTargetController(
                 }
                 if (position != null && !suppressPreSeekPosition) {
                     furthestPositionSeconds = maxOf(furthestPositionSeconds, position)
-                    _events.tryEmit(PlaybackTargetEvent.StatusChanged(position, isPlaying = state == "PLAYING"))
+                    emitPollEvent(pollToken, PlaybackTargetEvent.StatusChanged(position, isPlaying = state == "PLAYING"))
                 }
                 // The renderer couldn't decode the media: UPnP reports CurrentTransportStatus=ERROR_OCCURRED
                 // (often while parked in STOPPED, with no push callback of its own). Surface it so the engine
@@ -678,7 +692,10 @@ class DlnaTargetController(
                 // support, so an optimistic direct-play can fail here just as it can on Cast.
                 if (info?.status == "ERROR_OCCURRED") {
                     logger.w("dlna", "DLNA transport status=ERROR_OCCURRED — treating as a FORMAT failure")
-                    if (isActive) _events.tryEmit(PlaybackTargetEvent.Error(PlaybackFailureKind.FORMAT, "DLNA playback error"))
+                    emitPollEvent(
+                        pollToken,
+                        PlaybackTargetEvent.Error(PlaybackFailureKind.FORMAT, "DLNA playback error"),
+                    )
                     break
                 }
                 if (state == "PLAYING" || state == "TRANSITIONING") everPlayed = true
@@ -693,18 +710,18 @@ class DlnaTargetController(
                     // old stream down) — the STOPPED is the teardown, not a real finish. tryEmit isn't a
                     // suspension point, so without this guard a cancelled mid-iteration poll could still
                     // emit a stale Ended that stops the freshly-reloaded stream.
-                    if (isActive) {
-                        when (terminalOutcome) {
-                            DlnaTerminalStatePolicy.Outcome.COMPLETED -> {
+                    when (terminalOutcome) {
+                        DlnaTerminalStatePolicy.Outcome.COMPLETED -> {
+                            if (emitPollEvent(pollToken, PlaybackTargetEvent.Ended)) {
                                 logger.event("dlna", "DLNA end-of-media near ${loadedDurationSeconds}s")
-                                _events.tryEmit(PlaybackTargetEvent.Ended)
                             }
-                            DlnaTerminalStatePolicy.Outcome.STOPPED -> {
-                                logger.event("dlna", "DLNA renderer stopped at ${furthestPositionSeconds}s")
-                                _events.tryEmit(PlaybackTargetEvent.Stopped)
-                            }
-                            DlnaTerminalStatePolicy.Outcome.NONE -> Unit
                         }
+                        DlnaTerminalStatePolicy.Outcome.STOPPED -> {
+                            if (emitPollEvent(pollToken, PlaybackTargetEvent.Stopped)) {
+                                logger.event("dlna", "DLNA renderer stopped at ${furthestPositionSeconds}s")
+                            }
+                        }
+                        DlnaTerminalStatePolicy.Outcome.NONE -> Unit
                     }
                     break
                 }
@@ -713,9 +730,13 @@ class DlnaTargetController(
     }
 
     private fun stopPolling() {
+        pollSessionGate.invalidate()
         pollJob?.cancel()
         pollJob = null
     }
+
+    private fun emitPollEvent(token: Long, event: PlaybackTargetEvent): Boolean =
+        pollSessionGate.commit(token) { _events.tryEmit(event) }
 
     private fun positionSeconds(r: Renderer): Long? {
         val resp = soap(r.avTransport, "GetPositionInfo", "<InstanceID>0</InstanceID>")
