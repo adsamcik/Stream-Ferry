@@ -2124,6 +2124,7 @@ class PlaybackEngine(
                 val correcting = RendererResumePositionPolicy.correctionStarted(pending)
                 if (pendingRendererResumePosition !== pending) return
                 pendingRendererResumePosition = correcting
+                armRendererStartSettle(streamStartSeconds + action.positionSeconds)
                 logger.w(
                     "playback",
                     "Renderer started at ${event.positionSeconds}s instead of ${action.positionSeconds}s; " +
