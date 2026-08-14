@@ -159,6 +159,10 @@ data class PlaybackUiState(
     val targetName: String,
     val protocol: String,
     val mediaTitle: String = "",
+    /** TV-originated transport/timeline revision. Command acceptance alone never advances it. */
+    val rendererPlaybackRevision: Long = 0L,
+    /** TV-read volume revision, kept separate so a volume read cannot confirm a transport intent. */
+    val rendererVolumeRevision: Long = 0L,
     val isPlaying: Boolean = false,
     val isBuffering: Boolean = false,
     val positionSeconds: Long = 0,
@@ -208,6 +212,8 @@ data class PlaybackUiState(
     val currentSubtitleIndex: Int? = null,
     /** Label for a skippable segment covering the current position (e.g. "Skip intro"), or null. */
     val skipSegmentLabel: String? = null,
+    /** Responsive user intent layered over the renderer-confirmed values above. */
+    val controls: PlaybackControlUiState = PlaybackControlUiState(),
 )
 
 /** Compact now-playing snapshot for the diagnostics page (no secrets). */

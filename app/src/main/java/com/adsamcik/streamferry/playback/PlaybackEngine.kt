@@ -77,6 +77,9 @@ import kotlinx.coroutines.sync.withLock
 data class PlaybackStatus(
     val targetName: String,
     val protocolName: String,
+    /** Advance only when the corresponding state is read from the TV. */
+    val rendererPlaybackRevision: Long = 0L,
+    val rendererVolumeRevision: Long = 0L,
     val isPlaying: Boolean,
     val isBuffering: Boolean,
     val positionSeconds: Long,
@@ -255,6 +258,8 @@ class PlaybackEngine(
     @Volatile private var reportedPositionSeconds = 0L
     @Volatile private var isPlaying = false
     @Volatile private var isBuffering = false
+    private val rendererPlaybackRevision = java.util.concurrent.atomic.AtomicLong(0L)
+    private val rendererVolumeRevision = java.util.concurrent.atomic.AtomicLong(0L)
     // After a seek we optimistically show the target position; a status poll that was already in flight when
     // the seek was issued (esp. DLNA, which polls the renderer) can report the OLD position and snap the
     // scrubber backward. Ignore contradicting reports until the renderer confirms a position near the target
@@ -684,7 +689,6 @@ class PlaybackEngine(
         isPlaying = true
         controlErrorMessage = null
         reportJellyfinProgressSoon()
-        publishStatus()
     }
 
     suspend fun pause() = mutex.withLock {
@@ -699,7 +703,6 @@ class PlaybackEngine(
         controlErrorMessage = null
         smartResume.checkpoint(SmartResumeCheckpointKind.PAUSED)
         reportJellyfinProgressSoon()
-        publishStatus()
     }
 
     /** Seek by a relative amount (used by UI, keyboard/media-button, and notification skip actions). */
@@ -720,6 +723,13 @@ class PlaybackEngine(
         val requested = level.coerceIn(0f, 1f)
         t.setVolume(requested)
         rendererVolume = rendererVolume.acceptExplicit(requested)
+        val reported = runCatching { t.readCurrentVolume() }
+            .onFailure { logger.w(TAG, "TV accepted a volume command but did not confirm its level", it) }
+            .getOrNull()
+        if (reported != null) {
+            rendererVolume = rendererVolume.acceptReported(reported)
+            rendererVolumeRevision.incrementAndGet()
+        }
         publishStatus()
     }
 
@@ -733,6 +743,7 @@ class PlaybackEngine(
             .onFailure { logger.w(TAG, "Couldn't read the TV's current volume", it) }
             .getOrNull()
         rendererVolume = rendererVolume.acceptReported(reported)
+        if (reported != null) rendererVolumeRevision.incrementAndGet()
         if (!volumeSynchronized) {
             logger.w(TAG, "TV did not report an initial volume; remote volume controls remain disabled")
             publishStatus()
@@ -2192,6 +2203,7 @@ class PlaybackEngine(
                 seekSettleTargetSeconds = null // no seek pending, confirmed near target, or window expired
                 reportedPositionSeconds = event.positionSeconds
                 isPlaying = event.isPlaying
+                rendererPlaybackRevision.incrementAndGet()
                 recoverySession = recoverySession.transition(if (event.isPlaying) PlaybackPhase.PLAYING else PlaybackPhase.PAUSED)
                 // Evidence the stream actually started playing on the TV — cancels the startup watchdog.
                 if (event.isPlaying || event.positionSeconds > 0) markPlaybackStarted()
@@ -2549,6 +2561,8 @@ class PlaybackEngine(
         _status.value = PlaybackStatus(
             targetName = sel.displayName,
             protocolName = sel.protocol.name,
+            rendererPlaybackRevision = rendererPlaybackRevision.get(),
+            rendererVolumeRevision = rendererVolumeRevision.get(),
             isPlaying = isPlaying,
             isBuffering = isBuffering,
             positionSeconds = absolutePositionSeconds,

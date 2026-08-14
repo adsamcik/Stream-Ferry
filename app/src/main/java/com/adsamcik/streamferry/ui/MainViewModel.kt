@@ -67,8 +67,12 @@ import com.adsamcik.streamferry.ui.state.DiagnosticsUiState
 import com.adsamcik.streamferry.ui.state.DownloadUiItem
 import com.adsamcik.streamferry.ui.state.JellyfinItemAvailability
 import com.adsamcik.streamferry.ui.state.NowPlayingDiagnostics
+import com.adsamcik.streamferry.ui.state.PlaybackControlKind
+import com.adsamcik.streamferry.ui.state.PlaybackControlStatePolicy
+import com.adsamcik.streamferry.ui.state.PlaybackControlUiState
 import com.adsamcik.streamferry.ui.state.PlaybackUiState
 import com.adsamcik.streamferry.ui.state.QuickConnectUiState
+import com.adsamcik.streamferry.ui.state.RendererPlaybackSnapshot
 import com.adsamcik.streamferry.ui.state.Route
 import com.adsamcik.streamferry.ui.state.toUiState
 import com.adsamcik.streamferry.ui.theme.ThemeMode
@@ -194,6 +198,8 @@ class MainViewModel(
     @Volatile private var autoAdvancing = false
     /** Monotonic session-local id: duplicate media entries remain independently removable/repeatable. */
     private var playlistEntrySequence = 0L
+    /** Rejects late completions/timeouts after a newer control intent supersedes an older one. */
+    private var playbackControlCommandSequence = 0L
     private var lastPlaybackPositionSeconds: Long = 0L
     // What to re-play on reconnect (Jellyfin online OR an on-device / downloaded local file). Set after a
     // successful play()/playLocal(), cleared on stop / a new play.
@@ -278,7 +284,7 @@ class MainViewModel(
                     // now-playing presentation mounted until the replacement has begun.
                     val retainingPlayback = playbackStarting || reconnecting || autoAdvancing
                     val ended = status == null && cur.route == Route.PLAYBACK && !retainingPlayback
-                    val ui = status?.toUi()?.copy(reconnecting = reconnecting)
+                    val ui = status?.toUi(cur.playback)?.copy(reconnecting = reconnecting)
                         ?: cur.playback?.takeIf { retainingPlayback }
                             ?.copy(reconnecting = reconnecting)
                     cur.copy(
@@ -2083,44 +2089,113 @@ class MainViewModel(
         }
     }
 
-    fun togglePlayPause() = viewModelScope.launch {
-        try {
-            container.playbackEngine.togglePlayPause()
-        } catch (c: CancellationException) {
-            throw c
-        } catch (e: Exception) {
-            handlePlaybackControlFailure("change playback", e)
+    fun togglePlayPause() {
+        val playback = _state.value.playback ?: return
+        val targetPlaying = !(playback.controls.playPause?.targetPlaying ?: playback.isPlaying)
+        val commandId = beginPlaybackControl(PlaybackControlKind.PLAY_PAUSE) { current, id ->
+            PlaybackControlStatePolicy.requestPlayPause(
+                current = current,
+                commandId = id,
+                targetPlaying = targetPlaying,
+                rendererRevision = playback.rendererPlaybackRevision,
+            )
+        }
+        viewModelScope.launch {
+            try {
+                if (targetPlaying) container.playbackEngine.resume() else container.playbackEngine.pause()
+            } catch (c: CancellationException) {
+                throw c
+            } catch (e: Exception) {
+                handlePlaybackControlFailure(PlaybackControlKind.PLAY_PAUSE, commandId, "change playback", e)
+            }
         }
     }
 
-    fun seekTo(positionSeconds: Long) = viewModelScope.launch {
-        try {
-            container.playbackEngine.seekTo(positionSeconds)
-        } catch (c: CancellationException) {
-            throw c
-        } catch (e: Exception) {
-            handlePlaybackControlFailure("seek", e)
+    fun seekTo(positionSeconds: Long) {
+        val playback = _state.value.playback ?: return
+        val target = PlaybackPositionPolicy.clamp(positionSeconds, playback.durationSeconds)
+        val commandId = beginPlaybackControl(PlaybackControlKind.SEEK) { current, id ->
+            PlaybackControlStatePolicy.requestSeek(
+                current = current,
+                commandId = id,
+                targetSeconds = target,
+                rendererRevision = playback.rendererPlaybackRevision,
+            )
+        }
+        viewModelScope.launch {
+            try {
+                container.playbackEngine.seekTo(target)
+            } catch (c: CancellationException) {
+                throw c
+            } catch (e: Exception) {
+                handlePlaybackControlFailure(PlaybackControlKind.SEEK, commandId, "seek", e)
+            }
         }
     }
 
-    fun adjustVolume(direction: Int) = viewModelScope.launch {
-        try {
-            container.playbackEngine.adjustVolume(direction)
-        } catch (c: CancellationException) {
-            throw c
-        } catch (e: Exception) {
-            handlePlaybackControlFailure("change volume", e)
+    fun adjustVolume(direction: Int) {
+        if (direction == 0) return
+        val playback = _state.value.playback ?: return
+        val base = playback.controls.volume?.targetLevel ?: playback.volume
+        val target = (base + direction.coerceIn(-1, 1) * REMOTE_VOLUME_STEP).coerceIn(0f, 1f)
+        val commandId = beginPlaybackControl(PlaybackControlKind.VOLUME) { current, id ->
+            PlaybackControlStatePolicy.requestVolume(current, id, target, playback.rendererVolumeRevision)
+        }
+        viewModelScope.launch {
+            try {
+                container.playbackEngine.adjustVolume(direction)
+            } catch (c: CancellationException) {
+                throw c
+            } catch (e: Exception) {
+                handlePlaybackControlFailure(PlaybackControlKind.VOLUME, commandId, "change volume", e)
+            }
         }
     }
 
-    fun setVolume(level: Float) = viewModelScope.launch {
-        try {
-            container.playbackEngine.setVolume(level)
-        } catch (c: CancellationException) {
-            throw c
-        } catch (e: Exception) {
-            handlePlaybackControlFailure("change volume", e)
+    fun setVolume(level: Float) {
+        val playback = _state.value.playback ?: return
+        val target = level.coerceIn(0f, 1f)
+        val commandId = beginPlaybackControl(PlaybackControlKind.VOLUME) { current, id ->
+            PlaybackControlStatePolicy.requestVolume(current, id, target, playback.rendererVolumeRevision)
         }
+        viewModelScope.launch {
+            try {
+                container.playbackEngine.setVolume(target)
+            } catch (c: CancellationException) {
+                throw c
+            } catch (e: Exception) {
+                handlePlaybackControlFailure(PlaybackControlKind.VOLUME, commandId, "change volume", e)
+            }
+        }
+    }
+
+    private fun beginPlaybackControl(
+        kind: PlaybackControlKind,
+        transition: (PlaybackControlUiState, Long) -> PlaybackControlUiState,
+    ): Long {
+        val commandId = ++playbackControlCommandSequence
+        _state.update { current ->
+            current.copy(playback = current.playback?.let { playback ->
+                playback.copy(controls = transition(playback.controls, commandId))
+            })
+        }
+        viewModelScope.launch {
+            delay(PLAYBACK_CONTROL_CONFIRMATION_TIMEOUT_MS)
+            val message = when (kind) {
+                PlaybackControlKind.PLAY_PAUSE -> "The TV didn't confirm the playback change. Try again."
+                PlaybackControlKind.SEEK -> "The TV didn't confirm the new position. Try again."
+                PlaybackControlKind.VOLUME -> "The TV didn't confirm the volume. Try again."
+                PlaybackControlKind.OPTIONS -> return@launch
+            }
+            _state.update { current ->
+                current.copy(playback = current.playback?.let { playback ->
+                    playback.copy(
+                        controls = PlaybackControlStatePolicy.fail(playback.controls, kind, commandId, message),
+                    )
+                })
+            }
+        }
+        return commandId
     }
 
     /** Surface sender-command failures instead of leaving an optimistic TV control state on screen. */
@@ -2202,13 +2277,42 @@ class MainViewModel(
         }
     }
 
-    fun skipBy(deltaSeconds: Long) = viewModelScope.launch {
-        try {
-            container.playbackEngine.skip(deltaSeconds)
-        } catch (c: CancellationException) {
-            throw c
-        } catch (e: Exception) {
-            handlePlaybackControlFailure("seek", e)
+    private fun handlePlaybackControlFailure(
+        kind: PlaybackControlKind,
+        commandId: Long,
+        operation: String,
+        error: Exception,
+    ) {
+        if (isSessionExpired(error)) {
+            handleSessionExpired()
+            return
+        }
+        container.logger.w("playback", "Couldn't $operation on the TV", error)
+        val message = "Couldn't $operation on the TV. Try again."
+        _state.update { current ->
+            current.copy(playback = current.playback?.let { playback ->
+                playback.copy(
+                    controls = PlaybackControlStatePolicy.fail(playback.controls, kind, commandId, message),
+                )
+            })
+        }
+    }
+
+    fun skipBy(deltaSeconds: Long) {
+        val playback = _state.value.playback ?: return
+        val base = playback.controls.seek?.targetSeconds ?: playback.positionSeconds
+        val target = PlaybackPositionPolicy.clamp(base + deltaSeconds, playback.durationSeconds)
+        val commandId = beginPlaybackControl(PlaybackControlKind.SEEK) { current, id ->
+            PlaybackControlStatePolicy.requestSeek(current, id, target, playback.rendererPlaybackRevision)
+        }
+        viewModelScope.launch {
+            try {
+                container.playbackEngine.skip(deltaSeconds)
+            } catch (c: CancellationException) {
+                throw c
+            } catch (e: Exception) {
+                handlePlaybackControlFailure(PlaybackControlKind.SEEK, commandId, "seek", e)
+            }
         }
     }
 
@@ -3600,13 +3704,45 @@ class MainViewModel(
         }
     }
 
-    private fun PlaybackStatus.toUi() = PlaybackUiState(
+    private fun PlaybackStatus.toUi(previous: PlaybackUiState?): PlaybackUiState {
+        val sameRendererSession = previous != null &&
+            previous.targetName == targetName &&
+            previous.protocol == protocolName &&
+            previous.mediaTitle == title
+        val acceptPlaybackState = !sameRendererSession ||
+            rendererPlaybackRevision > previous.rendererPlaybackRevision
+        val acceptVolumeState = !sameRendererSession ||
+            rendererVolumeRevision > previous.rendererVolumeRevision
+        val confirmedPlaying = if (acceptPlaybackState) isPlaying else previous.isPlaying
+        val confirmedPosition = if (acceptPlaybackState) positionSeconds else previous.positionSeconds
+        val confirmedVolume = if (acceptVolumeState) volume else previous.volume
+        val previousControls = previous?.controls?.takeIf { sameRendererSession }
+            ?: PlaybackControlUiState()
+        val controls = PlaybackControlStatePolicy.reconcile(
+            current = previousControls,
+            renderer = RendererPlaybackSnapshot(
+                playbackRevision = rendererPlaybackRevision,
+                volumeRevision = rendererVolumeRevision,
+                isPlaying = confirmedPlaying,
+                positionSeconds = confirmedPosition,
+                volume = confirmedVolume,
+            ),
+            keepPending = !connectionLost && !isTerminal && phase !in setOf(
+                PlaybackPhase.STOPPED,
+                PlaybackPhase.COMPLETED,
+                PlaybackPhase.FAILED,
+                PlaybackPhase.RECONNECTING,
+            ),
+        )
+        return PlaybackUiState(
         targetName = targetName,
         protocol = protocolName,
         mediaTitle = title,
-        isPlaying = isPlaying,
+        rendererPlaybackRevision = rendererPlaybackRevision,
+        rendererVolumeRevision = rendererVolumeRevision,
+        isPlaying = confirmedPlaying,
         isBuffering = isBuffering,
-        positionSeconds = positionSeconds,
+        positionSeconds = confirmedPosition,
         durationSeconds = durationSeconds,
         streamMode = streamMode,
         currentBitrateBps = currentBitrateBps,
@@ -3624,7 +3760,7 @@ class MainViewModel(
         videoBitrateBps = videoBitrateBps,
         sourceFormat = sourceFormat,
         outputFormat = outputFormat,
-        volume = volume,
+        volume = confirmedVolume,
         volumeSupported = volumeSupported,
         errorMessage = errorMessage,
         phase = phase,
@@ -3637,7 +3773,9 @@ class MainViewModel(
         currentAudioIndex = currentAudioIndex,
         currentSubtitleIndex = currentSubtitleIndex,
         skipSegmentLabel = skipSegment?.label,
-    )
+        controls = controls,
+        )
+    }
 
     private fun formatPosition(positionSeconds: Long, durationSeconds: Long?): String {
         val pos = formatSeconds(positionSeconds)
@@ -3659,6 +3797,8 @@ class MainViewModel(
         const val CAST_SCAN_MS = 4_000L
         const val DLNA_SCAN_MS = 6_000L
         const val QUICK_CONNECT_POLL_MS = 3_000L
+        const val PLAYBACK_CONTROL_CONFIRMATION_TIMEOUT_MS = 8_000L
+        const val REMOTE_VOLUME_STEP = 0.05f
         const val LIBRARY_ERROR = "Couldn't load your library. Check the connection and try again."
         const val SECURE_STORAGE_ERROR =
             "Couldn't update secure storage. Check available device storage, restart the app, and try again."
