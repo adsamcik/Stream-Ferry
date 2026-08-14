@@ -22,7 +22,9 @@ class LocalSourceStore(context: Context) {
     fun removeFile(uri: String) = mutate(KEY_FILES) { it.remove(uri) }
 
     fun clear() {
-        prefs.edit().remove(KEY_FOLDERS).remove(KEY_FILES).apply()
+        check(prefs.edit().remove(KEY_FOLDERS).remove(KEY_FILES).commit()) {
+            "Could not clear local-media roots"
+        }
     }
 
     private fun mutate(key: String, op: (MutableSet<String>) -> Unit) {

@@ -18,6 +18,7 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 import kotlin.test.assertFalse
+import kotlin.test.assertFailsWith
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
@@ -89,6 +90,42 @@ class LocalMediaSourceGrantTest {
 
         verify(exactly = 0) { resolver.persistedUriPermissions }
         verify(exactly = 0) { resolver.releasePersistableUriPermission(any(), any()) }
+    }
+
+    @Test fun clearPersistedAccessReleasesEveryGrantAndClearsRoots() {
+        val readRoot = Uri.parse("content://provider/tree/read")
+        val writeRoot = Uri.parse("content://provider/document/write")
+        store.addFolder(readRoot.toString())
+        store.addFile(writeRoot.toString())
+        every { resolver.persistedUriPermissions } returns listOf(
+            permission(readRoot, read = true),
+            permission(writeRoot, read = true, write = true),
+        )
+
+        source.clearPersistedAccess()
+
+        assertFalse(store.folders().isNotEmpty())
+        assertFalse(store.files().isNotEmpty())
+        verify {
+            resolver.releasePersistableUriPermission(readRoot, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            resolver.releasePersistableUriPermission(
+                writeRoot,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+            )
+        }
+    }
+
+    @Test fun clearPersistedAccessStillClearsRootsWhenAReleaseFails() {
+        val root = Uri.parse("content://provider/tree/root")
+        store.addFolder(root.toString())
+        every { resolver.persistedUriPermissions } returns listOf(permission(root, read = true))
+        every {
+            resolver.releasePersistableUriPermission(root, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        } throws SecurityException("provider refused")
+
+        assertFailsWith<IllegalStateException> { source.clearPersistedAccess() }
+
+        assertFalse(store.folders().isNotEmpty())
     }
 
     private fun permission(uri: Uri, read: Boolean, write: Boolean = false): UriPermission =

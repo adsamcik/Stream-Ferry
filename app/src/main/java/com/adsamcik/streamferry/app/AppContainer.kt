@@ -47,6 +47,7 @@ import com.adsamcik.streamferry.diagnostics.CrashReporter
 import com.adsamcik.streamferry.diagnostics.DiagnosticsEventLog
 import com.adsamcik.streamferry.diagnostics.DiagnosticsPreferences
 import com.adsamcik.streamferry.diagnostics.NetworkInfoProvider
+import com.adsamcik.streamferry.diagnostics.ReportShare
 import com.adsamcik.streamferry.domain.JellyfinLibraryScope
 import com.adsamcik.streamferry.domain.MediaLibraryRepository
 import com.adsamcik.streamferry.domain.MediaSource
@@ -131,7 +132,7 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
     }
 
     private val deviceId: String by lazy {
-        val prefs = appContext.getSharedPreferences("jellyfin_bridge_device", Context.MODE_PRIVATE)
+        val prefs = appContext.getSharedPreferences(DEVICE_PREFS, Context.MODE_PRIVATE)
         prefs.getString(KEY_DEVICE_ID, null) ?: UUID.randomUUID().toString()
             .also { prefs.edit().putString(KEY_DEVICE_ID, it).apply() }
     }
@@ -491,6 +492,13 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
         serverConfigStore.clear()
         libraryCache.clear()
         downloadStore.clear()
+        runCatching { localMediaSource.clearPersistedAccess() }
+            .onFailure { logger.w("privacy", "Could not fully clear local-media access") }
+        runCatching { ReportShare.clearCachedReports(appContext) }
+            .onFailure { logger.w("privacy", "Could not fully clear cached diagnostic reports") }
+        runCatching {
+            check(appContext.getSharedPreferences(DEVICE_PREFS, Context.MODE_PRIVATE).edit().clear().commit())
+        }.onFailure { logger.w("privacy", "Could not clear the persisted installation identifier") }
         runCatching { resumeStore.clear() }
         runCatching { smartResumeStore.clear() }
         runCatching { jellyfinWatchMutationStore.clear() }
@@ -517,6 +525,7 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
     }.getOrNull() ?: "0.1.0"
 
     private companion object {
+        const val DEVICE_PREFS = "jellyfin_bridge_device"
         const val KEY_DEVICE_ID = "device_id"
         const val LOCAL_NETWORK_PERMISSION_POLL_MS = 1_000L
         const val DIAGNOSTICS_FLUSH_INTERVAL_MS = 10_000L

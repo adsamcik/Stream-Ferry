@@ -2,6 +2,7 @@ package com.adsamcik.streamferry.diagnostics
 
 import android.content.Intent
 import android.net.Uri
+import java.io.File
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -9,6 +10,7 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 
 @RunWith(RobolectricTestRunner::class)
@@ -31,5 +33,16 @@ class ReportShareTest {
         assertEquals(uri, streamUri)
         assertEquals(uri, intent.clipData!!.getItemAt(0).uri)
         assertFalse(intent.extras!!.containsKey(Intent.EXTRA_TEXT))
+    }
+
+    @Test fun clearCachedReportsDeletesEveryExport() {
+        val context = RuntimeEnvironment.getApplication()
+        val directory = File(context.cacheDir, "shared-reports").apply { mkdirs() }
+        File(directory, "stream-ferry-report-one.txt").writeText("one")
+        File(directory, "stream-ferry-report-two.txt").writeText("two")
+
+        ReportShare.clearCachedReports(context)
+
+        assertFalse(directory.exists())
     }
 }

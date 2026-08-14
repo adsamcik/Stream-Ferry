@@ -35,6 +35,21 @@ object ReportShare {
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
 
+    /** Revoke outstanding report grants and remove every cached export during delete-all. */
+    fun clearCachedReports(context: Context) {
+        val directory = File(context.cacheDir, DIRECTORY)
+        var incomplete = false
+        directory.listFiles()?.forEach { file ->
+            runCatching {
+                val uri = FileProvider.getUriForFile(context, "${context.packageName}.reportshare", file)
+                context.revokeUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            if (!file.delete() && file.exists()) incomplete = true
+        }
+        if (directory.exists() && !directory.delete()) incomplete = true
+        check(!incomplete) { "Could not clear cached diagnostic reports" }
+    }
+
     private fun prune(directory: File) {
         directory.listFiles()
             ?.sortedByDescending { it.lastModified() }

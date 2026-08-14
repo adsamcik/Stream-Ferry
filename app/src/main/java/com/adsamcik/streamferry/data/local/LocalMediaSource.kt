@@ -89,6 +89,29 @@ class LocalMediaSource(
         }
     }
 
+    /** Relinquish every SAF capability held by the app and clear the corresponding local roots. */
+    fun clearPersistedAccess() {
+        var incomplete = false
+        val permissions = runCatching { resolver.persistedUriPermissions }
+            .getOrElse {
+                incomplete = true
+                emptyList()
+            }
+        permissions.forEach { permission ->
+            runCatching {
+                var flags = 0
+                if (permission.isReadPermission) flags = flags or Intent.FLAG_GRANT_READ_URI_PERMISSION
+                if (permission.isWritePermission) flags = flags or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                if (flags != 0) resolver.releasePersistableUriPermission(permission.uri, flags)
+            }.onFailure { incomplete = true }
+        }
+        runCatching { store.clear() }.onFailure { incomplete = true }
+        if (incomplete) {
+            logger.w("local", "Could not fully clear local-media permissions")
+            throw IllegalStateException("Could not fully clear local-media permissions")
+        }
+    }
+
     private fun persist(uri: Uri) {
         runCatching { resolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
     }
