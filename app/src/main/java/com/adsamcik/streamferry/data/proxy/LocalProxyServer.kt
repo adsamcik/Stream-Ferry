@@ -395,6 +395,27 @@ class LocalProxyServer(
                 return
             }
             val contentType = resp.header("Content-Type")
+            if (resp.code == 416) {
+                val totalLength = upstreamRange?.let {
+                    UpstreamRangeVerifier.unsatisfiedTotal(resp.code, resp.headers("Content-Range"))
+                }
+                if (totalLength == null) {
+                    writeStatus(out, 502, "Bad Gateway")
+                    logger.w(TAG, "HLS upstream returned an invalid unsatisfied range")
+                    return
+                }
+                val mime = contentType ?: guessSegmentMime(resolvedResourceUrl.toString())
+                writeHeaders(
+                    out,
+                    HttpResponsePlan.plan(
+                        RangeParseResult.Unsatisfiable(totalLength),
+                        totalLength,
+                        mime,
+                        head,
+                    ),
+                )
+                return
+            }
             val playlist = looksLikePlaylist(resolvedResourceUrl.toString(), contentType)
             val responseValid = when {
                 playlist -> upstreamRange == null && resp.code == 200
@@ -592,7 +613,11 @@ class LocalProxyServer(
                 openUpstreamUrl(session.id, url, session.upstreamAuthHeader, rangeHeaderValue, originPolicy)
             }
             val response = result.getOrNull()
-            if (response != null && UpstreamRetry.isSuccess(response.code)) return response
+            if (response != null && (
+                    UpstreamRetry.isSuccess(response.code) ||
+                        (response.code == 416 && rangeHeaderValue != null)
+                    )
+            ) return response
             val code = response?.code
             response?.let(::closeUpstream)
             val timedOut = result.exceptionOrNull() is java.io.InterruptedIOException // incl. SocketTimeoutException

@@ -13,6 +13,10 @@ object UpstreamRangeVerifier {
         """^bytes\s+(\d+)-(\d+)/(\d+)$""",
         RegexOption.IGNORE_CASE,
     )
+    private val UNSATISFIED_CONTENT_RANGE = Regex(
+        """^bytes\s+\*/(\d+)$""",
+        RegexOption.IGNORE_CASE,
+    )
     private val REQUEST_RANGE = Regex(
         """^bytes=(\d*)-(\d*)$""",
         RegexOption.IGNORE_CASE,
@@ -64,6 +68,13 @@ object UpstreamRangeVerifier {
                     spanLength(actual.start, actual.endInclusive) == minOf(suffixLength, actual.totalLength)
             }
         }
+    }
+
+    /** Return the proven entity length from a canonical unsatisfied-range response. */
+    fun unsatisfiedTotal(statusCode: Int, contentRanges: List<String>): Long? {
+        if (statusCode != 416 || contentRanges.size != 1) return null
+        val match = UNSATISFIED_CONTENT_RANGE.matchEntire(contentRanges.single().trim()) ?: return null
+        return match.groupValues[1].toLongOrNull()
     }
 
     private fun parseContentRange(
