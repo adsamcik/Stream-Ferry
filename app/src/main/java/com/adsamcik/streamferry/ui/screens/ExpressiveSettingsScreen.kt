@@ -39,6 +39,7 @@ import androidx.compose.material.icons.rounded.DarkMode
 import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.FastForward
 import androidx.compose.material.icons.rounded.HighQuality
+import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.PlayCircle
 import androidx.compose.material.icons.rounded.Restore
 import androidx.compose.material.icons.rounded.Subtitles
@@ -113,6 +114,7 @@ fun ExpressiveSettingsScreen(
     onDeleteAll: () -> Unit,
     onAbout: () -> Unit,
     onDiagnostics: () -> Unit,
+    onPlaybackHistory: () -> Unit,
     onDownloads: () -> Unit,
     onServers: () -> Unit,
     themeMode: ThemeMode,
@@ -329,6 +331,13 @@ fun ExpressiveSettingsScreen(
         item(key = "manage-heading") { SettingsHeading("Manage") }
         item(key = "manage-group") {
             SettingsGroup {
+                SettingsActionRow(
+                    icon = Icons.Rounded.History,
+                    title = "Playback history",
+                    supporting = "Find recent videos and continue from the last confirmed position.",
+                    onClick = onPlaybackHistory,
+                )
+                SettingsDivider()
                 SettingsLinkRow(
                     iconRes = R.drawable.in_app_icon_servers,
                     title = "Servers",

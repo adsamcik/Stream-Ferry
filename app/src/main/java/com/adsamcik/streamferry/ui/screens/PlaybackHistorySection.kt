@@ -6,12 +6,12 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -47,45 +47,85 @@ import com.adsamcik.streamferry.ui.state.SmartResumeUiState
 import com.adsamcik.streamferry.ui.state.formatSmartResumeTime
 
 @Composable
-fun PlaybackHistorySection(
+fun PlaybackHistoryScreen(
     items: List<SmartResumeUiState>,
     onPlay: (String) -> Unit,
     onRemove: (String) -> Unit,
     onClear: () -> Unit,
+    modifier: Modifier = Modifier,
 ) {
-    if (items.isEmpty()) return
     var confirmClear by rememberSaveable { mutableStateOf(false) }
 
-    Column(
-        modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
+    LazyColumn(
+        modifier = modifier.fillMaxSize(),
+        contentPadding = PaddingValues(bottom = 28.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text(
-                    "Playback history",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold,
-                )
-                Text(
-                    "Return to something you watched earlier",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+        item(key = "history-summary") {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(
+                        if (items.isEmpty()) "Your recent playback will appear here" else
+                            "${items.size} recent ${if (items.size == 1) "video" else "videos"}",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Text(
+                        "Renderer-confirmed positions are saved privately on this phone.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                if (items.isNotEmpty()) {
+                    TextButton(
+                        onClick = { confirmClear = true },
+                        modifier = Modifier.heightIn(min = 48.dp),
+                    ) { Text("Clear all") }
+                }
             }
-            TextButton(
-                onClick = { confirmClear = true },
-                modifier = Modifier.heightIn(min = 48.dp),
-            ) { Text("Clear all") }
         }
 
-        LazyRow(
-            contentPadding = PaddingValues(end = 12.dp),
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
+        if (items.isEmpty()) {
+            item(key = "history-empty") {
+                ElevatedCard(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(24.dp),
+                    colors = CardDefaults.elevatedCardColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceContainer,
+                    ),
+                ) {
+                    Column(
+                        modifier = Modifier.fillMaxWidth().padding(28.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        Surface(
+                            modifier = Modifier.size(52.dp),
+                            shape = CircleShape,
+                            color = MaterialTheme.colorScheme.secondaryContainer,
+                            contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(Icons.Rounded.History, contentDescription = null)
+                            }
+                        }
+                        Text(
+                            "Nothing watched yet",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                        )
+                        Text(
+                            "Start a video on a TV and its confirmed progress will be kept here.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+        } else {
             items(items, key = SmartResumeUiState::historyKey) { item ->
                 PlaybackHistoryCard(
                     state = item,
@@ -134,8 +174,8 @@ private fun PlaybackHistoryCard(
     }
     ElevatedCard(
         modifier = Modifier
-            .width(276.dp)
-            .heightIn(min = 220.dp)
+            .fillMaxWidth()
+            .heightIn(min = 200.dp)
             .animateContentSize(MaterialTheme.motionScheme.defaultSpatialSpec()),
         shape = RoundedCornerShape(24.dp),
         colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
@@ -183,7 +223,7 @@ private fun PlaybackHistoryCard(
                 }
             }
 
-            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text(
                     state.title,
                     style = MaterialTheme.typography.titleMedium,

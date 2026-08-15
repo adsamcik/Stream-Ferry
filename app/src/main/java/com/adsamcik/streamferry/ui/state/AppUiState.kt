@@ -20,7 +20,7 @@ import com.adsamcik.streamferry.ui.theme.ThemeMode
 /** Navigation routes (§18 screens). */
 enum class Route {
     WELCOME, SERVER_SETUP, LOGIN, GALLERY, MEDIA_DETAIL,
-    TARGET_PICKER, PLAYBACK, DOWNLOADS, DIAGNOSTICS, SETTINGS, SERVERS, ABOUT,
+    TARGET_PICKER, PLAYBACK, DOWNLOADS, HISTORY, DIAGNOSTICS, SETTINGS, SERVERS, ABOUT,
 }
 
 /** State of the manual server-connection step. */

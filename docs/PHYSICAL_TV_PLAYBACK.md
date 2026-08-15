@@ -108,8 +108,8 @@ device fields; malformed or unknown versions are discarded safely.
 Smart Resume preserves the existing generation, stale-write, sequence, seek-regression, and completion
 guards. It checkpoints confirmed start/progress/seek, pause, disconnect, failure, lifecycle stop, explicit
 Stop, and completion. A completed record cannot be resurrected by delayed callbacks. The gallery keeps
-the latest resumable entry prominent and shows earlier or completed entries in a playback-history shelf;
-completed entries restart from the beginning.
+only the existing latest resumable entry prominent; the complete recent list lives under **Settings →
+Playback history**, where completed entries restart from the beginning.
 
 For Jellyfin media, resume uses the newer of the local renderer-confirmed checkpoint and the newly
 resolved server resume point. Local/downloaded resume similarly reconciles the legacy local position.

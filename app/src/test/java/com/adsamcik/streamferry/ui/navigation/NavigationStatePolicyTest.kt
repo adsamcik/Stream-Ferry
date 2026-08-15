@@ -74,6 +74,7 @@ class NavigationStatePolicyTest {
     @Test
     fun `process recreation restores stable routes and collapses contextual routes`() {
         assertEquals(Route.DOWNLOADS, NavigationStatePolicy.restoreRoute(Route.DOWNLOADS.name))
+        assertEquals(Route.HISTORY, NavigationStatePolicy.restoreRoute(Route.HISTORY.name))
         assertEquals(Route.GALLERY, NavigationStatePolicy.restoreDownloadsOrigin(Route.MEDIA_DETAIL.name))
         assertEquals(Route.GALLERY, NavigationStatePolicy.restoreRoute(Route.PLAYBACK.name))
         assertEquals(Route.WELCOME, NavigationStatePolicy.restoreRoute("not-a-route"))
@@ -113,6 +114,7 @@ class NavigationStatePolicyTest {
     fun `top level grouping follows the durable information architecture`() {
         assertEquals(TopLevelDestination.LIBRARY, NavigationStatePolicy.topLevelFor(Route.MEDIA_DETAIL))
         assertEquals(TopLevelDestination.SETTINGS, NavigationStatePolicy.topLevelFor(Route.DOWNLOADS))
+        assertEquals(TopLevelDestination.SETTINGS, NavigationStatePolicy.topLevelFor(Route.HISTORY))
         assertEquals(TopLevelDestination.SETTINGS, NavigationStatePolicy.topLevelFor(Route.DIAGNOSTICS))
     }
 }
