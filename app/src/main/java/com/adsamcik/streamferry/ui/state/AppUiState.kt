@@ -107,6 +107,8 @@ data class AppUiState(
 
     /** Latest app-wide renderer-confirmed checkpoint, displayed at either gallery root. */
     val smartResume: SmartResumeUiState? = null,
+    /** Bounded renderer-confirmed history, including completed items, newest first. */
+    val playbackHistory: List<SmartResumeUiState> = emptyList(),
 
     // ----- offline downloads -----
     val downloads: List<DownloadUiItem> = emptyList(),

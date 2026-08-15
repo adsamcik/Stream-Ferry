@@ -14,6 +14,7 @@ import com.adsamcik.streamferry.core.stream.Protocol
 import com.adsamcik.streamferry.core.resume.SmartResumeDeviceContext
 import com.adsamcik.streamferry.core.resume.SmartResumePositionReconciler
 import com.adsamcik.streamferry.core.resume.SmartResumeRecord
+import com.adsamcik.streamferry.core.resume.SmartResumeRecordState
 import com.adsamcik.streamferry.core.resume.SmartResumeSeed
 import com.adsamcik.streamferry.core.resume.SmartResumeSourceType
 import com.adsamcik.streamferry.core.stream.StreamPreferences
@@ -74,6 +75,7 @@ import com.adsamcik.streamferry.ui.state.PlaybackUiState
 import com.adsamcik.streamferry.ui.state.QuickConnectUiState
 import com.adsamcik.streamferry.ui.state.RendererPlaybackSnapshot
 import com.adsamcik.streamferry.ui.state.Route
+import com.adsamcik.streamferry.ui.state.toPlaybackHistoryUiState
 import com.adsamcik.streamferry.ui.state.toUiState
 import com.adsamcik.streamferry.ui.theme.ThemeMode
 import com.adsamcik.streamferry.BuildConfig
@@ -326,11 +328,13 @@ class MainViewModel(
                     activeWatchStateReconciliations.clear()
                 }
                 _state.update { current ->
+                    val history = container.smartResumeStore.history.value
                     current.copy(
                         loggedIn = user != null,
-                        smartResume = container.smartResumeStore.current
+                        smartResume = history.firstOrNull()
                             ?.takeUnless(::isSmartResumeBlockedByWatchMutation)
                             ?.toUiState(user),
+                        playbackHistory = playbackHistoryUiState(history, user),
                         // A mutation in a previous account must never leave this account's controls disabled,
                         // while a token refresh for the same account keeps its current operation visible.
                         watchStateMutationItemIds = if (sessionChanged) emptySet() else current.watchStateMutationItemIds,
@@ -371,12 +375,16 @@ class MainViewModel(
             }
         }
         viewModelScope.launch {
-            container.smartResumeStore.record.collect { record ->
+            container.smartResumeStore.history.collect { history ->
                 _state.update {
                     it.copy(
-                        smartResume = record
+                        smartResume = history.firstOrNull()
                             ?.takeUnless(::isSmartResumeBlockedByWatchMutation)
                             ?.toUiState(container.authRepository.currentUser.value),
+                        playbackHistory = playbackHistoryUiState(
+                            history,
+                            container.authRepository.currentUser.value,
+                        ),
                     )
                 }
             }
@@ -1865,9 +1873,15 @@ class MainViewModel(
         ).join()
     }
 
-    /** Resume the app-wide renderer-confirmed checkpoint through the normal target picker. */
-    fun resumeSmartResume() = viewModelScope.launch {
-        val record = container.smartResumeStore.current ?: return@launch
+    /** Resume the latest renderer-confirmed checkpoint through the normal target picker. */
+    fun resumeSmartResume() = resumePlaybackRecord(container.smartResumeStore.current)
+
+    fun resumePlaybackHistory(historyKey: String) = resumePlaybackRecord(
+        container.smartResumeStore.history.value.firstOrNull { it.identityKey() == historyKey },
+    )
+
+    private fun resumePlaybackRecord(record: SmartResumeRecord?) = viewModelScope.launch {
+        record ?: return@launch
         if (isSmartResumeBlockedByWatchMutation(record)) {
             _state.update { it.copy(errorMessage = "This item's watch-state change is waiting to sync. Reconnect to Jellyfin before resuming it.") }
             return@launch
@@ -1877,21 +1891,15 @@ class MainViewModel(
                 SmartResumeSourceType.JELLYFIN -> {
                     requireRecordOwner(record)
                     val item = container.jellyfinMediaSource.item(record.mediaId).getOrThrow()
-                    val position = SmartResumePositionReconciler.reconcile(
-                        record,
-                        rendererConfirmedSeconds = null,
-                        jellyfinResumeSeconds = item.resumePositionSeconds,
-                    ) ?: error("This playback is already complete.")
+                    val position = record.playbackStartPosition(jellyfinResumeSeconds = item.resumePositionSeconds)
                     beginSmartResumeTargetSelection(item, null, position, record.deviceContext())
                 }
                 SmartResumeSourceType.LOCAL -> {
                     val uri = record.localContentUri ?: error("This local video is no longer available.")
                     val item = container.localMediaSource.item(uri).getOrThrow()
-                    val position = SmartResumePositionReconciler.reconcile(
-                        record,
+                    val position = record.playbackStartPosition(
                         rendererConfirmedSeconds = container.resumeStore.resumePosition(uri),
-                        jellyfinResumeSeconds = null,
-                    ) ?: error("This playback is already complete.")
+                    )
                     beginSmartResumeTargetSelection(item, null, position, record.deviceContext())
                 }
                 SmartResumeSourceType.DOWNLOADED -> {
@@ -1900,13 +1908,11 @@ class MainViewModel(
                     val entry = container.downloadStore.get(owner, record.mediaId) ?: error("The downloaded copy was deleted.")
                     val file = container.downloadStore.fileFor(entry)
                     check(file.isFile && file.canRead() && file.length() > 0L) { "The downloaded copy is unavailable." }
-                    val position = SmartResumePositionReconciler.reconcile(
-                        record,
+                    val position = record.playbackStartPosition(
                         rendererConfirmedSeconds = container.resumeStore.resumePosition(
                             DownloadIdentity(owner, entry.itemId).resumeKey,
                         ),
-                        jellyfinResumeSeconds = null,
-                    ) ?: error("This playback is already complete.")
+                    )
                     beginSmartResumeTargetSelection(null, entry.itemId, position, record.deviceContext())
                 }
             }
@@ -1915,7 +1921,24 @@ class MainViewModel(
         }
     }
 
-    fun dismissSmartResume() = container.smartResumeStore.clear()
+    fun dismissSmartResume() {
+        container.smartResumeStore.current?.identityKey()?.let(container.smartResumeStore::remove)
+    }
+
+    fun removePlaybackHistory(historyKey: String) {
+        container.smartResumeStore.remove(historyKey)
+    }
+
+    fun clearPlaybackHistory() = container.smartResumeStore.clear()
+
+    private fun SmartResumeRecord.playbackStartPosition(
+        rendererConfirmedSeconds: Long? = null,
+        jellyfinResumeSeconds: Long? = null,
+    ): Long = if (state == SmartResumeRecordState.FINISHED) {
+        0L
+    } else {
+        SmartResumePositionReconciler.reconcile(this, rendererConfirmedSeconds, jellyfinResumeSeconds) ?: 0L
+    }
 
     private fun beginSmartResumeTargetSelection(
         item: MediaItem?,
@@ -2718,6 +2741,15 @@ class MainViewModel(
             ?.clearsResume() == true
     }
 
+    private fun playbackHistoryUiState(
+        records: List<SmartResumeRecord>,
+        currentUser: UserSession?,
+    ) = records
+        .asSequence()
+        .filterNot(::isSmartResumeBlockedByWatchMutation)
+        .mapNotNull { it.toPlaybackHistoryUiState(currentUser) }
+        .toList()
+
     private fun isPlaybackActiveFor(itemId: String): Boolean =
         _state.value.playback != null && _state.value.nowPlayingItem?.id == itemId
 
@@ -2803,16 +2835,15 @@ class MainViewModel(
         container.resumeStore.get(resumeKey)
             ?.takeIf { it.updatedAt <= mutation.createdAtMillis }
             ?.let { container.resumeStore.remove(resumeKey) }
-        val record = container.smartResumeStore.current
-        if (record != null &&
-            record.mediaId == mutation.itemId &&
-            record.serverId == mutation.serverId &&
-            record.userId == mutation.userId &&
-            record.sourceType in setOf(SmartResumeSourceType.JELLYFIN, SmartResumeSourceType.DOWNLOADED) &&
-            record.updatedAtMillis <= mutation.createdAtMillis
-        ) {
-            container.smartResumeStore.clear()
-        }
+        container.smartResumeStore.history.value
+            .filter { record ->
+                record.mediaId == mutation.itemId &&
+                    record.serverId == mutation.serverId &&
+                    record.userId == mutation.userId &&
+                    record.sourceType in setOf(SmartResumeSourceType.JELLYFIN, SmartResumeSourceType.DOWNLOADED) &&
+                    record.updatedAtMillis <= mutation.createdAtMillis
+            }
+            .forEach { container.smartResumeStore.remove(it.identityKey()) }
     }
     /** Reconcile server-owned folder counters and resume rows after a confirmed manual leaf mutation. */
     private fun refreshJellyfinMaterializationsAfterWatchStateMutation(session: UserSession) {
