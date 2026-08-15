@@ -4,6 +4,7 @@ import com.adsamcik.streamferry.core.stream.Protocol
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 class SmartResumeTest {
     private class MemoryStore : SmartResumeRecordStore {
@@ -135,5 +136,55 @@ class SmartResumeTest {
         val current = SmartResumeReducer.reduce(null, checkpoint(position = 900))!!
         val finished = SmartResumeReducer.reduce(current, checkpoint(sequence = 2, position = 995, kind = SmartResumeCheckpointKind.COMPLETED))!!
         assertEquals(finished, SmartResumeReducer.reduce(finished, checkpoint(sequence = 3, position = 900, kind = SmartResumeCheckpointKind.DISCONNECTED)))
+    }
+
+    @Test fun historyKeepsPreviousItemsAndUpdatesAnExistingIdentityInPlace() {
+        val first = SmartResumeHistoryReducer.reduce(emptyList(), checkpoint(position = 120))
+        val secondSeed = seed.copy(mediaId = "movie-2", displayTitle = "Second movie")
+        val second = SmartResumeHistoryReducer.reduce(
+            first,
+            checkpoint(position = 40, generation = 2, sessionId = "second").copy(seed = secondSeed),
+        )
+
+        assertEquals(listOf("movie-2", "movie-1"), second.map { it.mediaId })
+
+        val advanced = SmartResumeHistoryReducer.reduce(
+            second,
+            checkpoint(sequence = 2, position = 65, generation = 2, sessionId = "second", kind = SmartResumeCheckpointKind.PROGRESS)
+                .copy(seed = secondSeed),
+        )
+        assertEquals(65, advanced.first().confirmedPositionSeconds)
+        assertEquals(2, advanced.size)
+    }
+
+    @Test fun historyRejectsLateOlderSessionUpdatesAfterAnewItemStarts() {
+        val first = SmartResumeHistoryReducer.reduce(emptyList(), checkpoint(position = 120))
+        val secondSeed = seed.copy(mediaId = "movie-2", displayTitle = "Second movie")
+        val second = SmartResumeHistoryReducer.reduce(
+            first,
+            checkpoint(position = 40, generation = 2, sessionId = "second").copy(seed = secondSeed),
+        )
+
+        val afterLateUpdate = SmartResumeHistoryReducer.reduce(
+            second,
+            checkpoint(sequence = 2, position = 500, kind = SmartResumeCheckpointKind.STOPPED),
+        )
+
+        assertEquals(second, afterLateUpdate)
+    }
+
+    @Test fun historyIsDeduplicatedAndBounded() {
+        var history = emptyList<SmartResumeRecord>()
+        repeat(SmartResumeHistoryReducer.MAX_ENTRIES + 5) { index ->
+            history = SmartResumeHistoryReducer.reduce(
+                history,
+                checkpoint(position = 30, generation = index + 1L, sessionId = "session-$index")
+                    .copy(seed = seed.copy(mediaId = "movie-$index", displayTitle = "Movie $index")),
+            )
+        }
+
+        assertEquals(SmartResumeHistoryReducer.MAX_ENTRIES, history.size)
+        assertEquals("movie-24", history.first().mediaId)
+        assertTrue(history.none { it.mediaId == "movie-0" })
     }
 }

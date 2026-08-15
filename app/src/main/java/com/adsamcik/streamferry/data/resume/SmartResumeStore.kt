@@ -6,56 +6,73 @@ import com.adsamcik.streamferry.core.resume.SmartResumeCheckpoint
 import com.adsamcik.streamferry.core.resume.SmartResumeRecord
 import com.adsamcik.streamferry.core.resume.SmartResumeRecordState
 import com.adsamcik.streamferry.core.resume.SmartResumeRecordStore
-import com.adsamcik.streamferry.core.resume.SmartResumeReducer
+import com.adsamcik.streamferry.core.resume.SmartResumeHistoryReducer
 import com.adsamcik.streamferry.core.resume.SmartResumeSourceType
 import com.adsamcik.streamferry.core.stream.Protocol
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.nio.charset.StandardCharsets
 
-/** Atomic, no-backup persistence for one app-wide latest-playback record. */
+/** Atomic, no-backup persistence for bounded app-wide playback history. */
 class SmartResumeStore(context: Context) : SmartResumeRecordStore {
-    // Keep the v1 filename: updating it in place is what preserves existing users' checkpoint.
+    // Keep the v1 filename: the history envelope migrates the existing single checkpoint in place.
     private val atomicFile = AtomicFile(File(context.applicationContext.noBackupFilesDir, FILE_NAME))
     private val lock = Any()
-    private val _record = MutableStateFlow(load())
+    private val loaded = load()
+    private val _history = MutableStateFlow(loaded.records)
+    val history: StateFlow<List<SmartResumeRecord>> = _history.asStateFlow()
+    private val _record = MutableStateFlow(loaded.records.firstOrNull())
     val record: StateFlow<SmartResumeRecord?> = _record.asStateFlow()
     override val current: SmartResumeRecord? get() = _record.value
 
-    override fun apply(update: SmartResumeCheckpoint): SmartResumeRecord? = synchronized(lock) {
-        val next = SmartResumeReducer.reduce(_record.value, update)
-        if (next == _record.value) return@synchronized next
-        if (next == null) atomicFile.delete() else write(next)
-        _record.value = next
-        next
+    init {
+        if (loaded.requiresRewrite) runCatching { write(loaded.records) }
     }
 
-    override fun clear() = synchronized(lock) { atomicFile.delete(); _record.value = null }
+    override fun apply(update: SmartResumeCheckpoint): SmartResumeRecord? = synchronized(lock) {
+        val next = SmartResumeHistoryReducer.reduce(_history.value, update)
+        if (next == _history.value) return@synchronized _record.value
+        write(next)
+        publish(next)
+        _record.value
+    }
 
-    private fun load(): SmartResumeRecord? {
-        if (!atomicFile.baseFile.isFile) return null
+    /** Removes one media identity without discarding the rest of the user's history. */
+    fun remove(identityKey: String): Boolean = synchronized(lock) {
+        val next = _history.value.filterNot { it.identityKey() == identityKey }
+        if (next.size == _history.value.size) return@synchronized false
+        if (next.isEmpty()) atomicFile.delete() else write(next)
+        publish(next)
+        true
+    }
+
+    override fun clear() = synchronized(lock) {
+        atomicFile.delete()
+        publish(emptyList())
+    }
+
+    private fun load(): SmartResumeHistoryJsonCodec.Decoded {
+        if (!atomicFile.baseFile.isFile) return SmartResumeHistoryJsonCodec.Decoded(emptyList(), false)
         val decoded = runCatching {
             atomicFile.openRead().bufferedReader(StandardCharsets.UTF_8).use {
-                SmartResumeJsonCodec.decode(JSONObject(it.readText()))
+                SmartResumeHistoryJsonCodec.decode(JSONObject(it.readText()))
             }
         }.getOrNull()
-        val record = decoded?.record?.takeIf { it.isStructurallyValid() }
-        if (record == null) {
+        if (decoded == null || decoded.records.isEmpty()) {
             atomicFile.delete()
-            return null
+            return SmartResumeHistoryJsonCodec.Decoded(emptyList(), false)
         }
-        // A valid v1 document is immediately made v2, so the next restart no longer needs migration.
-        if (decoded.migratedFromV1) runCatching { write(record) }
-        return record
+        return decoded
     }
 
-    private fun write(record: SmartResumeRecord) {
+    private fun write(records: List<SmartResumeRecord>) {
         val stream = atomicFile.startWrite()
         try {
-            stream.write(SmartResumeJsonCodec.encode(record).toString().toByteArray(StandardCharsets.UTF_8))
+            stream.write(SmartResumeHistoryJsonCodec.encode(records).toString().toByteArray(StandardCharsets.UTF_8))
             stream.flush()
             atomicFile.finishWrite(stream)
         } catch (error: Throwable) {
@@ -64,7 +81,49 @@ class SmartResumeStore(context: Context) : SmartResumeRecordStore {
         }
     }
 
+    private fun publish(records: List<SmartResumeRecord>) {
+        _history.value = records
+        _record.value = records.firstOrNull()
+    }
+
     private companion object { const val FILE_NAME = "smart_resume_v1.json" }
+}
+
+/** Versioned history envelope. A legacy top-level record is accepted and rewritten on first load. */
+internal object SmartResumeHistoryJsonCodec {
+    private const val CURRENT_VERSION = 1
+
+    internal data class Decoded(
+        val records: List<SmartResumeRecord>,
+        val requiresRewrite: Boolean,
+    )
+
+    fun encode(records: List<SmartResumeRecord>) = JSONObject().apply {
+        put("version", CURRENT_VERSION)
+        put("records", JSONArray().apply {
+            SmartResumeHistoryReducer.normalize(records).forEach { put(SmartResumeJsonCodec.encode(it)) }
+        })
+    }
+
+    fun decode(document: JSONObject): Decoded? {
+        if (!document.has("records")) {
+            val legacy = SmartResumeJsonCodec.decode(document)?.record?.takeIf { it.isStructurallyValid() }
+                ?: return null
+            return Decoded(listOf(legacy), requiresRewrite = true)
+        }
+        if (document.getInt("version") != CURRENT_VERSION) return null
+        val encoded = document.getJSONArray("records")
+        val decoded = buildList {
+            for (index in 0 until encoded.length()) {
+                runCatching { SmartResumeJsonCodec.decode(encoded.getJSONObject(index))?.record }
+                    .getOrNull()
+                    ?.takeIf(SmartResumeRecord::isStructurallyValid)
+                    ?.let(::add)
+            }
+        }
+        val normalized = SmartResumeHistoryReducer.normalize(decoded)
+        return Decoded(normalized, requiresRewrite = normalized.size != encoded.length())
+    }
 }
 
 /** Framework-free v1-to-v2 migration and defaulting policy. */

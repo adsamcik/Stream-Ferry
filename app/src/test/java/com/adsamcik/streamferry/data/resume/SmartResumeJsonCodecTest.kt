@@ -7,7 +7,13 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNull
+import org.json.JSONObject
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
 
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [35])
 class SmartResumeRecordVersioningTest {
     private fun v1Fields() = SmartResumeRecordVersioning.StoredFields(
         sourceType = SmartResumeSourceType.JELLYFIN, mediaId = "movie", displayTitle = "Movie",
@@ -30,5 +36,28 @@ class SmartResumeRecordVersioningTest {
         assertNull(SmartResumeRecordVersioning.migrate(99, v1Fields()))
         assertNull(SmartResumeRecordVersioning.migrate(2, v1Fields().copy(lastSuccessfulProtocol = "not-a-protocol")))
         assertFalse(SmartResumeRecordVersioning.migrate(1, v1Fields())!!.record.version == 1)
+    }
+
+    @Test fun legacySingleRecordBecomesAHistoryEnvelope() {
+        val record = SmartResumeRecordVersioning.migrate(1, v1Fields())!!.record
+
+        val decoded = SmartResumeHistoryJsonCodec.decode(SmartResumeJsonCodec.encode(record))!!
+
+        assertEquals(listOf(record), decoded.records)
+        assertEquals(true, decoded.requiresRewrite)
+        val envelope = SmartResumeHistoryJsonCodec.encode(decoded.records)
+        assertEquals(1, envelope.getInt("version"))
+        assertEquals(1, envelope.getJSONArray("records").length())
+    }
+
+    @Test fun malformedHistoryEntriesAreDiscardedWithoutLosingValidRecords() {
+        val record = SmartResumeRecordVersioning.migrate(1, v1Fields())!!.record
+        val envelope = SmartResumeHistoryJsonCodec.encode(listOf(record))
+        envelope.getJSONArray("records").put(JSONObject().put("version", 99))
+
+        val decoded = SmartResumeHistoryJsonCodec.decode(envelope)!!
+
+        assertEquals(listOf(record), decoded.records)
+        assertEquals(true, decoded.requiresRewrite)
     }
 }

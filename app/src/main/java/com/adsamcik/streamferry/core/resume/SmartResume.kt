@@ -198,6 +198,46 @@ object SmartResumeReducer {
     )
 }
 
+/**
+ * Keeps a bounded, newest-first history while preserving [SmartResumeReducer]'s stale-session and
+ * position-regression guarantees. Generations are app-wide and therefore remain the authoritative
+ * ordering signal even if the wall clock changes between playback sessions.
+ */
+object SmartResumeHistoryReducer {
+    const val MAX_ENTRIES = 20
+
+    fun reduce(
+        history: List<SmartResumeRecord>,
+        update: SmartResumeCheckpoint,
+    ): List<SmartResumeRecord> {
+        val normalized = normalize(history)
+        val current = normalized.firstOrNull()
+        val next = SmartResumeReducer.reduce(current, update) ?: return normalized
+        if (next == current) return normalized
+        return normalize(listOf(next) + normalized.filterNot { it.identityKey() == next.identityKey() })
+    }
+
+    fun normalize(history: List<SmartResumeRecord>): List<SmartResumeRecord> = history
+        .asSequence()
+        .filter(SmartResumeRecord::isStructurallyValid)
+        .groupBy(SmartResumeRecord::identityKey)
+        .values
+        .mapNotNull { records ->
+            records.maxWithOrNull(
+                compareBy<SmartResumeRecord> { it.generation }
+                    .thenBy { it.sequence }
+                    .thenBy { it.updatedAtMillis },
+            )
+        }
+        .sortedWith(
+            compareByDescending<SmartResumeRecord> { it.generation }
+                .thenByDescending { it.sequence }
+                .thenByDescending { it.updatedAtMillis },
+        )
+        .take(MAX_ENTRIES)
+        .toList()
+}
+
 interface SmartResumeRecordStore {
     val current: SmartResumeRecord?
     fun apply(update: SmartResumeCheckpoint): SmartResumeRecord?
