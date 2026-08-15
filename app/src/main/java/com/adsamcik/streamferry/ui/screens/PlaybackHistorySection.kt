@@ -20,6 +20,7 @@ import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -29,10 +30,12 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -55,6 +58,11 @@ fun PlaybackHistoryScreen(
     modifier: Modifier = Modifier,
 ) {
     var confirmClear by rememberSaveable { mutableStateOf(false) }
+    var searchQuery by rememberSaveable { mutableStateOf("") }
+    val filteredItems = remember(items, searchQuery) { filterPlaybackHistory(items, searchQuery) }
+    LaunchedEffect(items.isEmpty()) {
+        if (items.isEmpty()) searchQuery = ""
+    }
 
     LazyColumn(
         modifier = modifier.fillMaxSize(),
@@ -68,13 +76,17 @@ fun PlaybackHistoryScreen(
             ) {
                 Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text(
-                        if (items.isEmpty()) "Your recent playback will appear here" else
-                            "${items.size} recent ${if (items.size == 1) "video" else "videos"}",
+                        when {
+                            items.isEmpty() -> "Your recent playback will appear here"
+                            searchQuery.isNotBlank() ->
+                                "${filteredItems.size} ${if (filteredItems.size == 1) "match" else "matches"}"
+                            else -> "${items.size} recent ${if (items.size == 1) "video" else "videos"}"
+                        },
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold,
                     )
                     Text(
-                        "Renderer-confirmed positions are saved privately on this phone.",
+                        "The last 90 days are saved privately on this phone.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -88,7 +100,29 @@ fun PlaybackHistoryScreen(
             }
         }
 
-        if (items.isEmpty()) {
+        if (items.isNotEmpty()) {
+            item(key = "history-search") {
+                OutlinedTextField(
+                    value = searchQuery,
+                    onValueChange = { searchQuery = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Search playback history") },
+                    placeholder = { Text("Title, episode, or source") },
+                    leadingIcon = { Icon(Icons.Rounded.Search, contentDescription = null) },
+                    trailingIcon = if (searchQuery.isNotEmpty()) {
+                        {
+                            IconButton(onClick = { searchQuery = "" }) {
+                                Icon(Icons.Rounded.Close, contentDescription = "Clear history search")
+                            }
+                        }
+                    } else null,
+                    singleLine = true,
+                    shape = RoundedCornerShape(18.dp),
+                )
+            }
+        }
+
+        if (items.isEmpty() || filteredItems.isEmpty()) {
             item(key = "history-empty") {
                 ElevatedCard(
                     modifier = Modifier.fillMaxWidth(),
@@ -109,16 +143,23 @@ fun PlaybackHistoryScreen(
                             contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
                         ) {
                             Box(contentAlignment = Alignment.Center) {
-                                Icon(Icons.Rounded.History, contentDescription = null)
+                                Icon(
+                                    if (items.isEmpty()) Icons.Rounded.History else Icons.Rounded.Search,
+                                    contentDescription = null,
+                                )
                             }
                         }
                         Text(
-                            "Nothing watched yet",
+                            if (items.isEmpty()) "Nothing watched yet" else "No matching history",
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold,
                         )
                         Text(
-                            "Start a video on a TV and its confirmed progress will be kept here.",
+                            if (items.isEmpty()) {
+                                "Start a video on a TV and its confirmed progress will be kept here."
+                            } else {
+                                "Try a different title, episode, or source."
+                            },
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -126,7 +167,7 @@ fun PlaybackHistoryScreen(
                 }
             }
         } else {
-            items(items, key = SmartResumeUiState::historyKey) { item ->
+            items(filteredItems, key = SmartResumeUiState::historyKey) { item ->
                 PlaybackHistoryCard(
                     state = item,
                     onPlay = { onPlay(item.historyKey) },
@@ -147,6 +188,7 @@ fun PlaybackHistoryScreen(
                 TextButton(
                     onClick = {
                         confirmClear = false
+                        searchQuery = ""
                         onClear()
                     },
                     colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
@@ -160,6 +202,18 @@ fun PlaybackHistoryScreen(
                 ) { Text("Cancel") }
             },
         )
+    }
+}
+
+internal fun filterPlaybackHistory(
+    items: List<SmartResumeUiState>,
+    query: String,
+): List<SmartResumeUiState> {
+    val terms = query.trim().split(Regex("\\s+")).filter(String::isNotEmpty)
+    if (terms.isEmpty()) return items
+    return items.filter { item ->
+        val fields = listOf(item.title, item.subtitle.orEmpty(), item.sourceLabel)
+        terms.all { term -> fields.any { field -> field.contains(term, ignoreCase = true) } }
     }
 }
 

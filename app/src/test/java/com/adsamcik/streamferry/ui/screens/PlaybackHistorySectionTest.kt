@@ -25,13 +25,43 @@ class PlaybackHistorySectionTest {
         )
     }
 
-    private fun historyState(position: Long, duration: Long?) = SmartResumeUiState(
-        historyKey = "key",
+    @Test fun historySearchMatchesTitleSubtitleAndSourceCaseInsensitively() {
+        val movie = historyState(
+            position = 754,
+            duration = 2_700,
+            title = "Arrival",
+            subtitle = "A Denis Villeneuve film",
+            source = "Jellyfin",
+        )
+        val episode = historyState(
+            position = 300,
+            duration = 2_400,
+            title = "Leviathan Wakes",
+            subtitle = "The Expanse · S1 E1",
+            source = "Downloaded",
+        )
+        val items = listOf(movie, episode)
+
+        assertEquals(listOf(movie), filterPlaybackHistory(items, "ARRIVAL"))
+        assertEquals(listOf(episode), filterPlaybackHistory(items, "expanse"))
+        assertEquals(listOf(episode), filterPlaybackHistory(items, "leviathan downloaded"))
+        assertEquals(items, filterPlaybackHistory(items, "  "))
+        assertEquals(emptyList(), filterPlaybackHistory(items, "local"))
+    }
+
+    private fun historyState(
+        position: Long,
+        duration: Long?,
+        title: String = "Movie",
+        subtitle: String? = null,
+        source: String = "Jellyfin",
+    ) = SmartResumeUiState(
+        historyKey = title,
         mediaId = "movie",
         sourceType = SmartResumeSourceType.JELLYFIN,
-        title = "Movie",
-        subtitle = null,
-        sourceLabel = "Jellyfin",
+        title = title,
+        subtitle = subtitle,
+        sourceLabel = source,
         positionSeconds = position,
         durationSeconds = duration,
         progressFraction = null,
