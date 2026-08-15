@@ -12,16 +12,14 @@ there is **no telemetry** and nothing leaves the device unless you share a repor
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-15
+
 ### Added
 - Added a private, searchable playback-history screen under Settings for the last 90 days of
   renderer-confirmed Jellyfin, downloaded, and local items, with exact left-off progress,
   resume/watch-again actions, and per-item or full clearing.
 - Existing single-item Smart Resume data migrates into the history automatically without retaining
   stream URLs, tokens, or live playback sessions.
-
-## [0.5.0] - 2026-08-09
-
-### Added
 - Added offline Jellyfin gallery browsing backed by account-scoped downloads and a durable library
   cache, so downloaded shows and episodes remain discoverable without a server connection.
 - Added a resilient playback queue with playlist browsing, queue controls, and seamless autoplay of
