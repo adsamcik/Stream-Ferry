@@ -17,8 +17,11 @@ import org.json.JSONObject
 import java.io.File
 import java.nio.charset.StandardCharsets
 
-/** Atomic, no-backup persistence for bounded app-wide playback history. */
-class SmartResumeStore(context: Context) : SmartResumeRecordStore {
+/** Atomic, no-backup persistence for rolling app-wide playback history. */
+class SmartResumeStore(
+    context: Context,
+    private val clock: () -> Long = System::currentTimeMillis,
+) : SmartResumeRecordStore {
     // Keep the v1 filename: the history envelope migrates the existing single checkpoint in place.
     private val atomicFile = AtomicFile(File(context.applicationContext.noBackupFilesDir, FILE_NAME))
     private val lock = Any()
@@ -34,7 +37,7 @@ class SmartResumeStore(context: Context) : SmartResumeRecordStore {
     }
 
     override fun apply(update: SmartResumeCheckpoint): SmartResumeRecord? = synchronized(lock) {
-        val next = SmartResumeHistoryReducer.reduce(_history.value, update)
+        val next = SmartResumeHistoryReducer.reduce(_history.value, update, clock())
         if (next == _history.value) return@synchronized _record.value
         write(next)
         publish(next)
@@ -62,11 +65,19 @@ class SmartResumeStore(context: Context) : SmartResumeRecordStore {
                 SmartResumeHistoryJsonCodec.decode(JSONObject(it.readText()))
             }
         }.getOrNull()
-        if (decoded == null || decoded.records.isEmpty()) {
+        if (decoded == null) {
             atomicFile.delete()
             return SmartResumeHistoryJsonCodec.Decoded(emptyList(), false)
         }
-        return decoded
+        val retained = SmartResumeHistoryReducer.normalize(decoded.records, clock())
+        if (retained.isEmpty()) {
+            atomicFile.delete()
+            return SmartResumeHistoryJsonCodec.Decoded(emptyList(), false)
+        }
+        return decoded.copy(
+            records = retained,
+            requiresRewrite = decoded.requiresRewrite || retained != decoded.records,
+        )
     }
 
     private fun write(records: List<SmartResumeRecord>) {

@@ -184,7 +184,34 @@ class SmartResumeTest {
         }
 
         assertEquals(SmartResumeHistoryReducer.MAX_ENTRIES, history.size)
-        assertEquals("movie-24", history.first().mediaId)
+        assertEquals("movie-${SmartResumeHistoryReducer.MAX_ENTRIES + 4}", history.first().mediaId)
         assertTrue(history.none { it.mediaId == "movie-0" })
+    }
+
+    @Test fun historyKeepsOnlyTheRollingNinetyDayWindow() {
+        val now = SmartResumeHistoryReducer.RETENTION_MILLIS + 50_000L
+        fun record(id: String, updatedAt: Long, generation: Long): SmartResumeRecord =
+            SmartResumeReducer.reduce(
+                null,
+                checkpoint(generation = generation, sessionId = "session-$id")
+                    .copy(
+                        seed = seed.copy(mediaId = id, displayTitle = id),
+                        updatedAtMillis = updatedAt,
+                    ),
+            )!!
+        val expired = record("expired", now - SmartResumeHistoryReducer.RETENTION_MILLIS - 1, 1)
+        val boundary = record("boundary", now - SmartResumeHistoryReducer.RETENTION_MILLIS, 2)
+        val recent = record("recent", now - 1, 3)
+
+        val retained = SmartResumeHistoryReducer.normalize(listOf(expired, boundary, recent), now)
+
+        assertEquals(listOf("recent", "boundary"), retained.map { it.mediaId })
+    }
+
+    @Test fun delayedExpiredStartCannotReenterHistory() {
+        val now = SmartResumeHistoryReducer.RETENTION_MILLIS + 10_000L
+        val expiredStart = checkpoint().copy(updatedAtMillis = now - SmartResumeHistoryReducer.RETENTION_MILLIS - 1)
+
+        assertEquals(emptyList(), SmartResumeHistoryReducer.reduce(emptyList(), expiredStart, now))
     }
 }

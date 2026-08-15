@@ -199,27 +199,40 @@ object SmartResumeReducer {
 }
 
 /**
- * Keeps a bounded, newest-first history while preserving [SmartResumeReducer]'s stale-session and
+ * Keeps a rolling, newest-first history while preserving [SmartResumeReducer]'s stale-session and
  * position-regression guarantees. Generations are app-wide and therefore remain the authoritative
- * ordering signal even if the wall clock changes between playback sessions.
+ * ordering signal even if the wall clock changes between playback sessions. A generous count ceiling
+ * remains as a corruption/abuse guard; normal retention is governed by [RETENTION_MILLIS].
  */
 object SmartResumeHistoryReducer {
-    const val MAX_ENTRIES = 20
+    const val RETENTION_DAYS = 90L
+    const val RETENTION_MILLIS = RETENTION_DAYS * 24 * 60 * 60 * 1_000L
+    const val MAX_ENTRIES = 500
 
     fun reduce(
         history: List<SmartResumeRecord>,
         update: SmartResumeCheckpoint,
+        nowMillis: Long = update.updatedAtMillis,
     ): List<SmartResumeRecord> {
-        val normalized = normalize(history)
+        val normalized = normalize(history, nowMillis)
         val current = normalized.firstOrNull()
         val next = SmartResumeReducer.reduce(current, update) ?: return normalized
         if (next == current) return normalized
-        return normalize(listOf(next) + normalized.filterNot { it.identityKey() == next.identityKey() })
+        return normalize(
+            listOf(next) + normalized.filterNot { it.identityKey() == next.identityKey() },
+            nowMillis,
+        )
     }
 
-    fun normalize(history: List<SmartResumeRecord>): List<SmartResumeRecord> = history
+    fun normalize(
+        history: List<SmartResumeRecord>,
+        nowMillis: Long? = null,
+    ): List<SmartResumeRecord> {
+        val cutoffMillis = nowMillis?.let { (it - RETENTION_MILLIS).coerceAtLeast(0L) }
+        return history
         .asSequence()
         .filter(SmartResumeRecord::isStructurallyValid)
+        .filter { cutoffMillis == null || it.updatedAtMillis >= cutoffMillis }
         .groupBy(SmartResumeRecord::identityKey)
         .values
         .mapNotNull { records ->
@@ -236,6 +249,7 @@ object SmartResumeHistoryReducer {
         )
         .take(MAX_ENTRIES)
         .toList()
+    }
 }
 
 interface SmartResumeRecordStore {
