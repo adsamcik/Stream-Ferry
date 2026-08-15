@@ -514,10 +514,13 @@ private fun LibraryHome(
     onOpenSearch: () -> Unit,
     onCloseSearch: () -> Unit,
 ) {
-    val smartResumeMediaId = state.smartResume
-        ?.takeIf { it.sourceType == SmartResumeSourceType.JELLYFIN }
-        ?.mediaId
-    val visibleContinueWatching = state.continueWatching.filterNot { it.id == smartResumeMediaId }
+    val rendererHistoryMediaIds = state.playbackHistory
+        .filter { it.sourceType == SmartResumeSourceType.JELLYFIN }
+        .mapTo(mutableSetOf()) { it.mediaId }
+    val visibleContinueWatching = state.continueWatching.filterNot { it.id in rendererHistoryMediaIds }
+    val visiblePlaybackHistory = state.playbackHistory.filterNot {
+        it.historyKey == state.smartResume?.historyKey
+    }
     val jellyfinUnavailable = state.activeSourceId == MediaSourceIds.JELLYFIN &&
         state.jellyfinLibraryStatus == JellyfinLibraryStatus.UNAVAILABLE
 
@@ -607,6 +610,16 @@ private fun LibraryHome(
                     smartResume,
                     viewModel::resumeSmartResume,
                     viewModel::dismissSmartResume,
+                )
+            }
+        }
+        if (visiblePlaybackHistory.isNotEmpty()) {
+            item(key = "playback-history", span = { GridItemSpan(maxLineSpan) }) {
+                PlaybackHistorySection(
+                    items = visiblePlaybackHistory,
+                    onPlay = viewModel::resumePlaybackHistory,
+                    onRemove = viewModel::removePlaybackHistory,
+                    onClear = viewModel::clearPlaybackHistory,
                 )
             }
         }

@@ -33,6 +33,9 @@ Implemented end-to-end:
   check, an **unwatched-episode count** on series/seasons, and an in-progress **progress bar**; a
   **Continue Watching** row surfaces resumable items. From an item's detail you can **mark it watched or
   unwatched** (a series/season cascades to its episodes), written back via Jellyfin's `UserData` API.
+- **Playback history** — a private, on-device shelf keeps up to 20 renderer-confirmed recent items from
+  Jellyfin, downloads, and local files, including exactly where playback stopped. Resume, watch again,
+  remove one entry, or clear the shelf without deleting media.
 - **Physical-TV picker** — live Cast (MediaRouter) + DLNA (SSDP) discoveries are conservatively
   aggregated into one TV row only when stable evidence is confident. Tapping the TV starts playback;
   Cast versus DLNA is normally an internal choice.
@@ -60,9 +63,10 @@ Implemented end-to-end:
   leaves Retry / Change TV / Stop available. Jellyfin API and download retries remain bounded too. See
   [docs/PHYSICAL_TV_PLAYBACK.md](docs/PHYSICAL_TV_PLAYBACK.md) and
   [docs/RESILIENCE.md](docs/RESILIENCE.md).
-- **Smart Resume + optional night volume** — app-private resume records retain renderer-confirmed
-  progress and stable previous-TV identity without persisting live sessions or proxy URLs. Night volume
-  is off by default, reduction-only, sparse, and stops adjusting after a manual phone-side change.
+- **Smart Resume + optional night volume** — app-private playback-history records retain
+  renderer-confirmed progress and stable previous-TV identity without persisting live sessions or proxy
+  URLs. Night volume is off by default, reduction-only, sparse, and stops adjusting after a manual
+  phone-side change.
 - **On-device crash reports** — an uncaught-exception handler writes a **redacted** crash report
   (stack trace + app/device info, secrets stripped) to app-private storage; view, share or clear them
   from **Settings → Diagnostics**. Sharing includes only reports from the **latest build** (crashes from
@@ -116,5 +120,5 @@ The pure-JVM core subset can also be verified directly with `kotlinc` (procedure
 
 No telemetry, analytics, ads, cloud services, or tracking. The access token and the Jellyfin server
 URL are stored encrypted (Android Keystore, AES-256-GCM); passwords are never stored. "Delete all app
-data" removes profiles, tokens, metadata, target/compatibility data, diagnostics, settings, and active
-buffers.
+data" removes profiles, tokens, metadata, playback history, target/compatibility data, diagnostics,
+settings, and active buffers.

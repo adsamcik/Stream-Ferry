@@ -241,7 +241,7 @@ class MainViewModel(
     @Volatile private var currentResumeKey: String? = null
     @Volatile private var currentDurationSeconds: Long? = null
     private var lastResumeSaveMs: Long = 0L
-    // Set only by the root Smart Resume card; consumed by the next selected-target play.
+    // Set by Smart Resume or a playback-history action; consumed by the next selected-target play.
     private var smartResumeOverrideSeconds: Long? = null
 
     init {

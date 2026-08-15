@@ -96,17 +96,20 @@ Typed Jellyfin/source/phone-gateway preparation failures do not trigger a transc
 changing the renderer cannot repair an unavailable source. Attempt failure stages and causes remain
 coarse and redacted because receiver error taxonomies vary substantially.
 
-## Smart Resume v2
+## Smart Resume v2 and playback history
 
-The app-private latest-playback record contains only reconstruction data: source type and stable media
-identity, server/user identity where relevant, display title/subtitle, duration, renderer-confirmed
-position, completion state, stable physical-TV/endpoint identity, last successful protocol, update time,
-record version, session generation, and sequence. Version 1 records migrate with empty device fields;
-malformed or unknown versions are discarded safely.
+The app-private store keeps at most 20 recent media identities. Each record contains only reconstruction
+data: source type and stable media identity, server/user identity where relevant, display title/subtitle,
+duration, renderer-confirmed position, completion state, stable physical-TV/endpoint identity, last
+successful protocol, update time, record version, session generation, and sequence. The previous
+single-record document migrates into the history envelope in place. Version 1 records migrate with empty
+device fields; malformed or unknown versions are discarded safely.
 
 Smart Resume preserves the existing generation, stale-write, sequence, seek-regression, and completion
 guards. It checkpoints confirmed start/progress/seek, pause, disconnect, failure, lifecycle stop, explicit
-Stop, and completion. A completed record cannot be resurrected by delayed callbacks.
+Stop, and completion. A completed record cannot be resurrected by delayed callbacks. The gallery keeps
+the latest resumable entry prominent and shows earlier or completed entries in a playback-history shelf;
+completed entries restart from the beginning.
 
 For Jellyfin media, resume uses the newer of the local renderer-confirmed checkpoint and the newly
 resolved server resume point. Local/downloaded resume similarly reconciles the legacy local position.
@@ -140,7 +143,7 @@ they are therefore not claimed as a detectable manual override.
 | Matching outcomes, false-merge guards, persisted link/unlink and selection | Unit-tested |
 | Attempt deduplication, finite budgets, stale generations, Stop, one protocol reservation | Unit-tested |
 | Network/format/lower-resolution policy | Unit-tested |
-| Smart Resume v1 migration, reconciliation, device identity, completion protection | Unit-tested |
+| Playback-history migration/bounds, reconciliation, device identity, completion protection | Unit-tested |
 | Gradual/hard/sparse/reduction-only/manual/DST volume decisions | Unit-tested |
 | Android integration and Compose code | Compiled by `assembleDebug`; see the verification report for the exact run |
 | Cast, Google TV, Samsung, LG, and dual-protocol behavior | Hardware-dependent; not verified by unit tests |

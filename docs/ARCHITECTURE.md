@@ -115,7 +115,7 @@ unavailable. Exact test totals belong in the current verification report rather 
   UNSUPPORTED). Jellyfin server transcoding remains the online fallback; no remote client-transcoder
   input provider is claimed.
 - `core.local.LocalMediaRules` — local-file video filtering, display titles, and container MIME.
-- `core.resume.*` — resume-vs-restart-vs-finished decisions, versioned Smart Resume records,
+- `core.resume.*` — resume-vs-restart-vs-finished decisions, bounded versioned playback history,
   local/server position reconciliation, and completion/stale-write protection.
 - `core.volume.NightVolumePolicy` — local-time gradual/hard reduction decisions, sparse command
   scheduling, manual override, and DST/midnight handling.
@@ -140,9 +140,9 @@ state. Manual DI via `AppContainer` (no DI framework — §14).
 
 1. User picks media, then one conservatively aggregated physical TV. Selecting it enters the durable
    Now Playing route and chooses an eligible Cast or DLNA endpoint internally. `PlaybackEngine` resolves
-   a target-compatible source, preserving `PlaySessionId`. Smart Resume uses the newer safe local
-   renderer-confirmed checkpoint and Jellyfin position, and auto-reuses a previous TV only by exact
-   stable identity.
+   a target-compatible source, preserving `PlaySessionId`. Smart Resume and playback-history actions use
+   the newer safe local renderer-confirmed checkpoint and Jellyfin position, and auto-reuse a previous TV
+   only by exact stable identity.
 2. `PlaybackSessionCoordinator` creates a proxy session (256-bit id), starts the foreground service,
    binds the proxy to an ephemeral LAN port.
 3. The Cast/DLNA controller loads **only** the phone proxy URL.

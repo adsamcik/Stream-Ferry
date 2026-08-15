@@ -12,6 +12,12 @@ there is **no telemetry** and nothing leaves the device unless you share a repor
 
 ## [Unreleased]
 
+### Added
+- Added a private playback-history shelf for up to 20 renderer-confirmed Jellyfin, downloaded, and
+  local items, with exact left-off progress, resume/watch-again actions, and per-item or full clearing.
+- Existing single-item Smart Resume data migrates into the history automatically without retaining
+  stream URLs, tokens, or live playback sessions.
+
 ## [0.5.0] - 2026-08-09
 
 ### Added

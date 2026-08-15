@@ -4,7 +4,7 @@ import com.adsamcik.streamferry.core.stream.Protocol
 import java.util.UUID
 import kotlin.math.abs
 
-/** Source identity for the app-wide, secret-free latest-playback checkpoint. */
+/** Source identity for a secret-free, renderer-confirmed playback-history checkpoint. */
 enum class SmartResumeSourceType { JELLYFIN, DOWNLOADED, LOCAL }
 enum class SmartResumeRecordState { IN_PROGRESS, FINISHED }
 enum class SmartResumeCheckpointKind { STARTED, PROGRESS, SEEK_CONFIRMED, PAUSED, STOPPED, DISCONNECTED, FAILURE, LIFECYCLE, COMPLETED }
@@ -251,8 +251,8 @@ object NoOpSmartResumeRecordStore : SmartResumeRecordStore {
 }
 
 /**
- * Renderer positions own Smart Resume. A new item cannot overwrite the existing checkpoint until
- * the renderer confirms playback; a terminal completion cannot be resurrected by late teardown events.
+ * Renderer positions own Smart Resume. A new item cannot become the latest history entry until the
+ * renderer confirms playback; a terminal completion cannot be resurrected by late teardown events.
  */
 class SmartResumeSessionTracker(
     private val store: SmartResumeRecordStore,
