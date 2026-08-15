@@ -115,8 +115,8 @@ unavailable. Exact test totals belong in the current verification report rather 
   UNSUPPORTED). Jellyfin server transcoding remains the online fallback; no remote client-transcoder
   input provider is claimed.
 - `core.local.LocalMediaRules` — local-file video filtering, display titles, and container MIME.
-- `core.resume.*` — resume-vs-restart-vs-finished decisions, bounded versioned playback history,
-  local/server position reconciliation, and completion/stale-write protection.
+- `core.resume.*` — resume-vs-restart-vs-finished decisions, rolling 90-day versioned playback
+  history, local/server position reconciliation, and completion/stale-write protection.
 - `core.volume.NightVolumePolicy` — local-time gradual/hard reduction decisions, sparse command
   scheduling, manual override, and DST/midnight handling.
 - `core.dlna.SecureXml` — XXE-hardened XML parsing.

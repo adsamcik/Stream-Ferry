@@ -39,7 +39,7 @@ class SmartResumeStore(
     override fun apply(update: SmartResumeCheckpoint): SmartResumeRecord? = synchronized(lock) {
         val next = SmartResumeHistoryReducer.reduce(_history.value, update, clock())
         if (next == _history.value) return@synchronized _record.value
-        write(next)
+        if (next.isEmpty()) atomicFile.delete() else write(next)
         publish(next)
         _record.value
     }

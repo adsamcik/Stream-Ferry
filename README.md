@@ -33,8 +33,8 @@ Implemented end-to-end:
   check, an **unwatched-episode count** on series/seasons, and an in-progress **progress bar**; a
   **Continue Watching** row surfaces resumable items. From an item's detail you can **mark it watched or
   unwatched** (a series/season cascades to its episodes), written back via Jellyfin's `UserData` API.
-- **Playback history** — a private screen under **Settings → Playback history** keeps up to 20
-  renderer-confirmed recent items from Jellyfin, downloads, and local files, including exactly where
+- **Playback history** — a private, searchable screen under **Settings → Playback history** keeps the
+  last 90 days of renderer-confirmed Jellyfin, downloaded, and local items, including exactly where
   playback stopped. Resume, watch again, remove one entry, or clear the history without deleting media.
 - **Physical-TV picker** — live Cast (MediaRouter) + DLNA (SSDP) discoveries are conservatively
   aggregated into one TV row only when stable evidence is confident. Tapping the TV starts playback;

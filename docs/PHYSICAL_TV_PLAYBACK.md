@@ -98,18 +98,20 @@ coarse and redacted because receiver error taxonomies vary substantially.
 
 ## Smart Resume v2 and playback history
 
-The app-private store keeps at most 20 recent media identities. Each record contains only reconstruction
-data: source type and stable media identity, server/user identity where relevant, display title/subtitle,
-duration, renderer-confirmed position, completion state, stable physical-TV/endpoint identity, last
-successful protocol, update time, record version, session generation, and sequence. The previous
-single-record document migrates into the history envelope in place. Version 1 records migrate with empty
-device fields; malformed or unknown versions are discarded safely.
+The app-private store keeps media identities from the rolling last 90 days, with a generous defensive
+count ceiling for corrupt or abusive input. Each record contains only reconstruction data: source type
+and stable media identity, server/user identity where relevant, display title/subtitle, duration,
+renderer-confirmed position, completion state, stable physical-TV/endpoint identity, last successful
+protocol, update time, record version, session generation, and sequence. The previous single-record
+document migrates into the history envelope in place. Version 1 records migrate with empty device fields;
+malformed or unknown versions are discarded safely.
 
 Smart Resume preserves the existing generation, stale-write, sequence, seek-regression, and completion
 guards. It checkpoints confirmed start/progress/seek, pause, disconnect, failure, lifecycle stop, explicit
 Stop, and completion. A completed record cannot be resurrected by delayed callbacks. The gallery keeps
 only the existing latest resumable entry prominent; the complete recent list lives under **Settings →
-Playback history**, where completed entries restart from the beginning.
+Playback history**, where it can be searched by title, subtitle/episode text, or source and completed
+entries restart from the beginning.
 
 For Jellyfin media, resume uses the newer of the local renderer-confirmed checkpoint and the newly
 resolved server resume point. Local/downloaded resume similarly reconciles the legacy local position.

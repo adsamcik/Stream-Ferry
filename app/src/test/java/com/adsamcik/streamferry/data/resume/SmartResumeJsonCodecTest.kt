@@ -1,20 +1,34 @@
 package com.adsamcik.streamferry.data.resume
 
+import com.adsamcik.streamferry.core.resume.SmartResumeCheckpoint
+import com.adsamcik.streamferry.core.resume.SmartResumeCheckpointKind
+import com.adsamcik.streamferry.core.resume.SmartResumeHistoryReducer
 import com.adsamcik.streamferry.core.resume.SmartResumeRecord
 import com.adsamcik.streamferry.core.resume.SmartResumeRecordState
+import com.adsamcik.streamferry.core.resume.SmartResumeSeed
 import com.adsamcik.streamferry.core.resume.SmartResumeSourceType
+import java.io.File
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import org.json.JSONObject
+import org.junit.After
+import org.junit.Before
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class SmartResumeRecordVersioningTest {
+    private val historyFile: File
+        get() = File(RuntimeEnvironment.getApplication().noBackupFilesDir, "smart_resume_v1.json")
+
+    @Before fun setUp() { historyFile.delete() }
+    @After fun tearDown() { historyFile.delete() }
+
     private fun v1Fields() = SmartResumeRecordVersioning.StoredFields(
         sourceType = SmartResumeSourceType.JELLYFIN, mediaId = "movie", displayTitle = "Movie",
         displaySubtitle = null, durationSeconds = 600, serverId = "server", userId = "user", localContentUri = null,
@@ -59,5 +73,37 @@ class SmartResumeRecordVersioningTest {
 
         assertEquals(listOf(record), decoded.records)
         assertEquals(true, decoded.requiresRewrite)
+    }
+
+    @Test fun reopeningTheStorePrunesAnExpiredHistoryFile() {
+        var now = 100_000L
+        val context = RuntimeEnvironment.getApplication()
+        val store = SmartResumeStore(context) { now }
+        store.apply(
+            SmartResumeCheckpoint(
+                seed = SmartResumeSeed(
+                    SmartResumeSourceType.JELLYFIN,
+                    mediaId = "movie",
+                    displayTitle = "Movie",
+                    durationSeconds = 600,
+                    serverId = "server",
+                    userId = "user",
+                ),
+                sessionId = "session",
+                generation = 1,
+                sequence = 1,
+                confirmedPositionSeconds = 120,
+                durationSeconds = 600,
+                updatedAtMillis = now,
+                kind = SmartResumeCheckpointKind.STARTED,
+            ),
+        )
+        assertEquals(1, store.history.value.size)
+
+        now += SmartResumeHistoryReducer.RETENTION_MILLIS + 1
+        val reopened = SmartResumeStore(context) { now }
+
+        assertEquals(emptyList(), reopened.history.value)
+        assertFalse(historyFile.exists())
     }
 }
