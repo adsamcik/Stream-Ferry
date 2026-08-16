@@ -121,6 +121,8 @@ android {
 }
 
 dependencies {
+    implementation(project(":core"))
+
     // --- AndroidX / Compose ---
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)

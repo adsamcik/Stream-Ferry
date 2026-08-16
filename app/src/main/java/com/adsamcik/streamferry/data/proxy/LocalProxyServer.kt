@@ -894,8 +894,9 @@ class LocalProxyServer(
         try {
             while (true) {
                 if (response == null) {
-                    if (!canResume || policy.rangeEndInclusive == null) return
-                    val requested = com.adsamcik.streamferry.core.http.ByteRange(policy.nextOffset, policy.rangeEndInclusive)
+                    val rangeEnd = policy.rangeEndInclusive
+                    if (!canResume || rangeEnd == null) return
+                    val requested = com.adsamcik.streamferry.core.http.ByteRange(policy.nextOffset, rangeEnd)
                     response = try {
                         openVerifiedRangeUpstream(session, requested, expectedTotalLength)
                     } catch (_: Exception) {
