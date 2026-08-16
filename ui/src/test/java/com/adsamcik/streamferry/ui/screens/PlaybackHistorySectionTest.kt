@@ -58,7 +58,7 @@ class PlaybackHistorySectionTest {
     ) = SmartResumeUiState(
         historyKey = title,
         mediaId = "movie",
-        sourceType = SmartResumeSourceType.JELLYFIN,
+            sourceType = SmartResumeSourceType.REMOTE,
         title = title,
         subtitle = subtitle,
         sourceLabel = source,

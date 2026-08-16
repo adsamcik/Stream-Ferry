@@ -35,7 +35,7 @@ class SmartResumeUiStateTest {
         state: SmartResumeRecordState = SmartResumeRecordState.IN_PROGRESS,
         position: Long = 120,
     ) = SmartResumeRecord(
-        sourceType = SmartResumeSourceType.JELLYFIN,
+            sourceType = SmartResumeSourceType.REMOTE,
         mediaId = "movie",
         displayTitle = "Movie",
         durationSeconds = 600,
