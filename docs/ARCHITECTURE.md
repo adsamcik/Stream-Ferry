@@ -1,10 +1,11 @@
 # Architecture
 
-Stream Ferry streams Jellyfin video to a TV **exclusively** through an in-RAM proxy hosted on the
-Android phone. The TV never talks to Jellyfin.
+Stream Ferry streams remote and on-device media to a TV **exclusively** through an in-RAM proxy hosted
+on the Android phone. The TV never talks to a media source. Jellyfin and local media are the current
+source implementations; another provider is added as an isolated `:source:*` module.
 
 ```
-Jellyfin server ──(LAN / remote HTTPS / VPN / split-tunnel)──▶ Android phone
+Source server / local file ──(LAN / remote HTTPS / VPN / device storage)──▶ Android phone
                                                                   │  in-RAM bounded proxy
                                                                   ▼
                           http://PHONE_LAN_IP:EPHEMERAL_PORT/session/<256-bit-id>/stream
@@ -14,48 +15,57 @@ Jellyfin server ──(LAN / remote HTTPS / VPN / split-tunnel)──▶ Android
 ```
 
 The phone is the intentional, sole media gateway. The TV receives only ephemeral, high-entropy,
-phone-hosted URLs. No Jellyfin URL, token, Authorization header, playlist URL, segment URL, subtitle
+phone-hosted URLs. No source URL, token, Authorization header, playlist URL, segment URL, subtitle
 URL, or poster URL ever reaches the TV.
 
-In-app poster art (library grid + media detail) is fetched by the **phone itself** from Jellyfin via a
-memory-cache-only Coil image loader: the access token is sent as an HTTP **header** (added only for the
-configured Jellyfin host), never embedded in the image URL — so it can't land in a log, a cache key, or
-anywhere it could leak — and posters are rendered on the phone only, never forwarded to the TV. The
-on-device playback controls' **seek-preview scrubber** uses the same path: dragging shows a thumbnail of
-the scrubbed position from Jellyfin **chapter ("section") images** (`Items/{id}/Images/Chapter/{index}`),
-again header-authed, host-scoped, and phone-UI only — chapter images and their URLs are never given to
-the TV.
+In-app artwork is represented by an opaque `ArtworkRef`. A Coil fetcher resolves that reference through
+the active source's `ArtworkProvider`; only the source implementation can construct the private request,
+attach credentials, and validate the origin. Coil, Compose, cache keys, and the TV never receive a
+source URL or credential. Chapter seek-preview images use the same source-owned path.
 
-## Layering
+## Module boundaries
 
-The UI layer never directly calls Jellyfin, Cast, DLNA, token storage, proxy sockets, URL
-construction, or playback reporting. It depends only on the domain interfaces in
-`com.adsamcik.streamferry.domain.Interfaces` and the `MainViewModel`.
+Only `:app` depends on concrete source implementations. UI and playback depend on provider-neutral
+contracts, and concrete sources do not depend on one another.
 
-| Package | Responsibility |
+```text
+                         :app
+                  composition / Android shell
+                    /        |         \
+                  :ui    :playback    :source:jellyfin
+                    \        |         :source:local
+                     \       |              |
+                        :source:api <--------+
+                              |
+                            :core
+```
+
+| Module | Responsibility |
 | --- | --- |
-| `ui`, `ui.screens`, `ui.theme`, `ui.state` | Compose Material 3 screens, immutable UI state, single `MainViewModel`. |
-| `domain` | Core interfaces + domain models, including the `MediaSource` abstraction (multi-source gallery: Jellyfin + on-device local) with per-source transcode capabilities. No Android/framework types in signatures where avoidable. |
-| `data.jellyfin` | `JellyfinClient` (auth, libraries/items/search, playback-info, media-source, reporting) + `JellyfinAuthRepository` / `JellyfinMediaLibraryRepository` over the **documented Jellyfin HTTP API** (OkHttp). |
-| `data.cast` | Direct Google Cast Sender SDK + AndroidX MediaRouter discovery (`CastOptionsProvider`, `CastTargetController`). |
-| `data.dlna` | SSDP discovery, device-description parsing, AVTransport control + position/state polling (manual UPnP). |
-| `data.proxy` | `LocalProxyServer` (ServerSocket + bounded RAM streaming, throughput meter) and request parsing. Also serves user-picked on-device files (offline downloads + SAF/MediaStore `content://`) from a seekable fd with full byte-range/seek — the TV still only ever receives the proxy URL. |
-| `data.storage`, `data.security` | Direct Android Keystore (AES-256-GCM) encryption for both the token store and the server profile (base URL/server/user id); no third-party crypto library. |
-| `data.cache` | Optional app-private cache of library **metadata** (`LibraryCache` + `CachingMediaLibraryRepository`) for offline/fast browsing. |
-| `data.download` | Optional offline downloads (`DownloadStore` + `MediaDownloader`): saves the original file to app-private storage. |
-| `data.local` | On-device video source: user-elective SAF folder/file grants (`LocalSourceStore`) + optional MediaStore, enumerated and exposed as a `MediaSource` (`LocalMediaSource`). |
-| `data.resume` | `ResumeStore` for per-file local positions plus versioned `SmartResumeStore` for safe cross-restart reconstruction data and previous physical-TV identity. |
-| `data.volume` | Small SharedPreferences-backed night-volume settings store; no background service or automation database. |
-| `physical` | Pure conservative Cast/DLNA aggregation, stable association/unlink policy, endpoint selection, and exact resume identity matching. |
-| `playback` | `PlaybackEngine` remains the orchestrator for source → proxy → renderer, adaptive bitrate, generation ownership, and bounded recovery. Pure `PlaybackRecoverySession`, existing `PlaybackRecovery` / `StartupWatchdog`, and `RendererCapabilityStore` hold policy outside the UI. Also `MediaSessionController` and `PlaybackServiceController`. |
-| `playback.streamselection` | Chooses a TV-compatible Jellyfin stream server-side. Online media is never transcoded on the phone; the separate `data.transcode` path is local-file-only. |
-| `playback.proxy` | `ProxyPlaybackService` foreground service (type `mediaPlayback`) hosting the MediaStyle controls notification. |
-| `playback.buffer` | Memory buffer policy (pass-through + rolling prebuffer). |
-| `playback.session` | `PlaybackSessionCoordinator` ties Jellyfin ↔ proxy ↔ Cast/DLNA sessions. |
-| `playback.reporting` | `JellyfinPlaybackReporter` (start/progress/pause/seek/stop/cleanup). |
-| `permissions` | Local-network / notification permission management. |
-| `diagnostics`, `logging` | Redacting logger, network info, compatibility runner. |
-| `core.*` | **Pure-JVM, dependency-free, unit-tested** matching, resume, volume, security, stream, and recovery policy (see below). |
+| `:app` | Android application shell and the only concrete-source registration/composition root; Android stores and lifecycle wiring remain here. |
+| `:core` | Pure-JVM policy and models: HTTP/HLS, recovery, ABR, stream decisions, security, resume, physical-TV aggregation, and other framework-free logic. |
+| `:source:api` | Namespaced identities (`SourceInstanceId`, `MediaRef`), normalized catalogue/artwork/state models, capability contracts, `ProviderPlaybackSession`, and credential-isolating `StreamLease`. It contains no provider name or protocol-specific model. |
+| `:source:jellyfin` | Jellyfin discovery, authentication, catalogue mapping, artwork, watch state, playback negotiation/reporting, download preparation, credentials, private upstream locators, and transcode cleanup. |
+| `:source:local` | SAF/MediaStore catalogue and local playback implementation. It has no Jellyfin dependency. |
+| `:playback` | `PlaybackEngine`, recovery, ABR, Cast/DLNA controllers, MediaSession, foreground playback service, and phone gateway. It depends on `:source:api`, never a concrete source. |
+| `:ui` | Compose screens, immutable UI state, and UI-facing controller contracts. It depends on `:source:api`, never a concrete source. |
+
+`checkSourceBoundaries` enforces the graph during every module `check`: it rejects concrete source
+imports/dependencies in `:ui` and `:playback`, cross-source imports/dependencies, provider names in
+`:source:api`, and provider-named declarations in `:core`.
+
+## Source and playback contracts
+
+Each configured source exposes a `SourceBackend` bundle containing only the capabilities it supports:
+catalogue, artwork, playback, user state, downloads, and setup. Durable identities are always
+`SourceInstanceId` + native id; cache, resume, playback, artwork, and download requests therefore cannot
+collide across providers, servers, or accounts.
+
+`PlaybackEngine` resolves a `PlaybackProvider` through `SourceRegistry` and receives a
+`ProviderPlaybackSession`. The provider session owns preparation, quality/track replanning, lifecycle
+reporting, media segments, and cleanup. Its `StreamLease` opens bytes without revealing a URL or header.
+The gateway owns Range handling, bounded buffers, retry, and opaque HLS rewriting; the source owns
+private locations, credentials, and origin/redirect validation.
 
 ## Adaptive application shell
 
@@ -138,21 +148,20 @@ state. Manual DI via `AppContainer` (no DI framework — §14).
 
 ## Session lifecycle
 
-1. User picks media, then one conservatively aggregated physical TV. Selecting it enters the durable
-   Now Playing route and chooses an eligible Cast or DLNA endpoint internally. `PlaybackEngine` resolves
-   a target-compatible source, preserving `PlaySessionId`. Smart Resume and playback-history actions use
-   the newer safe local renderer-confirmed checkpoint and Jellyfin position, and auto-reuse a previous TV
-   only by exact stable identity.
-2. `PlaybackSessionCoordinator` creates a proxy session (256-bit id), starts the foreground service,
-   binds the proxy to an ephemeral LAN port.
+1. User picks a namespaced `MediaRef`, then one conservatively aggregated physical TV. Selecting it
+   enters the durable Now Playing route and chooses an eligible Cast or DLNA endpoint internally.
+   `PlaybackEngine` asks the owning source to prepare a target-compatible provider session. Smart Resume
+   and playback-history actions use a renderer-confirmed checkpoint plus source user state, and auto-reuse
+   a previous TV only by exact stable identity.
+2. `DefaultPlaybackSessionCoordinator` creates a proxy session (256-bit id), attaches the source-owned
+   `StreamLease`, starts the foreground service, and binds the proxy to an ephemeral LAN port.
 3. The Cast/DLNA controller loads **only** the phone proxy URL.
-4. `JellyfinPlaybackReporter` reports start, then **progress every ~5 s** (position + paused state),
-   immediate updates after pause/resume/seek, and stop — so Jellyfin's resume point, "Continue Watching",
-   and played state stay in sync.
+4. `ProviderPlaybackSession` receives start, progress, pause, seek, and stop events. A remote source maps
+   them to its native reporting API; local media is not forced to implement a fake server lifecycle.
 5. While playing, the `AdaptiveBitrateController` measures real proxy throughput over a rolling
    ≥ 30 s window (plus renderer rebuffer events) and, with hysteresis, may switch quality mid-stream
-   by re-resolving PlaybackInfo at the current position and reloading the renderer with a new proxy
-   session ([ADAPTIVE_BITRATE.md](ADAPTIVE_BITRATE.md)).
+   by asking the provider session to replan at the current position and reloading the renderer with a
+   new proxy session ([ADAPTIVE_BITRATE.md](ADAPTIVE_BITRATE.md)).
 6. **Bounded recovery:** transient renderer/network failure admits one same-stream endpoint retry.
    Eligible startup incompatibility can advance through finite server compatibility/quality variants;
    after same-endpoint work, one alternate endpoint of the same confidently merged TV may be reserved.
@@ -160,5 +169,5 @@ state. Manual DI via `AppContainer` (no DI framework — §14).
    cancels recovery; old controllers cannot act. Exhaustion retains Now Playing with Retry, Change TV,
    Stop, and redacted history. The CPU + Wi-Fi locks remain owned by `ProxyPlaybackService` while the
    session is active.
-7. On stop/error/expiry/end: proxy session revoked, buffers cleared, Jellyfin transcode/HLS session
-   stopped, foreground service stopped.
+7. On stop/error/expiry/end: proxy session revoked, buffers cleared, provider session closed (including
+   source-native transcode cleanup where applicable), and foreground service stopped.
