@@ -1,6 +1,6 @@
 package com.adsamcik.streamferry.data.download
 
-import com.adsamcik.streamferry.domain.JellyfinRepository
+import com.adsamcik.streamferry.domain.ServerPlaybackProvider
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.logging.DiagnosticsLogger
 import io.mockk.coEvery
@@ -35,7 +35,7 @@ class MediaDownloaderOwnerScopeTest {
             val queue = DownloadQueueStore.forFilesDir(root)
             queue.add(pending)
             val downloader = MediaDownloader(
-                jellyfin = mockk<JellyfinRepository>(relaxed = true),
+                playbackProvider = mockk<ServerPlaybackProvider>(relaxed = true),
                 store = DownloadStore.forFilesDir(root),
                 queue = queue,
                 httpClient = OkHttpClient(),
@@ -56,10 +56,10 @@ class MediaDownloaderOwnerScopeTest {
     fun pauseAllCancelsImmediatelyButPreservesResumableState() = runTest {
         val root = Files.createTempDirectory("download-system-pause").toFile()
         try {
-            val jellyfin = mockk<JellyfinRepository>()
+            val playbackProvider = mockk<ServerPlaybackProvider>()
             val requestStarted = CompletableDeferred<Unit>()
             coEvery {
-                jellyfin.playbackInfo(any(), any(), any(), any(), any(), any(), any(), any(), any(), any())
+                playbackProvider.playbackInfo(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any())
             } coAnswers {
                 requestStarted.complete(Unit)
                 awaitCancellation()
@@ -71,7 +71,7 @@ class MediaDownloaderOwnerScopeTest {
             part.parentFile?.mkdirs()
             part.writeText("existing partial bytes")
             val downloader = MediaDownloader(
-                jellyfin = jellyfin,
+                playbackProvider = playbackProvider,
                 store = store,
                 queue = queue,
                 httpClient = OkHttpClient(),

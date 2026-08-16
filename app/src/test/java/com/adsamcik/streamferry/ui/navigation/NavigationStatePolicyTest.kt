@@ -91,14 +91,14 @@ class NavigationStatePolicyTest {
     @Test
     fun `restored source rejects unknown values`() {
         assertEquals(MediaSourceIds.LOCAL, NavigationStatePolicy.restoreSource(MediaSourceIds.LOCAL))
-        assertEquals(MediaSourceIds.JELLYFIN, NavigationStatePolicy.restoreSource("stale-source"))
+        assertEquals(MediaSourceIds.REMOTE, NavigationStatePolicy.restoreSource("stale-source"))
     }
 
     @Test
     fun `gallery request gate rejects a late response after navigating to another folder`() {
         val gate = GalleryLoadRequestGate()
-        val seasonOne = GalleryBrowseTarget(MediaSourceIds.JELLYFIN, "series-one")
-        val seasonTwenty = GalleryBrowseTarget(MediaSourceIds.JELLYFIN, "series-twenty")
+        val seasonOne = GalleryBrowseTarget(MediaSourceIds.REMOTE, "series-one")
+        val seasonTwenty = GalleryBrowseTarget(MediaSourceIds.REMOTE, "series-twenty")
         val firstRequest = gate.begin(seasonOne)
 
         assertTrue(gate.isCurrent(firstRequest, seasonOne))

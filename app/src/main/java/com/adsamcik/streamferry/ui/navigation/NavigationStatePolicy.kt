@@ -86,7 +86,7 @@ internal object NavigationStatePolicy {
 
     fun restoreSource(value: String?): String = when (value) {
         MediaSourceIds.LOCAL -> MediaSourceIds.LOCAL
-        else -> MediaSourceIds.JELLYFIN
+        else -> MediaSourceIds.REMOTE
     }
 }
 

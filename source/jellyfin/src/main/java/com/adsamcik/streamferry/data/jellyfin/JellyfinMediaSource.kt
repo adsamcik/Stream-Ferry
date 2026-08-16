@@ -14,7 +14,7 @@ import com.adsamcik.streamferry.domain.MediaSourceIds
 class JellyfinMediaSource(
     private val library: MediaLibraryRepository,
 ) : MediaSource {
-    override val id: String = MediaSourceIds.JELLYFIN
+    override val id: String = MediaSourceIds.REMOTE
     override val displayName: String = "Jellyfin"
     override val capabilities: SourceCapabilities =
         SourceCapabilities(

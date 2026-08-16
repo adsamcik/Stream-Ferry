@@ -83,7 +83,7 @@ import com.adsamcik.streamferry.app.StreamFerryApplication
 import com.adsamcik.streamferry.core.volume.NightVolumePolicy
 import com.adsamcik.streamferry.diagnostics.ReportExport
 import com.adsamcik.streamferry.diagnostics.ReportShare
-import com.adsamcik.streamferry.domain.JellyfinLibraryStatus
+import com.adsamcik.streamferry.domain.SourceAvailability
 import com.adsamcik.streamferry.domain.MediaSourceIds
 import com.adsamcik.streamferry.playback.PlaybackPhase
 import com.adsamcik.streamferry.playback.PlaybackControlPolicy
@@ -164,8 +164,8 @@ fun AppRoot(state: AppUiState, viewModel: MainViewModel, onScanDevices: () -> Un
         )
         val showMiniPlayer = state.playback != null && state.route != Route.PLAYBACK
         val galleryOwnsPhoneHeader = !useNavigationRail && state.route == Route.GALLERY
-        val showJellyfinUnavailableNotice = state.activeSourceId == MediaSourceIds.JELLYFIN &&
-            state.jellyfinLibraryStatus == JellyfinLibraryStatus.UNAVAILABLE
+        val showJellyfinUnavailableNotice = state.activeSourceId == MediaSourceIds.REMOTE &&
+            state.jellyfinLibraryStatus == SourceAvailability.UNAVAILABLE
         val spatialMotion = MaterialTheme.motionScheme.defaultSpatialSpec<IntOffset>()
         val effectsMotion = MaterialTheme.motionScheme.defaultEffectsSpec<Float>()
 

@@ -1,8 +1,8 @@
 package com.adsamcik.streamferry.data.jellyfin
 
 import com.adsamcik.streamferry.core.net.TrustedMediaOriginPolicy
-import com.adsamcik.streamferry.domain.JellyfinPlaybackReporter
-import com.adsamcik.streamferry.domain.JellyfinRepository
+import com.adsamcik.streamferry.domain.ProviderPlaybackReporter
+import com.adsamcik.streamferry.domain.ServerPlaybackProvider
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.domain.MediaSource
 import com.adsamcik.streamferry.domain.PlaybackInfo
@@ -107,8 +107,8 @@ class JellyfinSourceBackend(
 /** Maps the existing server negotiation/reporting implementation to the session-based source contract. */
 class JellyfinPlaybackProvider(
     private val source: SourceInstanceId,
-    private val repository: JellyfinRepository,
-    private val reporter: JellyfinPlaybackReporter,
+    private val repository: ServerPlaybackProvider,
+    private val reporter: ProviderPlaybackReporter,
     private val httpClient: OkHttpClient,
 ) : PlaybackProvider {
 
@@ -120,16 +120,6 @@ class JellyfinPlaybackProvider(
         if (request.media.source != source) {
             return Result.failure(IllegalArgumentException("Media reference belongs to another source instance"))
         }
-        val deviceProfile = request.preferredVideoCodec?.let { codec ->
-            DeviceProfiles.forTarget(
-                caps = request.target,
-                maxBitrateBps = request.maxBitrateBps,
-                forceTranscode = request.forceTranscode,
-                allowSubtitleBurnIn = request.allowSubtitleBurnIn,
-                preferredVideoCodec = codec,
-                maxVideoHeight = request.maxVideoHeight,
-            )
-        }
         return repository.playbackInfo(
             itemId = request.media.nativeId,
             capabilities = request.target,
@@ -140,7 +130,7 @@ class JellyfinPlaybackProvider(
             subtitleStreamIndex = request.subtitleTrack?.opaqueId?.toIntOrNull(),
             startPositionSeconds = request.startPositionSeconds,
             maxVideoHeight = request.maxVideoHeight,
-            deviceProfileOverride = deviceProfile,
+            preferredVideoCodec = request.preferredVideoCodec,
         ).mapCatching { info ->
             val upstream = repository.resolveUpstream(info)
             JellyfinProviderPlaybackSession(this, request, info, upstream)

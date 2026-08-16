@@ -51,7 +51,7 @@ import com.adsamcik.streamferry.diagnostics.DiagnosticsEventLog
 import com.adsamcik.streamferry.diagnostics.DiagnosticsPreferences
 import com.adsamcik.streamferry.diagnostics.NetworkInfoProvider
 import com.adsamcik.streamferry.diagnostics.ReportShare
-import com.adsamcik.streamferry.domain.JellyfinLibraryScope
+import com.adsamcik.streamferry.domain.AccountLibraryScope
 import com.adsamcik.streamferry.domain.MediaLibraryRepository
 import com.adsamcik.streamferry.domain.MediaSource
 import com.adsamcik.streamferry.domain.SecureTokenStore
@@ -66,7 +66,7 @@ import com.adsamcik.streamferry.playback.PlaybackEngine
 import com.adsamcik.streamferry.playback.PlaybackPreferences
 import com.adsamcik.streamferry.playback.PersistentRendererCapabilityStore
 import com.adsamcik.streamferry.playback.RendererCapabilityStore
-import com.adsamcik.streamferry.playback.reporting.DefaultJellyfinPlaybackReporter
+import com.adsamcik.streamferry.playback.reporting.DefaultProviderPlaybackReporter
 import com.adsamcik.streamferry.playback.session.DefaultPlaybackSessionCoordinator
 import com.adsamcik.streamferry.ui.theme.AppearancePreferences
 import com.adsamcik.streamferry.source.api.SourceRegistry
@@ -198,7 +198,7 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
                 // scope but never enables a remote request; it only unlocks that account's local metadata.
                 scope = {
                     (authRepository.currentUser.value ?: authRepository.cachedSession.value)
-                        ?.let { JellyfinLibraryScope(it.serverId, it.userId).cacheKey }
+                        ?.let { AccountLibraryScope(it.serverId, it.userId).cacheKey }
                         ?: "unauthenticated"
                 },
                 // A cached session intentionally has no token installed. It may read disk metadata but
@@ -239,8 +239,8 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
     private val jellyfinRepository: HttpJellyfinRepository by lazy {
         HttpJellyfinRepository(jellyfinClient, logger, httpClient)
     }
-    private val reporter: DefaultJellyfinPlaybackReporter by lazy {
-        DefaultJellyfinPlaybackReporter(jellyfinClient, deviceId, logger, jellyfinConnectionMonitor)
+    private val reporter: DefaultProviderPlaybackReporter by lazy {
+        DefaultProviderPlaybackReporter(jellyfinClient, deviceId, logger, jellyfinConnectionMonitor)
     }
 
     /**
@@ -349,7 +349,7 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
 
     val playbackEngine: PlaybackEngine by lazy {
         PlaybackEngine(
-            jellyfin = jellyfinRepository,
+            playbackProvider = jellyfinRepository,
             coordinator = coordinator,
             proxy = proxyServer,
             networkInfo = networkInfo,
@@ -369,7 +369,7 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
     private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     val downloader: MediaDownloader by lazy {
         MediaDownloader(
-            jellyfin = jellyfinRepository,
+            playbackProvider = jellyfinRepository,
             store = downloadStore,
             queue = downloadQueueStore,
             httpClient = httpClient,

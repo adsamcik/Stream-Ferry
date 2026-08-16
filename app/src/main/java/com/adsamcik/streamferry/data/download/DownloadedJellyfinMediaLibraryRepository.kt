@@ -103,12 +103,12 @@ class DownloadedJellyfinMediaLibraryRepository(
         isFolder = true,
         type = "Folder",
         subtitle = "Available offline",
-        sourceId = MediaSourceIds.JELLYFIN,
+        sourceId = MediaSourceIds.REMOTE,
     )
 
     private fun DownloadEntry.asGalleryItem(): MediaItem = mediaItem
         ?.takeIf { it.id == itemId }
-        ?.copy(sourceId = MediaSourceIds.JELLYFIN)
+        ?.copy(sourceId = MediaSourceIds.REMOTE)
         ?: MediaItem(
             id = itemId,
             title = title,
@@ -118,7 +118,7 @@ class DownloadedJellyfinMediaLibraryRepository(
             resumePositionSeconds = null,
             isFolder = false,
             type = "Video",
-            sourceId = MediaSourceIds.JELLYFIN,
+            sourceId = MediaSourceIds.REMOTE,
         )
 
     private fun MediaItem.matches(query: String): Boolean {

@@ -2,7 +2,7 @@ package com.adsamcik.streamferry.data.jellyfin
 
 import com.adsamcik.streamferry.core.stream.MediaProfile
 import com.adsamcik.streamferry.core.stream.TargetCapabilities
-import com.adsamcik.streamferry.domain.JellyfinRepository
+import com.adsamcik.streamferry.domain.ServerPlaybackProvider
 import com.adsamcik.streamferry.domain.PlaybackInfo
 import com.adsamcik.streamferry.domain.UpstreamSource
 import com.adsamcik.streamferry.source.api.DiagnosticSink
@@ -11,7 +11,7 @@ import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 
 /**
- * Concrete [JellyfinRepository] over the documented Jellyfin HTTP API (see [JellyfinApiContract]).
+ * Concrete [ServerPlaybackProvider] over the documented server HTTP API (see [JellyfinApiContract]).
  *
  * Responsibilities (§8):
  *   - Build a PlaybackInfo request whose DeviceProfile is derived from the target's real
@@ -28,7 +28,7 @@ class HttpJellyfinRepository(
     private val api: JellyfinApi,
     private val logger: DiagnosticSink,
     @Suppress("unused") private val httpClient: OkHttpClient,
-) : JellyfinRepository {
+) : ServerPlaybackProvider {
 
     override suspend fun playbackInfo(
         itemId: String,
@@ -40,14 +40,23 @@ class HttpJellyfinRepository(
         subtitleStreamIndex: Int?,
         startPositionSeconds: Long,
         maxVideoHeight: Int,
-        deviceProfileOverride: String?,
+        preferredVideoCodec: String?,
+        downloadProfile: com.adsamcik.streamferry.domain.DownloadTranscodeProfile?,
     ): Result<PlaybackInfo> = withContext(Dispatchers.IO) {
         runCatching {
-            val deviceProfile = deviceProfileOverride ?: DeviceProfiles.forTarget(
+            val deviceProfile = downloadProfile?.let { profile ->
+                DeviceProfiles.forDownload(
+                    maxBitrateBps = profile.maxBitrateBps,
+                    container = profile.container,
+                    videoCodec = profile.videoCodec,
+                    audioCodec = profile.audioCodec,
+                )
+            } ?: DeviceProfiles.forTarget(
                 caps = capabilities,
                 maxBitrateBps = maxBitrateBps,
                 forceTranscode = forceTranscode,
                 allowSubtitleBurnIn = allowSubtitleBurnIn,
+                preferredVideoCodec = preferredVideoCodec,
                 maxVideoHeight = maxVideoHeight,
             )
             val response = api.postPlaybackInfo(

@@ -5,7 +5,7 @@ import com.adsamcik.streamferry.data.cache.JellyfinConnectionMonitor
 import com.adsamcik.streamferry.data.jellyfin.HttpJellyfinRepository.Companion.TICKS_PER_SECOND
 import com.adsamcik.streamferry.data.jellyfin.JellyfinApi
 import com.adsamcik.streamferry.data.jellyfin.JellyfinHttpException
-import com.adsamcik.streamferry.domain.JellyfinPlaybackReporter
+import com.adsamcik.streamferry.domain.ProviderPlaybackReporter
 import com.adsamcik.streamferry.domain.PlaybackInfo
 import com.adsamcik.streamferry.source.api.DiagnosticSink
 import java.io.IOException
@@ -16,12 +16,12 @@ import kotlinx.coroutines.CancellationException
  * progress: callers pass real positions derived from target status; on unknown positions we report
  * the last known value rather than fabricating one.
  */
-class DefaultJellyfinPlaybackReporter(
+class DefaultProviderPlaybackReporter(
     private val api: JellyfinApi,
     private val deviceId: String,
     private val logger: DiagnosticSink,
     private val connectionMonitor: JellyfinConnectionMonitor? = null,
-) : JellyfinPlaybackReporter {
+) : ProviderPlaybackReporter {
 
     override suspend fun reportStart(info: PlaybackInfo) = reportStart(info, initialPositionSeconds = 0L)
 

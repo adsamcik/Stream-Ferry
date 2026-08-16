@@ -6,11 +6,11 @@ import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
-class JellyfinWatchStateTest {
+class WatchStateTest {
 
     @Test
     fun markWatchedClearsResumeAndSetsFullProgress() {
-        val updated = episode(played = false, position = 91, percentage = 38.0).withJellyfinWatchState(played = true)
+        val updated = episode(played = false, position = 91, percentage = 38.0).withWatchState(played = true)
 
         assertTrue(updated.played)
         assertEquals(100.0, updated.playedPercentage)
@@ -19,7 +19,7 @@ class JellyfinWatchStateTest {
 
     @Test
     fun markUnwatchedKeepsAnExistingResumePoint() {
-        val updated = episode(played = true, position = 91, percentage = 100.0).withJellyfinWatchState(played = false)
+        val updated = episode(played = true, position = 91, percentage = 100.0).withWatchState(played = false)
 
         assertFalse(updated.played)
         assertEquals(0.0, updated.playedPercentage)
@@ -28,19 +28,19 @@ class JellyfinWatchStateTest {
 
     @Test
     fun resetProgressReturnsEpisodeToAnUnwatchedStart() {
-        val updated = episode(played = true, position = 600, percentage = 100.0).withJellyfinProgressReset()
+        val updated = episode(played = true, position = 600, percentage = 100.0).withProgressReset()
 
         assertFalse(updated.played)
         assertEquals(0.0, updated.playedPercentage)
         assertNull(updated.resumePositionSeconds)
-        assertFalse(updated.hasJellyfinProgressToReset())
+        assertFalse(updated.hasProgressToReset())
     }
 
     @Test
-    fun onlyJellyfinEpisodesExposeTheEpisodeResetAction() {
-        assertTrue(episode().isJellyfinEpisode())
-        assertFalse(episode().copy(sourceId = MediaSourceIds.LOCAL).isJellyfinEpisode())
-        assertFalse(episode().copy(type = "Movie").isJellyfinEpisode())
+    fun episodeClassificationDoesNotDependOnConcreteSource() {
+        assertTrue(episode().isEpisode())
+        assertTrue(episode().copy(sourceId = MediaSourceIds.LOCAL).isEpisode())
+        assertFalse(episode().copy(type = "Movie").isEpisode())
     }
 
     private fun episode(

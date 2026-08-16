@@ -31,16 +31,16 @@ import com.adsamcik.streamferry.data.jellyfin.JellyfinWatchMutationKind
 import com.adsamcik.streamferry.data.jellyfin.JellyfinWatchMutationStore
 import com.adsamcik.streamferry.data.jellyfin.QuickConnectSession
 import com.adsamcik.streamferry.domain.DiscoveredTarget
-import com.adsamcik.streamferry.domain.JellyfinLibraryScope
-import com.adsamcik.streamferry.domain.JellyfinLibraryStatus
+import com.adsamcik.streamferry.domain.AccountLibraryScope
+import com.adsamcik.streamferry.domain.SourceAvailability
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.domain.MediaSource
 import com.adsamcik.streamferry.domain.MediaSourceIds
 import com.adsamcik.streamferry.data.security.SecureStorageException
 import com.adsamcik.streamferry.domain.UserSession
-import com.adsamcik.streamferry.domain.isJellyfinEpisode
-import com.adsamcik.streamferry.domain.withJellyfinProgressReset
-import com.adsamcik.streamferry.domain.withJellyfinWatchState
+import com.adsamcik.streamferry.domain.isEpisode
+import com.adsamcik.streamferry.domain.withProgressReset
+import com.adsamcik.streamferry.domain.withWatchState
 import com.adsamcik.streamferry.permissions.AndroidNetworkPermissionManager
 import com.adsamcik.streamferry.physical.PhysicalEndpointKey
 import com.adsamcik.streamferry.physical.PhysicalTv
@@ -367,7 +367,7 @@ class MainViewModel(
                 _state.update { it.copy(jellyfinLibraryStatus = status) }
                 // ONLINE is emitted only after a verified authenticated Jellyfin request succeeds. It is a
                 // safe recovery boundary for retrying durable actions that previously lost connectivity.
-                if (!deletingAllData && status == JellyfinLibraryStatus.ONLINE) {
+                if (!deletingAllData && status == SourceAvailability.ONLINE) {
                     container.authRepository.currentUser.value?.let(::schedulePendingJellyfinWatchStateReplay)
                     pendingWatchStateReconciliations.values.toList()
                         .forEach(::scheduleJellyfinWatchStateReconciliation)
@@ -416,7 +416,7 @@ class MainViewModel(
             if (restored != null) {
                 container.jellyfinConnectionMonitor.markOnline()
                 _state.update { it.copy(loggedIn = true, connectionState = ConnectionState.CONNECTED) }
-                if (_state.value.route == Route.GALLERY && _state.value.activeSourceId == MediaSourceIds.JELLYFIN) {
+                if (_state.value.route == Route.GALLERY && _state.value.activeSourceId == MediaSourceIds.REMOTE) {
                     val restoredQuery = _state.value.searchQuery
                     _state.update { it.copy(galleryLoading = true) }
                     launchGalleryLoad()
@@ -798,7 +798,7 @@ class MainViewModel(
         runCatching { container.playbackEngine.stop() }
             .onFailure { error -> container.logger.w("playback", "Couldn't stop online playback before $reason", error) }
         _state.update { current ->
-            if (current.nowPlayingItem?.sourceId != MediaSourceIds.JELLYFIN) current else current.copy(
+            if (current.nowPlayingItem?.sourceId != MediaSourceIds.REMOTE) current else current.copy(
                 route = if (current.route == Route.PLAYBACK) Route.GALLERY else current.route,
                 playback = null,
                 nowPlayingItem = null,
@@ -954,7 +954,7 @@ class MainViewModel(
         val target = request.target
         // Jellyfin can be browsed through an authenticated live session OR an isolated cached-session
         // scope. The latter never permits the repository to make a token-bearing remote request.
-        if (target.sourceId == MediaSourceIds.JELLYFIN && !_state.value.canBrowseJellyfin) {
+        if (target.sourceId == MediaSourceIds.REMOTE && !_state.value.canBrowseJellyfin) {
             updateCurrentGalleryLoad(request) {
                 it.copy(libraries = emptyList(), continueWatching = emptyList(), galleryLoading = false)
             }
@@ -1086,10 +1086,10 @@ class MainViewModel(
 
     private fun openDetail(item: MediaItem) {
         val shouldPreferOfflineCopy = _state.value.availabilityFor(item) == JellyfinItemAvailability.DOWNLOADED &&
-            _state.value.jellyfinLibraryStatus == com.adsamcik.streamferry.domain.JellyfinLibraryStatus.UNAVAILABLE
+            _state.value.jellyfinLibraryStatus == com.adsamcik.streamferry.domain.SourceAvailability.UNAVAILABLE
         val detailSession = container.authRepository.currentUser.value
         val detailMutationKey = detailSession
-            ?.takeIf { item.sourceId == MediaSourceIds.JELLYFIN }
+            ?.takeIf { item.sourceId == MediaSourceIds.REMOTE }
             ?.let { JellyfinWatchMutationKey(it.serverId, it.userId, item.id) }
         val detailMutationRevision = detailMutationKey?.let { jellyfinWatchStateRevisions[it] ?: 0L } ?: 0L
         _state.update {
@@ -1149,7 +1149,7 @@ class MainViewModel(
     /** A manual refresh is the explicit retry boundary for a cache-only Jellyfin session. */
     private suspend fun refreshOnlineJellyfinSessionIfNeeded() {
         val current = _state.value
-        if (current.activeSourceId != MediaSourceIds.JELLYFIN || current.loggedIn || !current.hasCachedJellyfinSession) return
+        if (current.activeSourceId != MediaSourceIds.REMOTE || current.loggedIn || !current.hasCachedJellyfinSession) return
         if (container.authRepository.ensureOnlineSession().isSuccess) {
             container.jellyfinConnectionMonitor.markOnline()
         } else {
@@ -1666,7 +1666,7 @@ class MainViewModel(
             container.logger.event("playback", "Ignoring a stale completed Jellyfin item")
             return
         }
-        if (completion.isJellyfinSession && completedItem?.sourceId == MediaSourceIds.JELLYFIN) {
+        if (completion.isJellyfinSession && completedItem?.sourceId == MediaSourceIds.REMOTE) {
             mutateJellyfinWatchState(
                 item = completedItem,
                 origin = "playback completion",
@@ -1698,7 +1698,7 @@ class MainViewModel(
         val owner = completionOwner ?: return
         val current = completedItem ?: return
         if (!container.playbackPreferences.autoPlayNextEpisode ||
-            current.sourceId != MediaSourceIds.JELLYFIN ||
+            current.sourceId != MediaSourceIds.REMOTE ||
             !current.type.equals("Episode", ignoreCase = true) ||
             snapshot.selectedTarget == null
         ) return
@@ -1805,17 +1805,17 @@ class MainViewModel(
         }
 
         val shouldUseOfflineCopy = availability == JellyfinItemAvailability.DOWNLOADED &&
-            snapshot.jellyfinLibraryStatus == com.adsamcik.streamferry.domain.JellyfinLibraryStatus.UNAVAILABLE
+            snapshot.jellyfinLibraryStatus == com.adsamcik.streamferry.domain.SourceAvailability.UNAVAILABLE
         val remaining = snapshot.playlist.remove(entry.entryId)
         val target = snapshot.selectedTarget
         val previousOnlineContext = reconnectContext as? ReconnectContext.Online
-        if (item.sourceId == MediaSourceIds.JELLYFIN && previousOnlineContext != null &&
+        if (item.sourceId == MediaSourceIds.REMOTE && previousOnlineContext != null &&
             !isActiveOnlinePlaybackOwner(previousOnlineContext.owner)
         ) {
             container.logger.event("playlist", "Skipped a stale Jellyfin queue hand-off after account change")
             return
         }
-        val canReuseConnection = !shouldUseOfflineCopy && item.sourceId == MediaSourceIds.JELLYFIN &&
+        val canReuseConnection = !shouldUseOfflineCopy && item.sourceId == MediaSourceIds.REMOTE &&
             previousOnlineContext != null && target != null &&
             isActiveOnlinePlaybackOwner(previousOnlineContext.owner)
         if (canReuseConnection) {
@@ -2378,7 +2378,7 @@ class MainViewModel(
     fun markWatched(item: MediaItem, played: Boolean) {
         // Never send a series/season mutation here: Jellyfin cascades it into child episodes, which can
         // race an active playback report for one of those children. This screen exposes leaf-item actions.
-        if (item.sourceId != MediaSourceIds.JELLYFIN || item.isFolder) return
+        if (item.sourceId != MediaSourceIds.REMOTE || item.isFolder) return
         mutateJellyfinWatchState(
             item = item,
             origin = "manual watch-state change",
@@ -2392,7 +2392,7 @@ class MainViewModel(
 
     /** Reset a Jellyfin episode to unwatched at 0:00, including every durable local resume representation. */
     fun resetEpisodeProgress(item: MediaItem) {
-        if (!item.isJellyfinEpisode()) return
+        if (!item.isEpisode()) return
         mutateJellyfinWatchState(
             item = item,
             origin = "manual progress reset",
@@ -2411,7 +2411,7 @@ class MainViewModel(
         mutationKind: JellyfinWatchMutationKind,
         rejectIfPlaying: Boolean = true,
     ) {
-        if (item.sourceId != MediaSourceIds.JELLYFIN || (rejectIfPlaying && item.isFolder)) return
+        if (item.sourceId != MediaSourceIds.REMOTE || (rejectIfPlaying && item.isFolder)) return
         if (rejectIfPlaying && isPlaybackActiveFor(item.id)) {
             _state.update { current ->
                 current.copy(errorMessage = "Stop this item before changing its watch state.")
@@ -2709,9 +2709,9 @@ class MainViewModel(
         kind != JellyfinWatchMutationKind.MARK_UNPLAYED
 
     private fun JellyfinWatchMutation.transform(): (MediaItem) -> MediaItem = when (kind) {
-        JellyfinWatchMutationKind.MARK_PLAYED -> { item -> item.withJellyfinWatchState(played = true) }
-        JellyfinWatchMutationKind.MARK_UNPLAYED -> { item -> item.withJellyfinWatchState(played = false) }
-        JellyfinWatchMutationKind.RESET_PROGRESS -> { item -> item.withJellyfinProgressReset() }
+        JellyfinWatchMutationKind.MARK_PLAYED -> { item -> item.withWatchState(played = true) }
+        JellyfinWatchMutationKind.MARK_UNPLAYED -> { item -> item.withWatchState(played = false) }
+        JellyfinWatchMutationKind.RESET_PROGRESS -> { item -> item.withProgressReset() }
     }
 
     private fun setWatchStateMutationUpdating(mutation: JellyfinWatchMutation, updating: Boolean) {
@@ -2731,7 +2731,7 @@ class MainViewModel(
         container.jellyfinWatchMutationStore.pendingFor(serverId, userId, itemId) != null
 
     private fun isPlaybackBlockedByPendingJellyfinWatchState(item: MediaItem, session: UserSession?): Boolean =
-        item.sourceId == MediaSourceIds.JELLYFIN && session != null &&
+        item.sourceId == MediaSourceIds.REMOTE && session != null &&
             hasPendingJellyfinWatchStateMutation(session.serverId, session.userId, item.id)
     private fun isSmartResumeBlockedByWatchMutation(record: SmartResumeRecord): Boolean {
         if (record.sourceType !in setOf(SmartResumeSourceType.JELLYFIN, SmartResumeSourceType.DOWNLOADED)) return false
@@ -2780,7 +2780,7 @@ class MainViewModel(
 
     /** Apply journal and confirmed local mutations to a list that may have been requested before either completed. */
     private fun withConfirmedJellyfinWatchState(sourceId: String, items: List<MediaItem>): List<MediaItem> {
-        if (sourceId != MediaSourceIds.JELLYFIN) return items
+        if (sourceId != MediaSourceIds.REMOTE) return items
         val session = activeJellyfinSession() ?: return items
         val transforms = LinkedHashMap<String, (MediaItem) -> MediaItem>()
         container.jellyfinWatchMutationStore.pendingFor(session.serverId, session.userId).forEach { mutation ->
@@ -2797,7 +2797,7 @@ class MainViewModel(
 
     /** A watched/reset action clears the resume row; do not let an older result put it back. */
     private fun withConfirmedJellyfinContinueWatchingState(sourceId: String, items: List<MediaItem>): List<MediaItem> {
-        if (sourceId != MediaSourceIds.JELLYFIN) return items
+        if (sourceId != MediaSourceIds.REMOTE) return items
         val session = activeJellyfinSession() ?: return items
         val clearingIds = mutableSetOf<String>()
         container.jellyfinWatchMutationStore.pendingFor(session.serverId, session.userId)
@@ -2818,7 +2818,7 @@ class MainViewModel(
         itemId: String,
         transform: (MediaItem) -> MediaItem,
     ): LibraryCache.ItemPatchToken = withContext(Dispatchers.IO) {
-        val scope = JellyfinLibraryScope(serverId, userId).cacheKey
+        val scope = AccountLibraryScope(serverId, userId).cacheKey
         // patchItem deliberately throws on a write error. The durable journal must remain pending instead of
         // acknowledging an action that an old offline record could subsequently undo.
         val cachePatch = container.libraryCache.patchItem(scope, itemId, transform)
@@ -2850,7 +2850,7 @@ class MainViewModel(
         if (container.authRepository.currentUser.value != session) return
         val snapshot = _state.value
         val target = snapshot.galleryTarget()
-        if (target.sourceId != MediaSourceIds.JELLYFIN) return
+        if (target.sourceId != MediaSourceIds.REMOTE) return
         launchGalleryLoad(target)
         viewModelScope.launch {
             if (container.authRepository.currentUser.value == session) loadContinueWatching(target.sourceId)
@@ -3496,7 +3496,7 @@ class MainViewModel(
 
     /** Keep an online renderer alive at end-of-media only when a real next item can reuse it. */
     private fun shouldAutoAdvance(item: MediaItem?, playlist: PlaybackQueue): Boolean =
-        item?.sourceId == MediaSourceIds.JELLYFIN && (
+        item?.sourceId == MediaSourceIds.REMOTE && (
             playlist.isNotEmpty ||
                 (container.playbackPreferences.autoPlayNextEpisode &&
                     item.type.equals("Episode", ignoreCase = true) && item.seriesId != null)

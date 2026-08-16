@@ -1,6 +1,6 @@
 package com.adsamcik.streamferry.data.cache
 
-import com.adsamcik.streamferry.domain.JellyfinLibraryStatus
+import com.adsamcik.streamferry.domain.SourceAvailability
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -10,18 +10,18 @@ import kotlinx.coroutines.flow.asStateFlow
  * token, or exception detail, so it is safe to surface directly as an availability indicator.
  */
 class JellyfinConnectionMonitor {
-    private val _status = MutableStateFlow(JellyfinLibraryStatus.UNKNOWN)
-    val status: StateFlow<JellyfinLibraryStatus> = _status.asStateFlow()
+    private val _status = MutableStateFlow(SourceAvailability.UNKNOWN)
+    val status: StateFlow<SourceAvailability> = _status.asStateFlow()
 
     fun markOnline() {
-        _status.value = JellyfinLibraryStatus.ONLINE
+        _status.value = SourceAvailability.ONLINE
     }
 
     fun markUnavailable() {
-        _status.value = JellyfinLibraryStatus.UNAVAILABLE
+        _status.value = SourceAvailability.UNAVAILABLE
     }
 
     fun reset() {
-        _status.value = JellyfinLibraryStatus.UNKNOWN
+        _status.value = SourceAvailability.UNKNOWN
     }
 }

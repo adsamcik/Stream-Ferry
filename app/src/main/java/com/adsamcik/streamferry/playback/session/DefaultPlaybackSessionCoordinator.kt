@@ -4,7 +4,7 @@ import com.adsamcik.streamferry.core.session.ProxySession
 import com.adsamcik.streamferry.core.session.SessionRegistry
 import com.adsamcik.streamferry.data.proxy.ClientTranscodeSource
 import com.adsamcik.streamferry.data.proxy.LocalProxyServer
-import com.adsamcik.streamferry.domain.JellyfinPlaybackReporter
+import com.adsamcik.streamferry.domain.ProviderPlaybackReporter
 import com.adsamcik.streamferry.domain.PlaybackInfo
 import com.adsamcik.streamferry.domain.PlaybackSessionCoordinator
 import com.adsamcik.streamferry.domain.UpstreamSource
@@ -27,7 +27,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 class DefaultPlaybackSessionCoordinator(
     private val sessions: SessionRegistry,
     private val proxy: LocalProxyServer,
-    private val reporter: JellyfinPlaybackReporter,
+    private val reporter: ProviderPlaybackReporter,
     private val logger: DiagnosticsLogger,
 ) : PlaybackSessionCoordinator {
 

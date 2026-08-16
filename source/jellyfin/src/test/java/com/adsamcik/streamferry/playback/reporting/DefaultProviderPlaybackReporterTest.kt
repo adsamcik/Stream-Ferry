@@ -7,19 +7,19 @@ import com.adsamcik.streamferry.data.jellyfin.JellyfinApi
 import com.adsamcik.streamferry.domain.PlaybackInfo
 import com.adsamcik.streamferry.domain.UpstreamSource
 import com.adsamcik.streamferry.source.api.DiagnosticSink
-import com.adsamcik.streamferry.domain.JellyfinLibraryStatus
+import com.adsamcik.streamferry.domain.SourceAvailability
 import java.io.IOException
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 
-class DefaultJellyfinPlaybackReporterTest {
+class DefaultProviderPlaybackReporterTest {
 
     @Test
     fun reportsKeepTheLibraryItemAndSelectedMediaSourceDistinct() = runTest {
         val api = RecordingApi()
         val monitor = JellyfinConnectionMonitor()
-        val reporter = DefaultJellyfinPlaybackReporter(api, "device", NoOpLogger, monitor)
+        val reporter = DefaultProviderPlaybackReporter(api, "device", NoOpLogger, monitor)
         val info = playbackInfo()
 
         reporter.reportStart(info, initialPositionSeconds = 12L)
@@ -34,18 +34,18 @@ class DefaultJellyfinPlaybackReporterTest {
             ),
             api.calls,
         )
-        assertEquals(JellyfinLibraryStatus.ONLINE, monitor.status.value)
+        assertEquals(SourceAvailability.ONLINE, monitor.status.value)
     }
 
     @Test
     fun transportFailureMarksJellyfinUnavailableWithoutEscapingPlaybackCleanup() = runTest {
         val api = RecordingApi(failure = IOException("network lost"))
         val monitor = JellyfinConnectionMonitor()
-        val reporter = DefaultJellyfinPlaybackReporter(api, "device", NoOpLogger, monitor)
+        val reporter = DefaultProviderPlaybackReporter(api, "device", NoOpLogger, monitor)
 
         reporter.reportProgress(playbackInfo(), positionSeconds = 7L, isPaused = true)
 
-        assertEquals(JellyfinLibraryStatus.UNAVAILABLE, monitor.status.value)
+        assertEquals(SourceAvailability.UNAVAILABLE, monitor.status.value)
     }
 
     private fun playbackInfo() = PlaybackInfo(

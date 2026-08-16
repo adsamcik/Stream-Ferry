@@ -14,11 +14,11 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.serialization.Serializable
 
 /**
- * Core domain interfaces (§19). The UI depends only on these; it never touches Jellyfin, Cast,
+ * Core domain interfaces (§19). The UI depends only on these; it never touches a server protocol, Cast,
  * DLNA, sockets, token storage, URL construction or playback reporting directly.
  */
 
-// ----- Identity / media model (domain-level, decoupled from the Jellyfin SDK types) -----
+// ----- Identity / media model (domain-level, decoupled from provider SDK types) -----
 
 data class ServerProfile(
     val id: String,
@@ -39,10 +39,10 @@ data class MediaItem(
     val overview: String?,
     val resumePositionSeconds: Long?,
     val isFolder: Boolean,
-    /** Jellyfin item type, e.g. "CollectionFolder", "Series", "Season", "Movie", "Episode". */
+    /** Provider-neutral item classification, e.g. library, series, season, movie, episode, or folder. */
     val type: String? = null,
     /**
-     * Jellyfin's numeric position within its parent when supplied (for example Season 0, Season 1,
+     * Numeric position within the item's parent when supplied (for example Season 0, Season 1,
      * …). A complete paged season snapshot uses this to keep its rows in a stable numeric order.
      */
     val indexNumber: Int? = null,
@@ -51,25 +51,24 @@ data class MediaItem(
     /** Optional secondary line for the gallery (e.g. "Series · S1 E3"); never a secret. */
     val subtitle: String? = null,
     /**
-     * Jellyfin Primary-image tag (a content hash) if the item has poster art, else null. Used only to
-     * build an in-app poster URL for THIS phone's gallery (the token is sent as a header, never in the
-     * URL); a poster URL is never given to the TV.
+     * Opaque provider artwork id when the item has poster art. Consumers must ask the owning
+     * [com.adsamcik.streamferry.source.api.ArtworkProvider] to fetch it.
      */
     val imageTag: String? = null,
     /**
      * Chapter markers ("sections") for the seek-preview scrubber, in ascending start order. Each may
-     * carry a Jellyfin chapter image (shown ONLY in this phone's playback UI while scrubbing — never
+     * carry an opaque chapter image id (shown ONLY in this phone's playback UI while scrubbing — never
      * given to the TV). Empty when the item has no chapters or hasn't been fully loaded yet.
      */
     val chapters: List<MediaChapter> = emptyList(),
     /**
-     * Which [MediaSource] this item belongs to (e.g. [MediaSourceIds.JELLYFIN], [MediaSourceIds.LOCAL]).
-     * Defaults to Jellyfin so existing Jellyfin-constructed items are unchanged.
+     * Which [MediaSource] this item belongs to (e.g. [MediaSourceIds.REMOTE], [MediaSourceIds.LOCAL]).
+     * Legacy source family used while callers migrate to [ref].
      */
-    val sourceId: String = MediaSourceIds.JELLYFIN,
+    val sourceId: String = MediaSourceIds.REMOTE,
     /** Configured source namespace. Defaults preserve existing serialized media during migration. */
     val sourceInstanceId: SourceInstanceId = SourceInstanceId(SourceProviderId(sourceId), sourceId),
-    /** True when the item is fully watched (Jellyfin native watch state). Always false for local files. */
+    /** True when the item is fully watched. Always false for sources without user state. */
     val played: Boolean = false,
     /** For a series/season folder, the number of still-unwatched child items; null when not applicable. */
     val unplayedItemCount: Int? = null,
@@ -82,7 +81,7 @@ data class MediaItem(
 
 /**
  * A single chapter ("section") of a video. [startSeconds] is where it begins; [imageTag], when present,
- * means Jellyfin has a chapter thumbnail for it (addressed by the chapter's index in [MediaItem.chapters]).
+ * means the source has a chapter thumbnail for it (addressed by the chapter's index in [MediaItem.chapters]).
  */
 @Serializable
 data class MediaChapter(
@@ -104,12 +103,12 @@ data class PlaybackInfo(
     val audioTracks: List<MediaTrack> = emptyList(),
     /** Selectable subtitle tracks reported by the server (empty if none). "Off" is implicit, not a track. */
     val subtitleTracks: List<MediaTrack> = emptyList(),
-    /** Jellyfin library item id used by session reports; distinct from [mediaSourceId] for multi-version media. */
+    /** Catalogue item id used by session reports; distinct from [mediaSourceId] for multi-version media. */
     val itemId: String = mediaSourceId,
 )
 
 /**
- * A selectable audio or subtitle stream of the current media (as reported by Jellyfin), surfaced so the
+ * A selectable audio or subtitle stream of the current media (as reported by its source), surfaced so the
  * user can pick a language. [index] is the server stream index passed back as AudioStreamIndex /
  * SubtitleStreamIndex to re-resolve playback with this track.
  */
@@ -127,12 +126,12 @@ data class MediaTrack(
 
 /** Stable identifiers for the built-in media sources. */
 object MediaSourceIds {
-    const val JELLYFIN = "jellyfin"
+    const val REMOTE = "remote"
     const val LOCAL = "local"
 }
 
 /**
- * A browsable source of video [MediaItem]s (Jellyfin, on-device local files, …). The gallery routes
+ * A browsable source of video [MediaItem]s (remote servers, on-device local files, …). The gallery routes
  * browsing/search through the active source; [capabilities] tells the player whether the source can
  * transcode server-side (otherwise the phone transcodes on-device).
  */
@@ -141,7 +140,7 @@ interface MediaSource {
     val displayName: String
     val capabilities: SourceCapabilities
 
-    /** Top-level entries: Jellyfin libraries, or the local granted folders / videos. */
+    /** Top-level entries: server libraries, or local granted folders / videos. */
     suspend fun roots(): Result<List<MediaItem>>
     suspend fun children(parentId: String): Result<List<MediaItem>>
     suspend fun item(itemId: String): Result<MediaItem>
@@ -180,7 +179,15 @@ interface MediaLibraryRepository {
     suspend fun continueWatching(): Result<List<MediaItem>> = Result.success(emptyList())
 }
 
-interface JellyfinRepository {
+data class DownloadTranscodeProfile(
+    val maxBitrateBps: Long,
+    val container: String,
+    val videoCodec: String,
+    val audioCodec: String,
+)
+
+/** Transitional provider-neutral playback seam used while the gateway adopts [ProviderPlaybackSession]. */
+interface ServerPlaybackProvider {
     /**
      * Request official playback info for a target+preferences. Returns a [PlaybackInfo] containing
      * the upstream stream locator INTERNALLY (never surfaced to UI/TV) plus PlaySessionId. The
@@ -196,14 +203,15 @@ interface JellyfinRepository {
         subtitleStreamIndex: Int?,
         startPositionSeconds: Long,
         maxVideoHeight: Int = 0,
-        deviceProfileOverride: String? = null,
+        preferredVideoCodec: String? = null,
+        downloadProfile: DownloadTranscodeProfile? = null,
     ): Result<PlaybackInfo>
 
     /** Resolve the secret upstream URL + auth header for a media source (proxy layer only). */
     suspend fun resolveUpstream(info: PlaybackInfo): UpstreamSource
 
     /**
-     * Skippable media segments (intro/outro/recap/…) for [itemId] from Jellyfin's Media Segments API
+     * Skippable media segments (intro/outro/recap/…) exposed by the source
      * (10.10+). Empty when the server/item has none — never an error, so playback is unaffected.
      */
     suspend fun mediaSegments(itemId: String): List<com.adsamcik.streamferry.core.segments.MediaSegment> = emptyList()
@@ -235,7 +243,7 @@ data class UpstreamSource(
     val authHeader: String?,
     /** MIME of the phone-proxied resource (the HLS playlist itself for HLS). */
     val contentType: String,
-    /** Actual encoded output container, from Jellyfin's TranscodingContainer when transcoding. */
+    /** Actual encoded output container reported by the source when transcoding. */
     val outputContainer: String,
     /** Actual HLS segment packaging; null for a progressive resource. */
     val hlsSegmentFormat: HlsSegmentFormat? = null,
@@ -243,7 +251,7 @@ data class UpstreamSource(
     /**
      * True when this is a live server-side transcode (HLS for Cast, progressive for DLNA). A transcode
      * is NOT byte-seekable and is seeked/resumed **server-side** by re-resolving at the target position
-     * (Jellyfin honours `startTimeTicks`); a direct-play stream is byte-range seekable via the proxy.
+     * (the source honours the start request); a direct-play stream is byte-range seekable via the proxy.
      */
     val isTranscoding: Boolean,
     /** True only when the proxy can safely honour byte-range requests for this resource. */
@@ -391,14 +399,14 @@ interface SecureTokenStore {
     suspend fun clear()
 }
 
-/** Maps a [ProxySession] to/from a Jellyfin play session and a target session (§8). */
+/** Maps a [ProxySession] to/from a provider play session and a target session (§8). */
 interface PlaybackSessionCoordinator {
     val active: Flow<ProxySession?>
     suspend fun start(info: PlaybackInfo, upstream: UpstreamSource, phoneLanIp: String): ProxySession
     suspend fun stop(reason: String)
 }
 
-interface JellyfinPlaybackReporter {
+interface ProviderPlaybackReporter {
     suspend fun reportStart(info: PlaybackInfo)
     /** Start reporting at the exact resume point rather than pretending resumed media began at zero. */
     suspend fun reportStart(info: PlaybackInfo, initialPositionSeconds: Long) = reportStart(info)

@@ -105,10 +105,10 @@ import coil.compose.AsyncImage
 import com.adsamcik.streamferry.core.resume.ResumePolicy
 import com.adsamcik.streamferry.core.resume.SmartResumeSourceType
 import com.adsamcik.streamferry.data.download.DownloadFormat
-import com.adsamcik.streamferry.domain.JellyfinLibraryStatus
+import com.adsamcik.streamferry.domain.SourceAvailability
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.domain.MediaSourceIds
-import com.adsamcik.streamferry.domain.isJellyfinEpisode
+import com.adsamcik.streamferry.domain.isEpisode
 import com.adsamcik.streamferry.ui.MainViewModel
 import com.adsamcik.streamferry.ui.components.ExpressiveLoadingIndicator
 import com.adsamcik.streamferry.ui.state.AppUiState
@@ -176,12 +176,12 @@ fun GalleryScreen(state: AppUiState, viewModel: MainViewModel, compact: Boolean 
     var indexedSection by remember(entries) { mutableStateOf<String?>(null) }
     var indexScrubbing by remember(entries) { mutableStateOf(false) }
     val isLocalSource = state.activeSourceId == MediaSourceIds.LOCAL
-    val isJellyfinSource = state.activeSourceId == MediaSourceIds.JELLYFIN
+    val isJellyfinSource = state.activeSourceId == MediaSourceIds.REMOTE
     val sources = viewModel.sources
     val activeSourceName = sources.firstOrNull { it.first == state.activeSourceId }?.second ?: "Library"
     val searchLabel = if (isLocalSource) "Search this device" else "Search $activeSourceName"
     val needsJellyfinLogin = isJellyfinSource && !state.canBrowseJellyfin
-    val jellyfinUnavailable = isJellyfinSource && state.jellyfinLibraryStatus == JellyfinLibraryStatus.UNAVAILABLE
+    val jellyfinUnavailable = isJellyfinSource && state.jellyfinLibraryStatus == SourceAvailability.UNAVAILABLE
     val showingSeasons = !searchActive && !atRoot && (
         state.currentFolder?.type.equals("Series", ignoreCase = true) ||
             (entries.isNotEmpty() && entries.all { it.type.equals("Season", ignoreCase = true) })
@@ -518,8 +518,8 @@ private fun LibraryHome(
         ?.takeIf { it.sourceType == SmartResumeSourceType.JELLYFIN }
         ?.mediaId
     val visibleContinueWatching = state.continueWatching.filterNot { it.id == smartResumeMediaId }
-    val jellyfinUnavailable = state.activeSourceId == MediaSourceIds.JELLYFIN &&
-        state.jellyfinLibraryStatus == JellyfinLibraryStatus.UNAVAILABLE
+    val jellyfinUnavailable = state.activeSourceId == MediaSourceIds.REMOTE &&
+        state.jellyfinLibraryStatus == SourceAvailability.UNAVAILABLE
 
     LazyVerticalGrid(
         state = gridState,
@@ -932,12 +932,12 @@ private fun SourceOption(
         label = "source-option-content",
     )
     val description = when (id) {
-        MediaSourceIds.JELLYFIN -> "Stream from your server"
+        MediaSourceIds.REMOTE -> "Stream from your server"
         MediaSourceIds.LOCAL -> "Videos stored on this phone"
         else -> "Browse this media source"
     }
     val icon = when (id) {
-        MediaSourceIds.JELLYFIN -> Icons.Rounded.Dns
+        MediaSourceIds.REMOTE -> Icons.Rounded.Dns
         MediaSourceIds.LOCAL -> Icons.Rounded.PhoneAndroid
         else -> Icons.Rounded.VideoLibrary
     }
@@ -1528,8 +1528,8 @@ fun MediaDetailScreen(
     }
     val download = state.downloadFor(media.id)
     val availability = state.availabilityFor(media)
-    val serverUnavailable = media.sourceId == MediaSourceIds.JELLYFIN &&
-        state.jellyfinLibraryStatus == JellyfinLibraryStatus.UNAVAILABLE
+    val serverUnavailable = media.sourceId == MediaSourceIds.REMOTE &&
+        state.jellyfinLibraryStatus == SourceAvailability.UNAVAILABLE
     val activePlaybackForMedia = state.playback != null && state.nowPlayingItem?.id == media.id
     val watchStateActionEnabled = state.loggedIn && !serverUnavailable && !activePlaybackForMedia
     val watchStateUpdating = media.id in state.watchStateMutationItemIds
@@ -1564,7 +1564,7 @@ fun MediaDetailScreen(
             }
             // Jellyfin applies series/season watched changes to every child. Keep the manual action on
             // playable leaf media so it cannot collide with a child episode currently being reported.
-            if (media.sourceId == MediaSourceIds.JELLYFIN && !media.isFolder) {
+            if (media.sourceId == MediaSourceIds.REMOTE && !media.isFolder) {
                 item(key = "detail-watch-state") {
                     WatchStateAction(
                         item = media,
@@ -1574,7 +1574,7 @@ fun MediaDetailScreen(
                         onToggle = { viewModel.markWatched(media, !media.played) },
                     )
                 }
-                if (media.isJellyfinEpisode()) {
+                if (media.isEpisode()) {
                     item(key = "detail-reset-progress") {
                         ResetProgressAction(
                             enabled = watchStateActionEnabled,
@@ -1839,9 +1839,9 @@ private fun WatchStateAction(
                 Text(
                     when {
                         updating -> "Updating watch state…"
-                        item.played && item.isJellyfinEpisode() -> "Mark episode as unwatched"
+                        item.played && item.isEpisode() -> "Mark episode as unwatched"
                         item.played -> "Mark as unwatched"
-                        item.isJellyfinEpisode() -> "Mark episode as watched"
+                        item.isEpisode() -> "Mark episode as watched"
                         else -> "Mark as watched"
                     },
                     style = MaterialTheme.typography.titleSmall,

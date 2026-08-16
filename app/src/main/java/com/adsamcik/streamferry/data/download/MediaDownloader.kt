@@ -5,9 +5,9 @@ import com.adsamcik.streamferry.core.resilience.Backoff
 import com.adsamcik.streamferry.core.resilience.RetryBudget
 import com.adsamcik.streamferry.core.stream.Protocol
 import com.adsamcik.streamferry.core.stream.TargetCapabilities
-import com.adsamcik.streamferry.data.jellyfin.DeviceProfiles
 import com.adsamcik.streamferry.data.jellyfin.JellyfinHttpException
-import com.adsamcik.streamferry.domain.JellyfinRepository
+import com.adsamcik.streamferry.domain.DownloadTranscodeProfile
+import com.adsamcik.streamferry.domain.ServerPlaybackProvider
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.logging.DiagnosticsLogger
 import kotlinx.coroutines.CoroutineScope
@@ -42,7 +42,7 @@ import kotlin.coroutines.coroutineContext
  * to disk metadata.
  */
 class MediaDownloader(
-    private val jellyfin: JellyfinRepository,
+    private val playbackProvider: ServerPlaybackProvider,
     private val store: DownloadStore,
     private val queue: DownloadQueueStore,
     private val httpClient: OkHttpClient,
@@ -357,7 +357,7 @@ class MediaDownloader(
         val identity = DownloadIdentity(owner, item.id)
         ensureOwnerActive(owner)
         val info = when (format) {
-            is DownloadFormat.Original -> jellyfin.playbackInfo(
+            is DownloadFormat.Original -> playbackProvider.playbackInfo(
                 itemId = item.id,
                 capabilities = DOWNLOAD_CAPS,
                 maxBitrateBps = null,
@@ -367,7 +367,7 @@ class MediaDownloader(
                 subtitleStreamIndex = null,
                 startPositionSeconds = 0,
             ).getOrThrow()
-            is DownloadFormat.Transcode -> jellyfin.playbackInfo(
+            is DownloadFormat.Transcode -> playbackProvider.playbackInfo(
                 itemId = item.id,
                 capabilities = DOWNLOAD_CAPS,
                 maxBitrateBps = format.maxBitrateBps,
@@ -376,15 +376,15 @@ class MediaDownloader(
                 audioStreamIndex = null,
                 subtitleStreamIndex = null,
                 startPositionSeconds = 0,
-                deviceProfileOverride = DeviceProfiles.forDownload(
-                    format.maxBitrateBps,
-                    format.container,
-                    format.videoCodec,
-                    format.audioCodec,
+                downloadProfile = DownloadTranscodeProfile(
+                    maxBitrateBps = format.maxBitrateBps,
+                    container = format.container,
+                    videoCodec = format.videoCodec,
+                    audioCodec = format.audioCodec,
                 ),
             ).getOrThrow()
         }
-        val upstream = jellyfin.resolveUpstream(info)
+        val upstream = playbackProvider.resolveUpstream(info)
         ensureOwnerActive(owner)
         require(!upstream.isHls) { "This title can only be streamed, not downloaded." }
         val originPolicy = TrustedMediaOriginPolicy.fromBaseUrl(upstream.url)

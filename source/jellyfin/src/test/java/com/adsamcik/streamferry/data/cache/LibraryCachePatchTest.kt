@@ -1,7 +1,7 @@
 package com.adsamcik.streamferry.data.cache
 
 import com.adsamcik.streamferry.domain.MediaItem
-import com.adsamcik.streamferry.domain.withJellyfinProgressReset
+import com.adsamcik.streamferry.domain.withProgressReset
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
@@ -47,7 +47,7 @@ class LibraryCachePatchTest {
         cache.put(scope, LibraryCache.childrenKey("season-1"), listOf(episode.copy(overview = "Episode detail")))
         now = 9_000L
 
-        cache.patchItem(scope, episode.id) { it.withJellyfinProgressReset() }
+        cache.patchItem(scope, episode.id) { it.withProgressReset() }
 
         mapOf(
             "views" to cache.get(scope, LibraryCache.KEY_VIEWS)?.single(),
@@ -74,7 +74,7 @@ class LibraryCachePatchTest {
         val stale = episode(position = 144L, percentage = 12.0)
 
         cache.put(scope, LibraryCache.childrenKey("season-1"), listOf(stale))
-        cache.patchItem(scope, stale.id) { it.withJellyfinProgressReset() }
+        cache.patchItem(scope, stale.id) { it.withProgressReset() }
 
         // Simulates a page request started before the action and completing afterwards.
         val returned = cache.put(scope, LibraryCache.childrenKey("season-1"), listOf(stale)).single()
@@ -97,7 +97,7 @@ class LibraryCachePatchTest {
         val episode = episode(position = 144L, percentage = 12.0)
         writeIndexOnly(scope, episode)
 
-        cache.patchItem(scope, episode.id) { it.withJellyfinProgressReset() }
+        cache.patchItem(scope, episode.id) { it.withProgressReset() }
 
         val patched = assertNotNull(cache.item(scope, episode.id))
         assertFalse(patched.played)
@@ -121,7 +121,7 @@ class LibraryCachePatchTest {
 
         cache.put(scope, key, listOf(stale))
         val olderRequest = cache.beginRemoteWrite(scope)
-        val patch = cache.patchItem(scope, stale.id) { it.withJellyfinProgressReset() }
+        val patch = cache.patchItem(scope, stale.id) { it.withProgressReset() }
         assertTrue(cache.confirmItemPatch(patch))
         val newerRequest = cache.beginRemoteWrite(scope)
 

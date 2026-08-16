@@ -17,7 +17,7 @@ import com.adsamcik.streamferry.data.proxy.LocalProxyServer
 import com.adsamcik.streamferry.diagnostics.NetworkInfoProvider
 import com.adsamcik.streamferry.domain.DiscoveredTarget
 import com.adsamcik.streamferry.domain.HlsSegmentFormat
-import com.adsamcik.streamferry.domain.JellyfinRepository
+import com.adsamcik.streamferry.domain.ServerPlaybackProvider
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.domain.MediaTrack
 import com.adsamcik.streamferry.domain.PlaybackFailureKind
@@ -46,7 +46,6 @@ import com.adsamcik.streamferry.core.volume.RendererVolumeState
 import com.adsamcik.streamferry.core.segments.MediaSegment
 import com.adsamcik.streamferry.core.segments.MediaSegmentTracker
 import com.adsamcik.streamferry.data.transcode.ClientTranscodeSession
-import com.adsamcik.streamferry.data.jellyfin.DeviceProfiles
 import com.adsamcik.streamferry.data.transcode.LocalMediaProbe
 import com.adsamcik.streamferry.data.transcode.OnDeviceTranscoder
 import android.content.Context
@@ -169,7 +168,7 @@ private data class LocalPlaybackParams(
  * throughput meter hold only numbers.
  */
 class PlaybackEngine(
-    private val jellyfin: JellyfinRepository,
+    private val playbackProvider: ServerPlaybackProvider,
     private val coordinator: DefaultPlaybackSessionCoordinator,
     private val proxy: LocalProxyServer,
     private val networkInfo: NetworkInfoProvider,
@@ -547,7 +546,7 @@ class PlaybackEngine(
             // Fetch skippable segments (intro/outro/recap) off the startup path; empty if unsupported.
             val segItemId = item.id
             scope.launch {
-                val segments = runCatching { jellyfin.mediaSegments(segItemId) }.getOrDefault(emptyList())
+                val segments = runCatching { playbackProvider.mediaSegments(segItemId) }.getOrDefault(emptyList())
                 if (segments.isNotEmpty() && item?.id == segItemId) {
                     mediaSegments = segments
                     logger.event("playback", "Loaded ${segments.size} skippable segment(s) (intro/outro)")
@@ -637,7 +636,7 @@ class PlaybackEngine(
                 if (monitorJob?.isActive != true) monitorJob = scope.launch { monitorLoop() }
                 val segItemId = item.id
                 scope.launch {
-                    val segments = runCatching { jellyfin.mediaSegments(segItemId) }.getOrDefault(emptyList())
+                    val segments = runCatching { playbackProvider.mediaSegments(segItemId) }.getOrDefault(emptyList())
                     if (segments.isNotEmpty() && this@PlaybackEngine.item?.id == segItemId) {
                         mediaSegments = segments
                         publishStatus()
@@ -1489,11 +1488,8 @@ class PlaybackEngine(
         val forceTranscode = effectiveForceTranscode() || audioTrackOverride
         // A manual codec override advertises only that output codec and, through [effectiveForceTranscode],
         // prevents direct play so Jellyfin must either honor it or return a clear failure.
-        val profileOverride = preferredCodec?.let {
-            DeviceProfiles.forTarget(caps, bitrate, forceTranscode, burnIn, preferredVideoCodec = it, maxVideoHeight = effectiveMaxVideoHeight())
-        }
         val info = preparePlaybackSource("Jellyfin couldn't prepare this media source.") {
-            jellyfin.playbackInfo(
+            playbackProvider.playbackInfo(
                 itemId = item.id,
                 capabilities = caps,
                 maxBitrateBps = bitrate,
@@ -1506,7 +1502,7 @@ class PlaybackEngine(
                 subtitleStreamIndex = subtitleSelection ?: -1,
                 startPositionSeconds = positionSeconds,
                 maxVideoHeight = effectiveMaxVideoHeight(),
-                deviceProfileOverride = profileOverride,
+                preferredVideoCodec = preferredCodec,
             ).getOrThrow()
         }
 
@@ -1523,7 +1519,7 @@ class PlaybackEngine(
             return
         }
         val upstream = preparePlaybackSource("Jellyfin couldn't resolve the selected media stream.") {
-            jellyfin.resolveUpstream(info)
+            playbackProvider.resolveUpstream(info)
         }
 
         if (initialiseAdaptive) {

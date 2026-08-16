@@ -1,7 +1,7 @@
 package com.adsamcik.streamferry.data.cache
 
 import com.adsamcik.streamferry.data.jellyfin.JellyfinHttpException
-import com.adsamcik.streamferry.domain.JellyfinLibraryStatus
+import com.adsamcik.streamferry.domain.SourceAvailability
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.domain.MediaLibraryRepository
 import kotlinx.coroutines.test.runTest
@@ -47,7 +47,7 @@ class CachingMediaLibraryRepositoryTest {
         assertEquals(item, repository.item(item.id).getOrThrow())
         assertEquals(listOf(item), repository.search("SEEN").getOrThrow())
         assertEquals(0, remote.callCount)
-        assertEquals(JellyfinLibraryStatus.UNKNOWN, monitor.status.value)
+        assertEquals(SourceAvailability.UNKNOWN, monitor.status.value)
     }
 
     @Test
@@ -65,7 +65,7 @@ class CachingMediaLibraryRepositoryTest {
         )
 
         assertEquals(listOf(cached), repository.videoLibraries().getOrThrow())
-        assertEquals(JellyfinLibraryStatus.UNAVAILABLE, monitor.status.value)
+        assertEquals(SourceAvailability.UNAVAILABLE, monitor.status.value)
     }
 
     @Test
@@ -85,7 +85,7 @@ class CachingMediaLibraryRepositoryTest {
 
         assertTrue(result.isFailure)
         assertTrue(result.exceptionOrNull() is JellyfinHttpException)
-        assertFalse(monitor.status.value == JellyfinLibraryStatus.UNAVAILABLE)
+        assertFalse(monitor.status.value == SourceAvailability.UNAVAILABLE)
     }
 
     @Test
