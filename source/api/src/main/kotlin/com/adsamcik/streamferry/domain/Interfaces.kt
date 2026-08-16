@@ -8,6 +8,7 @@ import com.adsamcik.streamferry.core.stream.StreamPreferences
 import com.adsamcik.streamferry.core.stream.TargetCapabilities
 import com.adsamcik.streamferry.core.transcode.SourceCapabilities
 import com.adsamcik.streamferry.source.api.MediaRef
+import com.adsamcik.streamferry.source.api.ArtworkRef
 import com.adsamcik.streamferry.source.api.SourceInstanceId
 import com.adsamcik.streamferry.source.api.SourceProviderId
 import kotlinx.coroutines.flow.Flow
@@ -55,6 +56,8 @@ data class MediaItem(
      * [com.adsamcik.streamferry.source.api.ArtworkProvider] to fetch it.
      */
     val imageTag: String? = null,
+    /** Source-owned artwork reference. UI and playback never receive a provider URL or credential. */
+    val artwork: ArtworkRef? = null,
     /**
      * Chapter markers ("sections") for the seek-preview scrubber, in ascending start order. Each may
      * carry an opaque chapter image id (shown ONLY in this phone's playback UI while scrubbing — never
@@ -88,8 +91,10 @@ data class MediaChapter(
     val startSeconds: Long,
     val name: String?,
     val imageTag: String?,
+    /** Source-owned chapter artwork reference, populated at the source-module boundary. */
+    val artwork: ArtworkRef? = null,
 ) {
-    val hasImage: Boolean get() = imageTag != null
+    val hasImage: Boolean get() = artwork != null || imageTag != null
 }
 
 data class PlaybackInfo(

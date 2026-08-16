@@ -8,6 +8,10 @@ import com.adsamcik.streamferry.domain.MediaSource
 import com.adsamcik.streamferry.domain.PlaybackInfo
 import com.adsamcik.streamferry.domain.UpstreamSource
 import com.adsamcik.streamferry.source.api.CatalogProvider
+import com.adsamcik.streamferry.source.api.ArtworkProvider
+import com.adsamcik.streamferry.source.api.ArtworkRef
+import com.adsamcik.streamferry.source.api.ArtworkRequest
+import com.adsamcik.streamferry.source.api.ArtworkResponse
 import com.adsamcik.streamferry.source.api.HlsSegmentFormat
 import com.adsamcik.streamferry.source.api.MediaRef
 import com.adsamcik.streamferry.source.api.MediaTrack
@@ -29,6 +33,7 @@ import com.adsamcik.streamferry.source.api.StreamResourceRef
 import com.adsamcik.streamferry.source.api.StreamResponse
 import com.adsamcik.streamferry.source.api.TrackRef
 import java.util.UUID
+import java.util.Base64
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -38,12 +43,14 @@ import kotlinx.coroutines.withContext
 import okhttp3.HttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 
 /** Provider-neutral registration for one configured server/account runtime. */
 class JellyfinSourceBackend(
     override val identity: SourceInstance,
     private val delegate: MediaSource,
     override val playback: PlaybackProvider,
+    private val artworkProvider: JellyfinArtworkProvider,
 ) : SourceBackend, CatalogProvider {
 
     init {
@@ -64,7 +71,7 @@ class JellyfinSourceBackend(
 
     override val capabilities: StateFlow<SourceCapabilities> = capabilityState.asStateFlow()
     override val catalog: CatalogProvider get() = this
-    override val artwork = null
+    override val artwork: ArtworkProvider = artworkProvider
     override val userState = null
     override val downloads = null
     override val setup = null
@@ -87,6 +94,12 @@ class JellyfinSourceBackend(
     private fun namespace(item: MediaItem): MediaItem = item.copy(
         sourceId = PROVIDER_ID.value,
         sourceInstanceId = identity.id,
+        artwork = item.imageTag?.let { artworkProvider.poster(item.id, it) },
+        chapters = item.chapters.mapIndexed { index, chapter ->
+            chapter.copy(
+                artwork = chapter.imageTag?.let { tag -> artworkProvider.chapter(item.id, index, tag) },
+            )
+        },
     )
 
     private inline fun <T> checked(ref: MediaRef, block: () -> Result<T>): Result<T> =
@@ -101,6 +114,84 @@ class JellyfinSourceBackend(
                 id = SourceInstanceId(PROVIDER_ID, "$serverId:$userId"),
                 displayName = displayName,
             )
+    }
+}
+
+/** Authenticated artwork access whose private URL and credential never cross the source boundary. */
+class JellyfinArtworkProvider(
+    private val source: SourceInstanceId,
+    private val client: JellyfinClient,
+    httpClient: OkHttpClient,
+) : ArtworkProvider {
+
+    private val imageClient = httpClient.newBuilder()
+        .followRedirects(false)
+        .followSslRedirects(false)
+        .build()
+
+    fun poster(itemId: String, imageTag: String): ArtworkRef =
+        ArtworkRef(source, encode(KIND_POSTER, itemId, imageTag))
+
+    fun chapter(itemId: String, chapterIndex: Int, imageTag: String): ArtworkRef =
+        ArtworkRef(source, encode(KIND_CHAPTER, itemId, chapterIndex.toString(), imageTag))
+
+    override suspend fun open(request: ArtworkRequest): Result<ArtworkResponse> = withContext(Dispatchers.IO) {
+        runCatching {
+            require(request.ref.source == source) { "Artwork belongs to another source instance" }
+            val fields = decode(request.ref.opaqueId)
+            val width = request.maxWidthPx
+            val urlText = when (fields.firstOrNull()) {
+                KIND_POSTER -> {
+                    require(fields.size == 3) { "Invalid poster artwork reference" }
+                    client.posterUrl(fields[1], fields[2], width ?: DEFAULT_POSTER_WIDTH_PX)
+                }
+                KIND_CHAPTER -> {
+                    require(fields.size == 4) { "Invalid chapter artwork reference" }
+                    client.chapterImageUrl(
+                        fields[1],
+                        fields[2].toInt(),
+                        fields[3],
+                        width ?: DEFAULT_CHAPTER_WIDTH_PX,
+                    )
+                }
+                else -> error("Unknown artwork reference")
+            } ?: error("Artwork source is not configured")
+            val url = urlText.toHttpUrlOrNull() ?: error("Artwork URL is invalid")
+            require(client.isTrustedServerUrl(url)) { "Artwork origin is not trusted" }
+
+            val httpRequest = Request.Builder().url(url).apply {
+                client.imageAuthHeader()?.let { header("Authorization", it) }
+            }.build()
+            val response = imageClient.newCall(httpRequest).execute()
+            if (!response.isSuccessful) {
+                response.close()
+                error("Artwork request failed with HTTP ${response.code}")
+            }
+            val body = response.body
+            ArtworkResponse(
+                contentType = body.contentType()?.toString() ?: "application/octet-stream",
+                contentLength = body.contentLength().takeIf { it >= 0L },
+                body = body.byteStream(),
+            )
+        }
+    }
+
+    private fun encode(vararg fields: String): String = fields.joinToString(SEPARATOR) { field ->
+        ENCODER.encodeToString(field.toByteArray(Charsets.UTF_8))
+    }
+
+    private fun decode(value: String): List<String> = value.split(SEPARATOR).map { field ->
+        String(DECODER.decode(field), Charsets.UTF_8)
+    }
+
+    companion object {
+        private const val KIND_POSTER = "poster"
+        private const val KIND_CHAPTER = "chapter"
+        private const val SEPARATOR = "."
+        private const val DEFAULT_POSTER_WIDTH_PX = 512
+        private const val DEFAULT_CHAPTER_WIDTH_PX = 320
+        private val ENCODER = Base64.getUrlEncoder().withoutPadding()
+        private val DECODER = Base64.getUrlDecoder()
     }
 }
 

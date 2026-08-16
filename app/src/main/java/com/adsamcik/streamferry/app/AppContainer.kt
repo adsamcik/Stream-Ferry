@@ -31,6 +31,7 @@ import com.adsamcik.streamferry.data.jellyfin.JellyfinClient
 import com.adsamcik.streamferry.data.jellyfin.JellyfinMediaLibraryRepository
 import com.adsamcik.streamferry.data.jellyfin.JellyfinMediaSource
 import com.adsamcik.streamferry.data.jellyfin.JellyfinPlaybackProvider
+import com.adsamcik.streamferry.data.jellyfin.JellyfinArtworkProvider
 import com.adsamcik.streamferry.data.jellyfin.JellyfinSourceBackend
 import com.adsamcik.streamferry.data.jellyfin.JellyfinWatchMutationStore
 import com.adsamcik.streamferry.data.language.ShowLanguageStore
@@ -69,6 +70,7 @@ import com.adsamcik.streamferry.playback.RendererCapabilityStore
 import com.adsamcik.streamferry.playback.reporting.DefaultProviderPlaybackReporter
 import com.adsamcik.streamferry.playback.session.DefaultPlaybackSessionCoordinator
 import com.adsamcik.streamferry.ui.theme.AppearancePreferences
+import com.adsamcik.streamferry.ui.artwork.ArtworkRefFetcher
 import com.adsamcik.streamferry.source.api.SourceRegistry
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -158,32 +160,10 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
     val jellyfinConnectionMonitor: JellyfinConnectionMonitor by lazy { JellyfinConnectionMonitor() }
 
     // ----- in-app poster images (Coil) -----
-    /**
-     * Coil image loader for in-app posters/thumbnails (gallery + detail). Uses a dedicated OkHttp client
-     * that injects the Jellyfin Authorization header ONLY for image requests to the configured server
-     * origin. Redirects are disabled here, so an image request can never carry that header elsewhere.
-     * The token stays in a header, never embedded in the URL (hence never in a cache key or a
-     * log). Both memory and disk caching are disabled: a tokenless image URL alone does not distinguish
-     * two accounts on the same server, and a late in-flight response must not repopulate another account's
-     * cache. Posters are shown on THIS phone only and are never given to the TV.
-     */
+    /** The UI carries only opaque artwork refs; the owning source performs every authenticated fetch. */
     val imageLoader: ImageLoader by lazy {
-        val imageClient = httpClient.newBuilder()
-            .followRedirects(false)
-            .followSslRedirects(false)
-            .addInterceptor { chain ->
-                val req = chain.request()
-                val header = jellyfinClient.imageAuthHeader()
-                val authed = if (header != null && jellyfinClient.isTrustedServerUrl(req.url)) {
-                    req.newBuilder().header("Authorization", header).build()
-                } else {
-                    req
-                }
-                chain.proceed(authed)
-            }
-            .build()
         ImageLoader.Builder(appContext)
-            .okHttpClient(imageClient)
+            .components { add(ArtworkRefFetcher.Factory(::sourceRegistry)) }
             .memoryCachePolicy(CachePolicy.DISABLED)
             .diskCachePolicy(CachePolicy.DISABLED)
             .crossfade(true)
@@ -258,6 +238,7 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
             backends += JellyfinSourceBackend(
                 identity = identity,
                 delegate = jellyfinMediaSource,
+                artworkProvider = JellyfinArtworkProvider(identity.id, jellyfinClient, httpClient),
                 playback = JellyfinPlaybackProvider(
                     source = identity.id,
                     repository = jellyfinRepository,

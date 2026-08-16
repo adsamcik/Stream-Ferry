@@ -3448,23 +3448,6 @@ class MainViewModel(
         lastResumeSaveMs = 0L
     }
 
-    /**
-     * In-app poster URL for [item] sized to ~[targetWidthPx], or null if the item has no art / no server.
-     * The token is sent by the image loader as a header, never in this URL; never given to the TV.
-     */
-    fun posterUrl(item: MediaItem, targetWidthPx: Int): String? =
-        if (item.imageTag == null) null else container.jellyfinClient.posterUrl(item.id, item.imageTag, targetWidthPx)
-
-    /**
-     * In-app **chapter** thumbnail URL for [item]'s chapter at [chapterIndex] (the seek-preview scrubber),
-     * or null if that chapter has no image / no server. Token goes via a header, never the URL or the TV.
-     */
-    fun chapterImageUrl(item: MediaItem, chapterIndex: Int, targetWidthPx: Int): String? {
-        val chapter = item.chapters.getOrNull(chapterIndex) ?: return null
-        if (!chapter.hasImage) return null
-        return container.jellyfinClient.chapterImageUrl(item.id, chapterIndex, chapter.imageTag, targetWidthPx)
-    }
-
     /** "Prefer original quality (direct play)" setting: Cast tries the original first, transcode fallback. */
     val preferDirectPlay: Boolean get() = container.playbackPreferences.preferDirectPlay
     fun setPreferDirectPlay(value: Boolean) { container.playbackPreferences.preferDirectPlay = value }

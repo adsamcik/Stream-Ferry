@@ -145,6 +145,7 @@ import com.adsamcik.streamferry.playback.PlaybackAttemptDescriptor
 import com.adsamcik.streamferry.playback.PlaybackControlPolicy
 import com.adsamcik.streamferry.playback.PlaybackPhase
 import com.adsamcik.streamferry.playback.PlaybackTimecode
+import com.adsamcik.streamferry.source.api.ArtworkRef
 import com.adsamcik.streamferry.ui.MainViewModel
 import com.adsamcik.streamferry.ui.components.ExpressiveLoadingIndicator
 import com.adsamcik.streamferry.ui.state.AppUiState
@@ -548,8 +549,8 @@ fun PlaybackScreen(state: AppUiState, viewModel: MainViewModel) {
         val chapters = nowPlaying?.chapters.orEmpty()
         val showingControlIssue = p.errorMessage == null && p.controls.issue != null
         val feedbackMessage = p.errorMessage ?: p.controls.issue?.message
-        val previewUrlFor: (Int) -> String? = { index ->
-            nowPlaying?.let { viewModel.chapterImageUrl(it, index, CHAPTER_PREVIEW_WIDTH_PX) }
+        val previewUrlFor: (Int) -> ArtworkRef? = { index ->
+            nowPlaying?.chapters?.getOrNull(index)?.artwork
         }
 
         if (p.isTerminal) {
@@ -658,7 +659,7 @@ private fun PlaybackTimelineControls(
     p: PlaybackUiState,
     positionProvider: () -> Long,
     chapters: List<MediaChapter>,
-    previewUrlFor: (Int) -> String?,
+    previewUrlFor: (Int) -> ArtworkRef?,
     viewModel: MainViewModel,
     compact: Boolean,
 ) {
@@ -1196,7 +1197,6 @@ private fun NowPlayingHero(p: PlaybackUiState, mediaTitle: String?, compact: Boo
     }
 }
 
-private const val CHAPTER_PREVIEW_WIDTH_PX = 384
 
 /**
  * Seekable progress bar: drag or tap to seek (committed on release), with a floating thumbnail
@@ -1208,7 +1208,7 @@ private fun SeekScrubber(
     p: PlaybackUiState,
     positionProvider: () -> Long,
     chapters: List<MediaChapter>,
-    previewUrlFor: (chapterIndex: Int) -> String?,
+    previewUrlFor: (chapterIndex: Int) -> ArtworkRef?,
     onSeek: (Long) -> Unit,
 ) {
     val duration = p.durationSeconds?.takeIf { it > 0 }
@@ -1430,7 +1430,7 @@ private fun ExactSeekDialog(
 
 /** Floating thumbnail preview shown above the scrubber while seeking. Fixed size for stable placement. */
 @Composable
-private fun SeekPreviewBubble(timeLabel: String, chapterName: String?, imageUrl: String?) {
+private fun SeekPreviewBubble(timeLabel: String, chapterName: String?, imageUrl: ArtworkRef?) {
     ElevatedCard(shape = RoundedCornerShape(16.dp), modifier = Modifier.width(156.dp).height(142.dp)) {
         Column(Modifier.fillMaxSize()) {
             Surface(

@@ -109,6 +109,7 @@ import com.adsamcik.streamferry.domain.SourceAvailability
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.domain.MediaSourceIds
 import com.adsamcik.streamferry.domain.isEpisode
+import com.adsamcik.streamferry.source.api.ArtworkRef
 import com.adsamcik.streamferry.ui.MainViewModel
 import com.adsamcik.streamferry.ui.components.ExpressiveLoadingIndicator
 import com.adsamcik.streamferry.ui.state.AppUiState
@@ -242,7 +243,7 @@ fun GalleryScreen(state: AppUiState, viewModel: MainViewModel, compact: Boolean 
                 seasons = entries,
                 state = seasonListState,
                 compact = compact,
-                posterUrlFor = { viewModel.posterUrl(it, POSTER_CARD_WIDTH_PX) },
+                posterUrlFor = { it.artwork },
                 availabilityFor = state::availabilityFor,
                 onSeasonClick = { viewModel.onItemClicked(it) },
             )
@@ -259,7 +260,7 @@ fun GalleryScreen(state: AppUiState, viewModel: MainViewModel, compact: Boolean 
                         items(entries, key = { it.id }, contentType = { "media" }) { item ->
                             MediaCard(
                                 item = item,
-                                posterUrl = viewModel.posterUrl(item, POSTER_CARD_WIDTH_PX),
+                                posterUrl = item.artwork,
                                 localThumbnailUri = item.localThumbnailUri(),
                                 availability = state.availabilityFor(item),
                                 compact = true,
@@ -306,7 +307,7 @@ fun GalleryScreen(state: AppUiState, viewModel: MainViewModel, compact: Boolean 
                         items(entries, key = { it.id }, contentType = { "media" }) { item ->
                             MediaCard(
                                 item = item,
-                                posterUrl = viewModel.posterUrl(item, POSTER_CARD_WIDTH_PX),
+                                posterUrl = item.artwork,
                                 localThumbnailUri = item.localThumbnailUri(),
                                 availability = state.availabilityFor(item),
                                 highlighted = indexScrubbing && indexedSection == sectionKey(item.title),
@@ -337,7 +338,7 @@ private fun SeasonList(
     seasons: List<MediaItem>,
     state: LazyListState,
     compact: Boolean,
-    posterUrlFor: (MediaItem) -> String?,
+    posterUrlFor: (MediaItem) -> ArtworkRef?,
     availabilityFor: (MediaItem) -> JellyfinItemAvailability,
     onSeasonClick: (MediaItem) -> Unit,
 ) {
@@ -387,7 +388,7 @@ private fun SeasonList(
 @Composable
 private fun SeasonListCard(
     season: MediaItem,
-    posterUrl: String?,
+    posterUrl: ArtworkRef?,
     availability: JellyfinItemAvailability,
     compact: Boolean,
     onClick: () -> Unit,
@@ -583,14 +584,14 @@ private fun LibraryHome(
                 if (compact && item.isFolder) {
                     LibraryTile(
                         item = item,
-                        posterUrl = viewModel.posterUrl(item, POSTER_CARD_WIDTH_PX),
+                        posterUrl = item.artwork,
                         availability = state.availabilityFor(item),
                         onClick = { viewModel.onItemClicked(item) },
                     )
                 } else {
                     MediaCard(
                         item = item,
-                        posterUrl = viewModel.posterUrl(item, POSTER_CARD_WIDTH_PX),
+                        posterUrl = item.artwork,
                         localThumbnailUri = item.localThumbnailUri(),
                         availability = state.availabilityFor(item),
                         compact = compact,
@@ -614,7 +615,7 @@ private fun LibraryHome(
             item(key = "continue-watching", span = { GridItemSpan(maxLineSpan) }) {
                 ContinueWatchingRow(
                     items = visibleContinueWatching,
-                    posterUrlFor = { viewModel.posterUrl(it, POSTER_CARD_WIDTH_PX) },
+                    posterUrlFor = { it.artwork },
                     availabilityFor = state::availabilityFor,
                     onClick = { viewModel.onItemClicked(it) },
                 )
@@ -1186,7 +1187,7 @@ private fun LocalThumbnail(uriString: String, modifier: Modifier = Modifier) {
 @Composable
 private fun ContinueWatchingRow(
     items: List<MediaItem>,
-    posterUrlFor: (MediaItem) -> String?,
+    posterUrlFor: (MediaItem) -> ArtworkRef?,
     availabilityFor: (MediaItem) -> JellyfinItemAvailability,
     onClick: (MediaItem) -> Unit,
 ) {
@@ -1211,7 +1212,7 @@ private fun ContinueWatchingRow(
 @Composable
 private fun ContinueWatchingCard(
     item: MediaItem,
-    posterUrl: String?,
+    posterUrl: ArtworkRef?,
     availability: JellyfinItemAvailability,
     onClick: () -> Unit,
 ) {
@@ -1327,7 +1328,7 @@ private fun ItemAvailabilityLabel(
 @Composable
 private fun LibraryTile(
     item: MediaItem,
-    posterUrl: String?,
+    posterUrl: ArtworkRef?,
     availability: JellyfinItemAvailability = JellyfinItemAvailability.AVAILABLE,
     onClick: () -> Unit,
 ) {
@@ -1376,7 +1377,7 @@ private fun LibraryTile(
 @Composable
 private fun MediaCard(
     item: MediaItem,
-    posterUrl: String?,
+    posterUrl: ArtworkRef?,
     localThumbnailUri: String?,
     availability: JellyfinItemAvailability = JellyfinItemAvailability.AVAILABLE,
     compact: Boolean = false,
@@ -1552,7 +1553,7 @@ fun MediaDetailScreen(
             item(key = "detail-hero") {
                 DetailHero(
                     item = media,
-                    posterUrl = viewModel.posterUrl(media, POSTER_DETAIL_WIDTH_PX),
+                    posterUrl = media.artwork,
                     compact = compact,
                     availability = availability,
                 )
@@ -1620,7 +1621,7 @@ fun MediaDetailScreen(
 private fun DetailHero(
     item: MediaItem,
     availability: JellyfinItemAvailability,
-    posterUrl: String?,
+    posterUrl: ArtworkRef?,
     compact: Boolean,
 ) {
     ElevatedCard(
@@ -2180,7 +2181,7 @@ private fun DetailPlaybackDock(
 }
 
 @Composable
-private fun DetailPoster(posterUrl: String?, title: String, modifier: Modifier = Modifier) {
+private fun DetailPoster(posterUrl: ArtworkRef?, title: String, modifier: Modifier = Modifier) {
     Surface(
         shape = RoundedCornerShape(16.dp),
         color = MaterialTheme.colorScheme.secondaryContainer,
@@ -2205,8 +2206,6 @@ private fun DetailPoster(posterUrl: String?, title: String, modifier: Modifier =
     }
 }
 
-private const val POSTER_CARD_WIDTH_PX = 360
-private const val POSTER_DETAIL_WIDTH_PX = 320
 private const val CONTINUE_CARD_WIDTH = 132
 
 @Composable
