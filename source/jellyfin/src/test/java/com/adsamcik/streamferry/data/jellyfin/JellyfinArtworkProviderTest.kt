@@ -23,8 +23,8 @@ class JellyfinArtworkProviderTest {
         )
         val provider = JellyfinArtworkProvider(source, client, httpClient)
 
-        val poster = provider.poster("native-item", "image-tag")
-        val chapter = provider.chapter("native-item", 3, "chapter-tag")
+        val poster = provider.posterForTag("native-item", "image-tag")
+        val chapter = provider.chapterForTag("native-item", 3, "chapter-tag")
 
         assertEquals(source, poster.source)
         assertEquals(source, chapter.source)

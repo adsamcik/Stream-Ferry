@@ -125,6 +125,12 @@ class JellyfinClient(
 
     /** Upstream sources resolved during PlaybackInfo, keyed by media source id (secret values). */
     private val upstreamCache = ConcurrentHashMap<String, JellyfinUpstreamSource>()
+    /** Provider artwork tags stay source-private; shared catalogue items carry only ArtworkRef. */
+    private val artworkMetadata = ConcurrentHashMap<String, JellyfinArtworkMetadata>()
+
+    internal fun posterImageTag(itemId: String): String? = artworkMetadata[itemId]?.posterTag
+    internal fun chapterImageTag(itemId: String, chapterIndex: Int): String? =
+        artworkMetadata[itemId]?.chapterTags?.get(chapterIndex)
 
     // ----- session management (used by the auth repository) -----
 
@@ -158,6 +164,7 @@ class JellyfinClient(
         accessToken = null
         userId = null
         upstreamCache.clear()
+        artworkMetadata.clear()
     }
 
     fun clearAll() {
@@ -999,6 +1006,12 @@ class JellyfinClient(
         // video libraries; for items (Movie/Series/Season/Episode) CollectionType is null so Type wins.
         val kind = collectionType ?: type
         val folder = isFolder ?: (collectionType != null || type in FOLDER_TYPES)
+        artworkMetadata[id] = JellyfinArtworkMetadata(
+            posterTag = imageTags?.get("Primary"),
+            chapterTags = chapters.orEmpty().mapIndexedNotNull { index, chapter ->
+                chapter.imageTag?.let { index to it }
+            }.toMap(),
+        )
         return MediaItem(
             id = id,
             title = name ?: "(untitled)",
@@ -1012,12 +1025,10 @@ class JellyfinClient(
             indexNumber = indexNumber,
             seriesId = seriesId,
             subtitle = episodeSubtitle(),
-            imageTag = imageTags?.get("Primary"),
             chapters = chapters?.map {
                 MediaChapter(
                     startSeconds = it.startPositionTicks / TICKS_PER_SECOND,
                     name = it.name,
-                    imageTag = it.imageTag,
                 )
             }.orEmpty(),
             played = userData?.played ?: false,
@@ -1216,6 +1227,11 @@ private fun List<MediaSourceDto>.selectPlayableSource(requireTranscode: Boolean)
     } else {
         firstOrNull { it.isDirectlyPlayable() } ?: firstOrNull { it.hasTranscodeUrl() }
     }
+
+    private data class JellyfinArtworkMetadata(
+        val posterTag: String?,
+        val chapterTags: Map<Int, String>,
+    )
 
 private fun MediaSourceDto.isDirectlyPlayable(): Boolean =
     !directStreamUrl.isNullOrBlank() || supportsDirectStream == true || supportsDirectPlay == true

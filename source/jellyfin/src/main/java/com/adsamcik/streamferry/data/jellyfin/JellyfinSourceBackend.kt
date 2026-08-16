@@ -96,11 +96,9 @@ class JellyfinSourceBackend(
     private fun namespace(item: MediaItem): MediaItem = item.copy(
         // `sourceId` is the legacy UI slot ("remote"); canonical provider/account identity is `ref`.
         sourceInstanceId = identity.id,
-        artwork = item.imageTag?.let { artworkProvider.poster(item.id, it) },
+        artwork = artworkProvider.poster(item.id),
         chapters = item.chapters.mapIndexed { index, chapter ->
-            chapter.copy(
-                artwork = chapter.imageTag?.let { tag -> artworkProvider.chapter(item.id, index, tag) },
-            )
+            chapter.copy(artwork = artworkProvider.chapter(item.id, index))
         },
     )
 
@@ -195,10 +193,19 @@ class JellyfinArtworkProvider(
         .followSslRedirects(false)
         .build()
 
-    fun poster(itemId: String, imageTag: String): ArtworkRef =
+    fun poster(itemId: String): ArtworkRef? = client.posterImageTag(itemId)?.let { imageTag ->
+        posterForTag(itemId, imageTag)
+    }
+
+    fun chapter(itemId: String, chapterIndex: Int): ArtworkRef? =
+        client.chapterImageTag(itemId, chapterIndex)?.let { imageTag ->
+            chapterForTag(itemId, chapterIndex, imageTag)
+        }
+
+    internal fun posterForTag(itemId: String, imageTag: String): ArtworkRef =
         ArtworkRef(source, encode(KIND_POSTER, itemId, imageTag))
 
-    fun chapter(itemId: String, chapterIndex: Int, imageTag: String): ArtworkRef =
+    internal fun chapterForTag(itemId: String, chapterIndex: Int, imageTag: String): ArtworkRef =
         ArtworkRef(source, encode(KIND_CHAPTER, itemId, chapterIndex.toString(), imageTag))
 
     override suspend fun open(request: ArtworkRequest): Result<ArtworkResponse> = withContext(Dispatchers.IO) {

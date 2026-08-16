@@ -50,17 +50,12 @@ data class MediaItem(
     val seriesId: String? = null,
     /** Optional secondary line for the gallery (e.g. "Series · S1 E3"); never a secret. */
     val subtitle: String? = null,
-    /**
-     * Opaque provider artwork id when the item has poster art. Consumers must ask the owning
-     * [com.adsamcik.streamferry.source.api.ArtworkProvider] to fetch it.
-     */
-    val imageTag: String? = null,
     /** Source-owned artwork reference. UI and playback never receive a provider URL or credential. */
     val artwork: ArtworkRef? = null,
     /**
      * Chapter markers ("sections") for the seek-preview scrubber, in ascending start order. Each may
-     * carry an opaque chapter image id (shown ONLY in this phone's playback UI while scrubbing — never
-     * given to the TV). Empty when the item has no chapters or hasn't been fully loaded yet.
+     * carry a source-owned artwork reference (shown ONLY in this phone's playback UI while scrubbing —
+     * never given to the TV). Empty when the item has no chapters or hasn't been fully loaded yet.
      */
     val chapters: List<MediaChapter> = emptyList(),
     /**
@@ -82,18 +77,16 @@ data class MediaItem(
 }
 
 /**
- * A single chapter ("section") of a video. [startSeconds] is where it begins; [imageTag], when present,
- * means the source has a chapter thumbnail for it (addressed by the chapter's index in [MediaItem.chapters]).
+ * A single chapter ("section") of a video. [startSeconds] is where it begins; [artwork], when present,
+ * is an opaque reference owned by the source.
  */
 @Serializable
 data class MediaChapter(
     val startSeconds: Long,
     val name: String?,
-    val imageTag: String?,
-    /** Source-owned chapter artwork reference, populated at the source-module boundary. */
     val artwork: ArtworkRef? = null,
 ) {
-    val hasImage: Boolean get() = artwork != null || imageTag != null
+    val hasImage: Boolean get() = artwork != null
 }
 
 /**

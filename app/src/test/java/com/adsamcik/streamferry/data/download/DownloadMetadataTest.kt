@@ -24,7 +24,6 @@ class DownloadMetadataTest {
         isFolder = false,
         type = "Movie",
         subtitle = "Director's cut",
-        imageTag = "poster-tag",
     )
     private val owner = DownloadOwner(serverId = "server-a", userId = "user-a")
 
