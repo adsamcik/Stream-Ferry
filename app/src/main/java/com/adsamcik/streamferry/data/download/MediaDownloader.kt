@@ -1,15 +1,11 @@
 package com.adsamcik.streamferry.data.download
 
 import com.adsamcik.streamferry.source.api.DownloadFormat
-
-import com.adsamcik.streamferry.core.net.TrustedMediaOriginPolicy
+import com.adsamcik.streamferry.source.api.DownloadProvider
+import com.adsamcik.streamferry.source.api.StreamResponse
+import com.adsamcik.streamferry.core.http.ByteRange
 import com.adsamcik.streamferry.core.resilience.Backoff
 import com.adsamcik.streamferry.core.resilience.RetryBudget
-import com.adsamcik.streamferry.core.stream.Protocol
-import com.adsamcik.streamferry.core.stream.TargetCapabilities
-import com.adsamcik.streamferry.data.jellyfin.JellyfinHttpException
-import com.adsamcik.streamferry.domain.DownloadTranscodeProfile
-import com.adsamcik.streamferry.domain.ServerPlaybackProvider
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.logging.DiagnosticsLogger
 import kotlinx.coroutines.CoroutineScope
@@ -24,8 +20,6 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runInterruptible
-import okhttp3.OkHttpClient
-import okhttp3.Request
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
@@ -36,28 +30,21 @@ import kotlin.coroutines.coroutineContext
 
 /**
  * Optional offline downloader (§5 download exception): resolves an item's **original** (direct-play)
- * stream from Jellyfin and saves the full file to app-private storage for later, offline playback. The
+ * stream from its source and saves the full file to app-private storage for later, offline playback. The
  * streaming proxy stays RAM-only; this is a separate, strictly user-initiated path.
  *
  * Progress + status are exposed as a [StateFlow]; the persistent set of completed downloads lives in
- * [DownloadStore]. The Jellyfin token is used only to fetch the bytes server-side and is never written
- * to disk metadata.
+ * [DownloadStore]. Source credentials remain behind [DownloadProvider] and are never written to disk.
  */
 class MediaDownloader(
-    private val playbackProvider: ServerPlaybackProvider,
+    private val downloadProvider: DownloadProvider,
     private val store: DownloadStore,
     private val queue: DownloadQueueStore,
-    private val httpClient: OkHttpClient,
     private val logger: DiagnosticsLogger,
     private val scope: CoroutineScope,
     /** Non-null in production: the one account whose token/origin is installed in [jellyfin]. */
     private val activeOwnerProvider: (() -> DownloadOwner?)? = null,
 ) {
-    /** Redirects are inspected below before an authenticated download request is re-issued. */
-    private val pinnedHttpClient = httpClient.newBuilder()
-        .followRedirects(false)
-        .followSslRedirects(false)
-        .build()
 
     sealed interface DownloadState {
         data object Queued : DownloadState
@@ -69,7 +56,7 @@ class MediaDownloader(
     }
 
     /**
-     * Live download state keyed by the full server/user/item identity, never by a bare Jellyfin id.
+     * Live download state keyed by the full source-owner/item identity, never by a bare native id.
      * Consumers must filter by [DownloadIdentity.owner] before presenting a server's downloads.
      */
     private val _states = MutableStateFlow<Map<DownloadIdentity, DownloadState>>(emptyMap())
@@ -134,7 +121,7 @@ class MediaDownloader(
                 // partial bytes so the same owner can safely resume later. Explicit cancellation/delete
                 // still discards the partial copy through the normal path below.
                 if (pauseRequests.remove(identity)) {
-                    logger.event("download", "Paused download until its Jellyfin account is active again")
+                    logger.event("download", "Paused download until its source account is active again")
                 } else {
                     runCatching { store.partFileFor(item.id, owner).delete() }
                     runCatching { store.partMetaFileFor(item.id, owner).delete() }
@@ -180,8 +167,8 @@ class MediaDownloader(
     }
 
     /**
-     * Re-enqueue persisted-but-unfinished requests for the currently authenticated Jellyfin owner.
-     * The owner is required: the underlying Jellyfin client carries one server/token and must never
+     * Re-enqueue persisted-but-unfinished requests for the currently authenticated source owner.
+     * The owner is required: the active source runtime carries one account and must never
      * resolve another account's queued item after an account switch.
      */
     suspend fun resumePending(owner: DownloadOwner): Boolean {
@@ -189,7 +176,7 @@ class MediaDownloader(
         return resumePendingEntries(owner, queue.allForOwner(owner))
     }
 
-    /** True when this authenticated Jellyfin owner has a persisted unfinished request. */
+    /** True when this authenticated source owner has a persisted unfinished request. */
     suspend fun hasPendingPersisted(owner: DownloadOwner): Boolean =
         hasPendingEntries(owner, queue.allForOwner(owner))
 
@@ -255,7 +242,7 @@ class MediaDownloader(
     }
 
     /**
-     * Stop every active request before the singleton Jellyfin client changes server/user credentials.
+     * Stop every active request before the source runtime changes account credentials.
      * Unlike [cancelAllAndJoin], it preserves the queue and `.part`/validator files for a later resume.
      */
     suspend fun pauseAllAndJoin() {
@@ -323,7 +310,7 @@ class MediaDownloader(
                 throw c
             } catch (e: Exception) {
                 // An account transition is a deliberate pause boundary, never a retry loop against the
-                // newly configured Jellyfin client.
+                // newly configured source runtime.
                 if (e is DownloadOwnerInactiveException || !isRecoverable(e)) throw e
                 val len = currentPartLength(item.id, owner)
                 val madeProgress = format is DownloadFormat.Original && len > highWaterBytes
@@ -358,47 +345,19 @@ class MediaDownloader(
     private suspend fun runDownload(item: MediaItem, format: DownloadFormat, owner: DownloadOwner?) {
         val identity = DownloadIdentity(owner, item.id)
         ensureOwnerActive(owner)
-        val info = when (format) {
-            is DownloadFormat.Original -> playbackProvider.playbackInfo(
-                itemId = item.id,
-                capabilities = DOWNLOAD_CAPS,
-                maxBitrateBps = null,
-                forceTranscode = false,
-                allowSubtitleBurnIn = false,
-                audioStreamIndex = null,
-                subtitleStreamIndex = null,
-                startPositionSeconds = 0,
-            ).getOrThrow()
-            is DownloadFormat.Transcode -> playbackProvider.playbackInfo(
-                itemId = item.id,
-                capabilities = DOWNLOAD_CAPS,
-                maxBitrateBps = format.maxBitrateBps,
-                forceTranscode = true,
-                allowSubtitleBurnIn = false,
-                audioStreamIndex = null,
-                subtitleStreamIndex = null,
-                startPositionSeconds = 0,
-                downloadProfile = DownloadTranscodeProfile(
-                    maxBitrateBps = format.maxBitrateBps,
-                    container = format.container,
-                    videoCodec = format.videoCodec,
-                    audioCodec = format.audioCodec,
-                ),
-            ).getOrThrow()
-        }
-        val upstream = playbackProvider.resolveUpstream(info)
+        val prepared = downloadProvider.prepareDownload(item.ref, format).getOrThrow()
+        val stream = prepared.stream
+        val descriptor = stream.descriptor
         ensureOwnerActive(owner)
-        require(!upstream.isHls) { "This title can only be streamed, not downloaded." }
-        val originPolicy = TrustedMediaOriginPolicy.fromBaseUrl(upstream.url)
-            ?: throw IOException("Refusing a download with an invalid Jellyfin origin.")
+        require(!descriptor.isHls) { "This title can only be streamed, not downloaded." }
 
-        val fileName = identity.fileName(info.profile.container, upstream.contentType)
+        val fileName = identity.fileName(prepared.container, descriptor.contentType)
         val part = store.partFileFor(item.id, owner)
         val meta = store.partMetaFileFor(item.id, owner)
         part.parentFile?.mkdirs()
 
         // Resume an interrupted download from the bytes already on disk. We send Range + If-Range, but
-        // because some servers (incl. Jellyfin's static handler) ignore If-Range, we ALSO verify the
+        // because some servers ignore conditional ranges, we ALSO verify the
         // resumed response's total size matches what we recorded — so a file that changed underneath us
         // forces a clean restart instead of splicing two different versions into one corrupt file.
         // Transcode downloads are re-encoded on each request and are NOT byte-range resumable.
@@ -415,40 +374,10 @@ class MediaDownloader(
         }
         val tryResume = existing > 0 && (storedValidator != null || storedTotal > 0)
 
-        fun fullRequest(): Request = Request.Builder().url(upstream.url).get()
-            .apply { upstream.authHeader?.let { header("Authorization", it) } }
-            .build()
-
-        suspend fun openPinned(request: Request): okhttp3.Response {
-            var current = request
-            repeat(MAX_DOWNLOAD_REDIRECTS + 1) {
-                ensureOwnerActive(owner)
-                if (!originPolicy.isTrusted(current.url)) {
-                    throw IOException("Refusing a download request outside the configured Jellyfin origin.")
-                }
-                // Make both connection setup and response-header reads promptly cancellable. This matters
-                // when Android times out the data-sync foreground service: pauseAll() must not leave a
-                // blocked application-scope OkHttp call running after foreground protection is removed.
-                val response = runInterruptible(Dispatchers.IO) { pinnedHttpClient.newCall(current).execute() }
-                if (!response.isRedirect) return response
-                val redirect = response.header("Location")?.let { originPolicy.resolve(it, current.url) }
-                response.close()
-                current = redirect?.let { current.newBuilder().url(it).build() }
-                    ?: throw IOException("Refusing a download redirect outside the configured Jellyfin origin.")
-            }
-            throw IOException("Too many redirects from the configured Jellyfin origin.")
-        }
-
         var resp = if (tryResume) {
-            openPinned(
-                Request.Builder().url(upstream.url).get().apply {
-                    upstream.authHeader?.let { header("Authorization", it) }
-                    storedValidator?.let { header("If-Range", it) }
-                    header("Range", "bytes=$existing-")
-                }.build(),
-            )
+            stream.open(ByteRange(existing, Long.MAX_VALUE)).getOrThrow()
         } else {
-            openPinned(fullRequest())
+            stream.open().getOrThrow()
         }
 
         var resumed = false
@@ -460,17 +389,17 @@ class MediaDownloader(
             when {
                 // A matching total alone is insufficient: appending a 206 that starts elsewhere silently
                 // corrupts the offline copy. Require the exact byte the partial file ends at.
-                resp.code == 206 && startsAtExisting && sizeOk -> {
+                resp.statusCode == 206 && startsAtExisting && sizeOk -> {
                     resumed = true
                     resumedRange = range
                 }
-                resp.code == 200 -> resumed = false // server returned the full entity; use it as a restart
+                resp.statusCode == 200 -> resumed = false // source returned the full entity; use it as a restart
                 else -> {
                     // Range ignored, malformed, or for another offset: discard the stale validator and
                     // fetch a complete entity rather than splicing incompatible byte ranges together.
                     resp.close()
                     runCatching { meta.delete() }
-                    resp = openPinned(fullRequest())
+                    resp = stream.open().getOrThrow()
                     resumed = false
                 }
             }
@@ -479,28 +408,27 @@ class MediaDownloader(
         var downloaded = 0L
         var expectedTotal: Long? = null
         resp.use { r ->
-            if (!r.isSuccessful) throw JellyfinHttpException(r.code)
-            if (!resumed && r.code != 200) {
-                throw IOException("Server returned a partial response to a full download request.")
+            if (r.statusCode !in 200..299) throw DownloadHttpException(r.statusCode)
+            if (!resumed && r.statusCode != 200) {
+                throw IOException("Source returned a partial response to a full download request.")
             }
             val newValidator = r.header("ETag") ?: r.header("Last-Modified")
             val startAt = if (resumed) existing else 0L
-            val remaining = r.body?.contentLength()?.takeIf { it >= 0 }
+            val remaining = r.header("Content-Length")?.toLongOrNull()?.takeIf { it >= 0 }
             val total = when {
-                resumed && resumedRange?.total != null -> resumedRange?.total
+                resumed && resumedRange?.total != null -> resumedRange.total
                 resumed && remaining != null -> startAt + remaining
                 remaining != null -> remaining
-                else -> upstream.totalLength
+                else -> descriptor.totalLength
             }
             expectedTotal = total?.takeIf { it >= startAt }
             downloaded = startAt
             setState(identity, DownloadState.Running(downloaded, expectedTotal))
-            val body = r.body ?: error("Empty response")
             val downloadContext = coroutineContext
             // One interruptible region covers the full socket/file copy, avoiding per-chunk dispatcher
             // overhead while still interrupting a blocked read as soon as pauseAll() cancels the job.
             runInterruptible(Dispatchers.IO) {
-                body.byteStream().use { ins ->
+                r.body.use { ins ->
                     val fos = FileOutputStream(part, /* append = */ resumed)
                     // Opening in non-append mode truncated the file: record the validator + total for *these*
                     // bytes (after the truncate) so a future resume can verify the same file version.
@@ -528,8 +456,8 @@ class MediaDownloader(
             }
         }
 
-        // EOF is not proof of completion for a chunked body. If either the response or Jellyfin's
-        // PlaybackInfo supplied a total, retain the partial file and let normal recovery resume it.
+        // EOF is not proof of completion for a chunked body. If either the response or source descriptor
+        // supplied a total, retain the partial file and let normal recovery resume it.
         expectedTotal?.let { expected ->
             if (downloaded != expected) {
                 throw IOException("Download ended at $downloaded bytes; expected $expected bytes.")
@@ -552,10 +480,10 @@ class MediaDownloader(
                 itemId = item.id,
                 title = item.title,
                 fileName = fileName,
-                mimeType = upstream.contentType,
-                container = info.profile.container,
+                mimeType = descriptor.contentType,
+                container = prepared.container,
                 sizeBytes = downloaded,
-                runtimeSeconds = info.runtimeSeconds,
+                runtimeSeconds = prepared.runtimeSeconds,
                 downloadedAtMillis = System.currentTimeMillis(),
                 qualityLabel = format.label,
                 owner = owner,
@@ -568,10 +496,15 @@ class MediaDownloader(
     private fun setState(identity: DownloadIdentity, s: DownloadState) = _states.update { it + (identity to s) }
     private fun clearState(identity: DownloadIdentity) = _states.update { it - identity }
 
+    private fun StreamResponse.header(name: String): String? =
+        headers.entries.firstOrNull { it.key.equals(name, ignoreCase = true) }?.value
+
     /** A deliberate session boundary: retain queue/partial bytes until this owner is live again. */
     private class DownloadOwnerInactiveException : IOException(
-        "Download paused until its Jellyfin account is active again.",
+        "Download paused until its source account is active again.",
     )
+
+    internal class DownloadHttpException(val statusCode: Int) : Exception("HTTP $statusCode")
 
     private data class ContentRange(val start: Long, val endInclusive: Long, val total: Long?)
 
@@ -586,8 +519,8 @@ class MediaDownloader(
     }
 
     private fun friendly(e: Exception): String = when (e) {
-        is DownloadOwnerInactiveException -> "Paused until this Jellyfin account is active again."
-        is JellyfinHttpException -> e.serverReason?.let { "Server error: $it" } ?: "Server error (HTTP ${e.code})."
+        is DownloadOwnerInactiveException -> "Paused until this source account is active again."
+        is DownloadHttpException -> "Server error (HTTP ${e.statusCode})."
         is IllegalArgumentException, is IllegalStateException -> e.message ?: "Download failed."
         else -> "Download failed. Check your connection and try again."
     }
@@ -595,18 +528,6 @@ class MediaDownloader(
     companion object {
         private const val TAG = "MediaDownloader"
         private const val PROGRESS_EMIT_BYTES = 1024L * 1024 // emit progress ~every 1 MiB
-        private const val MAX_DOWNLOAD_REDIRECTS = 3
         private val CONTENT_RANGE = Regex("""bytes\s+(\d+)-(\d+)/(\d+|\*)""", RegexOption.IGNORE_CASE)
-
-        /** Broad direct-play capabilities so Jellyfin returns the ORIGINAL file (no transcode) to save. */
-        private val DOWNLOAD_CAPS = TargetCapabilities(
-            protocol = Protocol.CAST,
-            supportedContainers = setOf("mp4", "mkv", "webm", "avi", "mov", "ts", "m4v"),
-            supportedVideoCodecs = setOf("h264", "hevc", "h265", "vp9", "vp8", "av1", "mpeg4", "mpeg2video"),
-            supportedAudioCodecs = setOf("aac", "ac3", "eac3", "mp3", "opus", "flac", "vorbis", "dts", "truehd", "pcm"),
-            supportsHevc = true,
-            supports10Bit = true,
-            supportsHls = false,
-        )
     }
 }

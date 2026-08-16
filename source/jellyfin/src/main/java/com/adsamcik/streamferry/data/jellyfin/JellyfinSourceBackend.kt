@@ -1,6 +1,9 @@
 package com.adsamcik.streamferry.data.jellyfin
 
 import com.adsamcik.streamferry.core.net.TrustedMediaOriginPolicy
+import com.adsamcik.streamferry.core.stream.Protocol
+import com.adsamcik.streamferry.core.stream.TargetCapabilities
+import com.adsamcik.streamferry.domain.DownloadTranscodeProfile
 import com.adsamcik.streamferry.domain.ProviderPlaybackReporter
 import com.adsamcik.streamferry.domain.ServerPlaybackProvider
 import com.adsamcik.streamferry.domain.MediaItem
@@ -8,6 +11,9 @@ import com.adsamcik.streamferry.domain.MediaSource
 import com.adsamcik.streamferry.domain.PlaybackInfo
 import com.adsamcik.streamferry.domain.UpstreamSource
 import com.adsamcik.streamferry.source.api.CatalogProvider
+import com.adsamcik.streamferry.source.api.DownloadFormat
+import com.adsamcik.streamferry.source.api.DownloadProvider
+import com.adsamcik.streamferry.source.api.DownloadStream
 import com.adsamcik.streamferry.source.api.ArtworkProvider
 import com.adsamcik.streamferry.source.api.ArtworkRef
 import com.adsamcik.streamferry.source.api.ArtworkRequest
@@ -52,6 +58,7 @@ class JellyfinSourceBackend(
     private val delegate: MediaSource,
     override val playback: PlaybackProvider,
     private val artworkProvider: JellyfinArtworkProvider,
+    override val downloads: DownloadProvider,
 ) : SourceBackend, CatalogProvider {
 
     init {
@@ -74,7 +81,6 @@ class JellyfinSourceBackend(
     override val catalog: CatalogProvider get() = this
     override val artwork: ArtworkProvider = artworkProvider
     override val userState = null
-    override val downloads = null
     override val setup = null
 
     override suspend fun roots(): Result<List<MediaItem>> = delegate.roots().map(::namespace)
@@ -115,6 +121,70 @@ class JellyfinSourceBackend(
                 id = SourceInstanceId(PROVIDER_ID, "$serverId:$userId"),
                 displayName = displayName,
             )
+    }
+}
+
+/** Prepares provider-owned download bytes; the durable queue never receives a URL or credential. */
+class JellyfinDownloadProvider(
+    private val source: SourceInstanceId,
+    private val repository: ServerPlaybackProvider,
+    private val httpClient: OkHttpClient,
+) : DownloadProvider {
+
+    override suspend fun prepareDownload(media: MediaRef, format: DownloadFormat): Result<DownloadStream> {
+        if (media.source != source) {
+            return Result.failure(IllegalArgumentException("Media reference belongs to another source instance"))
+        }
+        val infoResult = when (format) {
+            DownloadFormat.Original -> repository.playbackInfo(
+                itemId = media.nativeId,
+                capabilities = DOWNLOAD_CAPABILITIES,
+                maxBitrateBps = null,
+                forceTranscode = false,
+                allowSubtitleBurnIn = false,
+                audioStreamIndex = null,
+                subtitleStreamIndex = null,
+                startPositionSeconds = 0,
+            )
+            is DownloadFormat.Transcode -> repository.playbackInfo(
+                itemId = media.nativeId,
+                capabilities = DOWNLOAD_CAPABILITIES,
+                maxBitrateBps = format.maxBitrateBps,
+                forceTranscode = true,
+                allowSubtitleBurnIn = false,
+                audioStreamIndex = null,
+                subtitleStreamIndex = null,
+                startPositionSeconds = 0,
+                downloadProfile = DownloadTranscodeProfile(
+                    maxBitrateBps = format.maxBitrateBps,
+                    container = format.container,
+                    videoCodec = format.videoCodec,
+                    audioCodec = format.audioCodec,
+                ),
+            )
+        }
+        return infoResult.mapCatching { info ->
+            val upstream = repository.resolveUpstream(info)
+            require(!upstream.isHls) { "This title can only be streamed, not downloaded." }
+            DownloadStream(
+                media = media,
+                stream = JellyfinStreamLease(upstream, httpClient),
+                container = info.profile.container,
+                runtimeSeconds = info.runtimeSeconds,
+            )
+        }
+    }
+
+    private companion object {
+        val DOWNLOAD_CAPABILITIES = TargetCapabilities(
+            protocol = Protocol.CAST,
+            supportedContainers = setOf("mp4", "mkv", "webm", "avi", "mov", "ts", "m4v"),
+            supportedVideoCodecs = setOf("h264", "hevc", "h265", "vp9", "vp8", "av1", "mpeg4", "mpeg2video"),
+            supportedAudioCodecs = setOf("aac", "ac3", "eac3", "mp3", "opus", "flac", "vorbis", "dts", "truehd", "pcm"),
+            supportsHevc = true,
+            supports10Bit = true,
+            supportsHls = false,
+        )
     }
 }
 

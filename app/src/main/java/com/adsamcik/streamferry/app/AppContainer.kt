@@ -30,6 +30,7 @@ import com.adsamcik.streamferry.data.jellyfin.JellyfinAuthRepository
 import com.adsamcik.streamferry.data.jellyfin.JellyfinClient
 import com.adsamcik.streamferry.data.jellyfin.JellyfinMediaLibraryRepository
 import com.adsamcik.streamferry.data.jellyfin.JellyfinMediaSource
+import com.adsamcik.streamferry.data.jellyfin.JellyfinDownloadProvider
 import com.adsamcik.streamferry.data.jellyfin.JellyfinPlaybackProvider
 import com.adsamcik.streamferry.data.jellyfin.JellyfinArtworkProvider
 import com.adsamcik.streamferry.data.jellyfin.JellyfinSourceBackend
@@ -73,6 +74,9 @@ import com.adsamcik.streamferry.playback.session.DefaultPlaybackSessionCoordinat
 import com.adsamcik.streamferry.ui.theme.AppearancePreferences
 import com.adsamcik.streamferry.ui.artwork.ArtworkRefFetcher
 import com.adsamcik.streamferry.source.api.MediaRef
+import com.adsamcik.streamferry.source.api.DownloadFormat
+import com.adsamcik.streamferry.source.api.DownloadProvider
+import com.adsamcik.streamferry.source.api.DownloadStream
 import com.adsamcik.streamferry.source.api.PlaybackProvider
 import com.adsamcik.streamferry.source.api.PlaybackRequest
 import com.adsamcik.streamferry.source.api.SourceBackend
@@ -271,6 +275,7 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
                 identity = identity,
                 delegate = rawJellyfinMediaSource,
                 artworkProvider = JellyfinArtworkProvider(identity.id, jellyfinClient, httpClient),
+                downloads = JellyfinDownloadProvider(identity.id, jellyfinRepository, httpClient),
                 playback = JellyfinPlaybackProvider(
                     source = identity.id,
                     repository = jellyfinRepository,
@@ -299,6 +304,20 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
                 request.copy(media = request.media.copy(source = backend.identity.id))
             }
             provider.prepare(normalized).getOrThrow()
+        }
+    }
+
+    private val registeredDownloadProvider = object : DownloadProvider {
+        override suspend fun prepareDownload(media: MediaRef, format: DownloadFormat): Result<DownloadStream> = runCatching {
+            val registry = sourceRegistry()
+            val backend = registry.get(media.source)
+                ?: registry.all().singleOrNull { candidate ->
+                    candidate.downloads != null && media.source.provider.value == MediaSourceIds.REMOTE
+                }
+                ?: error("No download source is registered for this media")
+            val provider = backend.downloads ?: error("This source does not support downloads")
+            val normalized = if (media.source == backend.identity.id) media else media.copy(source = backend.identity.id)
+            provider.prepareDownload(normalized, format).getOrThrow()
         }
     }
 
@@ -403,10 +422,9 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
     private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     val downloader: MediaDownloader by lazy {
         MediaDownloader(
-            playbackProvider = jellyfinRepository,
+            downloadProvider = registeredDownloadProvider,
             store = downloadStore,
             queue = downloadQueueStore,
-            httpClient = httpClient,
             logger = logger,
             scope = ioScope,
             // JellyfinClient is a singleton mutable session. A download may make remote requests only

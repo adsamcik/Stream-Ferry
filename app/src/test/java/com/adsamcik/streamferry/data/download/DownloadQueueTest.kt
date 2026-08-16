@@ -2,7 +2,6 @@ package com.adsamcik.streamferry.data.download
 
 import com.adsamcik.streamferry.source.api.DownloadFormat
 
-import com.adsamcik.streamferry.data.jellyfin.JellyfinHttpException
 import kotlinx.coroutines.runBlocking
 import java.io.IOException
 import java.nio.file.Files
@@ -124,7 +123,7 @@ class DownloadQueueTest {
         assertTrue(DownloadQueue.isRecoverableFailure(IOException("connection reset")))
         assertTrue(DownloadQueue.isRecoverableFailure(SocketTimeoutException("timeout")))
         listOf(408, 425, 429, 500, 502, 503, 504).forEach { code ->
-            assertTrue(DownloadQueue.isRecoverableFailure(JellyfinHttpException(code)), "HTTP $code should be recoverable")
+            assertTrue(DownloadQueue.isRecoverableFailure(MediaDownloader.DownloadHttpException(code)), "HTTP $code should be recoverable")
         }
     }
 
@@ -132,7 +131,7 @@ class DownloadQueueTest {
     fun permanentFailuresAreNotRecoverable() {
         // 4xx that mean the item/session is gone, plus auth, plus a non-downloadable (HLS-only) item.
         listOf(400, 401, 403, 404, 410, 416).forEach { code ->
-            assertFalse(DownloadQueue.isRecoverableFailure(JellyfinHttpException(code)), "HTTP $code should be permanent")
+            assertFalse(DownloadQueue.isRecoverableFailure(MediaDownloader.DownloadHttpException(code)), "HTTP $code should be permanent")
         }
         assertFalse(DownloadQueue.isRecoverableFailure(IllegalArgumentException("This title can only be streamed, not downloaded.")))
         assertFalse(DownloadQueue.isRecoverableFailure(IllegalStateException("Empty response")))

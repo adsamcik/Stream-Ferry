@@ -263,15 +263,15 @@ interface UserStateProvider {
     suspend fun update(media: MediaRef, state: MediaUserState): Result<MediaUserState>
 }
 
-enum class DownloadQuality { ORIGINAL, HIGH, MEDIUM, LOW }
-
 data class DownloadStream(
     val media: MediaRef,
     val stream: StreamLease,
+    val container: String?,
+    val runtimeSeconds: Long?,
 )
 
 interface DownloadProvider {
-    suspend fun prepareDownload(media: MediaRef, quality: DownloadQuality): Result<DownloadStream>
+    suspend fun prepareDownload(media: MediaRef, format: DownloadFormat): Result<DownloadStream>
 }
 
 class SourceRegistry(backends: Iterable<SourceBackend> = emptyList()) {
