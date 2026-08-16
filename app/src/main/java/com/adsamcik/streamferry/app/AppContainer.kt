@@ -69,7 +69,7 @@ import com.adsamcik.streamferry.playback.PlaybackEngine
 import com.adsamcik.streamferry.playback.PlaybackPreferences
 import com.adsamcik.streamferry.playback.PersistentRendererCapabilityStore
 import com.adsamcik.streamferry.playback.RendererCapabilityStore
-import com.adsamcik.streamferry.playback.reporting.DefaultProviderPlaybackReporter
+import com.adsamcik.streamferry.data.jellyfin.DefaultJellyfinPlaybackReporter
 import com.adsamcik.streamferry.playback.session.DefaultPlaybackSessionCoordinator
 import com.adsamcik.streamferry.ui.theme.AppearancePreferences
 import com.adsamcik.streamferry.ui.artwork.ArtworkRefFetcher
@@ -255,8 +255,8 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
     private val jellyfinRepository: HttpJellyfinRepository by lazy {
         HttpJellyfinRepository(jellyfinClient, logger, httpClient)
     }
-    private val reporter: DefaultProviderPlaybackReporter by lazy {
-        DefaultProviderPlaybackReporter(jellyfinClient, deviceId, logger, jellyfinConnectionMonitor)
+    private val reporter: DefaultJellyfinPlaybackReporter by lazy {
+        DefaultJellyfinPlaybackReporter(jellyfinClient, deviceId, logger, jellyfinConnectionMonitor)
     }
 
     /**

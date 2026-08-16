@@ -12,7 +12,6 @@ import com.adsamcik.streamferry.domain.HlsSegmentFormat
 import com.adsamcik.streamferry.domain.MediaChapter
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.domain.MediaTrack
-import com.adsamcik.streamferry.domain.UpstreamSource
 import com.adsamcik.streamferry.source.api.DiagnosticSink
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -125,7 +124,7 @@ class JellyfinClient(
     private val retryBudget = RetryBudget(maxConsecutiveFailures = 3)
 
     /** Upstream sources resolved during PlaybackInfo, keyed by media source id (secret values). */
-    private val upstreamCache = ConcurrentHashMap<String, UpstreamSource>()
+    private val upstreamCache = ConcurrentHashMap<String, JellyfinUpstreamSource>()
 
     // ----- session management (used by the auth repository) -----
 
@@ -511,7 +510,7 @@ class JellyfinClient(
         MediaTrack(index = idx, language = s.language, label = label, isDefault = s.isDefault, isForced = s.isForced)
     }
 
-    override fun resolveUpstreamFor(mediaSourceId: String): UpstreamSource =
+    override fun resolveUpstreamFor(mediaSourceId: String): JellyfinUpstreamSource =
         upstreamCache[mediaSourceId] ?: error("No resolved upstream for media source")
 
     private fun resolveUpstream(
@@ -519,7 +518,7 @@ class JellyfinClient(
         source: MediaSourceDto,
         playSessionId: String?,
         requireTranscode: Boolean,
-    ): UpstreamSource {
+    ): JellyfinUpstreamSource {
         val canDirect = source.isDirectlyPlayable()
         val transcodingUrl = source.transcodingUrl?.takeIf { it.isNotBlank() }
         val useTranscode = (requireTranscode || !canDirect) && transcodingUrl != null
@@ -556,7 +555,7 @@ class JellyfinClient(
         } else {
             null
         }
-        return UpstreamSource(
+        return JellyfinUpstreamSource(
             url = absoluteUpstreamUrl(rawUrl),
             authHeader = authHeaderValue(),
             contentType = if (isHls) HLS_MIME else mimeForContainer(outputContainer),

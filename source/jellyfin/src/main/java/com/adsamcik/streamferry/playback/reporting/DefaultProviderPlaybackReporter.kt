@@ -1,12 +1,8 @@
-package com.adsamcik.streamferry.playback.reporting
+package com.adsamcik.streamferry.data.jellyfin
 
 import com.adsamcik.streamferry.core.resilience.UpstreamRetry
 import com.adsamcik.streamferry.data.cache.JellyfinConnectionMonitor
 import com.adsamcik.streamferry.data.jellyfin.HttpJellyfinRepository.Companion.TICKS_PER_SECOND
-import com.adsamcik.streamferry.data.jellyfin.JellyfinApi
-import com.adsamcik.streamferry.data.jellyfin.JellyfinHttpException
-import com.adsamcik.streamferry.domain.ProviderPlaybackReporter
-import com.adsamcik.streamferry.domain.PlaybackInfo
 import com.adsamcik.streamferry.source.api.DiagnosticSink
 import java.io.IOException
 import kotlinx.coroutines.CancellationException
@@ -16,16 +12,16 @@ import kotlinx.coroutines.CancellationException
  * progress: callers pass real positions derived from target status; on unknown positions we report
  * the last known value rather than fabricating one.
  */
-class DefaultProviderPlaybackReporter(
+class DefaultJellyfinPlaybackReporter(
     private val api: JellyfinApi,
     private val deviceId: String,
     private val logger: DiagnosticSink,
     private val connectionMonitor: JellyfinConnectionMonitor? = null,
-) : ProviderPlaybackReporter {
+) : JellyfinPlaybackReporter {
 
-    override suspend fun reportStart(info: PlaybackInfo) = reportStart(info, initialPositionSeconds = 0L)
+    override suspend fun reportStart(info: JellyfinPlaybackInfo) = reportStart(info, initialPositionSeconds = 0L)
 
-    override suspend fun reportStart(info: PlaybackInfo, initialPositionSeconds: Long) = reportLifecycle("reportStart") {
+    override suspend fun reportStart(info: JellyfinPlaybackInfo, initialPositionSeconds: Long) = reportLifecycle("reportStart") {
         api.reportPlaying(
             playSessionId = info.playSessionId,
             itemId = info.itemId,
@@ -34,7 +30,7 @@ class DefaultProviderPlaybackReporter(
         )
     }
 
-    override suspend fun reportProgress(info: PlaybackInfo, positionSeconds: Long, isPaused: Boolean) =
+    override suspend fun reportProgress(info: JellyfinPlaybackInfo, positionSeconds: Long, isPaused: Boolean) =
         reportLifecycle("reportProgress") {
             api.reportProgress(
                 playSessionId = info.playSessionId,
@@ -45,7 +41,7 @@ class DefaultProviderPlaybackReporter(
             )
         }
 
-    override suspend fun reportStopped(info: PlaybackInfo, positionSeconds: Long) = reportLifecycle("reportStopped") {
+    override suspend fun reportStopped(info: JellyfinPlaybackInfo, positionSeconds: Long) = reportLifecycle("reportStopped") {
         api.reportStopped(
             playSessionId = info.playSessionId,
             itemId = info.itemId,
@@ -54,7 +50,7 @@ class DefaultProviderPlaybackReporter(
         )
     }
 
-    override suspend fun stopTranscode(info: PlaybackInfo) = reportLifecycle("stopTranscode") {
+    override suspend fun stopTranscode(info: JellyfinPlaybackInfo) = reportLifecycle("stopTranscode") {
         // DELETE /Videos/ActiveEncodings — only meaningful for transcode/HLS sessions; harmless
         // otherwise. Critical to avoid abandoned server-side transcodes after the user stops.
         api.stopActiveEncoding(info.playSessionId, deviceId)

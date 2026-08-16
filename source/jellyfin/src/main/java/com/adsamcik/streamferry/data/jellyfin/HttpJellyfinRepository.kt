@@ -2,16 +2,13 @@ package com.adsamcik.streamferry.data.jellyfin
 
 import com.adsamcik.streamferry.core.stream.MediaProfile
 import com.adsamcik.streamferry.core.stream.TargetCapabilities
-import com.adsamcik.streamferry.domain.ServerPlaybackProvider
-import com.adsamcik.streamferry.domain.PlaybackInfo
-import com.adsamcik.streamferry.domain.UpstreamSource
 import com.adsamcik.streamferry.source.api.DiagnosticSink
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 
 /**
- * Concrete [ServerPlaybackProvider] over the documented server HTTP API (see [JellyfinApiContract]).
+ * Concrete [JellyfinPlaybackRepository] over the documented server HTTP API (see [JellyfinApiContract]).
  *
  * Responsibilities (§8):
  *   - Build a PlaybackInfo request whose DeviceProfile is derived from the target's real
@@ -28,7 +25,7 @@ class HttpJellyfinRepository(
     private val api: JellyfinApi,
     private val logger: DiagnosticSink,
     @Suppress("unused") private val httpClient: OkHttpClient,
-) : ServerPlaybackProvider {
+) : JellyfinPlaybackRepository {
 
     override suspend fun playbackInfo(
         itemId: String,
@@ -41,8 +38,8 @@ class HttpJellyfinRepository(
         startPositionSeconds: Long,
         maxVideoHeight: Int,
         preferredVideoCodec: String?,
-        downloadProfile: com.adsamcik.streamferry.domain.DownloadTranscodeProfile?,
-    ): Result<PlaybackInfo> = withContext(Dispatchers.IO) {
+        downloadProfile: JellyfinDownloadTranscodeProfile?,
+    ): Result<JellyfinPlaybackInfo> = withContext(Dispatchers.IO) {
         runCatching {
             val deviceProfile = downloadProfile?.let { profile ->
                 DeviceProfiles.forDownload(
@@ -69,7 +66,7 @@ class HttpJellyfinRepository(
                 requireTranscode = forceTranscode,
             )
             // (The enriched "PlaybackInfo resolved …" event is logged in JellyfinClient.postPlaybackInfo.)
-            PlaybackInfo(
+            JellyfinPlaybackInfo(
                 mediaSourceId = response.mediaSourceId,
                 playSessionId = response.playSessionId,
                 profile = MediaProfile(
@@ -91,7 +88,7 @@ class HttpJellyfinRepository(
         }.onFailure { logger.e("jellyfin", "PlaybackInfo request failed (${it.javaClass.simpleName})", it) }
     }
 
-    override suspend fun resolveUpstream(info: PlaybackInfo): UpstreamSource = withContext(Dispatchers.IO) {
+    override suspend fun resolveUpstream(info: JellyfinPlaybackInfo): JellyfinUpstreamSource = withContext(Dispatchers.IO) {
         // The upstream URL + auth header are secrets resolved from the cached PlaybackInfo response.
         api.resolveUpstreamFor(info.mediaSourceId)
     }

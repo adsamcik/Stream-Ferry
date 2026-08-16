@@ -2,10 +2,6 @@ package com.adsamcik.streamferry.data.jellyfin
 
 import com.adsamcik.streamferry.core.stream.MediaProfile
 import com.adsamcik.streamferry.core.stream.TargetCapabilities
-import com.adsamcik.streamferry.domain.DownloadTranscodeProfile
-import com.adsamcik.streamferry.domain.PlaybackInfo
-import com.adsamcik.streamferry.domain.ServerPlaybackProvider
-import com.adsamcik.streamferry.domain.UpstreamSource
 import com.adsamcik.streamferry.source.api.DownloadFormat
 import com.adsamcik.streamferry.source.api.MediaRef
 import com.adsamcik.streamferry.source.api.SourceInstanceId
@@ -46,10 +42,10 @@ class JellyfinDownloadProviderTest {
         assertFalse(repository.called)
     }
 
-    private class RecordingRepository : ServerPlaybackProvider {
+    private class RecordingRepository : JellyfinPlaybackRepository {
         var called = false
         var forceTranscode = false
-        var downloadProfile: DownloadTranscodeProfile? = null
+        var downloadProfile: JellyfinDownloadTranscodeProfile? = null
 
         override suspend fun playbackInfo(
             itemId: String,
@@ -62,13 +58,13 @@ class JellyfinDownloadProviderTest {
             startPositionSeconds: Long,
             maxVideoHeight: Int,
             preferredVideoCodec: String?,
-            downloadProfile: DownloadTranscodeProfile?,
-        ): Result<PlaybackInfo> {
+            downloadProfile: JellyfinDownloadTranscodeProfile?,
+        ): Result<JellyfinPlaybackInfo> {
             called = true
             this.forceTranscode = forceTranscode
             this.downloadProfile = downloadProfile
             return Result.success(
-                PlaybackInfo(
+                JellyfinPlaybackInfo(
                     mediaSourceId = "media-source",
                     playSessionId = "play-session",
                     profile = MediaProfile("mp4", "h264", audioCodec = "aac"),
@@ -78,7 +74,7 @@ class JellyfinDownloadProviderTest {
             )
         }
 
-        override suspend fun resolveUpstream(info: PlaybackInfo) = UpstreamSource(
+        override suspend fun resolveUpstream(info: JellyfinPlaybackInfo) = JellyfinUpstreamSource(
             url = "https://media.example/video.mp4",
             authHeader = "private-credential",
             contentType = "video/mp4",

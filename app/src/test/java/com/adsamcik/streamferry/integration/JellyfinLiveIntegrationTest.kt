@@ -6,10 +6,10 @@ import com.adsamcik.streamferry.core.stream.TargetCapabilities
 import com.adsamcik.streamferry.data.jellyfin.HttpJellyfinRepository
 import com.adsamcik.streamferry.data.jellyfin.JellyfinClient
 import com.adsamcik.streamferry.data.jellyfin.JellyfinPlaybackProvider
+import com.adsamcik.streamferry.data.jellyfin.JellyfinPlaybackInfo
+import com.adsamcik.streamferry.data.jellyfin.JellyfinPlaybackReporter
 import com.adsamcik.streamferry.data.jellyfin.JellyfinSourceBackend
 import com.adsamcik.streamferry.data.proxy.LocalProxyServer
-import com.adsamcik.streamferry.domain.PlaybackInfo
-import com.adsamcik.streamferry.domain.ProviderPlaybackReporter
 import com.adsamcik.streamferry.source.api.MediaRef
 import com.adsamcik.streamferry.source.api.PlaybackRequest
 import com.adsamcik.streamferry.source.api.ProviderPlaybackSession
@@ -324,10 +324,10 @@ class JellyfinLiveIntegrationTest {
         override fun clear() {}
     }
 
-    private class NoopReporter : ProviderPlaybackReporter {
-        override suspend fun reportStart(info: PlaybackInfo) {}
-        override suspend fun reportProgress(info: PlaybackInfo, positionSeconds: Long, isPaused: Boolean) {}
-        override suspend fun reportStopped(info: PlaybackInfo, positionSeconds: Long) {}
-        override suspend fun stopTranscode(info: PlaybackInfo) {}
+    private class NoopReporter : JellyfinPlaybackReporter {
+        override suspend fun reportStart(info: JellyfinPlaybackInfo) {}
+        override suspend fun reportProgress(info: JellyfinPlaybackInfo, positionSeconds: Long, isPaused: Boolean) {}
+        override suspend fun reportStopped(info: JellyfinPlaybackInfo, positionSeconds: Long) {}
+        override suspend fun stopTranscode(info: JellyfinPlaybackInfo) {}
     }
 }

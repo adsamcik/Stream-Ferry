@@ -1,7 +1,6 @@
 package com.adsamcik.streamferry.data.jellyfin
 
 import com.adsamcik.streamferry.domain.MediaTrack
-import com.adsamcik.streamferry.domain.UpstreamSource
 
 /**
  * Thin, auditable HTTP boundary to the documented Jellyfin endpoints (see [JellyfinApiContract]).
@@ -52,7 +51,7 @@ interface JellyfinApi {
     ): PlaybackInfoResult
 
     /** Resolve the upstream source for a previously fetched media source id (held in memory). */
-    fun resolveUpstreamFor(mediaSourceId: String): UpstreamSource
+    fun resolveUpstreamFor(mediaSourceId: String): JellyfinUpstreamSource
 
     /** Skippable media segments (intro/outro/recap/…) for an item; empty when none/unsupported. */
     suspend fun mediaSegments(itemId: String): List<com.adsamcik.streamferry.core.segments.MediaSegment> = emptyList()

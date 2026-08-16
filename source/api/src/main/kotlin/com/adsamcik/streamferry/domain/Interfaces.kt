@@ -96,21 +96,6 @@ data class MediaChapter(
     val hasImage: Boolean get() = artwork != null || imageTag != null
 }
 
-data class PlaybackInfo(
-    val mediaSourceId: String,
-    val playSessionId: String?,
-    val profile: MediaProfile,
-    val runtimeSeconds: Long?,
-    /** Source bitrate (bits/sec) when reported, used to cap the adaptive bitrate ladder. */
-    val sourceBitrateBps: Long? = null,
-    /** Selectable audio tracks reported by the server (empty if none/unknown). */
-    val audioTracks: List<MediaTrack> = emptyList(),
-    /** Selectable subtitle tracks reported by the server (empty if none). "Off" is implicit, not a track. */
-    val subtitleTracks: List<MediaTrack> = emptyList(),
-    /** Catalogue item id used by session reports; distinct from [mediaSourceId] for multi-version media. */
-    val itemId: String = mediaSourceId,
-)
-
 /**
  * A selectable audio or subtitle stream of the current media (as reported by its source), surfaced so the
  * user can pick a language. [index] is the server stream index passed back as AudioStreamIndex /
@@ -183,44 +168,6 @@ interface MediaLibraryRepository {
     suspend fun continueWatching(): Result<List<MediaItem>> = Result.success(emptyList())
 }
 
-data class DownloadTranscodeProfile(
-    val maxBitrateBps: Long,
-    val container: String,
-    val videoCodec: String,
-    val audioCodec: String,
-)
-
-/** Transitional provider-neutral playback seam used while the gateway adopts [ProviderPlaybackSession]. */
-interface ServerPlaybackProvider {
-    /**
-     * Request official playback info for a target+preferences. Returns a [PlaybackInfo] containing
-     * the upstream stream locator INTERNALLY (never surfaced to UI/TV) plus PlaySessionId. The
-     * concrete upstream URL is provided to the proxy layer only, via [openUpstream].
-     */
-    suspend fun playbackInfo(
-        itemId: String,
-        capabilities: TargetCapabilities,
-        maxBitrateBps: Long?,
-        forceTranscode: Boolean,
-        allowSubtitleBurnIn: Boolean,
-        audioStreamIndex: Int?,
-        subtitleStreamIndex: Int?,
-        startPositionSeconds: Long,
-        maxVideoHeight: Int = 0,
-        preferredVideoCodec: String? = null,
-        downloadProfile: DownloadTranscodeProfile? = null,
-    ): Result<PlaybackInfo>
-
-    /** Resolve the secret upstream URL + auth header for a media source (proxy layer only). */
-    suspend fun resolveUpstream(info: PlaybackInfo): UpstreamSource
-
-    /**
-     * Skippable media segments (intro/outro/recap/…) exposed by the source
-     * (10.10+). Empty when the server/item has none — never an error, so playback is unaffected.
-     */
-    suspend fun mediaSegments(itemId: String): List<com.adsamcik.streamferry.core.segments.MediaSegment> = emptyList()
-}
-
 /** Actual media-segment packaging for an HLS playlist handed to a Cast receiver. */
 enum class HlsSegmentFormat {
     /** HLS media is carried in MPEG-2 transport-stream segments. */
@@ -240,42 +187,6 @@ data class RendererStream(
     val hlsSegmentFormat: HlsSegmentFormat? = null,
     val isByteSeekable: Boolean = false,
 )
-
-/** Secret upstream descriptor — never logged or sent to the TV. */
-data class UpstreamSource(
-    val url: String,
-    val authHeader: String?,
-    /** MIME of the phone-proxied resource (the HLS playlist itself for HLS). */
-    val contentType: String,
-    /** Actual encoded output container reported by the source when transcoding. */
-    val outputContainer: String,
-    /** Actual HLS segment packaging; null for a progressive resource. */
-    val hlsSegmentFormat: HlsSegmentFormat? = null,
-    val isHls: Boolean,
-    /**
-     * True when this is a live server-side transcode (HLS for Cast, progressive for DLNA). A transcode
-     * is NOT byte-seekable and is seeked/resumed **server-side** by re-resolving at the target position
-     * (the source honours the start request); a direct-play stream is byte-range seekable via the proxy.
-     */
-    val isTranscoding: Boolean,
-    /** True only when the proxy can safely honour byte-range requests for this resource. */
-    val isByteSeekable: Boolean,
-    /** Byte length of a direct-play entity when known, null for a transcode (unknown live length). */
-    val totalLength: Long?,
-) {
-    init {
-        require(isHls == (hlsSegmentFormat != null)) {
-            "HLS streams must declare a segment format; progressive streams must not."
-        }
-        require(!isTranscoding || !isByteSeekable) {
-            "Live transcoded streams must not advertise byte seeking."
-        }
-    }
-
-    /** The complete metadata passed to the Cast or DLNA controller. */
-    val rendererStream: RendererStream
-        get() = RendererStream(contentType, hlsSegmentFormat, isByteSeekable)
-}
 
 // ----- Targets -----
 
@@ -401,16 +312,6 @@ interface SecureTokenStore {
     suspend fun get(serverId: String): String?
     suspend fun remove(serverId: String)
     suspend fun clear()
-}
-
-interface ProviderPlaybackReporter {
-    suspend fun reportStart(info: PlaybackInfo)
-    /** Start reporting at the exact resume point rather than pretending resumed media began at zero. */
-    suspend fun reportStart(info: PlaybackInfo, initialPositionSeconds: Long) = reportStart(info)
-    suspend fun reportProgress(info: PlaybackInfo, positionSeconds: Long, isPaused: Boolean)
-    suspend fun reportStopped(info: PlaybackInfo, positionSeconds: Long)
-    /** Ensure server-side transcode/HLS session is torn down (§8 cleanup). */
-    suspend fun stopTranscode(info: PlaybackInfo)
 }
 
 interface NetworkPermissionManager {

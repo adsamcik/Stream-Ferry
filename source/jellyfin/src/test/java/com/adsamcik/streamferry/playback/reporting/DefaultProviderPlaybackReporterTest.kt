@@ -3,9 +3,10 @@ package com.adsamcik.streamferry.playback.reporting
 import com.adsamcik.streamferry.core.stream.MediaProfile
 import com.adsamcik.streamferry.data.cache.JellyfinConnectionMonitor
 import com.adsamcik.streamferry.data.jellyfin.HttpJellyfinRepository.Companion.TICKS_PER_SECOND
+import com.adsamcik.streamferry.data.jellyfin.DefaultJellyfinPlaybackReporter
 import com.adsamcik.streamferry.data.jellyfin.JellyfinApi
-import com.adsamcik.streamferry.domain.PlaybackInfo
-import com.adsamcik.streamferry.domain.UpstreamSource
+import com.adsamcik.streamferry.data.jellyfin.JellyfinPlaybackInfo
+import com.adsamcik.streamferry.data.jellyfin.JellyfinUpstreamSource
 import com.adsamcik.streamferry.source.api.DiagnosticSink
 import com.adsamcik.streamferry.domain.SourceAvailability
 import java.io.IOException
@@ -13,13 +14,13 @@ import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 
-class DefaultProviderPlaybackReporterTest {
+class DefaultJellyfinPlaybackReporterTest {
 
     @Test
     fun reportsKeepTheLibraryItemAndSelectedMediaSourceDistinct() = runTest {
         val api = RecordingApi()
         val monitor = JellyfinConnectionMonitor()
-        val reporter = DefaultProviderPlaybackReporter(api, "device", NoOpLogger, monitor)
+        val reporter = DefaultJellyfinPlaybackReporter(api, "device", NoOpLogger, monitor)
         val info = playbackInfo()
 
         reporter.reportStart(info, initialPositionSeconds = 12L)
@@ -41,14 +42,14 @@ class DefaultProviderPlaybackReporterTest {
     fun transportFailureMarksJellyfinUnavailableWithoutEscapingPlaybackCleanup() = runTest {
         val api = RecordingApi(failure = IOException("network lost"))
         val monitor = JellyfinConnectionMonitor()
-        val reporter = DefaultProviderPlaybackReporter(api, "device", NoOpLogger, monitor)
+        val reporter = DefaultJellyfinPlaybackReporter(api, "device", NoOpLogger, monitor)
 
         reporter.reportProgress(playbackInfo(), positionSeconds = 7L, isPaused = true)
 
         assertEquals(SourceAvailability.UNAVAILABLE, monitor.status.value)
     }
 
-    private fun playbackInfo() = PlaybackInfo(
+    private fun playbackInfo() = JellyfinPlaybackInfo(
         mediaSourceId = "source-version",
         playSessionId = "play-session",
         profile = MediaProfile(container = "mkv", videoCodec = "h264", audioCodec = "aac"),
@@ -79,7 +80,7 @@ class DefaultProviderPlaybackReporterTest {
             requireTranscode: Boolean,
         ): JellyfinApi.PlaybackInfoResult = error("unused")
 
-        override fun resolveUpstreamFor(mediaSourceId: String): UpstreamSource = error("unused")
+        override fun resolveUpstreamFor(mediaSourceId: String): JellyfinUpstreamSource = error("unused")
 
         override suspend fun reportPlaying(playSessionId: String?, itemId: String) = error("Expected rich report")
 

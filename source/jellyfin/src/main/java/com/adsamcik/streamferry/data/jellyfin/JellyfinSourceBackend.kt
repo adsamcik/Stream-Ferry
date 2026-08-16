@@ -3,13 +3,8 @@ package com.adsamcik.streamferry.data.jellyfin
 import com.adsamcik.streamferry.core.net.TrustedMediaOriginPolicy
 import com.adsamcik.streamferry.core.stream.Protocol
 import com.adsamcik.streamferry.core.stream.TargetCapabilities
-import com.adsamcik.streamferry.domain.DownloadTranscodeProfile
-import com.adsamcik.streamferry.domain.ProviderPlaybackReporter
-import com.adsamcik.streamferry.domain.ServerPlaybackProvider
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.domain.MediaSource
-import com.adsamcik.streamferry.domain.PlaybackInfo
-import com.adsamcik.streamferry.domain.UpstreamSource
 import com.adsamcik.streamferry.source.api.CatalogProvider
 import com.adsamcik.streamferry.source.api.DownloadFormat
 import com.adsamcik.streamferry.source.api.DownloadProvider
@@ -127,7 +122,7 @@ class JellyfinSourceBackend(
 /** Prepares provider-owned download bytes; the durable queue never receives a URL or credential. */
 class JellyfinDownloadProvider(
     private val source: SourceInstanceId,
-    private val repository: ServerPlaybackProvider,
+    private val repository: JellyfinPlaybackRepository,
     private val httpClient: OkHttpClient,
 ) : DownloadProvider {
 
@@ -155,7 +150,7 @@ class JellyfinDownloadProvider(
                 audioStreamIndex = null,
                 subtitleStreamIndex = null,
                 startPositionSeconds = 0,
-                downloadProfile = DownloadTranscodeProfile(
+                downloadProfile = JellyfinDownloadTranscodeProfile(
                     maxBitrateBps = format.maxBitrateBps,
                     container = format.container,
                     videoCodec = format.videoCodec,
@@ -269,8 +264,8 @@ class JellyfinArtworkProvider(
 /** Maps the existing server negotiation/reporting implementation to the session-based source contract. */
 class JellyfinPlaybackProvider(
     private val source: SourceInstanceId,
-    private val repository: ServerPlaybackProvider,
-    private val reporter: ProviderPlaybackReporter,
+    private val repository: JellyfinPlaybackRepository,
+    private val reporter: JellyfinPlaybackReporter,
     private val httpClient: OkHttpClient,
 ) : PlaybackProvider {
 
@@ -302,8 +297,8 @@ class JellyfinPlaybackProvider(
     private inner class JellyfinProviderPlaybackSession(
         private val provider: JellyfinPlaybackProvider,
         private val request: PlaybackRequest,
-        private val info: PlaybackInfo,
-        upstreamSource: UpstreamSource,
+        private val info: JellyfinPlaybackInfo,
+        upstreamSource: JellyfinUpstreamSource,
     ) : ProviderPlaybackSession {
 
         override val upstream: StreamLease = JellyfinStreamLease(upstreamSource, httpClient)
@@ -364,7 +359,7 @@ class JellyfinPlaybackProvider(
 
 /** Keeps every private locator and authorization value inside the source module. */
 private class JellyfinStreamLease(
-    upstream: UpstreamSource,
+    upstream: JellyfinUpstreamSource,
     httpClient: OkHttpClient,
 ) : StreamLease {
 
