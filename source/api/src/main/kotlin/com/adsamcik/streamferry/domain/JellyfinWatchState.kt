@@ -5,7 +5,7 @@ package com.adsamcik.streamferry.domain
  * the UI makes the live gallery, offline cache, and downloaded-library snapshot agree immediately
  * after a user action, before the authoritative refresh returns.
  */
-internal fun MediaItem.withJellyfinWatchState(played: Boolean): MediaItem =
+fun MediaItem.withJellyfinWatchState(played: Boolean): MediaItem =
     if (played) {
         copy(
             played = true,
@@ -26,15 +26,15 @@ internal fun MediaItem.withJellyfinWatchState(played: Boolean): MediaItem =
     }
 
 /** Reset an item to an unwatched, start-from-the-beginning state. */
-internal fun MediaItem.withJellyfinProgressReset(): MediaItem = copy(
+fun MediaItem.withJellyfinProgressReset(): MediaItem = copy(
     played = false,
     playedPercentage = 0.0,
     resumePositionSeconds = null,
 )
 
 /** A reset is useful for a partially watched or completed item; untouched episodes stay uncluttered. */
-internal fun MediaItem.hasJellyfinProgressToReset(): Boolean =
+fun MediaItem.hasJellyfinProgressToReset(): Boolean =
     played || (resumePositionSeconds ?: 0L) > 0L || (playedPercentage ?: 0.0) > 0.0
 
-internal fun MediaItem.isJellyfinEpisode(): Boolean =
+fun MediaItem.isJellyfinEpisode(): Boolean =
     sourceId == MediaSourceIds.JELLYFIN && type.equals("Episode", ignoreCase = true)

@@ -7,6 +7,9 @@ import com.adsamcik.streamferry.core.stream.StreamDecision
 import com.adsamcik.streamferry.core.stream.StreamPreferences
 import com.adsamcik.streamferry.core.stream.TargetCapabilities
 import com.adsamcik.streamferry.core.transcode.SourceCapabilities
+import com.adsamcik.streamferry.source.api.MediaRef
+import com.adsamcik.streamferry.source.api.SourceInstanceId
+import com.adsamcik.streamferry.source.api.SourceProviderId
 import kotlinx.coroutines.flow.Flow
 import kotlinx.serialization.Serializable
 
@@ -64,13 +67,18 @@ data class MediaItem(
      * Defaults to Jellyfin so existing Jellyfin-constructed items are unchanged.
      */
     val sourceId: String = MediaSourceIds.JELLYFIN,
+    /** Configured source namespace. Defaults preserve existing serialized media during migration. */
+    val sourceInstanceId: SourceInstanceId = SourceInstanceId(SourceProviderId(sourceId), sourceId),
     /** True when the item is fully watched (Jellyfin native watch state). Always false for local files. */
     val played: Boolean = false,
     /** For a series/season folder, the number of still-unwatched child items; null when not applicable. */
     val unplayedItemCount: Int? = null,
     /** Watched fraction (0..100) of a single item, when the server reports it; null otherwise. */
     val playedPercentage: Double? = null,
-)
+) {
+    /** Canonical provider/account-safe identity used by new caches, queues, playback, and diagnostics. */
+    val ref: MediaRef get() = MediaRef(sourceInstanceId, id)
+}
 
 /**
  * A single chapter ("section") of a video. [startSeconds] is where it begins; [imageTag], when present,
