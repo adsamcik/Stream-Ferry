@@ -130,7 +130,6 @@ Stream Ferry-owned code is **source available** for noncommercial purposes under
 OSI-approved open-source license. Commercial use requires a separate written license from the
 copyright holder; use the repository's contact channels to enquire.
 
-This change is prospective. Versions through tag `v0.5.0` and commit
-`605dbcc7272f9025621c1ad9bd1b48970739b835` remain available under their original
-[MIT License](LICENSE-MIT). See [NOTICE](NOTICE) for the exact scope and cutoff. Third-party
-components retain their own terms as documented in [docs/LICENSES.md](docs/LICENSES.md).
+Third-party components retain their own terms as documented in
+[docs/LICENSES.md](docs/LICENSES.md). See [NOTICE](NOTICE) for licensing scope and the required
+copyright notice.
