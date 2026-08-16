@@ -5,7 +5,6 @@ import com.adsamcik.streamferry.core.redaction.LogRedactor
 import com.adsamcik.streamferry.core.server.ServerIdentity
 import com.adsamcik.streamferry.data.security.ServerConfigStore
 import com.adsamcik.streamferry.data.security.StoredServer
-import com.adsamcik.streamferry.domain.AuthRepository
 import com.adsamcik.streamferry.domain.SecureTokenStore
 import com.adsamcik.streamferry.domain.ServerProfile
 import com.adsamcik.streamferry.domain.UserSession
@@ -32,10 +31,10 @@ class JellyfinAuthRepository(
     private val tokenStore: SecureTokenStore,
     private val configStore: ServerConfigStore,
     private val logger: DiagnosticSink,
-) : AuthRepository {
+) {
 
     private val _currentUser = MutableStateFlow<UserSession?>(null)
-    override val currentUser = _currentUser.asStateFlow()
+    val currentUser = _currentUser.asStateFlow()
     /**
      * A tokenless identity used only to scope cached metadata and completed downloads while the server
      * cannot be verified. The stored token is deliberately never installed into [client] in this mode.
@@ -73,7 +72,7 @@ class JellyfinAuthRepository(
         "Jellyfin is unavailable or the saved session cannot be verified.",
     )
 
-    override suspend fun setServer(rawUrl: String, userApprovedHttp: Boolean): Result<ServerProfile> {
+    suspend fun setServer(rawUrl: String, userApprovedHttp: Boolean): Result<ServerProfile> {
         return when (val v = ServerUrlValidator.validate(rawUrl, userApprovedHttp)) {
             is ServerUrlValidator.Result.Invalid -> Result.failure(IllegalArgumentException(v.reason))
             is ServerUrlValidator.Result.NeedsHttpApproval -> Result.failure(HttpApprovalRequiredException(v.baseUrl))
@@ -99,13 +98,13 @@ class JellyfinAuthRepository(
         }
     }
 
-    override suspend fun testConnection(): Result<String> = authOperationMutex.withLock {
+    suspend fun testConnection(): Result<String> = authOperationMutex.withLock {
         runCatching {
             client.systemInfoPublic() ?: throw IllegalStateException("No response from the server.")
         }.onFailure { logger.w("auth", "Connection test failed", it) }
     }
 
-    override suspend fun login(username: String, password: String): Result<UserSession> = authOperationMutex.withLock {
+    suspend fun login(username: String, password: String): Result<UserSession> = authOperationMutex.withLock {
         runCatching {
             val operation = beginCredentialOperation()
             // Keep the client origin stable from operation creation through the credential POST and
@@ -188,7 +187,7 @@ class JellyfinAuthRepository(
         return session
     }
 
-    override suspend fun logout() = authOperationMutex.withLock {
+    suspend fun logout() = authOperationMutex.withLock {
         val id = synchronized(stateLock) {
             stateGeneration += 1
             val currentId = serverId
@@ -203,7 +202,7 @@ class JellyfinAuthRepository(
         Unit
     }
 
-    override suspend fun deleteServerProfile(serverId: String) = authOperationMutex.withLock {
+    suspend fun deleteServerProfile(serverId: String) = authOperationMutex.withLock {
         val wasCurrent = synchronized(stateLock) {
             if (this.serverId != serverId) false else {
                 stateGeneration += 1
@@ -219,7 +218,7 @@ class JellyfinAuthRepository(
         if (wasCurrent) logger.event("auth", "Active server profile deleted")
     }
 
-    override suspend fun deleteAllData() = authOperationMutex.withLock {
+    suspend fun deleteAllData() = authOperationMutex.withLock {
         synchronized(stateLock) {
             stateGeneration += 1
             client.clearAll()
@@ -231,7 +230,7 @@ class JellyfinAuthRepository(
         persistenceMutex.withLock { configStore.clear() }
     }
 
-    override suspend fun servers(): List<ServerProfile> {
+    suspend fun servers(): List<ServerProfile> {
         val active = configStore.activeId()
         return configStore.servers().map { s ->
             ServerProfile(
@@ -244,7 +243,7 @@ class JellyfinAuthRepository(
         }
     }
 
-    override suspend fun switchServer(serverId: String): UserSession? = authOperationMutex.withLock {
+    suspend fun switchServer(serverId: String): UserSession? = authOperationMutex.withLock {
         val generation = synchronized(stateLock) {
             stateGeneration += 1
             client.clearAuth()

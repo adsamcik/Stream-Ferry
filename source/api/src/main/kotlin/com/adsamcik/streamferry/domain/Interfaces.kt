@@ -144,20 +144,6 @@ interface MediaSource {
 
 // ----- Repositories -----
 
-interface AuthRepository {
-    val currentUser: Flow<UserSession?>
-    suspend fun setServer(rawUrl: String, userApprovedHttp: Boolean): Result<ServerProfile>
-    suspend fun testConnection(): Result<String> // returns redacted server version string
-    suspend fun login(username: String, password: String): Result<UserSession>
-    suspend fun logout()
-    suspend fun deleteServerProfile(serverId: String)
-    suspend fun deleteAllData()
-    /** All known server profiles (kept even when offline); active + loggedIn flags for the picker. */
-    suspend fun servers(): List<ServerProfile>
-    /** Switch the active server; returns its restored session, or null if it needs login / can't verify. */
-    suspend fun switchServer(serverId: String): UserSession?
-}
-
 interface MediaLibraryRepository {
     suspend fun videoLibraries(): Result<List<MediaItem>>
     suspend fun children(parentId: String): Result<List<MediaItem>>
