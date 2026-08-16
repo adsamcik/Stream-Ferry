@@ -288,6 +288,7 @@ class SourceRegistry(backends: Iterable<SourceBackend> = emptyList()) {
 
 /** Minimal redaction-safe diagnostics surface that source implementations may depend on. */
 interface DiagnosticSink {
+    fun trace(tag: String, message: String) = debug(tag, message)
     fun debug(tag: String, message: String) {}
     fun info(tag: String, message: String) {}
     fun warn(tag: String, message: String, error: Throwable? = null) {}

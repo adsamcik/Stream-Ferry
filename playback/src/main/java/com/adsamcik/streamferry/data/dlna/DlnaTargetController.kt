@@ -20,7 +20,7 @@ import com.adsamcik.streamferry.domain.PlaybackFailureKind
 import com.adsamcik.streamferry.domain.PlaybackTargetController
 import com.adsamcik.streamferry.domain.PlaybackTargetEvent
 import com.adsamcik.streamferry.domain.RendererStream
-import com.adsamcik.streamferry.logging.DiagnosticsLogger
+import com.adsamcik.streamferry.source.api.DiagnosticSink
 import com.adsamcik.streamferry.permissions.LocalNetworkAccessDeniedException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -64,7 +64,7 @@ import java.util.Locale
  * No third-party UPnP library is used (dependency rule §11): platform multicast + OkHttp SOAP only.
  */
 class DlnaTargetController(
-    private val logger: DiagnosticsLogger,
+    private val logger: DiagnosticSink,
     private val network: NetworkInfoProvider,
     private val httpClient: OkHttpClient = OkHttpClient(),
     /** Fresh local-network permission check; no cached UI decision is trusted. */

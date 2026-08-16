@@ -9,7 +9,7 @@ import android.content.Intent
 import android.graphics.drawable.Icon
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
-import com.adsamcik.streamferry.R
+import com.adsamcik.streamferry.playback.R
 import com.adsamcik.streamferry.playback.proxy.ProxyPlaybackService
 
 /**

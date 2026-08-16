@@ -6,7 +6,7 @@ import com.adsamcik.streamferry.core.transcode.StreamContainer
 import com.adsamcik.streamferry.core.transcode.TranscodeTarget
 import com.adsamcik.streamferry.core.transcode.VideoCodec
 import com.adsamcik.streamferry.data.proxy.ClientTranscodeSource
-import com.adsamcik.streamferry.logging.DiagnosticsLogger
+import com.adsamcik.streamferry.source.api.DiagnosticSink
 import kotlinx.coroutines.runBlocking
 import java.io.File
 
@@ -26,7 +26,7 @@ class ClientTranscodeSession(
     runtimeSeconds: Double,
     private val target: TranscodeTarget,
     private val cacheDir: File,
-    private val logger: DiagnosticsLogger,
+    private val logger: DiagnosticSink,
 ) : ClientTranscodeSource {
 
     private val planner = MediaPlaylistPlanner()

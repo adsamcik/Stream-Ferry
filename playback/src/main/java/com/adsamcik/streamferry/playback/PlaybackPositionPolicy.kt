@@ -1,7 +1,7 @@
 package com.adsamcik.streamferry.playback
 
 /** Pure timeline decisions shared by every playback source and renderer protocol. */
-internal object PlaybackPositionPolicy {
+object PlaybackPositionPolicy {
     /** Keep commands inside the known media timeline; unknown-duration streams are only lower-bounded. */
     fun clamp(requestedSeconds: Long, durationSeconds: Long?): Long {
         val nonNegative = requestedSeconds.coerceAtLeast(0L)

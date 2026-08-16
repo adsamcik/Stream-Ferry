@@ -11,7 +11,7 @@ import android.media.session.PlaybackState
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
-import com.adsamcik.streamferry.R
+import com.adsamcik.streamferry.playback.R
 import com.adsamcik.streamferry.core.metadata.MetadataSanitizer
 import kotlin.math.roundToInt
 

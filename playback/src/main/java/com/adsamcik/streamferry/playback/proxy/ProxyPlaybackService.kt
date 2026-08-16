@@ -9,11 +9,9 @@ import android.net.wifi.WifiManager
 import android.os.IBinder
 import android.os.PowerManager
 import android.os.SystemClock
-import com.adsamcik.streamferry.app.StreamFerryApplication
-import com.adsamcik.streamferry.app.startForegroundCompat
-import com.adsamcik.streamferry.logging.DiagnosticsLogger
 import com.adsamcik.streamferry.playback.MediaSessionController
 import com.adsamcik.streamferry.playback.PlaybackNotificationFactory
+import com.adsamcik.streamferry.source.api.DiagnosticSink
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.withTimeoutOrNull
@@ -50,10 +48,10 @@ sealed interface ProxyForegroundStartRequestResult {
 class ProxyPlaybackService : Service() {
 
     private val controller: MediaSessionController?
-        get() = (application as? StreamFerryApplication)?.container?.mediaSessionController
+        get() = (application as? PlaybackServiceOwner)?.playbackServiceDependencies()?.controller
 
-    private val logger: DiagnosticsLogger?
-        get() = (application as? StreamFerryApplication)?.container?.logger
+    private val logger: DiagnosticSink?
+        get() = (application as? PlaybackServiceOwner)?.playbackServiceDependencies()?.logger
 
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
@@ -212,7 +210,8 @@ class ProxyPlaybackService : Service() {
                 .setAction(ACTION_START)
                 .putExtra(EXTRA_FOREGROUND_LATCH_TOKEN, foregroundLatchToken)
             startRequestedElapsedMs = SystemClock.elapsedRealtime()
-            val logger = (context.applicationContext as? StreamFerryApplication)?.container?.logger
+            val logger = (context.applicationContext as? PlaybackServiceOwner)
+                ?.playbackServiceDependencies()?.logger
             // Prefer a plain startService(): when the app is in the foreground (always true for a
             // user-initiated play), it is NOT subject to the ~5 s startForegroundService() ->
             // startForeground() deadline, so the service can foreground the instant the main thread frees
@@ -264,6 +263,16 @@ class ProxyPlaybackService : Service() {
             }
         }
     }
+}
+
+data class PlaybackServiceDependencies(
+    val controller: MediaSessionController,
+    val logger: DiagnosticSink,
+)
+
+/** Implemented by the application composition root; the playback module never imports the app. */
+interface PlaybackServiceOwner {
+    fun playbackServiceDependencies(): PlaybackServiceDependencies?
 }
 
 /**

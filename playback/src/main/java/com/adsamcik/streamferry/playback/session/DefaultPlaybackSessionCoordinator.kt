@@ -8,7 +8,7 @@ import com.adsamcik.streamferry.domain.ProviderPlaybackReporter
 import com.adsamcik.streamferry.domain.PlaybackInfo
 import com.adsamcik.streamferry.domain.PlaybackSessionCoordinator
 import com.adsamcik.streamferry.domain.UpstreamSource
-import com.adsamcik.streamferry.logging.DiagnosticsLogger
+import com.adsamcik.streamferry.source.api.DiagnosticSink
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -28,7 +28,7 @@ class DefaultPlaybackSessionCoordinator(
     private val sessions: SessionRegistry,
     private val proxy: LocalProxyServer,
     private val reporter: ProviderPlaybackReporter,
-    private val logger: DiagnosticsLogger,
+    private val logger: DiagnosticSink,
 ) : PlaybackSessionCoordinator {
 
     private val _active = MutableStateFlow<ProxySession?>(null)

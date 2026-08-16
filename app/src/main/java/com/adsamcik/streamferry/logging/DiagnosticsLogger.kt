@@ -30,7 +30,7 @@ interface DiagnosticsLogger : DiagnosticSink {
      * Opt-in verbose trace (e.g. Cast/DLNA request/response traffic). Recorded — redacted — only while
      * [traceEnabled] is true, so it's off by default and never bloats the log unless the user asks for it.
      */
-    fun trace(tag: String, message: String)
+    override fun trace(tag: String, message: String)
 
     /** Gates [trace]; toggled by the opt-in "detailed TV communication tracing" setting. */
     var traceEnabled: Boolean

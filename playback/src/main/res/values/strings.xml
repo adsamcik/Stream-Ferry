@@ -1,0 +1,15 @@
+<resources>
+    <string name="app_name">Stream Ferry</string>
+    <string name="play">Play</string>
+    <string name="pause">Pause</string>
+    <string name="stop">Stop</string>
+    <string name="notif_channel_playback">Playback</string>
+    <string name="notif_channel_playback_description">Remote playback controls and progress</string>
+    <string name="notif_preparing">Preparing playback</string>
+    <string name="notif_playing_on">Playing on %1$s</string>
+    <string name="notif_buffering_on">Connecting to %1$s</string>
+    <string name="notif_paused_on">Paused on %1$s</string>
+    <string name="notif_your_tv">your TV</string>
+    <string name="notif_rewind_30">Rewind 30 seconds</string>
+    <string name="notif_forward_30">Forward 30 seconds</string>
+</resources>

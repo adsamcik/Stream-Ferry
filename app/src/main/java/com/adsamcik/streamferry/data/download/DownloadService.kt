@@ -13,7 +13,7 @@ import com.adsamcik.streamferry.R
 import com.adsamcik.streamferry.app.ACTION_OPEN_DOWNLOADS
 import com.adsamcik.streamferry.app.MainActivity
 import com.adsamcik.streamferry.app.StreamFerryApplication
-import com.adsamcik.streamferry.app.startForegroundCompat
+import com.adsamcik.streamferry.playback.proxy.startForegroundCompat
 import com.adsamcik.streamferry.data.download.MediaDownloader.DownloadState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers

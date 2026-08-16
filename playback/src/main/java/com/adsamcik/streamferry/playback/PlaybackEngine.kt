@@ -25,7 +25,7 @@ import com.adsamcik.streamferry.domain.PlaybackInfo
 import com.adsamcik.streamferry.domain.PlaybackTargetController
 import com.adsamcik.streamferry.domain.PlaybackTargetEvent
 import com.adsamcik.streamferry.domain.RendererStream
-import com.adsamcik.streamferry.logging.DiagnosticsLogger
+import com.adsamcik.streamferry.source.api.DiagnosticSink
 import com.adsamcik.streamferry.playback.session.DefaultPlaybackSessionCoordinator
 import com.adsamcik.streamferry.core.stream.StreamSelectionService
 import com.adsamcik.streamferry.core.transcode.DeviceEncodeCapabilities
@@ -173,7 +173,7 @@ class PlaybackEngine(
     private val proxy: LocalProxyServer,
     private val networkInfo: NetworkInfoProvider,
     private val serviceController: PlaybackServiceController,
-    private val logger: DiagnosticsLogger,
+    private val logger: DiagnosticSink,
     private val appContext: Context,
     private val onDeviceTranscoder: OnDeviceTranscoder,
     // A PROVIDER (not the value) so probing the phone's encoders — MediaCodecList enumeration, which can

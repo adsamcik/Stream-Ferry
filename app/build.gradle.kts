@@ -125,6 +125,7 @@ dependencies {
     implementation(project(":source:api"))
     implementation(project(":source:local"))
     implementation(project(":source:jellyfin"))
+    implementation(project(":playback"))
 
     // --- AndroidX / Compose ---
     implementation(libs.androidx.core.ktx)

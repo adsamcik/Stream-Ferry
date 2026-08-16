@@ -17,7 +17,7 @@ import androidx.media3.transformer.InAppFragmentedMp4Muxer
 import androidx.media3.transformer.Transformer
 import com.adsamcik.streamferry.core.transcode.TranscodeTarget
 import com.adsamcik.streamferry.core.transcode.VideoCodec
-import com.adsamcik.streamferry.logging.DiagnosticsLogger
+import com.adsamcik.streamferry.source.api.DiagnosticSink
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.TimeoutCancellationException
@@ -38,7 +38,7 @@ import java.io.File
 @SuppressLint("UnsafeOptInUsageError")
 class OnDeviceTranscoder(
     context: Context,
-    private val logger: DiagnosticsLogger,
+    private val logger: DiagnosticSink,
 ) {
     private val appContext = context.applicationContext
     private val thread = HandlerThread("ondevice-transcoder").apply { start() }

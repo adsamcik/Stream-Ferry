@@ -31,7 +31,7 @@ import com.adsamcik.streamferry.domain.PlaybackFailureKind
 import com.adsamcik.streamferry.domain.PlaybackTargetController
 import com.adsamcik.streamferry.domain.PlaybackTargetEvent
 import com.adsamcik.streamferry.domain.RendererStream
-import com.adsamcik.streamferry.logging.DiagnosticsLogger
+import com.adsamcik.streamferry.source.api.DiagnosticSink
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -62,7 +62,7 @@ import kotlin.time.Duration.Companion.milliseconds
 class CastTargetController(
     private val appContext: Context,
     private val castContextProvider: () -> CastContext?,
-    private val logger: DiagnosticsLogger,
+    private val logger: DiagnosticSink,
 ) : PlaybackTargetController {
 
     // Resolved fresh on every use: the shared CastContext may only become available after an initial

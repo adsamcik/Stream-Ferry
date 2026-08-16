@@ -18,7 +18,7 @@ import com.adsamcik.streamferry.core.resilience.UpstreamRetry
 import com.adsamcik.streamferry.core.session.ProxySession
 import com.adsamcik.streamferry.core.session.SessionLookup
 import com.adsamcik.streamferry.core.session.SessionRegistry
-import com.adsamcik.streamferry.logging.DiagnosticsLogger
+import com.adsamcik.streamferry.source.api.DiagnosticSink
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -56,7 +56,7 @@ import java.util.concurrent.TimeUnit
  */
 class LocalProxyServer(
     private val sessions: SessionRegistry,
-    private val logger: DiagnosticsLogger,
+    private val logger: DiagnosticSink,
     private val httpClient: OkHttpClient = defaultClient(),
     /**
      * Resolver used ONLY to open user-picked local `content://` videos (SAF / MediaStore) as a seekable
