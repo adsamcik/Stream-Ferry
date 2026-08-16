@@ -516,7 +516,7 @@ private fun LibraryHome(
     onCloseSearch: () -> Unit,
 ) {
     val smartResumeMediaId = state.smartResume
-        ?.takeIf { it.sourceType == SmartResumeSourceType.JELLYFIN }
+        ?.takeIf { it.sourceType == SmartResumeSourceType.REMOTE }
         ?.mediaId
     val visibleContinueWatching = state.continueWatching.filterNot { it.id == smartResumeMediaId }
     val remoteUnavailable = state.activeSourceId == MediaSourceIds.REMOTE &&

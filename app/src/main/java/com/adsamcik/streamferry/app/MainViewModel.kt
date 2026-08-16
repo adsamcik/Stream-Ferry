@@ -1887,10 +1887,10 @@ class MainViewModel(
         }
         runCatching {
             when (record.sourceType) {
-                SmartResumeSourceType.JELLYFIN -> {
+                SmartResumeSourceType.REMOTE -> {
                     requireRecordOwner(record)
                     val item = container.jellyfinMediaSource.item(record.mediaId).getOrThrow()
-                    val position = record.playbackStartPosition(jellyfinResumeSeconds = item.resumePositionSeconds)
+                    val position = record.playbackStartPosition(sourceResumeSeconds = item.resumePositionSeconds)
                     beginSmartResumeTargetSelection(item, null, position, record.deviceContext())
                 }
                 SmartResumeSourceType.LOCAL -> {
@@ -1932,11 +1932,11 @@ class MainViewModel(
 
     private fun SmartResumeRecord.playbackStartPosition(
         rendererConfirmedSeconds: Long? = null,
-        jellyfinResumeSeconds: Long? = null,
+        sourceResumeSeconds: Long? = null,
     ): Long = if (state == SmartResumeRecordState.FINISHED) {
         0L
     } else {
-        SmartResumePositionReconciler.reconcile(this, rendererConfirmedSeconds, jellyfinResumeSeconds) ?: 0L
+        SmartResumePositionReconciler.reconcile(this, rendererConfirmedSeconds, sourceResumeSeconds) ?: 0L
     }
 
     private fun beginSmartResumeTargetSelection(
@@ -1980,7 +1980,7 @@ class MainViewModel(
 
     private fun onlineSmartResumeSeed(item: MediaItem, owner: UserSession): SmartResumeSeed =
         SmartResumeSeed(
-            SmartResumeSourceType.JELLYFIN,
+            SmartResumeSourceType.REMOTE,
             item.id,
             item.title,
             item.subtitle,
@@ -2733,7 +2733,7 @@ class MainViewModel(
         item.sourceId == MediaSourceIds.REMOTE && session != null &&
             hasPendingJellyfinWatchStateMutation(session.serverId, session.userId, item.id)
     private fun isSmartResumeBlockedByWatchMutation(record: SmartResumeRecord): Boolean {
-        if (record.sourceType !in setOf(SmartResumeSourceType.JELLYFIN, SmartResumeSourceType.DOWNLOADED)) return false
+        if (record.sourceType !in setOf(SmartResumeSourceType.REMOTE, SmartResumeSourceType.DOWNLOADED)) return false
         val serverId = record.serverId ?: return false
         val userId = record.userId ?: return false
         return container.jellyfinWatchMutationStore.pendingFor(serverId, userId, record.mediaId)
@@ -2839,7 +2839,7 @@ class MainViewModel(
                 record.mediaId == mutation.itemId &&
                     record.serverId == mutation.serverId &&
                     record.userId == mutation.userId &&
-                    record.sourceType in setOf(SmartResumeSourceType.JELLYFIN, SmartResumeSourceType.DOWNLOADED) &&
+                    record.sourceType in setOf(SmartResumeSourceType.REMOTE, SmartResumeSourceType.DOWNLOADED) &&
                     record.updatedAtMillis <= mutation.createdAtMillis
             }
             .forEach { container.smartResumeStore.remove(it.identityKey()) }
@@ -3413,12 +3413,12 @@ class MainViewModel(
         if (hasPendingJellyfinWatchStateMutation(owner.serverId, owner.userId, item.id)) {
             null
         } else {
-            SmartResumePositionReconciler.reconcileJellyfinItem(
+            SmartResumePositionReconciler.reconcileRemoteItem(
                 record = container.smartResumeStore.current,
                 itemId = item.id,
                 serverId = owner.serverId,
                 userId = owner.userId,
-                jellyfinResumeSeconds = item.resumePositionSeconds,
+                sourceResumeSeconds = item.resumePositionSeconds,
             )
         }
 

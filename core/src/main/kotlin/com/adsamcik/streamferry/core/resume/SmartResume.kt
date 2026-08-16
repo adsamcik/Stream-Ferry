@@ -5,7 +5,7 @@ import java.util.UUID
 import kotlin.math.abs
 
 /** Source identity for a secret-free, renderer-confirmed playback-history checkpoint. */
-enum class SmartResumeSourceType { JELLYFIN, DOWNLOADED, LOCAL }
+enum class SmartResumeSourceType { REMOTE, DOWNLOADED, LOCAL }
 enum class SmartResumeRecordState { IN_PROGRESS, FINISHED }
 enum class SmartResumeCheckpointKind { STARTED, PROGRESS, SEEK_CONFIRMED, PAUSED, STOPPED, DISCONNECTED, FAILURE, LIFECYCLE, COMPLETED }
 
@@ -27,7 +27,7 @@ data class SmartResumeSeed(
         .joinToString("\u001f")
 
     fun isStructurallyValid(): Boolean = when (sourceType) {
-        SmartResumeSourceType.JELLYFIN, SmartResumeSourceType.DOWNLOADED ->
+        SmartResumeSourceType.REMOTE, SmartResumeSourceType.DOWNLOADED ->
             mediaId.isNotBlank() && displayTitle.isNotBlank() && !serverId.isNullOrBlank() && !userId.isNullOrBlank()
         SmartResumeSourceType.LOCAL -> mediaId.isNotBlank() && displayTitle.isNotBlank() && !localContentUri.isNullOrBlank()
     }
@@ -96,41 +96,41 @@ data class SmartResumeCheckpoint(
 )
 
 /**
- * Reconciles independently-confirmed renderer and Jellyfin positions without letting a stale server
+ * Reconciles independently-confirmed renderer and source positions without letting a stale server
  * checkpoint move this device backwards. Finished records remain finished even if late telemetry arrives.
  */
 object SmartResumePositionReconciler {
     /**
-     * Reconcile a crash-safe renderer checkpoint only when it belongs to the exact Jellyfin account and
+     * Reconcile a crash-safe renderer checkpoint only when it belongs to the exact source account and
      * library item being played. A stale checkpoint from another show or account must never move playback.
      */
-    fun reconcileJellyfinItem(
+    fun reconcileRemoteItem(
         record: SmartResumeRecord?,
         itemId: String,
         serverId: String,
         userId: String,
-        jellyfinResumeSeconds: Long?,
+        sourceResumeSeconds: Long?,
     ): Long? {
         val matchingRecord = record?.takeIf {
-            it.sourceType == SmartResumeSourceType.JELLYFIN &&
+            it.sourceType == SmartResumeSourceType.REMOTE &&
                 it.mediaId == itemId &&
                 it.serverId == serverId &&
                 it.userId == userId
         }
         return if (matchingRecord != null) {
-            reconcile(matchingRecord, rendererConfirmedSeconds = null, jellyfinResumeSeconds = jellyfinResumeSeconds)
+            reconcile(matchingRecord, rendererConfirmedSeconds = null, sourceResumeSeconds = sourceResumeSeconds)
         } else {
-            jellyfinResumeSeconds
+            sourceResumeSeconds
         }
     }
 
     fun reconcile(
         record: SmartResumeRecord?,
         rendererConfirmedSeconds: Long?,
-        jellyfinResumeSeconds: Long?,
+        sourceResumeSeconds: Long?,
     ): Long? {
         if (record?.state == SmartResumeRecordState.FINISHED) return null
-        val position = listOfNotNull(record?.confirmedPositionSeconds, rendererConfirmedSeconds, jellyfinResumeSeconds)
+        val position = listOfNotNull(record?.confirmedPositionSeconds, rendererConfirmedSeconds, sourceResumeSeconds)
             .filter { it >= 0 }
             .maxOrNull() ?: return null
         return ResumePolicy.resumePosition(position, record?.durationSeconds)

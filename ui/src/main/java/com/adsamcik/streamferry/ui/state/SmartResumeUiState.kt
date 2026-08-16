@@ -45,7 +45,7 @@ fun SmartResumeRecord.toPlaybackHistoryUiState(currentUser: UserSession?): Smart
         title = displayTitle,
         subtitle = displaySubtitle,
         sourceLabel = when (sourceType) {
-            SmartResumeSourceType.JELLYFIN -> "Jellyfin"
+            SmartResumeSourceType.REMOTE -> "Server"
             SmartResumeSourceType.DOWNLOADED -> "Downloaded"
             SmartResumeSourceType.LOCAL -> "On this device"
         },

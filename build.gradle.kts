@@ -18,7 +18,8 @@ val checkSourceBoundaries by tasks.registering {
     val sourceImplementations = listOf("source/jellyfin/src", "source/local/src")
         .map { layout.projectDirectory.dir(it) }
     val sharedApi = layout.projectDirectory.dir("source/api/src/main")
-    inputs.files(guardedSourceTrees, sourceImplementations, sharedApi)
+    val sharedCore = layout.projectDirectory.dir("core/src/main")
+    inputs.files(guardedSourceTrees, sourceImplementations, sharedApi, sharedCore)
     inputs.files(
         layout.projectDirectory.file("ui/build.gradle.kts"),
         layout.projectDirectory.file("playback/build.gradle.kts"),
@@ -80,6 +81,18 @@ val checkSourceBoundaries by tasks.registering {
             file.readLines().forEachIndexed { index, line ->
                 if (line.contains("Jellyfin", ignoreCase = true) || line.contains("Plex", ignoreCase = true)) {
                     violations += "${file.relativeTo(projectDir)}:${index + 1}: provider name in shared API"
+                }
+            }
+        }
+
+        val providerNamedDeclaration = Regex(
+            """\b(data\s+class|enum\s+class|sealed\s+(class|interface)|class|interface|object|fun)\s+\w*(Jellyfin|Plex)\w*""",
+            RegexOption.IGNORE_CASE,
+        )
+        kotlinFiles("core/src/main").forEach { file ->
+            file.readLines().forEachIndexed { index, line ->
+                if (providerNamedDeclaration.containsMatchIn(line)) {
+                    violations += "${file.relativeTo(projectDir)}:${index + 1}: provider name in shared core declaration"
                 }
             }
         }

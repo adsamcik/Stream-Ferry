@@ -13,7 +13,7 @@ class SmartResumeTest {
             SmartResumeReducer.reduce(current, update).also { current = it }
         override fun clear() { current = null }
     }
-    private val seed = SmartResumeSeed(SmartResumeSourceType.JELLYFIN, "movie-1", "Movie", durationSeconds = 1_000, serverId = "server", userId = "user")
+    private val seed = SmartResumeSeed(SmartResumeSourceType.REMOTE, "movie-1", "Movie", durationSeconds = 1_000, serverId = "server", userId = "user")
 
     private fun checkpoint(
         sequence: Long = 1,
@@ -48,22 +48,22 @@ class SmartResumeTest {
     }
     @Test fun reconciliationUsesNewestConfirmedPositionAndNeverRegressesToServer() {
         val record = SmartResumeReducer.reduce(null, checkpoint(position = 120))!!
-        assertEquals(135, SmartResumePositionReconciler.reconcile(record, rendererConfirmedSeconds = 135, jellyfinResumeSeconds = 90))
+        assertEquals(135, SmartResumePositionReconciler.reconcile(record, rendererConfirmedSeconds = 135, sourceResumeSeconds = 90))
     }
 
     @Test fun matchingJellyfinCheckpointWinsOverStaleServerResume() {
         val record = SmartResumeReducer.reduce(null, checkpoint(position = 135))!!
 
-        assertEquals(135, SmartResumePositionReconciler.reconcileJellyfinItem(
-            record, itemId = "movie-1", serverId = "server", userId = "user", jellyfinResumeSeconds = 90,
+        assertEquals(135, SmartResumePositionReconciler.reconcileRemoteItem(
+            record, itemId = "movie-1", serverId = "server", userId = "user", sourceResumeSeconds = 90,
         ))
     }
 
     @Test fun unrelatedJellyfinCheckpointCannotOverrideServerResume() {
         val record = SmartResumeReducer.reduce(null, checkpoint(position = 135))!!
 
-        assertEquals(90, SmartResumePositionReconciler.reconcileJellyfinItem(
-            record, itemId = "another-movie", serverId = "server", userId = "user", jellyfinResumeSeconds = 90,
+        assertEquals(90, SmartResumePositionReconciler.reconcileRemoteItem(
+            record, itemId = "another-movie", serverId = "server", userId = "user", sourceResumeSeconds = 90,
         ))
     }
 
@@ -73,8 +73,8 @@ class SmartResumeTest {
             started, checkpoint(sequence = 2, position = 995, kind = SmartResumeCheckpointKind.COMPLETED),
         )!!
 
-        assertNull(SmartResumePositionReconciler.reconcileJellyfinItem(
-            finished, itemId = "movie-1", serverId = "server", userId = "user", jellyfinResumeSeconds = 900,
+        assertNull(SmartResumePositionReconciler.reconcileRemoteItem(
+            finished, itemId = "movie-1", serverId = "server", userId = "user", sourceResumeSeconds = 900,
         ))
     }
 
@@ -83,7 +83,7 @@ class SmartResumeTest {
             SmartResumeReducer.reduce(null, checkpoint(position = 900))!!,
             checkpoint(sequence = 2, position = 995, kind = SmartResumeCheckpointKind.COMPLETED),
         )!!
-        assertNull(SmartResumePositionReconciler.reconcile(finished, rendererConfirmedSeconds = 800, jellyfinResumeSeconds = 800))
+        assertNull(SmartResumePositionReconciler.reconcile(finished, rendererConfirmedSeconds = 800, sourceResumeSeconds = 800))
     }
 
     @Test fun staleGenerationAndSequenceCannotOverwriteRecord() {
