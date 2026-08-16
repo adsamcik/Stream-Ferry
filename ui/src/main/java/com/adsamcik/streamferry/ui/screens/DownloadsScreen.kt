@@ -44,7 +44,7 @@ import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import com.adsamcik.streamferry.ui.MainViewModel
+import com.adsamcik.streamferry.ui.UiController
 import com.adsamcik.streamferry.ui.state.AppUiState
 import com.adsamcik.streamferry.ui.state.DownloadUiItem
 
@@ -53,7 +53,7 @@ import com.adsamcik.streamferry.ui.state.DownloadUiItem
  * shell can give it bounded height without introducing nested scrolling or infinite-height measurement.
  */
 @Composable
-fun DownloadsScreen(state: AppUiState, viewModel: MainViewModel, onCast: () -> Unit) {
+fun DownloadsScreen(state: AppUiState, viewModel: UiController, onCast: () -> Unit) {
     var deleteCandidate by rememberSaveable { mutableStateOf<String?>(null) }
 
     LazyColumn(

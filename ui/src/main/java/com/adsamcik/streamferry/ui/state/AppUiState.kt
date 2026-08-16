@@ -6,7 +6,7 @@ import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.domain.MediaSourceIds
 import com.adsamcik.streamferry.domain.MediaTrack
 import com.adsamcik.streamferry.domain.ServerProfile
-import com.adsamcik.streamferry.logging.LogEntry
+import com.adsamcik.streamferry.core.logging.LogEntry
 import com.adsamcik.streamferry.physical.PhysicalTv
 import com.adsamcik.streamferry.playback.PlaybackAttemptDescriptor
 import com.adsamcik.streamferry.playback.PlaybackPhase
@@ -43,22 +43,22 @@ data class AppUiState(
     val serverName: String? = null,             // safe display string (name + version)
 
     // ----- auth -----
-    /** A live, identity-verified Jellyfin session is installed. */
+    /** A live, identity-verified remote-source session is installed. */
     val loggedIn: Boolean = false,
-    /** A tokenless scope has usable Jellyfin cache/download metadata while live verification is unavailable. */
-    val hasCachedJellyfinSession: Boolean = false,
-    /** Reachability of the active Jellyfin library; never used as a substitute for authentication. */
-    val jellyfinLibraryStatus: SourceAvailability = SourceAvailability.UNKNOWN,
+    /** A tokenless scope has usable remote cache/download metadata while live verification is unavailable. */
+    val hasCachedRemoteSession: Boolean = false,
+    /** Reachability of the active remote library; never used as a substitute for authentication. */
+    val sourceAvailability: SourceAvailability = SourceAvailability.UNKNOWN,
     val servers: List<ServerProfile> = emptyList(),
 
     // ----- quick connect (device-code style login) -----
     val quickConnect: QuickConnectUiState? = null,
 
     // ----- gallery (libraries + drill-down) -----
-    /** Active media source id for the gallery switcher (Jellyfin / on-device). */
+    /** Active media source id for the gallery switcher (remote / on-device). */
     val activeSourceId: String = MediaSourceIds.REMOTE,
     val libraries: List<MediaItem> = emptyList(),
-    /** "Continue Watching" (Jellyfin resume list) shown at the top of the library root; empty otherwise. */
+    /** Source-provided "Continue Watching" list shown at the library root; empty otherwise. */
     val continueWatching: List<MediaItem> = emptyList(),
     val folderStack: List<MediaItem> = emptyList(), // breadcrumb of opened folders
     val items: List<MediaItem> = emptyList(),       // children of the current folder
@@ -120,23 +120,23 @@ data class AppUiState(
     /** The folder currently being browsed, or null at the library root. */
     val currentFolder: MediaItem? get() = folderStack.lastOrNull()
 
-    /** True when Jellyfin content can be browsed from a live session or its safe tokenless cache scope. */
-    val canBrowseJellyfin: Boolean get() = loggedIn || hasCachedJellyfinSession
+    /** True when remote content can be browsed from a live session or its safe tokenless cache scope. */
+    val canBrowseRemote: Boolean get() = loggedIn || hasCachedRemoteSession
 
     /** Download state for a given item id, or null if not downloaded/downloading. */
     fun downloadFor(itemId: String?): DownloadUiItem? = itemId?.let { id -> downloads.firstOrNull { it.itemId == id } }
 
     /** How a gallery/detail item can be used at this moment. */
-    fun availabilityFor(item: MediaItem): JellyfinItemAvailability = when {
-        item.sourceId != MediaSourceIds.REMOTE -> JellyfinItemAvailability.AVAILABLE
-        downloadFor(item.id)?.completed == true -> JellyfinItemAvailability.DOWNLOADED
-        jellyfinLibraryStatus == SourceAvailability.UNAVAILABLE -> JellyfinItemAvailability.UNAVAILABLE
-        else -> JellyfinItemAvailability.AVAILABLE
+    fun availabilityFor(item: MediaItem): SourceItemAvailability = when {
+        item.sourceId != MediaSourceIds.REMOTE -> SourceItemAvailability.AVAILABLE
+        downloadFor(item.id)?.completed == true -> SourceItemAvailability.DOWNLOADED
+        sourceAvailability == SourceAvailability.UNAVAILABLE -> SourceItemAvailability.UNAVAILABLE
+        else -> SourceItemAvailability.AVAILABLE
     }
 }
 
-/** Visual/playback availability for a Jellyfin item; a completed download always wins over an outage. */
-enum class JellyfinItemAvailability { AVAILABLE, UNAVAILABLE, DOWNLOADED }
+/** Visual/playback availability for a remote item; a completed download always wins over an outage. */
+enum class SourceItemAvailability { AVAILABLE, UNAVAILABLE, DOWNLOADED }
 
 /** UI view of a download (completed or in-progress). No secrets. */
 data class DownloadUiItem(
@@ -149,7 +149,7 @@ data class DownloadUiItem(
 )
 
 /**
- * Quick Connect flow state. [code] is shown for the user to approve on their Jellyfin server; the
+ * Device-code flow state. [code] is shown for the user to approve on their source server; the
  * secret used to poll is held only in the ViewModel and never surfaced here.
  */
 data class QuickConnectUiState(

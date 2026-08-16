@@ -8,6 +8,9 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.createSavedStateHandle
 import androidx.lifecycle.viewmodel.initializer
@@ -15,7 +18,6 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import androidx.fragment.app.FragmentActivity
 import com.adsamcik.streamferry.permissions.AndroidNetworkPermissionManager
 import com.adsamcik.streamferry.ui.AppRoot
-import com.adsamcik.streamferry.ui.MainViewModel
 import com.adsamcik.streamferry.ui.theme.StreamFerryTheme
 
 /**
@@ -45,6 +47,8 @@ class MainActivity : FragmentActivity() {
         handleLaunchIntent(intent)
         setContent {
             val state by viewModel.state.collectAsStateWithLifecycle()
+            val uiController = remember(viewModel) { MainViewModelUiController(viewModel) }
+            var nightVolumePolicy by remember { mutableStateOf(container.nightVolumeSettingsStore.load()) }
             StreamFerryTheme(themeMode = state.themeMode) {
                 // Request the local-network (+ notifications) permissions before scanning/playing, then
                 // scan. Browsing the library never needs these; only TV playback does, so it is deferred.
@@ -61,7 +65,13 @@ class MainActivity : FragmentActivity() {
                 }
                 AppRoot(
                     state = state,
-                    viewModel = viewModel,
+                    viewModel = uiController,
+                    appVersion = container.appVersionName(),
+                    nightVolumePolicy = nightVolumePolicy,
+                    onNightVolumePolicyChange = { policy ->
+                        nightVolumePolicy = policy
+                        container.nightVolumeSettingsStore.save(policy)
+                    },
                     onScanDevices = {
                         if (container.permissions.hasLocalNetworkAccess()) viewModel.scanTargets()
                         else permissionLauncher.launch(AndroidNetworkPermissionManager.PLAYBACK_PERMISSIONS)

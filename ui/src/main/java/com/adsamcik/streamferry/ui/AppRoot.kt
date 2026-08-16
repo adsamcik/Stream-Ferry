@@ -79,7 +79,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
-import com.adsamcik.streamferry.app.StreamFerryApplication
 import com.adsamcik.streamferry.core.volume.NightVolumePolicy
 import com.adsamcik.streamferry.diagnostics.ReportExport
 import com.adsamcik.streamferry.diagnostics.ReportShare
@@ -95,7 +94,7 @@ import com.adsamcik.streamferry.ui.screens.DiagnosticsScreen
 import com.adsamcik.streamferry.ui.screens.DownloadsScreen
 import com.adsamcik.streamferry.ui.screens.ExpressiveSettingsScreen
 import com.adsamcik.streamferry.ui.screens.GalleryScreen
-import com.adsamcik.streamferry.ui.screens.JellyfinUnavailableHeaderNotice
+import com.adsamcik.streamferry.ui.screens.SourceUnavailableHeaderNotice
 import com.adsamcik.streamferry.ui.screens.LoginScreen
 import com.adsamcik.streamferry.ui.screens.MediaDetailScreen
 import com.adsamcik.streamferry.ui.screens.PlaybackScreen
@@ -143,13 +142,16 @@ private val upNavigationRoutes = setOf(
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun AppRoot(state: AppUiState, viewModel: MainViewModel, onScanDevices: () -> Unit) {
+fun AppRoot(
+    state: AppUiState,
+    viewModel: UiController,
+    onScanDevices: () -> Unit,
+    appVersion: String,
+    nightVolumePolicy: NightVolumePolicy,
+    onNightVolumePolicyChange: (NightVolumePolicy) -> Unit,
+) {
     val back = backActionFor(state, viewModel)
     val context = LocalContext.current
-    val nightVolumeSettings = remember(context.applicationContext) {
-        (context.applicationContext as StreamFerryApplication).container.nightVolumeSettingsStore
-    }
-    var nightVolumePolicy by remember { mutableStateOf(nightVolumeSettings.load()) }
     val showUpNavigation = state.route in upNavigationRoutes
 
     BackHandler(enabled = back != null) { back?.invoke() }
@@ -164,8 +166,8 @@ fun AppRoot(state: AppUiState, viewModel: MainViewModel, onScanDevices: () -> Un
         )
         val showMiniPlayer = state.playback != null && state.route != Route.PLAYBACK
         val galleryOwnsPhoneHeader = !useNavigationRail && state.route == Route.GALLERY
-        val showJellyfinUnavailableNotice = state.activeSourceId == MediaSourceIds.REMOTE &&
-            state.jellyfinLibraryStatus == SourceAvailability.UNAVAILABLE
+        val showSourceUnavailableNotice = state.activeSourceId == MediaSourceIds.REMOTE &&
+            state.sourceAvailability == SourceAvailability.UNAVAILABLE
         val spatialMotion = MaterialTheme.motionScheme.defaultSpatialSpec<IntOffset>()
         val effectsMotion = MaterialTheme.motionScheme.defaultEffectsSpec<Float>()
 
@@ -183,8 +185,8 @@ fun AppRoot(state: AppUiState, viewModel: MainViewModel, onScanDevices: () -> Un
                                 titleContentColor = MaterialTheme.colorScheme.onSurface,
                             ),
                         )
-                        if (showJellyfinUnavailableNotice) {
-                            JellyfinUnavailableHeaderNotice(
+                        if (showSourceUnavailableNotice) {
+                            SourceUnavailableHeaderNotice(
                                 onRetry = viewModel::refreshGallery,
                                 modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
                             )
@@ -244,11 +246,9 @@ fun AppRoot(state: AppUiState, viewModel: MainViewModel, onScanDevices: () -> Un
                             viewModel = viewModel,
                             onScanDevices = onScanDevices,
                             context = context,
+                            appVersion = appVersion,
                             nightVolumePolicy = nightVolumePolicy,
-                            onNightVolumePolicyChange = { policy ->
-                                nightVolumePolicy = policy
-                                nightVolumeSettings.save(policy)
-                            },
+                            onNightVolumePolicyChange = onNightVolumePolicyChange,
                             expanded = useNavigationRail,
                             reserveMiniPlayerSpace = useNavigationRail && showMiniPlayer,
                         )
@@ -280,9 +280,10 @@ fun AppRoot(state: AppUiState, viewModel: MainViewModel, onScanDevices: () -> Un
 @Composable
 private fun ScreenContent(
     state: AppUiState,
-    viewModel: MainViewModel,
+    viewModel: UiController,
     onScanDevices: () -> Unit,
     context: android.content.Context,
+    appVersion: String,
     nightVolumePolicy: NightVolumePolicy,
     onNightVolumePolicyChange: (NightVolumePolicy) -> Unit,
     expanded: Boolean,
@@ -325,7 +326,7 @@ private fun ScreenContent(
                         .weight(1f)
                         .fillMaxWidth(),
                 ) {
-                    RouteContent(state, viewModel, onScanDevices, context, nightVolumePolicy, onNightVolumePolicyChange, compact = !expanded)
+                    RouteContent(state, viewModel, onScanDevices, context, appVersion, nightVolumePolicy, onNightVolumePolicyChange, compact = !expanded)
                 }
             }
         } else {
@@ -338,7 +339,7 @@ private fun ScreenContent(
                     message = shellErrorMessage,
                     onDismiss = viewModel::dismissError,
                 )
-                RouteContent(state, viewModel, onScanDevices, context, nightVolumePolicy, onNightVolumePolicyChange, compact = !expanded)
+                RouteContent(state, viewModel, onScanDevices, context, appVersion, nightVolumePolicy, onNightVolumePolicyChange, compact = !expanded)
             }
         }
     }
@@ -347,9 +348,10 @@ private fun ScreenContent(
 @Composable
 private fun RouteContent(
     state: AppUiState,
-    viewModel: MainViewModel,
+    viewModel: UiController,
     onScanDevices: () -> Unit,
     context: android.content.Context,
+    appVersion: String,
     nightVolumePolicy: NightVolumePolicy,
     onNightVolumePolicyChange: (NightVolumePolicy) -> Unit,
     compact: Boolean,
@@ -413,13 +415,13 @@ private fun RouteContent(
             nightVolumePolicy = nightVolumePolicy,
             onNightVolumePolicyChange = onNightVolumePolicyChange,
         )
-        Route.ABOUT -> AboutScreen()
+        Route.ABOUT -> AboutScreen(appVersion)
         Route.SERVERS -> ServersScreen(state, viewModel)
     }
 }
 
 @Composable
-private fun CompactNavigation(state: AppUiState, viewModel: MainViewModel) {
+private fun CompactNavigation(state: AppUiState, viewModel: UiController) {
     val selected = NavigationStatePolicy.topLevelFor(state.route)
     NavigationBar {
         NavigationBarItem(
@@ -438,7 +440,7 @@ private fun CompactNavigation(state: AppUiState, viewModel: MainViewModel) {
 }
 
 @Composable
-private fun WideNavigation(state: AppUiState, viewModel: MainViewModel) {
+private fun WideNavigation(state: AppUiState, viewModel: UiController) {
     val selected = NavigationStatePolicy.topLevelFor(state.route)
     NavigationRail {
         NavigationRailItem(
@@ -461,7 +463,7 @@ private fun WideNavigation(state: AppUiState, viewModel: MainViewModel) {
 @Composable
 private fun MiniPlayer(
     state: AppUiState,
-    viewModel: MainViewModel,
+    viewModel: UiController,
     modifier: Modifier = Modifier,
     compact: Boolean = false,
 ) {
@@ -711,7 +713,7 @@ private fun CrashAlertDialog(count: Int, reportText: () -> String, onDismiss: ()
     )
 }
 
-private fun backActionFor(state: AppUiState, viewModel: MainViewModel): (() -> Unit)? = when (state.route) {
+private fun backActionFor(state: AppUiState, viewModel: UiController): (() -> Unit)? = when (state.route) {
     Route.WELCOME -> null
     Route.SERVER_SETUP -> ({ viewModel.navigate(Route.WELCOME) })
     Route.LOGIN -> ({ viewModel.navigate(Route.SERVER_SETUP) })

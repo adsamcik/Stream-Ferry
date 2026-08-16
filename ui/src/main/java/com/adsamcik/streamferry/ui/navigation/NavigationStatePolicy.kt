@@ -4,7 +4,7 @@ import com.adsamcik.streamferry.domain.MediaSourceIds
 import com.adsamcik.streamferry.ui.state.Route
 
 /** Pure route policy shared by the app shell, saved-state restoration, and JVM tests. */
-internal object NavigationStatePolicy {
+object NavigationStatePolicy {
 
     enum class TopLevelDestination { LIBRARY, SETTINGS }
 
@@ -91,22 +91,22 @@ internal object NavigationStatePolicy {
 }
 
 /** Immutable identity of the currently browsed source/folder. */
-internal data class GalleryBrowseTarget(
+data class GalleryBrowseTarget(
     val sourceId: String,
     val folderId: String?,
 )
 
 /** A monotonically newer gallery request supersedes every earlier request. */
-internal data class GalleryLoadRequest(
+data class GalleryLoadRequest(
     val generation: Long,
     val target: GalleryBrowseTarget,
 )
 
 /**
  * Keeps asynchronous gallery responses tied to the source and folder that started them. It is deliberately
- * UI-framework-free so a late Jellyfin response cannot replace a newer browse target or reset its scroll.
+ * UI-framework-free so a late source response cannot replace a newer browse target or reset its scroll.
  */
-internal class GalleryLoadRequestGate {
+class GalleryLoadRequestGate {
     private var nextGeneration = 0L
     private var current: GalleryLoadRequest? = null
 

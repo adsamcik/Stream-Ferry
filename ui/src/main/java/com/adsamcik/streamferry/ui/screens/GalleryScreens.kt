@@ -104,16 +104,16 @@ import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import com.adsamcik.streamferry.core.resume.ResumePolicy
 import com.adsamcik.streamferry.core.resume.SmartResumeSourceType
-import com.adsamcik.streamferry.data.download.DownloadFormat
+import com.adsamcik.streamferry.source.api.DownloadFormat
 import com.adsamcik.streamferry.domain.SourceAvailability
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.domain.MediaSourceIds
 import com.adsamcik.streamferry.domain.isEpisode
 import com.adsamcik.streamferry.source.api.ArtworkRef
-import com.adsamcik.streamferry.ui.MainViewModel
+import com.adsamcik.streamferry.ui.UiController
 import com.adsamcik.streamferry.ui.components.ExpressiveLoadingIndicator
 import com.adsamcik.streamferry.ui.state.AppUiState
-import com.adsamcik.streamferry.ui.state.JellyfinItemAvailability
+import com.adsamcik.streamferry.ui.state.SourceItemAvailability
 import com.adsamcik.streamferry.ui.state.Route
 import com.adsamcik.streamferry.ui.theme.StreamFerryTheme
 import kotlinx.coroutines.launch
@@ -132,7 +132,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 @Composable
-fun GalleryScreen(state: AppUiState, viewModel: MainViewModel, compact: Boolean = false) {
+fun GalleryScreen(state: AppUiState, viewModel: UiController, compact: Boolean = false) {
     val searchActive = state.searchQuery.isNotBlank()
     val atRoot = state.folderStack.isEmpty()
     var searchOpen by rememberSaveable { mutableStateOf(false) }
@@ -177,12 +177,12 @@ fun GalleryScreen(state: AppUiState, viewModel: MainViewModel, compact: Boolean 
     var indexedSection by remember(entries) { mutableStateOf<String?>(null) }
     var indexScrubbing by remember(entries) { mutableStateOf(false) }
     val isLocalSource = state.activeSourceId == MediaSourceIds.LOCAL
-    val isJellyfinSource = state.activeSourceId == MediaSourceIds.REMOTE
+    val isRemoteSource = state.activeSourceId == MediaSourceIds.REMOTE
     val sources = viewModel.sources
     val activeSourceName = sources.firstOrNull { it.first == state.activeSourceId }?.second ?: "Library"
     val searchLabel = if (isLocalSource) "Search this device" else "Search $activeSourceName"
-    val needsJellyfinLogin = isJellyfinSource && !state.canBrowseJellyfin
-    val jellyfinUnavailable = isJellyfinSource && state.jellyfinLibraryStatus == SourceAvailability.UNAVAILABLE
+    val needsRemoteLogin = isRemoteSource && !state.canBrowseRemote
+    val remoteUnavailable = isRemoteSource && state.sourceAvailability == SourceAvailability.UNAVAILABLE
     val showingSeasons = !searchActive && !atRoot && (
         state.currentFolder?.type.equals("Series", ignoreCase = true) ||
             (entries.isNotEmpty() && entries.all { it.type.equals("Season", ignoreCase = true) })
@@ -194,7 +194,7 @@ fun GalleryScreen(state: AppUiState, viewModel: MainViewModel, compact: Boolean 
             viewModel = viewModel,
             entries = entries,
             isLocalSource = isLocalSource,
-            needsJellyfinLogin = needsJellyfinLogin,
+            needsRemoteLogin = needsRemoteLogin,
             compact = compact,
             gridState = gridState,
             searchOpen = searchOpen,
@@ -214,8 +214,8 @@ fun GalleryScreen(state: AppUiState, viewModel: MainViewModel, compact: Boolean 
                 },
                 onSearch = { searchOpen = true },
                 searchVisible = searchActive || searchOpen,
-                showJellyfinUnavailableNotice = jellyfinUnavailable,
-                onRetryJellyfin = viewModel::refreshGallery,
+                showSourceUnavailableNotice = remoteUnavailable,
+                onRetrySource = viewModel::refreshGallery,
             )
             if (searchActive || searchOpen) {
                 LibrarySearchField(
@@ -235,7 +235,7 @@ fun GalleryScreen(state: AppUiState, viewModel: MainViewModel, compact: Boolean 
             )
         }
         when {
-            needsJellyfinLogin -> JellyfinLoginPrompt(viewModel)
+            needsRemoteLogin -> RemoteLoginPrompt(viewModel)
             (state.galleryLoading && entries.isEmpty()) || state.searching -> CenteredProgress("Loading…")
             entries.isEmpty() && searchActive -> Text("No results for \"${state.searchQuery}\".")
             entries.isEmpty() -> EmptyLibraryPrompt(state, viewModel, isLocalSource)
@@ -339,7 +339,7 @@ private fun SeasonList(
     state: LazyListState,
     compact: Boolean,
     posterUrlFor: (MediaItem) -> ArtworkRef?,
-    availabilityFor: (MediaItem) -> JellyfinItemAvailability,
+    availabilityFor: (MediaItem) -> SourceItemAvailability,
     onSeasonClick: (MediaItem) -> Unit,
 ) {
     LazyColumn(
@@ -389,7 +389,7 @@ private fun SeasonList(
 private fun SeasonListCard(
     season: MediaItem,
     posterUrl: ArtworkRef?,
-    availability: JellyfinItemAvailability,
+    availability: SourceItemAvailability,
     compact: Boolean,
     onClick: () -> Unit,
 ) {
@@ -505,10 +505,10 @@ private const val SEASON_FADE_MS = 220
 @Composable
 private fun LibraryHome(
     state: AppUiState,
-    viewModel: MainViewModel,
+    viewModel: UiController,
     entries: List<MediaItem>,
     isLocalSource: Boolean,
-    needsJellyfinLogin: Boolean,
+    needsRemoteLogin: Boolean,
     compact: Boolean,
     gridState: LazyGridState,
     searchOpen: Boolean,
@@ -519,8 +519,8 @@ private fun LibraryHome(
         ?.takeIf { it.sourceType == SmartResumeSourceType.JELLYFIN }
         ?.mediaId
     val visibleContinueWatching = state.continueWatching.filterNot { it.id == smartResumeMediaId }
-    val jellyfinUnavailable = state.activeSourceId == MediaSourceIds.REMOTE &&
-        state.jellyfinLibraryStatus == SourceAvailability.UNAVAILABLE
+    val remoteUnavailable = state.activeSourceId == MediaSourceIds.REMOTE &&
+        state.sourceAvailability == SourceAvailability.UNAVAILABLE
 
     LazyVerticalGrid(
         state = gridState,
@@ -538,8 +538,8 @@ private fun LibraryHome(
                         onBack = null,
                         onSearch = onOpenSearch,
                         searchVisible = searchOpen,
-                        showJellyfinUnavailableNotice = jellyfinUnavailable,
-                        onRetryJellyfin = viewModel::refreshGallery,
+                        showSourceUnavailableNotice = remoteUnavailable,
+                        onRetrySource = viewModel::refreshGallery,
                     )
                 }
                 SourceSwitcher(viewModel.sources, state.activeSourceId, viewModel::selectSource)
@@ -571,8 +571,8 @@ private fun LibraryHome(
         }
 
         when {
-            needsJellyfinLogin -> item(span = { GridItemSpan(maxLineSpan) }) {
-                JellyfinLoginPrompt(viewModel)
+            needsRemoteLogin -> item(span = { GridItemSpan(maxLineSpan) }) {
+                RemoteLoginPrompt(viewModel)
             }
             state.galleryLoading && entries.isEmpty() -> item(span = { GridItemSpan(maxLineSpan) }) {
                 CenteredProgress("Loading…")
@@ -627,7 +627,7 @@ private fun LibraryHome(
 @Composable
 private fun LibrarySearchField(
     state: AppUiState,
-    viewModel: MainViewModel,
+    viewModel: UiController,
     compact: Boolean = false,
     label: String = "Search library",
     onClose: (() -> Unit)? = null,
@@ -710,8 +710,8 @@ private fun PhoneGalleryHeader(
     onBack: (() -> Unit)?,
     onSearch: () -> Unit,
     searchVisible: Boolean,
-    showJellyfinUnavailableNotice: Boolean = false,
-    onRetryJellyfin: () -> Unit = {},
+    showSourceUnavailableNotice: Boolean = false,
+    onRetrySource: () -> Unit = {},
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
     Row(
@@ -749,16 +749,16 @@ private fun PhoneGalleryHeader(
             }
         }
     }
-        if (showJellyfinUnavailableNotice) {
-            JellyfinUnavailableHeaderNotice(
-                onRetry = onRetryJellyfin,
+        if (showSourceUnavailableNotice) {
+            SourceUnavailableHeaderNotice(
+                onRetry = onRetrySource,
                 modifier = Modifier.padding(bottom = 4.dp),
             )
         }
     }
 }
 @Composable
-internal fun JellyfinUnavailableHeaderNotice(
+internal fun SourceUnavailableHeaderNotice(
     onRetry: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -783,7 +783,7 @@ internal fun JellyfinUnavailableHeaderNotice(
                 verticalArrangement = Arrangement.spacedBy(2.dp),
             ) {
                 Text(
-                    "Jellyfin unavailable",
+                    "Source unavailable",
                     style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.Bold,
                 )
@@ -810,15 +810,15 @@ private fun LibrarySectionTitle(title: String) {
 }
 
 @Composable
-private fun JellyfinLoginPrompt(viewModel: MainViewModel) {
+private fun RemoteLoginPrompt(viewModel: UiController) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text("Connect to your Jellyfin server to browse it here, or switch to \"On this device\" above.")
-        Button(onClick = { viewModel.navigate(Route.SERVER_SETUP) }) { Text("Connect to Jellyfin") }
+        Text("Connect to your media server to browse it here, or switch to \"On this device\" above.")
+        Button(onClick = { viewModel.navigate(Route.SERVER_SETUP) }) { Text("Connect a server") }
     }
 }
 
 @Composable
-private fun EmptyLibraryPrompt(state: AppUiState, viewModel: MainViewModel, isLocalSource: Boolean) {
+private fun EmptyLibraryPrompt(state: AppUiState, viewModel: UiController, isLocalSource: Boolean) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         if (isLocalSource) {
             Text("No on-device videos yet. Add a folder or files above, or allow access to all your videos.")
@@ -835,10 +835,10 @@ private fun MediaItem.localThumbnailUri(): String? =
 /** A quick queue affordance appears only while a playback session is available to return to. */
 private fun playlistAddAction(
     state: AppUiState,
-    viewModel: MainViewModel,
+    viewModel: UiController,
     item: MediaItem,
 ): (() -> Unit)? = if (
-    state.playback != null && !item.isFolder && state.availabilityFor(item) != JellyfinItemAvailability.UNAVAILABLE
+    state.playback != null && !item.isFolder && state.availabilityFor(item) != SourceItemAvailability.UNAVAILABLE
 ) {
     { viewModel.enqueue(item) }
 } else {
@@ -1012,7 +1012,7 @@ private fun SourceOption(
  * ViewModel which persists them and refreshes.
  */
 @Composable
-private fun LocalAccessActions(viewModel: MainViewModel) {
+private fun LocalAccessActions(viewModel: UiController) {
     val folderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) {
         viewModel.onLocalFolderPicked(it)
     }
@@ -1188,7 +1188,7 @@ private fun LocalThumbnail(uriString: String, modifier: Modifier = Modifier) {
 private fun ContinueWatchingRow(
     items: List<MediaItem>,
     posterUrlFor: (MediaItem) -> ArtworkRef?,
-    availabilityFor: (MediaItem) -> JellyfinItemAvailability,
+    availabilityFor: (MediaItem) -> SourceItemAvailability,
     onClick: (MediaItem) -> Unit,
 ) {
     Column(
@@ -1213,7 +1213,7 @@ private fun ContinueWatchingRow(
 private fun ContinueWatchingCard(
     item: MediaItem,
     posterUrl: ArtworkRef?,
-    availability: JellyfinItemAvailability,
+    availability: SourceItemAvailability,
     onClick: () -> Unit,
 ) {
     Card(
@@ -1293,11 +1293,11 @@ private fun watchStateLabel(item: MediaItem): String? {
 }
 @Composable
 private fun ItemAvailabilityLabel(
-    availability: JellyfinItemAvailability,
+    availability: SourceItemAvailability,
     modifier: Modifier = Modifier,
 ) {
-    if (availability == JellyfinItemAvailability.AVAILABLE) return
-    val downloaded = availability == JellyfinItemAvailability.DOWNLOADED
+    if (availability == SourceItemAvailability.AVAILABLE) return
+    val downloaded = availability == SourceItemAvailability.DOWNLOADED
     Surface(
         modifier = modifier,
         shape = RoundedCornerShape(10.dp),
@@ -1329,7 +1329,7 @@ private fun ItemAvailabilityLabel(
 private fun LibraryTile(
     item: MediaItem,
     posterUrl: ArtworkRef?,
-    availability: JellyfinItemAvailability = JellyfinItemAvailability.AVAILABLE,
+    availability: SourceItemAvailability = SourceItemAvailability.AVAILABLE,
     onClick: () -> Unit,
 ) {
     Card(
@@ -1379,7 +1379,7 @@ private fun MediaCard(
     item: MediaItem,
     posterUrl: ArtworkRef?,
     localThumbnailUri: String?,
-    availability: JellyfinItemAvailability = JellyfinItemAvailability.AVAILABLE,
+    availability: SourceItemAvailability = SourceItemAvailability.AVAILABLE,
     compact: Boolean = false,
     highlighted: Boolean = false,
     onClick: () -> Unit,
@@ -1516,7 +1516,7 @@ private fun CountBadge(count: Int, modifier: Modifier = Modifier) {
 @Composable
 fun MediaDetailScreen(
     state: AppUiState,
-    viewModel: MainViewModel,
+    viewModel: UiController,
     onChooseTv: () -> Unit,
     compact: Boolean = false,
 ) {
@@ -1530,7 +1530,7 @@ fun MediaDetailScreen(
     val download = state.downloadFor(media.id)
     val availability = state.availabilityFor(media)
     val serverUnavailable = media.sourceId == MediaSourceIds.REMOTE &&
-        state.jellyfinLibraryStatus == SourceAvailability.UNAVAILABLE
+        state.sourceAvailability == SourceAvailability.UNAVAILABLE
     val activePlaybackForMedia = state.playback != null && state.nowPlayingItem?.id == media.id
     val watchStateActionEnabled = state.loggedIn && !serverUnavailable && !activePlaybackForMedia
     val watchStateUpdating = media.id in state.watchStateMutationItemIds
@@ -1620,7 +1620,7 @@ fun MediaDetailScreen(
 @Composable
 private fun DetailHero(
     item: MediaItem,
-    availability: JellyfinItemAvailability,
+    availability: SourceItemAvailability,
     posterUrl: ArtworkRef?,
     compact: Boolean,
 ) {
@@ -1919,7 +1919,7 @@ private fun ResetProgressAction(
 private fun OfflineDetailCard(
     item: MediaItem,
     download: com.adsamcik.streamferry.ui.state.DownloadUiItem?,
-    viewModel: MainViewModel,
+    viewModel: UiController,
     serverUnavailable: Boolean,
 ) {
     var selectedFormat by remember(item.id) { mutableStateOf<DownloadFormat>(DownloadFormat.Original) }
@@ -2063,7 +2063,7 @@ private fun DownloadFormatPicker(
 @Composable
 private fun DetailPlaybackDock(
     item: MediaItem,
-    availability: JellyfinItemAvailability,
+    availability: SourceItemAvailability,
     downloadCompleted: Boolean,
     serverUnavailable: Boolean,
     playlistCount: Int,
@@ -2083,7 +2083,7 @@ private fun DetailPlaybackDock(
     )
     val resumeAt = item.resumePositionSeconds?.takeIf { it > 0L }
     val offlinePreferred = serverUnavailable && downloadCompleted
-    val onlinePlayable = !serverUnavailable && availability != JellyfinItemAvailability.UNAVAILABLE
+    val onlinePlayable = !serverUnavailable && availability != SourceItemAvailability.UNAVAILABLE
 
     Surface(
         modifier = Modifier.fillMaxWidth(),

@@ -68,7 +68,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
-import com.adsamcik.streamferry.ui.MainViewModel
+import com.adsamcik.streamferry.ui.UiController
 import com.adsamcik.streamferry.ui.components.ExpressiveLoadingIndicator
 import com.adsamcik.streamferry.ui.components.QuickConnectCodeCard
 import com.adsamcik.streamferry.ui.state.AppUiState
@@ -139,7 +139,7 @@ fun WelcomeScreen(loggedIn: Boolean, onContinue: () -> Unit, onLocalOnly: () -> 
 }
 
 @Composable
-fun ServerSetupScreen(state: AppUiState, viewModel: MainViewModel) {
+fun ServerSetupScreen(state: AppUiState, viewModel: UiController) {
     val focusManager = LocalFocusManager.current
     val keyboard = LocalSoftwareKeyboardController.current
     val canSubmit = state.serverUrlInput.isNotBlank() &&
@@ -255,7 +255,7 @@ fun ServerSetupScreen(state: AppUiState, viewModel: MainViewModel) {
 }
 
 @Composable
-fun LoginScreen(state: AppUiState, viewModel: MainViewModel) {
+fun LoginScreen(state: AppUiState, viewModel: UiController) {
     var username by rememberSaveable { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
     val quickConnect = state.quickConnect
@@ -449,7 +449,7 @@ private fun QuickConnectPanelPreview() {
 }
 
 @Composable
-fun ServersScreen(state: AppUiState, viewModel: MainViewModel) {
+fun ServersScreen(state: AppUiState, viewModel: UiController) {
     var forgetCandidateId by rememberSaveable { mutableStateOf<String?>(null) }
     Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
         Text(

@@ -1,5 +1,7 @@
 package com.adsamcik.streamferry.data.download
 
+import com.adsamcik.streamferry.source.api.DownloadFormat
+
 import com.adsamcik.streamferry.domain.MediaItem
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json

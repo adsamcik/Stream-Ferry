@@ -1,5 +1,7 @@
 package com.adsamcik.streamferry.data.download
 
+import com.adsamcik.streamferry.source.api.DownloadFormat
+
 import com.adsamcik.streamferry.data.jellyfin.JellyfinHttpException
 import kotlinx.coroutines.runBlocking
 import java.io.IOException

@@ -2,6 +2,8 @@ package com.adsamcik.streamferry.logging
 
 import android.util.Log
 import com.adsamcik.streamferry.core.redaction.LogRedactor
+import com.adsamcik.streamferry.core.logging.LogEntry
+import com.adsamcik.streamferry.core.logging.LogLevel
 import com.adsamcik.streamferry.source.api.DiagnosticSink
 import java.text.SimpleDateFormat
 import java.util.Date

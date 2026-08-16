@@ -146,10 +146,10 @@ import com.adsamcik.streamferry.playback.PlaybackControlPolicy
 import com.adsamcik.streamferry.playback.PlaybackPhase
 import com.adsamcik.streamferry.playback.PlaybackTimecode
 import com.adsamcik.streamferry.source.api.ArtworkRef
-import com.adsamcik.streamferry.ui.MainViewModel
+import com.adsamcik.streamferry.ui.UiController
 import com.adsamcik.streamferry.ui.components.ExpressiveLoadingIndicator
 import com.adsamcik.streamferry.ui.state.AppUiState
-import com.adsamcik.streamferry.ui.state.JellyfinItemAvailability
+import com.adsamcik.streamferry.ui.state.SourceItemAvailability
 import com.adsamcik.streamferry.ui.state.PlaybackUiState
 import com.adsamcik.streamferry.ui.state.displayedIsPlaying
 import com.adsamcik.streamferry.ui.state.displayedPositionSeconds
@@ -163,7 +163,7 @@ import kotlin.math.sin
 private const val TARGET_AUTO_REFRESH_SECONDS = 15
 
 @Composable
-fun TargetPickerScreen(state: AppUiState, viewModel: MainViewModel, onRescan: () -> Unit) {
+fun TargetPickerScreen(state: AppUiState, viewModel: UiController, onRescan: () -> Unit) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val latestRescan by rememberUpdatedState(onRescan)
@@ -516,7 +516,7 @@ private fun LocalNetworkAccessCard(onOpenSettings: () -> Unit) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun PlaybackScreen(state: AppUiState, viewModel: MainViewModel) {
+fun PlaybackScreen(state: AppUiState, viewModel: UiController) {
     val p = state.playback
     if (p == null) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -660,7 +660,7 @@ private fun PlaybackTimelineControls(
     positionProvider: () -> Long,
     chapters: List<MediaChapter>,
     previewUrlFor: (Int) -> ArtworkRef?,
-    viewModel: MainViewModel,
+    viewModel: UiController,
     compact: Boolean,
 ) {
     SeekScrubber(
@@ -771,7 +771,7 @@ private fun TerminalPlaybackCard(
 @Composable
 private fun PlaybackQuickActions(
     p: PlaybackUiState,
-    viewModel: MainViewModel,
+    viewModel: UiController,
     hasQueuedItem: Boolean,
     onOpenOptions: () -> Unit,
     onStop: () -> Unit,
@@ -839,7 +839,7 @@ private fun PlaybackQuickActions(
 }
 
 @Composable
-private fun PlaylistCard(state: AppUiState, viewModel: MainViewModel) {
+private fun PlaylistCard(state: AppUiState, viewModel: UiController) {
     val entries = state.playlist.entries
     var expanded by rememberSaveable { mutableStateOf(false) }
     val visibleEntries = if (expanded) entries else entries.take(4)
@@ -880,11 +880,11 @@ private fun PlaylistCard(state: AppUiState, viewModel: MainViewModel) {
                 visibleEntries.forEachIndexed { index, entry ->
                     val availability = state.availabilityFor(entry.item)
                     val availabilityLabel = when (availability) {
-                        JellyfinItemAvailability.DOWNLOADED -> "Downloaded · available offline"
-                        JellyfinItemAvailability.UNAVAILABLE -> "Unavailable until Jellyfin reconnects"
-                        JellyfinItemAvailability.AVAILABLE -> entry.item.subtitle ?: "Ready after the current item"
+                        SourceItemAvailability.DOWNLOADED -> "Downloaded · available offline"
+                        SourceItemAvailability.UNAVAILABLE -> "Unavailable until the source reconnects"
+                        SourceItemAvailability.AVAILABLE -> entry.item.subtitle ?: "Ready after the current item"
                     }
-                    val availabilityColor = if (availability == JellyfinItemAvailability.UNAVAILABLE) {
+                    val availabilityColor = if (availability == SourceItemAvailability.UNAVAILABLE) {
                         MaterialTheme.colorScheme.error
                     } else {
                         MaterialTheme.colorScheme.onSurfaceVariant
@@ -1002,7 +1002,7 @@ private fun QuickControlButton(
 @Composable
 private fun PlaybackOptionsSheet(
     p: PlaybackUiState,
-    viewModel: MainViewModel,
+    viewModel: UiController,
     sheetState: androidx.compose.material3.SheetState,
     onDismiss: () -> Unit,
 ) {
@@ -1534,7 +1534,7 @@ private fun WaveBar(fraction: Float, playing: Boolean, indeterminate: Boolean, m
 @Composable
 private fun TransportControls(
     p: PlaybackUiState,
-    viewModel: MainViewModel,
+    viewModel: UiController,
     compact: Boolean = false,
 ) {
     val duration = p.durationSeconds?.takeIf { it > 0 }
@@ -1608,7 +1608,7 @@ private fun TransportControls(
 }
 
 @Composable
-private fun VolumeControl(p: PlaybackUiState, viewModel: MainViewModel, compact: Boolean = false) {
+private fun VolumeControl(p: PlaybackUiState, viewModel: UiController, compact: Boolean = false) {
     // Drive the device volume only when the user releases the slider — onValueChange fires ~60x/s during
     // a drag, which would flood a DLNA renderer (one blocking SOAP call each) and delay other commands.
     // Local drag state keeps the thumb responsive while dragging.

@@ -1,5 +1,6 @@
-package com.adsamcik.streamferry.data.download
+package com.adsamcik.streamferry.source.api
 
+/** Provider-neutral durable-download output request. Sources decide whether a profile is supported. */
 sealed interface DownloadFormat {
     val label: String
 

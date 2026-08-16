@@ -1,11 +1,10 @@
-package com.adsamcik.streamferry.ui
+package com.adsamcik.streamferry.app
 
 import android.content.Intent
 import android.net.Uri
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import com.adsamcik.streamferry.app.AppContainer
 import com.adsamcik.streamferry.core.redaction.LogRedactor
 import com.adsamcik.streamferry.core.resilience.UpstreamRetry
 import com.adsamcik.streamferry.core.language.LanguagePreferenceResolver
@@ -20,7 +19,7 @@ import com.adsamcik.streamferry.core.resume.SmartResumeSourceType
 import com.adsamcik.streamferry.core.stream.StreamPreferences
 import com.adsamcik.streamferry.data.cache.LibraryCache
 import com.adsamcik.streamferry.data.download.DownloadEntry
-import com.adsamcik.streamferry.data.download.DownloadFormat
+import com.adsamcik.streamferry.source.api.DownloadFormat
 import com.adsamcik.streamferry.data.download.DownloadIdentity
 import com.adsamcik.streamferry.data.download.DownloadOwner
 import com.adsamcik.streamferry.data.download.MediaDownloader.DownloadState
@@ -66,7 +65,7 @@ import com.adsamcik.streamferry.ui.state.AppUiState
 import com.adsamcik.streamferry.ui.state.ConnectionState
 import com.adsamcik.streamferry.ui.state.DiagnosticsUiState
 import com.adsamcik.streamferry.ui.state.DownloadUiItem
-import com.adsamcik.streamferry.ui.state.JellyfinItemAvailability
+import com.adsamcik.streamferry.ui.state.SourceItemAvailability
 import com.adsamcik.streamferry.ui.state.NowPlayingDiagnostics
 import com.adsamcik.streamferry.ui.state.PlaybackControlKind
 import com.adsamcik.streamferry.ui.state.PlaybackControlStatePolicy
@@ -357,14 +356,14 @@ class MainViewModel(
         }
         viewModelScope.launch {
             container.authRepository.cachedSession.collect { cached ->
-                _state.update { it.copy(hasCachedJellyfinSession = cached != null) }
+                _state.update { it.copy(hasCachedRemoteSession = cached != null) }
                 if (cached != null) materializePendingJellyfinWatchStateMutations(cached)
                 refreshDownloadEntries()
             }
         }
         viewModelScope.launch {
             container.jellyfinConnectionMonitor.status.collect { status ->
-                _state.update { it.copy(jellyfinLibraryStatus = status) }
+                _state.update { it.copy(sourceAvailability = status) }
                 // ONLINE is emitted only after a verified authenticated Jellyfin request succeeds. It is a
                 // safe recovery boundary for retrying durable actions that previously lost connectivity.
                 if (!deletingAllData && status == SourceAvailability.ONLINE) {
@@ -401,7 +400,7 @@ class MainViewModel(
         viewModelScope.launch {
             val cached = runCatching { container.authRepository.restoreCachedSession() }.getOrNull()
             if (cached != null) {
-                _state.update { it.copy(hasCachedJellyfinSession = true) }
+                _state.update { it.copy(hasCachedRemoteSession = true) }
                 materializePendingJellyfinWatchStateMutations(cached)
             }
             val initialGallery = _state.value.route == Route.GALLERY
@@ -509,7 +508,7 @@ class MainViewModel(
     fun dismissError() = _state.update { it.copy(errorMessage = null) }
 
     fun onWelcomeContinue() {
-        if (_state.value.canBrowseJellyfin) openLibraries() else navigate(Route.SERVER_SETUP)
+        if (_state.value.canBrowseRemote) openLibraries() else navigate(Route.SERVER_SETUP)
     }
 
     /** Open the multi-server picker (kept even when offline). */
@@ -535,7 +534,7 @@ class MainViewModel(
                     }
                     cached != null -> {
                         container.jellyfinConnectionMonitor.markUnavailable()
-                        _state.update { it.copy(hasCachedJellyfinSession = true, loggedIn = false) }
+                        _state.update { it.copy(hasCachedRemoteSession = true, loggedIn = false) }
                         openLibraries()
                     }
                     else -> _state.update {
@@ -549,7 +548,7 @@ class MainViewModel(
                 _state.update {
                     it.copy(
                         loggedIn = container.authRepository.currentUser.value != null,
-                        hasCachedJellyfinSession = container.authRepository.cachedSession.value != null,
+                        hasCachedRemoteSession = container.authRepository.cachedSession.value != null,
                         errorMessage = SECURE_STORAGE_ERROR,
                     )
                 }
@@ -575,7 +574,7 @@ class MainViewModel(
                 _state.update {
                     it.copy(
                         loggedIn = container.authRepository.currentUser.value != null,
-                        hasCachedJellyfinSession = container.authRepository.cachedSession.value != null,
+                        hasCachedRemoteSession = container.authRepository.cachedSession.value != null,
                         errorMessage = SECURE_STORAGE_ERROR,
                     )
                 }
@@ -954,7 +953,7 @@ class MainViewModel(
         val target = request.target
         // Jellyfin can be browsed through an authenticated live session OR an isolated cached-session
         // scope. The latter never permits the repository to make a token-bearing remote request.
-        if (target.sourceId == MediaSourceIds.REMOTE && !_state.value.canBrowseJellyfin) {
+        if (target.sourceId == MediaSourceIds.REMOTE && !_state.value.canBrowseRemote) {
             updateCurrentGalleryLoad(request) {
                 it.copy(libraries = emptyList(), continueWatching = emptyList(), galleryLoading = false)
             }
@@ -1085,8 +1084,8 @@ class MainViewModel(
     }
 
     private fun openDetail(item: MediaItem) {
-        val shouldPreferOfflineCopy = _state.value.availabilityFor(item) == JellyfinItemAvailability.DOWNLOADED &&
-            _state.value.jellyfinLibraryStatus == com.adsamcik.streamferry.domain.SourceAvailability.UNAVAILABLE
+        val shouldPreferOfflineCopy = _state.value.availabilityFor(item) == SourceItemAvailability.DOWNLOADED &&
+            _state.value.sourceAvailability == com.adsamcik.streamferry.domain.SourceAvailability.UNAVAILABLE
         val detailSession = container.authRepository.currentUser.value
         val detailMutationKey = detailSession
             ?.takeIf { item.sourceId == MediaSourceIds.REMOTE }
@@ -1149,7 +1148,7 @@ class MainViewModel(
     /** A manual refresh is the explicit retry boundary for a cache-only Jellyfin session. */
     private suspend fun refreshOnlineJellyfinSessionIfNeeded() {
         val current = _state.value
-        if (current.activeSourceId != MediaSourceIds.REMOTE || current.loggedIn || !current.hasCachedJellyfinSession) return
+        if (current.activeSourceId != MediaSourceIds.REMOTE || current.loggedIn || !current.hasCachedRemoteSession) return
         if (container.authRepository.ensureOnlineSession().isSuccess) {
             container.jellyfinConnectionMonitor.markOnline()
         } else {
@@ -1524,7 +1523,7 @@ class MainViewModel(
                         onForegrounded = goToPlayback,
                     )
                 } else {
-                    check(s.availabilityFor(item) != JellyfinItemAvailability.UNAVAILABLE) {
+                    check(s.availabilityFor(item) != SourceItemAvailability.UNAVAILABLE) {
                         "Jellyfin is unavailable. Download this item to play it offline."
                     }
                     // Keep an online connection alive only when episode autoplay or this session's playlist
@@ -1777,7 +1776,7 @@ class MainViewModel(
         val item = entry.item
         val availability = snapshot.availabilityFor(item)
         val pendingWatchState = isPlaybackBlockedByPendingJellyfinWatchState(item, activeJellyfinSession())
-        if (availability == JellyfinItemAvailability.UNAVAILABLE || pendingWatchState) {
+        if (availability == SourceItemAvailability.UNAVAILABLE || pendingWatchState) {
             val message = if (pendingWatchState) {
                 "${item.title}'s watch-state change is waiting to sync. Reconnect to Jellyfin before playing it."
             } else {
@@ -1804,8 +1803,8 @@ class MainViewModel(
             return
         }
 
-        val shouldUseOfflineCopy = availability == JellyfinItemAvailability.DOWNLOADED &&
-            snapshot.jellyfinLibraryStatus == com.adsamcik.streamferry.domain.SourceAvailability.UNAVAILABLE
+        val shouldUseOfflineCopy = availability == SourceItemAvailability.DOWNLOADED &&
+            snapshot.sourceAvailability == com.adsamcik.streamferry.domain.SourceAvailability.UNAVAILABLE
         val remaining = snapshot.playlist.remove(entry.entryId)
         val target = snapshot.selectedTarget
         val previousOnlineContext = reconnectContext as? ReconnectContext.Online
@@ -2068,7 +2067,7 @@ class MainViewModel(
         val snapshot = _state.value
         val reason = when {
             queuedItem.isFolder -> "Open this title and choose a specific episode or movie to add."
-            snapshot.availabilityFor(queuedItem) == JellyfinItemAvailability.UNAVAILABLE ->
+            snapshot.availabilityFor(queuedItem) == SourceItemAvailability.UNAVAILABLE ->
                 "${queuedItem.title} is unavailable while Jellyfin is offline."
             else -> null
         }

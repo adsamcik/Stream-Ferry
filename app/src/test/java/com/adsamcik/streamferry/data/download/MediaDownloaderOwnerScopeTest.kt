@@ -1,5 +1,7 @@
 package com.adsamcik.streamferry.data.download
 
+import com.adsamcik.streamferry.source.api.DownloadFormat
+
 import com.adsamcik.streamferry.domain.ServerPlaybackProvider
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.logging.DiagnosticsLogger

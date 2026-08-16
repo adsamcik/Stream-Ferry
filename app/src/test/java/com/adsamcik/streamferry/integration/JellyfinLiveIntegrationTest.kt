@@ -7,7 +7,7 @@ import com.adsamcik.streamferry.data.jellyfin.HttpJellyfinRepository
 import com.adsamcik.streamferry.data.jellyfin.JellyfinClient
 import com.adsamcik.streamferry.data.proxy.LocalProxyServer
 import com.adsamcik.streamferry.logging.DiagnosticsLogger
-import com.adsamcik.streamferry.logging.LogEntry
+import com.adsamcik.streamferry.core.logging.LogEntry
 import kotlinx.coroutines.runBlocking
 import okhttp3.OkHttpClient
 import okhttp3.Request

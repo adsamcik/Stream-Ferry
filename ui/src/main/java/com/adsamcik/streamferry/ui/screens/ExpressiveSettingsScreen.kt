@@ -89,7 +89,7 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
-import com.adsamcik.streamferry.R
+import com.adsamcik.streamferry.ui.R
 import com.adsamcik.streamferry.core.language.Languages
 import com.adsamcik.streamferry.core.volume.NightVolumePolicy
 import com.adsamcik.streamferry.ui.theme.ThemeMode

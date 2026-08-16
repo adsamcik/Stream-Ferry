@@ -1,4 +1,4 @@
-package com.adsamcik.streamferry.logging
+package com.adsamcik.streamferry.core.logging
 
 enum class LogLevel { DEBUG, INFO, WARN, ERROR, EVENT, TRACE }
 

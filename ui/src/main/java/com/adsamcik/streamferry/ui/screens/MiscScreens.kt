@@ -66,11 +66,10 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
-import com.adsamcik.streamferry.BuildConfig
 import com.adsamcik.streamferry.diagnostics.ReportExport
 import com.adsamcik.streamferry.diagnostics.ReportShare
-import com.adsamcik.streamferry.logging.LogEntry
-import com.adsamcik.streamferry.logging.LogLevel
+import com.adsamcik.streamferry.core.logging.LogEntry
+import com.adsamcik.streamferry.core.logging.LogLevel
 import com.adsamcik.streamferry.ui.state.AppUiState
 import com.adsamcik.streamferry.ui.theme.StreamFerryTheme
 import java.text.SimpleDateFormat
@@ -501,7 +500,7 @@ private fun LogEntryRow(
 
 
 @Composable
-fun AboutScreen() {
+fun AboutScreen(appVersion: String) {
     Column(
         modifier = Modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(14.dp),
@@ -522,7 +521,7 @@ fun AboutScreen() {
                     modifier = Modifier.semantics { heading() },
                 )
                 Text(
-                    "Version " + BuildConfig.VERSION_NAME,
+                    "Version $appVersion",
                     style = MaterialTheme.typography.labelLarge,
                     color = MaterialTheme.colorScheme.onPrimaryContainer,
                 )
@@ -598,7 +597,7 @@ private fun AboutFactCard(
 private fun AboutScreenPreview() {
     StreamFerryTheme {
         Surface(color = MaterialTheme.colorScheme.background) {
-            Box(Modifier.padding(16.dp)) { AboutScreen() }
+            Box(Modifier.padding(16.dp)) { AboutScreen("1.0.0") }
         }
     }
 }

@@ -1,5 +1,7 @@
 package com.adsamcik.streamferry.data.download
 
+import com.adsamcik.streamferry.source.api.DownloadFormat
+
 import com.adsamcik.streamferry.core.net.TrustedMediaOriginPolicy
 import com.adsamcik.streamferry.core.resilience.Backoff
 import com.adsamcik.streamferry.core.resilience.RetryBudget
