@@ -13,6 +13,7 @@ import com.adsamcik.streamferry.domain.MediaChapter
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.domain.MediaTrack
 import com.adsamcik.streamferry.source.api.DiagnosticSink
+import com.adsamcik.streamferry.source.api.SourceHttpException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -1069,11 +1070,10 @@ class JellyfinClient(
     }
 }
 
-class JellyfinHttpException(val code: Int, val serverReason: String? = null) :
-    RuntimeException("Jellyfin request failed with HTTP $code" + (serverReason?.let { " ($it)" } ?: "")) {
-    /** A 401 means the stored access token was revoked/expired — the user must re-authenticate. */
-    val isUnauthorized: Boolean get() = code == 401
-}
+internal class JellyfinHttpException(
+    val code: Int,
+    val serverReason: String? = null,
+) : SourceHttpException(code, serverReason)
 
 /**
  * The UserData patch used by Reset progress. Explicitly mark it unplayed as well as clearing ticks;

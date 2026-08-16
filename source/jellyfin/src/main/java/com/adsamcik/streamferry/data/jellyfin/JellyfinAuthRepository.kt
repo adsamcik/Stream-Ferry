@@ -9,6 +9,7 @@ import com.adsamcik.streamferry.domain.SecureTokenStore
 import com.adsamcik.streamferry.domain.ServerProfile
 import com.adsamcik.streamferry.domain.UserSession
 import com.adsamcik.streamferry.source.api.DiagnosticSink
+import com.adsamcik.streamferry.source.api.InsecureTransportApprovalRequiredException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
@@ -75,7 +76,8 @@ class JellyfinAuthRepository(
     suspend fun setServer(rawUrl: String, userApprovedHttp: Boolean): Result<ServerProfile> {
         return when (val v = ServerUrlValidator.validate(rawUrl, userApprovedHttp)) {
             is ServerUrlValidator.Result.Invalid -> Result.failure(IllegalArgumentException(v.reason))
-            is ServerUrlValidator.Result.NeedsHttpApproval -> Result.failure(HttpApprovalRequiredException(v.baseUrl))
+            is ServerUrlValidator.Result.NeedsHttpApproval ->
+                Result.failure(InsecureTransportApprovalRequiredException(v.baseUrl))
             is ServerUrlValidator.Result.Valid -> authOperationMutex.withLock {
                 runCatching {
                     val generation = beginServerConfiguration(v.baseUrl)
@@ -432,5 +434,3 @@ class JellyfinAuthRepository(
         }
     }
 }
-
-class HttpApprovalRequiredException(val baseUrl: String) : RuntimeException("This LAN http address must be explicitly approved before use.")

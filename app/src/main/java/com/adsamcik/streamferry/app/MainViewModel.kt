@@ -22,11 +22,11 @@ import com.adsamcik.streamferry.data.download.DownloadEntry
 import com.adsamcik.streamferry.source.api.DownloadFormat
 import com.adsamcik.streamferry.source.api.MediaRef
 import com.adsamcik.streamferry.source.api.MediaUserState
+import com.adsamcik.streamferry.source.api.InsecureTransportApprovalRequiredException
+import com.adsamcik.streamferry.source.api.SourceHttpException
 import com.adsamcik.streamferry.data.download.DownloadIdentity
 import com.adsamcik.streamferry.data.download.DownloadOwner
 import com.adsamcik.streamferry.data.download.MediaDownloader.DownloadState
-import com.adsamcik.streamferry.data.jellyfin.HttpApprovalRequiredException
-import com.adsamcik.streamferry.data.jellyfin.JellyfinHttpException
 import com.adsamcik.streamferry.data.jellyfin.JellyfinWatchMutation
 import com.adsamcik.streamferry.data.jellyfin.JellyfinWatchMutationKind
 import com.adsamcik.streamferry.data.jellyfin.JellyfinWatchMutationStore
@@ -620,7 +620,7 @@ class MainViewModel(
                     }
                 },
                 onFailure = { e ->
-                    if (e is HttpApprovalRequiredException) {
+                    if (e is InsecureTransportApprovalRequiredException) {
                         _state.update {
                             it.copy(connectionState = ConnectionState.IDLE, needsHttpApproval = true, isBusy = false, errorMessage = null)
                         }
@@ -1043,7 +1043,7 @@ class MainViewModel(
      * session is no longer usable.
      */
     private fun isSessionExpired(t: Throwable): Boolean =
-        generateSequence(t) { it.cause }.any { it is JellyfinHttpException && it.isUnauthorized }
+        generateSequence(t) { it.cause }.any { it is SourceHttpException && it.isUnauthorized }
 
     /**
      * Pick the most informative message from a failure chain: a Jellyfin HTTP error (which now carries
@@ -1051,7 +1051,7 @@ class MainViewModel(
      * generic wrapper so the user sees *why* the server rejected the request, not just the outer label.
      */
     private fun bestFailureReason(t: Throwable): String {
-        val http = generateSequence(t) { it.cause }.filterIsInstance<JellyfinHttpException>().firstOrNull()
+        val http = generateSequence(t) { it.cause }.filterIsInstance<SourceHttpException>().firstOrNull()
         return http?.message ?: t.message ?: t.javaClass.simpleName
     }
 
@@ -1061,9 +1061,10 @@ class MainViewModel(
      * "check the connection" line.
      */
     private fun libraryErrorMessage(t: Throwable): String {
-        val http = generateSequence(t) { it.cause }.filterIsInstance<JellyfinHttpException>().firstOrNull()
+        val http = generateSequence(t) { it.cause }.filterIsInstance<SourceHttpException>().firstOrNull()
             ?: return LIBRARY_ERROR
-        val detail = http.serverReason?.takeIf { it.isNotBlank() } ?: "server returned HTTP ${http.code}"
+        val detail = http.sourceReason?.takeIf { it.isNotBlank() }
+            ?: "server returned HTTP ${http.statusCode}"
         return "$LIBRARY_ERROR ($detail)"
     }
 
@@ -1585,7 +1586,7 @@ class MainViewModel(
                 val latestFailureCause = container.playbackEngine.recoverySnapshot().attempts.lastOrNull()?.failureCause
                 val upstreamFailure = latestFailureCause == PlaybackFailureCause.UPSTREAM_OR_SERVER_UNAVAILABLE ||
                     generateSequence(e) { it.cause }.any {
-                        it is JellyfinHttpException || it is PlaybackPreparationException
+                        it is SourceHttpException || it is PlaybackPreparationException
                     }
                 if (!upstreamFailure) {
                     container.logger.w("Playback", "Couldn't start playback", e)
@@ -2898,7 +2899,9 @@ class MainViewModel(
     private fun isJellyfinConnectivityFailure(error: Throwable): Boolean =
         generateSequence(error) { it.cause }.any { cause ->
             cause is IOException ||
-                (cause is JellyfinHttpException && !cause.isUnauthorized && UpstreamRetry.isRetryableStatus(cause.code))
+                (cause is SourceHttpException &&
+                    !cause.isUnauthorized &&
+                    UpstreamRetry.isRetryableStatus(cause.statusCode))
         }
 
     /** Explicit retry starts a fresh bounded recovery budget but keeps the same physical TV and checkpoint. */

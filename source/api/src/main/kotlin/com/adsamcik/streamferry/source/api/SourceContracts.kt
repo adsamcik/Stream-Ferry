@@ -53,6 +53,21 @@ data class SourceInstance(
     val displayName: String,
 )
 
+/** Provider-neutral failure surfaced after a source maps its native protocol error. */
+open class SourceHttpException(
+    val statusCode: Int,
+    val sourceReason: String? = null,
+) : RuntimeException(
+    "Source request failed with HTTP $statusCode" + (sourceReason?.let { " ($it)" } ?: ""),
+) {
+    val isUnauthorized: Boolean get() = statusCode == 401
+}
+
+/** A user-entered insecure address requires explicit approval before source setup may continue. */
+class InsecureTransportApprovalRequiredException(
+    val normalizedAddress: String,
+) : RuntimeException("This LAN http address must be explicitly approved before use.")
+
 /** Optional source features. Consumers check these instead of branching on a provider id. */
 data class SourceCapabilities(
     val supportsSearch: Boolean = true,
