@@ -34,6 +34,7 @@ import com.adsamcik.streamferry.data.jellyfin.JellyfinDownloadProvider
 import com.adsamcik.streamferry.data.jellyfin.JellyfinPlaybackProvider
 import com.adsamcik.streamferry.data.jellyfin.JellyfinArtworkProvider
 import com.adsamcik.streamferry.data.jellyfin.JellyfinSourceBackend
+import com.adsamcik.streamferry.data.jellyfin.JellyfinUserStateProvider
 import com.adsamcik.streamferry.data.jellyfin.JellyfinWatchMutationStore
 import com.adsamcik.streamferry.data.language.ShowLanguageStore
 import com.adsamcik.streamferry.data.local.LocalMediaSource
@@ -276,6 +277,7 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
                 delegate = rawJellyfinMediaSource,
                 artworkProvider = JellyfinArtworkProvider(identity.id, jellyfinClient, httpClient),
                 downloads = JellyfinDownloadProvider(identity.id, jellyfinRepository, httpClient),
+                userState = JellyfinUserStateProvider(identity.id, jellyfinClient),
                 playback = JellyfinPlaybackProvider(
                     source = identity.id,
                     repository = jellyfinRepository,

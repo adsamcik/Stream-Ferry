@@ -20,6 +20,8 @@ import com.adsamcik.streamferry.core.stream.StreamPreferences
 import com.adsamcik.streamferry.data.cache.LibraryCache
 import com.adsamcik.streamferry.data.download.DownloadEntry
 import com.adsamcik.streamferry.source.api.DownloadFormat
+import com.adsamcik.streamferry.source.api.MediaRef
+import com.adsamcik.streamferry.source.api.MediaUserState
 import com.adsamcik.streamferry.data.download.DownloadIdentity
 import com.adsamcik.streamferry.data.download.DownloadOwner
 import com.adsamcik.streamferry.data.download.MediaDownloader.DownloadState
@@ -2536,14 +2538,18 @@ class MainViewModel(
         return true
     }
     private suspend fun submitJellyfinWatchStateMutation(mutation: JellyfinWatchMutation) {
-        when (mutation.kind) {
-            JellyfinWatchMutationKind.MARK_PLAYED ->
-                container.jellyfinClient.markPlayed(mutation.itemId, played = true)
-            JellyfinWatchMutationKind.MARK_UNPLAYED ->
-                container.jellyfinClient.markPlayed(mutation.itemId, played = false)
-            JellyfinWatchMutationKind.RESET_PROGRESS ->
-                container.jellyfinClient.resetProgress(mutation.itemId)
+        val backend = container.sourceRegistry().all().singleOrNull { it.userState != null }
+            ?: error("The active source does not support watch-state updates.")
+        val state = when (mutation.kind) {
+            JellyfinWatchMutationKind.MARK_PLAYED -> MediaUserState(played = true)
+            JellyfinWatchMutationKind.MARK_UNPLAYED -> MediaUserState(played = false)
+            JellyfinWatchMutationKind.RESET_PROGRESS -> MediaUserState(
+                played = false,
+                resumePositionSeconds = 0,
+            )
         }
+        backend.userState?.update(MediaRef(backend.identity.id, mutation.itemId), state)?.getOrThrow()
+            ?: error("The active source does not support watch-state updates.")
     }
 
     private fun handleJellyfinWatchStateMutationFailure(

@@ -16,6 +16,7 @@ import com.adsamcik.streamferry.source.api.ArtworkResponse
 import com.adsamcik.streamferry.source.api.HlsSegmentFormat
 import com.adsamcik.streamferry.source.api.MediaRef
 import com.adsamcik.streamferry.source.api.MediaTrack
+import com.adsamcik.streamferry.source.api.MediaUserState
 import com.adsamcik.streamferry.source.api.PlaybackChange
 import com.adsamcik.streamferry.source.api.PlaybackDescriptor
 import com.adsamcik.streamferry.source.api.PlaybackEvent
@@ -34,6 +35,7 @@ import com.adsamcik.streamferry.source.api.StreamResourceKind
 import com.adsamcik.streamferry.source.api.StreamResourceRef
 import com.adsamcik.streamferry.source.api.StreamResponse
 import com.adsamcik.streamferry.source.api.TrackRef
+import com.adsamcik.streamferry.source.api.UserStateProvider
 import java.util.UUID
 import java.util.Base64
 import java.util.concurrent.ConcurrentHashMap
@@ -54,6 +56,7 @@ class JellyfinSourceBackend(
     override val playback: PlaybackProvider,
     private val artworkProvider: JellyfinArtworkProvider,
     override val downloads: DownloadProvider,
+    override val userState: UserStateProvider,
 ) : SourceBackend, CatalogProvider {
 
     init {
@@ -75,7 +78,6 @@ class JellyfinSourceBackend(
     override val capabilities: StateFlow<SourceCapabilities> = capabilityState.asStateFlow()
     override val catalog: CatalogProvider get() = this
     override val artwork: ArtworkProvider = artworkProvider
-    override val userState = null
     override val setup = null
 
     override suspend fun roots(): Result<List<MediaItem>> = delegate.roots().map(::namespace)
@@ -114,6 +116,30 @@ class JellyfinSourceBackend(
                 id = SourceInstanceId(PROVIDER_ID, "$serverId:$userId"),
                 displayName = displayName,
             )
+    }
+}
+
+/** Maps provider-neutral watch-state updates to Jellyfin's native item APIs. */
+class JellyfinUserStateProvider internal constructor(
+    private val source: SourceInstanceId,
+    private val updatePlayed: suspend (itemId: String, played: Boolean) -> Unit,
+    private val resetProgress: suspend (itemId: String) -> Unit,
+) : UserStateProvider {
+
+    constructor(source: SourceInstanceId, client: JellyfinClient) : this(
+        source = source,
+        updatePlayed = { itemId, played -> client.markPlayed(itemId, played) },
+        resetProgress = client::resetProgress,
+    )
+
+    override suspend fun update(media: MediaRef, state: MediaUserState): Result<MediaUserState> = runCatching {
+        require(media.source == source) { "Media reference belongs to another source instance" }
+        when {
+            state.played -> updatePlayed(media.nativeId, true)
+            state.resumePositionSeconds == 0L -> resetProgress(media.nativeId)
+            else -> updatePlayed(media.nativeId, false)
+        }
+        state
     }
 }
 
