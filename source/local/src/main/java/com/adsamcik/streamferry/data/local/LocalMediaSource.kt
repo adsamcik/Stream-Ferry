@@ -13,7 +13,7 @@ import com.adsamcik.streamferry.core.transcode.SourceCapabilities
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.domain.MediaSource
 import com.adsamcik.streamferry.domain.MediaSourceIds
-import com.adsamcik.streamferry.logging.DiagnosticsLogger
+import com.adsamcik.streamferry.source.api.DiagnosticSink
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -33,7 +33,7 @@ import kotlinx.coroutines.withContext
 class LocalMediaSource(
     context: Context,
     private val store: LocalSourceStore,
-    private val logger: DiagnosticsLogger,
+    private val logger: DiagnosticSink,
     private val hasAllMediaAccess: () -> Boolean,
     private val hasSelectedMediaAccess: () -> Boolean,
     private val resolver: ContentResolver = context.applicationContext.contentResolver,
@@ -85,7 +85,7 @@ class LocalMediaSource(
                     if (flags != 0) resolver.releasePersistableUriPermission(rootUri, flags)
                 }
         }.onFailure {
-            logger.w("local", "Could not release a removed local-media permission")
+            logger.warn("local", "Could not release a removed local-media permission")
         }
     }
 
@@ -107,7 +107,7 @@ class LocalMediaSource(
         }
         runCatching { store.clear() }.onFailure { incomplete = true }
         if (incomplete) {
-            logger.w("local", "Could not fully clear local-media permissions")
+            logger.warn("local", "Could not fully clear local-media permissions")
             throw IllegalStateException("Could not fully clear local-media permissions")
         }
     }

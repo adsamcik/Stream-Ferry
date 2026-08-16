@@ -4,7 +4,7 @@ import android.content.ContentResolver
 import android.content.Intent
 import android.content.UriPermission
 import android.net.Uri
-import com.adsamcik.streamferry.logging.DiagnosticsLogger
+import com.adsamcik.streamferry.source.api.DiagnosticSink
 import io.mockk.Runs
 import io.mockk.every
 import io.mockk.just
@@ -35,7 +35,7 @@ class LocalMediaSourceGrantTest {
         source = LocalMediaSource(
             context = context,
             store = store,
-            logger = mockk<DiagnosticsLogger>(relaxed = true),
+            logger = mockk<DiagnosticSink>(relaxed = true),
             hasAllMediaAccess = { false },
             hasSelectedMediaAccess = { false },
             resolver = resolver,

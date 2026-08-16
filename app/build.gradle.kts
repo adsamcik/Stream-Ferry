@@ -123,6 +123,7 @@ android {
 dependencies {
     implementation(project(":core"))
     implementation(project(":source:api"))
+    implementation(project(":source:local"))
 
     // --- AndroidX / Compose ---
     implementation(libs.androidx.core.ktx)

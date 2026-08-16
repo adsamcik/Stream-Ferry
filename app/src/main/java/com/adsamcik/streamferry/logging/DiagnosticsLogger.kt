@@ -2,6 +2,7 @@ package com.adsamcik.streamferry.logging
 
 import android.util.Log
 import com.adsamcik.streamferry.core.redaction.LogRedactor
+import com.adsamcik.streamferry.source.api.DiagnosticSink
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -11,14 +12,19 @@ import java.util.Locale
  * Jellyfin URLs, full proxy URLs, auth params and PlaySessionIds can never reach logcat or exports
  * (§13). In release builds, verbose/debug are dropped entirely.
  */
-interface DiagnosticsLogger {
+interface DiagnosticsLogger : DiagnosticSink {
     fun d(tag: String, message: String)
     fun i(tag: String, message: String)
     fun w(tag: String, message: String, t: Throwable? = null)
     fun e(tag: String, message: String, t: Throwable? = null)
 
     /** Append a structured, already-safe diagnostics entry for the redacted export. */
-    fun event(category: String, message: String)
+    override fun event(category: String, message: String)
+
+    override fun debug(tag: String, message: String) = d(tag, message)
+    override fun info(tag: String, message: String) = i(tag, message)
+    override fun warn(tag: String, message: String, error: Throwable?) = w(tag, message, error)
+    override fun error(tag: String, message: String, error: Throwable?) = e(tag, message, error)
 
     /**
      * Opt-in verbose trace (e.g. Cast/DLNA request/response traffic). Recorded — redacted — only while
