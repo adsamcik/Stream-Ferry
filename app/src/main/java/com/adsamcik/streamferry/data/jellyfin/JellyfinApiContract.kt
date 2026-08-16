@@ -4,7 +4,7 @@ package com.adsamcik.streamferry.data.jellyfin
  * DECISION RECORD — Jellyfin integration (§8).
  *
  * Context
- *   The official Jellyfin Kotlin SDK (org.jellyfin.sdk:jellyfin-core:1.8.11, LGPL-3.0) is verified
+ *   The official Jellyfin Kotlin SDK (org.jellyfin.sdk:jellyfin-core:1.8.12, LGPL-3.0) is verified
  *   present on Maven Central and is included in the version catalog. The app needs: manual server
  *   URL, username/password auth, playback-info with explicit stream-selection parameters,
  *   media-source resolution, PlaySessionId preservation, playback reporting and transcode/HLS

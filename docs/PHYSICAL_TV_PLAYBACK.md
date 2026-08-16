@@ -1,7 +1,7 @@
 # Physical-TV playback and recovery
 
 This document describes the implemented simplified playback path. It is intentionally small enough
-for a personal open-source project: no device cloud, telemetry, compatibility database, background
+for a personal source-available project: no device cloud, telemetry, compatibility database, background
 workflow engine, or claim of universal TV support.
 
 ## User flow

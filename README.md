@@ -122,3 +122,15 @@ No telemetry, analytics, ads, cloud services, or tracking. The access token and 
 URL are stored encrypted (Android Keystore, AES-256-GCM); passwords are never stored. "Delete all app
 data" removes profiles, tokens, metadata, playback history, target/compatibility data, diagnostics,
 settings, and active buffers.
+
+## License
+
+Stream Ferry-owned code is **source available** for noncommercial purposes under the
+[PolyForm Noncommercial License 1.0.0](LICENSE) (`PolyForm-Noncommercial-1.0.0`). This is not an
+OSI-approved open-source license. Commercial use requires a separate written license from the
+copyright holder; use the repository's contact channels to enquire.
+
+This change is prospective. Versions through tag `v0.5.0` and commit
+`605dbcc7272f9025621c1ad9bd1b48970739b835` remain available under their original
+[MIT License](LICENSE-MIT). See [NOTICE](NOTICE) for the exact scope and cutoff. Third-party
+components retain their own terms as documented in [docs/LICENSES.md](docs/LICENSES.md).

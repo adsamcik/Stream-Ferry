@@ -361,8 +361,8 @@ fun ExpressiveSettingsScreen(
                 SettingsDivider()
                 SettingsLinkRow(
                     iconRes = R.drawable.in_app_icon_about,
-                    title = "About & open-source licenses",
-                    supporting = "Version, privacy and open-source notices.",
+                    title = "About & licenses",
+                    supporting = "Version, privacy, licensing and third-party notices.",
                     onClick = onAbout,
                 )
             }

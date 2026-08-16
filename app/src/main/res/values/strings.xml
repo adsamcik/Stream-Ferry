@@ -32,7 +32,7 @@
     <string name="logout">Log out</string>
     <string name="delete_profile">Delete server profile</string>
     <string name="delete_all">Delete all app data</string>
-    <string name="licenses">Open-source licenses</string>
+    <string name="licenses">Licenses</string>
 
     <!-- Playback -->
     <string name="play">Play</string>

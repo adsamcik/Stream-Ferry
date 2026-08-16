@@ -546,8 +546,11 @@ fun AboutScreen() {
         )
         AboutFactCard(
             icon = Icons.Rounded.Code,
-            title = "Open source",
-            body = "Open-source notices are bundled with the app and documented in docs/LICENSES.md.",
+            title = "Source available",
+            body = "Stream Ferry-owned code is noncommercial source available under PolyForm Noncommercial 1.0.0: " +
+                "https://polyformproject.org/licenses/noncommercial/1.0.0\n" +
+                "Required Notice: Copyright 2026 adsamcik\n" +
+                "Third-party notices are documented in docs/LICENSES.md.",
         )
     }
 }
