@@ -41,18 +41,14 @@ Because the app links the LGPL-3.0 Jellyfin SDK, to remain compliant when distri
 
 ## App license
 
-Stream Ferry-owned code in distributions made after the licensing cutoff is offered under the
-[PolyForm Noncommercial License 1.0.0](../LICENSE), SPDX identifier
+Stream Ferry-owned code is offered under the [PolyForm Noncommercial License 1.0.0](../LICENSE),
+SPDX identifier
 `PolyForm-Noncommercial-1.0.0`. It may be used, changed, and redistributed for permitted
 noncommercial purposes. It is source available, not OSI-approved open source, and the public license
 does not grant commercial-use rights. Contact the copyright holder through the repository's contact
 channels for a separate commercial license.
 
-The cutoff is tag `v0.5.0`, commit `605dbcc7272f9025621c1ad9bd1b48970739b835`. Versions through and
-including that point were published under the [MIT License](../LICENSE-MIT); those historical grants
-are not revoked. [NOTICE](../NOTICE) records the scope, required copyright notice, and cutoff.
-
 This first-party license does not apply to the Jellyfin SDK, Google Cast SDK, AndroidX, or any other
 third-party component. Those components remain under the terms identified above. In particular, the
 PolyForm terms and any separate commercial agreement must not restrict a recipient's LGPL rights in
-the Jellyfin SDK.
+the Jellyfin SDK. [NOTICE](../NOTICE) records the scope and required copyright notice.

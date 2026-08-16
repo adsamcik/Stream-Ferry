@@ -1,17 +1,12 @@
 Required Notice: Copyright 2026 adsamcik
 
-LICENSING SCOPE AND CUTOFF
+LICENSING SCOPE
 
-Stream Ferry-owned code and other first-party materials in distributions made
-after commit 605dbcc7272f9025621c1ad9bd1b48970739b835 (tag v0.5.0) are offered
-under the PolyForm Noncommercial License 1.0.0 in LICENSE.
+Stream Ferry-owned code and other first-party materials are offered under the
+PolyForm Noncommercial License 1.0.0 in LICENSE unless stated otherwise.
 
-Versions through and including that commit and tag were published under the MIT
-License reproduced in LICENSE-MIT. Those historical MIT permissions remain in
-effect for copies received under that license.
-
-Third-party components and materials are not relicensed. They remain governed
-by their respective license terms; see docs/LICENSES.md.
+Third-party components and materials are not covered by the Stream Ferry
+license. They remain governed by their respective terms; see docs/LICENSES.md.
 
 The public PolyForm license does not grant commercial-use rights. For a
 separate license permitting commercial use, modification, integration, or
