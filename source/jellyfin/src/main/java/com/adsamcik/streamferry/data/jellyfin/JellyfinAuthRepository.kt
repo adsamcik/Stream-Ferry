@@ -9,7 +9,7 @@ import com.adsamcik.streamferry.domain.AuthRepository
 import com.adsamcik.streamferry.domain.SecureTokenStore
 import com.adsamcik.streamferry.domain.ServerProfile
 import com.adsamcik.streamferry.domain.UserSession
-import com.adsamcik.streamferry.logging.DiagnosticsLogger
+import com.adsamcik.streamferry.source.api.DiagnosticSink
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
@@ -19,7 +19,7 @@ import kotlinx.coroutines.sync.withLock
  * One Quick Connect code bound to the exact server configuration that issued it. The user-facing code
  * is safe for the UI; the secret stays inside the data layer and is never passed as a standalone value.
  */
-internal data class QuickConnectSession(
+class QuickConnectSession internal constructor(
     val code: String,
     internal val handshake: QuickConnectHandshake,
     internal val serverId: String,
@@ -31,7 +31,7 @@ class JellyfinAuthRepository(
     private val client: JellyfinClient,
     private val tokenStore: SecureTokenStore,
     private val configStore: ServerConfigStore,
-    private val logger: DiagnosticsLogger,
+    private val logger: DiagnosticSink,
 ) : AuthRepository {
 
     private val _currentUser = MutableStateFlow<UserSession?>(null)
@@ -125,7 +125,7 @@ class JellyfinAuthRepository(
      * logout, or replacement Quick Connect start invalidates this object before its secret can be polled
      * or exchanged anywhere else.
      */
-    internal suspend fun startQuickConnect(): Result<QuickConnectSession> = authOperationMutex.withLock {
+    suspend fun startQuickConnect(): Result<QuickConnectSession> = authOperationMutex.withLock {
         runCatching {
             val operation = beginQuickConnectOperation()
             val handshake = client.quickConnectInitiate()
@@ -142,7 +142,7 @@ class JellyfinAuthRepository(
     }
 
     /** Poll only the server that created this code; never send a stale secret after a server change. */
-    internal suspend fun pollQuickConnect(session: QuickConnectSession): Result<Boolean> = authOperationMutex.withLock {
+    suspend fun pollQuickConnect(session: QuickConnectSession): Result<Boolean> = authOperationMutex.withLock {
         runCatching {
             requireCurrent(session.generation, session.serverId)
             client.quickConnectPoll(session.handshake.secret)
@@ -150,7 +150,7 @@ class JellyfinAuthRepository(
     }
 
     /** Exchange only a still-current code, then install its resulting token through the normal guard. */
-    internal suspend fun completeQuickConnect(session: QuickConnectSession): Result<UserSession> = authOperationMutex.withLock {
+    suspend fun completeQuickConnect(session: QuickConnectSession): Result<UserSession> = authOperationMutex.withLock {
         runCatching {
             requireCurrent(session.generation, session.serverId)
             val operation = beginCredentialOperation()

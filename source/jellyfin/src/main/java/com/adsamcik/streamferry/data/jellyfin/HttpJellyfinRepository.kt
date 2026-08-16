@@ -5,7 +5,7 @@ import com.adsamcik.streamferry.core.stream.TargetCapabilities
 import com.adsamcik.streamferry.domain.JellyfinRepository
 import com.adsamcik.streamferry.domain.PlaybackInfo
 import com.adsamcik.streamferry.domain.UpstreamSource
-import com.adsamcik.streamferry.logging.DiagnosticsLogger
+import com.adsamcik.streamferry.source.api.DiagnosticSink
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -26,7 +26,7 @@ import okhttp3.OkHttpClient
  */
 class HttpJellyfinRepository(
     private val api: JellyfinApi,
-    private val logger: DiagnosticsLogger,
+    private val logger: DiagnosticSink,
     @Suppress("unused") private val httpClient: OkHttpClient,
 ) : JellyfinRepository {
 

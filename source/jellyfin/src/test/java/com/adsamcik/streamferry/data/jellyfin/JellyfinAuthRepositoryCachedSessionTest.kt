@@ -4,8 +4,7 @@ import com.adsamcik.streamferry.data.security.ServerConfigStore
 import com.adsamcik.streamferry.data.security.StoredServer
 import com.adsamcik.streamferry.domain.SecureTokenStore
 import com.adsamcik.streamferry.domain.UserSession
-import com.adsamcik.streamferry.logging.DiagnosticsLogger
-import com.adsamcik.streamferry.logging.LogEntry
+import com.adsamcik.streamferry.source.api.DiagnosticSink
 import io.mockk.every
 import io.mockk.mockk
 import kotlinx.coroutines.runBlocking
@@ -139,18 +138,7 @@ class JellyfinAuthRepositoryCachedSessionTest {
         }
     }
 
-    private object NoopLogger : DiagnosticsLogger {
-        override var traceEnabled: Boolean = false
-        override fun d(tag: String, message: String) = Unit
-        override fun i(tag: String, message: String) = Unit
-        override fun w(tag: String, message: String, t: Throwable?) = Unit
-        override fun e(tag: String, message: String, t: Throwable?) = Unit
-        override fun event(category: String, message: String) = Unit
-        override fun trace(tag: String, message: String) = Unit
-        override fun exportRedacted(): List<String> = emptyList()
-        override fun entries(): List<LogEntry> = emptyList()
-        override fun clear() = Unit
-    }
+    private object NoopLogger : DiagnosticSink
 
     private companion object {
         const val SERVER_ID = "server-id"

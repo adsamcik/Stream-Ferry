@@ -290,7 +290,12 @@ class SourceRegistry(backends: Iterable<SourceBackend> = emptyList()) {
 interface DiagnosticSink {
     fun debug(tag: String, message: String) {}
     fun info(tag: String, message: String) {}
-    fun warn(tag: String, message: String, error: Throwable? = null)
-    fun error(tag: String, message: String, error: Throwable? = null)
-    fun event(category: String, message: String)
+    fun warn(tag: String, message: String, error: Throwable? = null) {}
+    fun error(tag: String, message: String, error: Throwable? = null) {}
+    fun event(category: String, message: String) {}
+
+    fun d(tag: String, message: String) = debug(tag, message)
+    fun i(tag: String, message: String) = info(tag, message)
+    fun w(tag: String, message: String, error: Throwable? = null) = warn(tag, message, error)
+    fun e(tag: String, message: String, error: Throwable? = null) = error(tag, message, error)
 }

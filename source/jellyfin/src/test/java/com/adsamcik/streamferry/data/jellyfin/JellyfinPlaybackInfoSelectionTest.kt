@@ -1,7 +1,6 @@
 package com.adsamcik.streamferry.data.jellyfin
 
-import com.adsamcik.streamferry.logging.DiagnosticsLogger
-import com.adsamcik.streamferry.logging.LogEntry
+import com.adsamcik.streamferry.source.api.DiagnosticSink
 import java.io.IOException
 import kotlinx.coroutines.runBlocking
 import okhttp3.Interceptor
@@ -153,18 +152,7 @@ class JellyfinPlaybackInfoSelectionTest {
         }
     }
 
-    private object NoopLogger : DiagnosticsLogger {
-        override var traceEnabled: Boolean = false
-        override fun d(tag: String, message: String) = Unit
-        override fun i(tag: String, message: String) = Unit
-        override fun w(tag: String, message: String, t: Throwable?) = Unit
-        override fun e(tag: String, message: String, t: Throwable?) = Unit
-        override fun event(category: String, message: String) = Unit
-        override fun trace(tag: String, message: String) = Unit
-        override fun exportRedacted(): List<String> = emptyList()
-        override fun entries(): List<LogEntry> = emptyList()
-        override fun clear() = Unit
-    }
+    private object NoopLogger : DiagnosticSink
 
     private companion object {
         val JSON = "application/json".toMediaType()

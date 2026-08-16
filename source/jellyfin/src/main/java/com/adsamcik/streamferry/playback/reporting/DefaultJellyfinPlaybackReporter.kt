@@ -7,7 +7,7 @@ import com.adsamcik.streamferry.data.jellyfin.JellyfinApi
 import com.adsamcik.streamferry.data.jellyfin.JellyfinHttpException
 import com.adsamcik.streamferry.domain.JellyfinPlaybackReporter
 import com.adsamcik.streamferry.domain.PlaybackInfo
-import com.adsamcik.streamferry.logging.DiagnosticsLogger
+import com.adsamcik.streamferry.source.api.DiagnosticSink
 import java.io.IOException
 import kotlinx.coroutines.CancellationException
 
@@ -19,7 +19,7 @@ import kotlinx.coroutines.CancellationException
 class DefaultJellyfinPlaybackReporter(
     private val api: JellyfinApi,
     private val deviceId: String,
-    private val logger: DiagnosticsLogger,
+    private val logger: DiagnosticSink,
     private val connectionMonitor: JellyfinConnectionMonitor? = null,
 ) : JellyfinPlaybackReporter {
 

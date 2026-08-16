@@ -6,8 +6,7 @@ import com.adsamcik.streamferry.data.jellyfin.HttpJellyfinRepository.Companion.T
 import com.adsamcik.streamferry.data.jellyfin.JellyfinApi
 import com.adsamcik.streamferry.domain.PlaybackInfo
 import com.adsamcik.streamferry.domain.UpstreamSource
-import com.adsamcik.streamferry.logging.DiagnosticsLogger
-import com.adsamcik.streamferry.logging.LogEntry
+import com.adsamcik.streamferry.source.api.DiagnosticSink
 import com.adsamcik.streamferry.domain.JellyfinLibraryStatus
 import java.io.IOException
 import kotlinx.coroutines.test.runTest
@@ -132,16 +131,5 @@ class DefaultJellyfinPlaybackReporterTest {
         }
     }
 
-    private object NoOpLogger : DiagnosticsLogger {
-        override var traceEnabled: Boolean = false
-        override fun d(tag: String, message: String) = Unit
-        override fun i(tag: String, message: String) = Unit
-        override fun w(tag: String, message: String, t: Throwable?) = Unit
-        override fun e(tag: String, message: String, t: Throwable?) = Unit
-        override fun event(category: String, message: String) = Unit
-        override fun trace(tag: String, message: String) = Unit
-        override fun exportRedacted(): List<String> = emptyList()
-        override fun entries(): List<LogEntry> = emptyList()
-        override fun clear() = Unit
-    }
+    private object NoOpLogger : DiagnosticSink
 }

@@ -3,7 +3,7 @@ package com.adsamcik.streamferry.data.jellyfin
 import com.adsamcik.streamferry.core.resilience.LibraryPagingPolicy
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.domain.MediaLibraryRepository
-import com.adsamcik.streamferry.logging.DiagnosticsLogger
+import com.adsamcik.streamferry.source.api.DiagnosticSink
 import java.util.Locale
 
 /**
@@ -13,7 +13,7 @@ import java.util.Locale
  */
 class JellyfinMediaLibraryRepository(
     private val client: JellyfinClient,
-    private val logger: DiagnosticsLogger,
+    private val logger: DiagnosticSink,
 ) : MediaLibraryRepository {
 
     override suspend fun videoLibraries(): Result<List<MediaItem>> = runCatching {

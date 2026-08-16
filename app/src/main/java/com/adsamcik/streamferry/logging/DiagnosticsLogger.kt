@@ -13,10 +13,10 @@ import java.util.Locale
  * (§13). In release builds, verbose/debug are dropped entirely.
  */
 interface DiagnosticsLogger : DiagnosticSink {
-    fun d(tag: String, message: String)
-    fun i(tag: String, message: String)
-    fun w(tag: String, message: String, t: Throwable? = null)
-    fun e(tag: String, message: String, t: Throwable? = null)
+    override fun d(tag: String, message: String)
+    override fun i(tag: String, message: String)
+    override fun w(tag: String, message: String, error: Throwable?)
+    override fun e(tag: String, message: String, error: Throwable?)
 
     /** Append a structured, already-safe diagnostics entry for the redacted export. */
     override fun event(category: String, message: String)

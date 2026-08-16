@@ -30,9 +30,12 @@ import com.adsamcik.streamferry.data.jellyfin.JellyfinAuthRepository
 import com.adsamcik.streamferry.data.jellyfin.JellyfinClient
 import com.adsamcik.streamferry.data.jellyfin.JellyfinMediaLibraryRepository
 import com.adsamcik.streamferry.data.jellyfin.JellyfinMediaSource
+import com.adsamcik.streamferry.data.jellyfin.JellyfinPlaybackProvider
+import com.adsamcik.streamferry.data.jellyfin.JellyfinSourceBackend
 import com.adsamcik.streamferry.data.jellyfin.JellyfinWatchMutationStore
 import com.adsamcik.streamferry.data.language.ShowLanguageStore
 import com.adsamcik.streamferry.data.local.LocalMediaSource
+import com.adsamcik.streamferry.data.local.LocalSourceBackend
 import com.adsamcik.streamferry.data.local.LocalSourceStore
 import com.adsamcik.streamferry.data.resume.ResumeStore
 import com.adsamcik.streamferry.data.resume.SmartResumeStore
@@ -66,6 +69,7 @@ import com.adsamcik.streamferry.playback.RendererCapabilityStore
 import com.adsamcik.streamferry.playback.reporting.DefaultJellyfinPlaybackReporter
 import com.adsamcik.streamferry.playback.session.DefaultPlaybackSessionCoordinator
 import com.adsamcik.streamferry.ui.theme.AppearancePreferences
+import com.adsamcik.streamferry.source.api.SourceRegistry
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -226,6 +230,7 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
             hasSelectedMediaAccess = { permissions.hasSelectedMediaVideo() },
         )
     }
+    val localSourceBackend: LocalSourceBackend by lazy { LocalSourceBackend(localMediaSource) }
     /** All browsable sources, in display order (Jellyfin first, then on-device). */
     val mediaSources: List<MediaSource> by lazy { listOf(jellyfinMediaSource, localMediaSource) }
     val libraryCache: LibraryCache by lazy { LibraryCache(appContext) }
@@ -236,6 +241,32 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
     }
     private val reporter: DefaultJellyfinPlaybackReporter by lazy {
         DefaultJellyfinPlaybackReporter(jellyfinClient, deviceId, logger, jellyfinConnectionMonitor)
+    }
+
+    /**
+     * Concrete source registration lives only in the application composition root. Rebuild the registry
+     * after an account/server transition so its immutable source instance id always matches that session.
+     */
+    fun sourceRegistry(): SourceRegistry {
+        val backends = mutableListOf<com.adsamcik.streamferry.source.api.SourceBackend>(localSourceBackend)
+        (authRepository.currentUser.value ?: authRepository.cachedSession.value)?.let { session ->
+            val identity = JellyfinSourceBackend.identity(
+                serverId = session.serverId,
+                userId = session.userId,
+                displayName = "Jellyfin",
+            )
+            backends += JellyfinSourceBackend(
+                identity = identity,
+                delegate = jellyfinMediaSource,
+                playback = JellyfinPlaybackProvider(
+                    source = identity.id,
+                    repository = jellyfinRepository,
+                    reporter = reporter,
+                    httpClient = httpClient,
+                ),
+            )
+        }
+        return SourceRegistry(backends)
     }
     private val coordinator: DefaultPlaybackSessionCoordinator by lazy {
         DefaultPlaybackSessionCoordinator(sessionRegistry, proxyServer, reporter, logger)

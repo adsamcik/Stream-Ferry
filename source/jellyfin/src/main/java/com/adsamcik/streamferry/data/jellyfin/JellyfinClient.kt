@@ -13,7 +13,7 @@ import com.adsamcik.streamferry.domain.MediaChapter
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.domain.MediaTrack
 import com.adsamcik.streamferry.domain.UpstreamSource
-import com.adsamcik.streamferry.logging.DiagnosticsLogger
+import com.adsamcik.streamferry.source.api.DiagnosticSink
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -57,7 +57,7 @@ class JellyfinClient(
     private val deviceId: String,
     private val deviceName: String,
     private val appVersion: String,
-    private val logger: DiagnosticsLogger,
+    private val logger: DiagnosticSink,
     private val clientName: String = "Stream Ferry",
 ) : JellyfinApi {
 
