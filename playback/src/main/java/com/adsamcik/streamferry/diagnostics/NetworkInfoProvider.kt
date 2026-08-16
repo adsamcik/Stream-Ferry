@@ -22,7 +22,7 @@ class NetworkInfoProvider(context: Context) {
      *
      * Selection is delegated to the pure-JVM [LanInterfaceSelector] so the (security/correctness
      * sensitive) choice is unit-tested. Crucially, when a VPN such as WireGuard is up to reach a
-     * remote Jellyfin, the tunnel interface (e.g. `wg0`/`tun0`) may also carry a site-local address;
+     * a remote media server, the tunnel interface (e.g. `wg0`/`tun0`) may also carry a site-local address;
      * binding the proxy there would make the phone unreachable by the TV on the real Wi-Fi LAN. The
      * selector demotes tunnel/point-to-point/cellular interfaces and prefers the Wi-Fi/Ethernet LAN.
      */
@@ -91,7 +91,7 @@ class NetworkInfoProvider(context: Context) {
     /**
      * The Wi-Fi [Network] (even when a VPN is the *default* network), or null. Sockets/clients bound to
      * it reach LAN devices (the TV) directly over Wi-Fi instead of being captured by the VPN tunnel —
-     * required for DLNA device-description fetch + SOAP control while a VPN is up to reach Jellyfin.
+     * required for DLNA device-description fetch + SOAP control while a VPN reaches a media source.
      */
     @Suppress("DEPRECATION")
     fun wifiNetwork(): Network? {

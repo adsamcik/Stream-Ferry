@@ -29,6 +29,7 @@ import com.adsamcik.streamferry.source.api.SourceInstanceId
 import com.adsamcik.streamferry.source.api.SourceProviderId
 import com.adsamcik.streamferry.source.api.StreamDescriptor
 import com.adsamcik.streamferry.source.api.StreamLease
+import com.adsamcik.streamferry.source.api.StreamResourceKind
 import com.adsamcik.streamferry.source.api.StreamResourceRef
 import com.adsamcik.streamferry.source.api.StreamResponse
 import com.adsamcik.streamferry.source.api.TrackRef
@@ -92,7 +93,7 @@ class JellyfinSourceBackend(
     private fun namespace(items: List<MediaItem>): List<MediaItem> = items.map(::namespace)
 
     private fun namespace(item: MediaItem): MediaItem = item.copy(
-        sourceId = PROVIDER_ID.value,
+        // `sourceId` is the legacy UI slot ("remote"); canonical provider/account identity is `ref`.
         sourceInstanceId = identity.id,
         artwork = item.imageTag?.let { artworkProvider.poster(item.id, it) },
         chapters = item.chapters.mapIndexed { index, chapter ->
@@ -218,7 +219,7 @@ class JellyfinPlaybackProvider(
             forceTranscode = request.forceTranscode,
             allowSubtitleBurnIn = request.allowSubtitleBurnIn,
             audioStreamIndex = request.audioTrack?.opaqueId?.toIntOrNull(),
-            subtitleStreamIndex = request.subtitleTrack?.opaqueId?.toIntOrNull(),
+            subtitleStreamIndex = if (request.subtitlesDisabled) -1 else request.subtitleTrack?.opaqueId?.toIntOrNull(),
             startPositionSeconds = request.startPositionSeconds,
             maxVideoHeight = request.maxVideoHeight,
             preferredVideoCodec = request.preferredVideoCodec,
@@ -294,7 +295,7 @@ class JellyfinPlaybackProvider(
 /** Keeps every private locator and authorization value inside the source module. */
 private class JellyfinStreamLease(
     upstream: UpstreamSource,
-    private val httpClient: OkHttpClient,
+    httpClient: OkHttpClient,
 ) : StreamLease {
 
     private val initialUrl = upstream.url
@@ -303,6 +304,10 @@ private class JellyfinStreamLease(
         "Playback origin is not a valid HTTP(S) authority"
     }
     private val resources = ConcurrentHashMap<String, HttpUrl>()
+    private val streamClient = httpClient.newBuilder()
+        .followRedirects(false)
+        .followSslRedirects(false)
+        .build()
 
     override val descriptor = StreamDescriptor(
         contentType = upstream.contentType,
@@ -320,12 +325,24 @@ private class JellyfinStreamLease(
     override suspend fun open(range: com.adsamcik.streamferry.core.http.ByteRange?): Result<StreamResponse> =
         openTrusted(requireNotNull(origin.trustedAbsolute(initialUrl)), range)
 
-    override suspend fun resolve(playlistReference: String): Result<StreamResourceRef?> = runCatching {
-        val resolved = origin.resolve(playlistReference, requireNotNull(origin.trustedAbsolute(initialUrl)))
+    override suspend fun resolve(
+        playlistReference: String,
+        fromPlaylist: StreamResourceRef?,
+    ): Result<StreamResourceRef?> = runCatching {
+        val base = fromPlaylist?.let { resources[it.opaqueId] }
+            ?: requireNotNull(origin.trustedAbsolute(initialUrl))
+        val resolved = origin.resolve(playlistReference, base)
             ?: return@runCatching null
         val opaqueId = UUID.randomUUID().toString()
         resources[opaqueId] = resolved
-        StreamResourceRef(opaqueId)
+        StreamResourceRef(
+            opaqueId = opaqueId,
+            kind = if (resolved.encodedPath.endsWith(".m3u8", ignoreCase = true)) {
+                StreamResourceKind.PLAYLIST
+            } else {
+                StreamResourceKind.MEDIA
+            },
+        )
     }
 
     override suspend fun open(
@@ -342,24 +359,36 @@ private class JellyfinStreamLease(
         range: com.adsamcik.streamferry.core.http.ByteRange?,
     ): Result<StreamResponse> = withContext(Dispatchers.IO) {
         runCatching {
-            require(origin.isTrusted(url)) { "Cross-origin stream request rejected" }
-            val request = Request.Builder().url(url).apply {
-                authorization?.let { header("Authorization", it) }
-                range?.let { header("Range", "bytes=${it.start}-${it.endInclusive}") }
-            }.build()
-            val response = httpClient.newCall(request).execute()
-            val body = response.body
-            StreamResponse(
-                statusCode = response.code,
-                headers = SAFE_RESPONSE_HEADERS.mapNotNull { name ->
-                    response.header(name)?.let { value -> name to value }
-                }.toMap(),
-                body = body.byteStream(),
-            )
+            var target = url
+            repeat(MAX_REDIRECTS + 1) {
+                require(origin.isTrusted(target)) { "Cross-origin stream request rejected" }
+                val request = Request.Builder().url(target).apply {
+                    authorization?.let { header("Authorization", it) }
+                    range?.let {
+                        val end = if (it.endInclusive == Long.MAX_VALUE) "" else it.endInclusive.toString()
+                        header("Range", "bytes=${it.start}-$end")
+                    }
+                }.build()
+                val response = streamClient.newCall(request).execute()
+                if (!response.isRedirect) {
+                    return@runCatching StreamResponse(
+                        statusCode = response.code,
+                        headers = SAFE_RESPONSE_HEADERS.mapNotNull { name ->
+                            response.header(name)?.let { value -> name to value }
+                        }.toMap(),
+                        body = response.body.byteStream(),
+                    )
+                }
+                val next = response.header("Location")?.let { location -> origin.resolve(location, target) }
+                response.close()
+                target = next ?: error("Cross-origin stream redirect rejected")
+            }
+            error("Too many stream redirects")
         }
     }
 
     companion object {
+        private const val MAX_REDIRECTS = 3
         private val SAFE_RESPONSE_HEADERS = listOf(
             "Content-Type",
             "Content-Length",

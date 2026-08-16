@@ -1,14 +1,13 @@
 package com.adsamcik.streamferry.core.session
 
-import com.adsamcik.streamferry.core.redaction.LogRedactor
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * A single active proxy session. The [upstreamUrl] (the real Jellyfin stream URL, which may carry
- * an access token) is held ONLY here in memory and is NEVER serialised to the TV, logs, or disk.
+ * A single active phone-gateway session. It contains routing metadata only: provider locators and
+ * credentials are retained by the source-owned stream lease registered with the Android gateway.
  *
  * Lifetime is a *sliding idle window* ([idleTtlMillis]) bounded by an *absolute ceiling*
  * ([expiresAtMillis]). Each access during active playback renews the effective expiry to
@@ -18,13 +17,7 @@ import java.util.concurrent.atomic.AtomicLong
  */
 data class ProxySession(
     val id: String,
-    /** Real Jellyfin upstream URL incl. auth — secret. Never exposed to the TV or logs. */
-    val upstreamUrl: String,
-    /** Authorization header value to send upstream (Jellyfin token) — secret. */
-    val upstreamAuthHeader: String?,
     val contentType: String,
-    /** Jellyfin PlaySessionId, used for reporting/cleanup. Secret w.r.t. logs. */
-    val playSessionId: String?,
     val createdAtMillis: Long,
     /** Absolute hard ceiling: the session can never live past this, even under continuous use. */
     val expiresAtMillis: Long,
@@ -95,10 +88,7 @@ class SessionRegistry(
     private val allowedSubPaths = setOf("stream", "playlist.m3u8", "test")
 
     fun create(
-        upstreamUrl: String,
-        upstreamAuthHeader: String?,
         contentType: String,
-        playSessionId: String?,
         isHls: Boolean = false,
         totalLength: Long? = null,
         localFilePath: String? = null,
@@ -111,10 +101,7 @@ class SessionRegistry(
         val now = clock()
         val session = ProxySession(
             id = id,
-            upstreamUrl = upstreamUrl,
-            upstreamAuthHeader = upstreamAuthHeader,
             contentType = contentType,
-            playSessionId = playSessionId,
             createdAtMillis = now,
             expiresAtMillis = now + ttlMillis,
             idleTtlMillis = idleTtlMillis,
@@ -233,4 +220,4 @@ class SessionRegistry(
 }
 
 /** Helper to redact a session reference for logs. */
-fun ProxySession.logId(): String = "session:${id.take(6)}… (${LogRedactor.redactUrl(upstreamUrl)})"
+fun ProxySession.logId(): String = "session:${id.take(6)}…"

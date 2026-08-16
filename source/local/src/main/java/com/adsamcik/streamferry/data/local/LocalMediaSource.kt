@@ -13,6 +13,7 @@ import com.adsamcik.streamferry.core.transcode.SourceCapabilities
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.domain.MediaSource
 import com.adsamcik.streamferry.domain.MediaSourceIds
+import com.adsamcik.streamferry.source.api.SourceInstanceId
 import com.adsamcik.streamferry.source.api.DiagnosticSink
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -271,15 +272,18 @@ class LocalMediaSource(
     private fun folderItem(id: String, name: String) = MediaItem(
         id = id, title = name, year = null, runtimeSeconds = null, overview = null,
         resumePositionSeconds = null, isFolder = true, type = "Folder", sourceId = MediaSourceIds.LOCAL,
+        sourceInstanceId = LOCAL_INSTANCE_ID,
     )
 
     private fun videoItem(id: String, fileName: String, runtimeSeconds: Long?) = MediaItem(
         id = id, title = LocalMediaRules.displayTitle(fileName), year = null,
         runtimeSeconds = runtimeSeconds, overview = null, resumePositionSeconds = null,
         isFolder = false, type = "Video", sourceId = MediaSourceIds.LOCAL,
+        sourceInstanceId = LOCAL_INSTANCE_ID,
     )
 
     private companion object {
         const val MEDIASTORE_ALL = "streamferry://local/all-videos"
+        val LOCAL_INSTANCE_ID = SourceInstanceId(LocalSourceBackend.PROVIDER_ID, LocalSourceBackend.DEFAULT_INSTANCE)
     }
 }

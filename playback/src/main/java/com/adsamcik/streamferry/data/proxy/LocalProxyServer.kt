@@ -6,12 +6,12 @@ import com.adsamcik.streamferry.core.buffer.MemoryBufferPolicy
 import com.adsamcik.streamferry.core.hls.HlsRewriter
 import com.adsamcik.streamferry.core.hls.HlsSegmentRegistry
 import com.adsamcik.streamferry.core.http.BoundedBody
+import com.adsamcik.streamferry.core.http.ByteRange
 import com.adsamcik.streamferry.core.http.HttpRange
 import com.adsamcik.streamferry.core.http.HttpResponsePlan
 import com.adsamcik.streamferry.core.http.RangeParseResult
 import com.adsamcik.streamferry.core.http.UpstreamRangeVerifier
 import com.adsamcik.streamferry.core.net.ConnectionLimiter
-import com.adsamcik.streamferry.core.net.TrustedMediaOriginPolicy
 import com.adsamcik.streamferry.core.resilience.ResilientStreamPolicy
 import com.adsamcik.streamferry.core.resilience.ThroughputWatchdog
 import com.adsamcik.streamferry.core.resilience.UpstreamRetry
@@ -19,16 +19,16 @@ import com.adsamcik.streamferry.core.session.ProxySession
 import com.adsamcik.streamferry.core.session.SessionLookup
 import com.adsamcik.streamferry.core.session.SessionRegistry
 import com.adsamcik.streamferry.source.api.DiagnosticSink
+import com.adsamcik.streamferry.source.api.StreamLease
+import com.adsamcik.streamferry.source.api.StreamResourceKind
+import com.adsamcik.streamferry.source.api.StreamResourceRef
+import com.adsamcik.streamferry.source.api.StreamResponse
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import okhttp3.Call
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.Response
 import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileInputStream
@@ -43,7 +43,6 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ThreadLocalRandom
-import java.util.concurrent.TimeUnit
 
 /**
  * In-RAM, session-scoped HTTP proxy (§6). Binds to the phone LAN IP on an ephemeral port ONLY while
@@ -57,7 +56,6 @@ import java.util.concurrent.TimeUnit
 class LocalProxyServer(
     private val sessions: SessionRegistry,
     private val logger: DiagnosticSink,
-    private val httpClient: OkHttpClient = defaultClient(),
     /**
      * Resolver used ONLY to open user-picked local `content://` videos (SAF / MediaStore) as a seekable
      * file descriptor. Null in tests / when content playback isn't wired. The TV still only ever receives
@@ -69,14 +67,6 @@ class LocalProxyServer(
     /** Fresh operation-level Android local-network permission check. */
     private val requireLocalNetworkAccess: () -> Unit = {},
 ) {
-    /**
-     * Redirects are handled below so a Jellyfin Authorization header is never automatically followed
-     * to another origin. This also applies when callers inject an otherwise default OkHttp client.
-     */
-    private val upstreamHttpClient = httpClient.newBuilder()
-        .followRedirects(false)
-        .followSslRedirects(false)
-        .build()
 
     private var serverSocket: ServerSocket? = null
     private var scope: CoroutineScope? = null
@@ -88,10 +78,10 @@ class LocalProxyServer(
     private val lifecycleLock = Any()
     /** Active renderer sockets, closed synchronously when the session is revoked. */
     private val activeClients = ConcurrentHashMap.newKeySet<Socket>()
-    /** In-flight upstream HTTP calls, indexed by the opaque proxy session. */
-    private val activeCallsBySession = ConcurrentHashMap<String, MutableSet<Call>>()
-    /** Lets normal response cleanup remove its call from the active-session registry. */
-    private val responseCalls = ConcurrentHashMap<Response, Call>()
+    /** Source-owned byte access. Provider URLs, headers, and tokens never enter this module. */
+    private val remoteLeases = ConcurrentHashMap<String, StreamLease>()
+    /** Open bodies are tracked so local teardown can cut renderer access before remote cleanup. */
+    private val activeResponses = ConcurrentHashMap<String, MutableSet<StreamResponse>>()
 
     /**
      * Optional sink notified of each chunk of bytes successfully delivered downstream (to the TV).
@@ -110,8 +100,9 @@ class LocalProxyServer(
     @Volatile
     var onDownstreamClosed: ((bytesServed: Long, durationMs: Long, completedNormally: Boolean) -> Unit)? = null
 
-    /** Per-session opaque<->upstream-URL maps for HLS playlist rewriting (cleared on stop). */
+    /** Per-session opaque resource maps for HLS playlist rewriting (cleared on stop). */
     private val hlsRegistries = ConcurrentHashMap<String, HlsSegmentRegistry>()
+    private val hlsResources = ConcurrentHashMap<String, ConcurrentHashMap<String, StreamResourceRef>>()
 
     /** Per-session on-device transcode origins (cleared/released on stop). */
     private val clientTranscoders = ConcurrentHashMap<String, ClientTranscodeSource>()
@@ -123,6 +114,18 @@ class LocalProxyServer(
 
     fun unregisterClientTranscode(sessionId: String) {
         clientTranscoders.remove(sessionId)?.let { runCatching { it.release() } }
+    }
+
+    fun registerStreamLease(sessionId: String, lease: StreamLease) {
+        require(sessions.isActive(sessionId)) { "Proxy session is not active" }
+        remoteLeases[sessionId] = lease
+    }
+
+    fun unregisterStreamLease(sessionId: String) {
+        remoteLeases.remove(sessionId)
+        activeResponses.remove(sessionId)?.forEach { response -> runCatching { response.close() } }
+        hlsRegistries.remove(sessionId)
+        hlsResources.remove(sessionId)
     }
 
     val isRunning: Boolean get() = serverSocket != null
@@ -156,28 +159,29 @@ class LocalProxyServer(
      */
     @Synchronized
     fun stop() {
-        val calls: List<Call>
+        val responses: List<StreamResponse>
         val clients: List<Socket>
         val listener: ServerSocket?
         val oldScope: CoroutineScope?
         synchronized(lifecycleLock) {
             stopping = true
             sessions.revokeAll()
-            calls = activeCallsBySession.values.flatMap { it.toList() }
+            responses = activeResponses.values.flatMap { it.toList() }
             clients = activeClients.toList()
-            activeCallsBySession.clear()
-            responseCalls.clear()
+            activeResponses.clear()
+            remoteLeases.clear()
             activeClients.clear()
             listener = serverSocket
             serverSocket = null
             oldScope = scope
             scope = null
         }
-        calls.forEach { call -> runCatching { call.cancel() } }
+        responses.forEach { response -> runCatching { response.close() } }
         clients.forEach { client -> runCatching { client.close() } }
         runCatching { listener?.close() }
         oldScope?.cancel()
         hlsRegistries.clear()
+        hlsResources.clear()
         clientTranscoders.values.forEach { runCatching { it.release() } }
         clientTranscoders.clear()
         boundAddress = null
@@ -221,7 +225,7 @@ class LocalProxyServer(
         }
     }
 
-    private fun handle(client: Socket) {
+    private suspend fun handle(client: Socket) {
         client.soTimeout = SOCKET_TIMEOUT_MS
         client.use { sock ->
             val counting = CountingOutputStream(BufferedOutputStream(sock.getOutputStream()))
@@ -268,7 +272,7 @@ class LocalProxyServer(
         }
     }
 
-    private fun serve(session: ProxySession, req: RequestLine, out: OutputStream) {
+    private suspend fun serve(session: ProxySession, req: RequestLine, out: OutputStream) {
         val head = req.method == "HEAD"
         // On-device transcode: serve the phone-hosted HLS/CMAF playlist + on-demand segments.
         clientTranscoders[session.id]?.let {
@@ -280,8 +284,8 @@ class LocalProxyServer(
             serveLocalFile(session, req, out, head)
             return
         }
-        // HLS transcode sessions are served as a rewritten playlist + proxied segments so the TV never
-        // sees a Jellyfin URL or token (it only ever fetches ".../stream?seg=<opaque>").
+        // HLS sessions are served as a rewritten playlist + proxied resources so the TV never sees a
+        // provider URL or token (it only ever fetches ".../stream?seg=<opaque>").
         if (session.isHls) {
             serveHls(session, req, queryParam(req.path, "seg"), out, head)
             return
@@ -289,7 +293,12 @@ class LocalProxyServer(
 
         // A progressive transcode whose total size is unknown is deliberately non-seekable. Returning a
         // synthetic 206 here would claim bytes we cannot verify, so answer a normal 200 without ranges.
-        val totalLength = session.totalLength ?: req.knownTotalLength ?: -1L
+        val lease = remoteLeases[session.id]
+        if (lease == null) {
+            writeStatus(out, 404, "Not Found")
+            return
+        }
+        val totalLength = lease.descriptor.totalLength ?: session.totalLength ?: req.knownTotalLength ?: -1L
         if (totalLength < 0) {
             serveUnknownLengthUpstream(session, out, head)
             return
@@ -306,9 +315,9 @@ class LocalProxyServer(
         val rangeEndInclusive = requestedRange?.endInclusive ?: totalLength - 1
         val first = runCatching {
             if (requestedRange != null) {
-                openVerifiedRangeUpstream(session, requestedRange, totalLength)
+                openVerifiedRangeUpstream(session, lease, requestedRange, totalLength)
             } else {
-                openFullUpstream(session, totalLength)
+                openFullUpstream(session, lease, totalLength)
             }
         }.getOrNull()
         if (first == null) {
@@ -317,10 +326,10 @@ class LocalProxyServer(
             return
         }
 
-        // Safety net: a non-HLS session must never relay an HLS playlist (it would contain Jellyfin
-        // segment URLs + the token). If the upstream unexpectedly returns one, refuse.
-        if (looksLikePlaylist(first.request.url.toString(), first.header("Content-Type"))) {
-            closeUpstream(first)
+        // Safety net: a non-HLS session must never relay an HLS playlist (it could contain provider
+        // resource URLs). If the source unexpectedly returns one, refuse.
+        if (looksLikePlaylist(first.header("Content-Type"))) {
+            closeUpstream(session.id, first)
             writeStatus(out, 502, "Bad Gateway")
             logger.w(TAG, "Refusing to relay an HLS playlist on a non-HLS session")
             return
@@ -329,172 +338,175 @@ class LocalProxyServer(
         logger.trace(TAG, "TV ${req.method} direct stream: ${plan.status.code} range=${req.rangeHeader ?: "full"} total=$totalLength")
         writeHeaders(out, plan)
         if (head) {
-            closeUpstream(first)
+            closeUpstream(session.id, first)
             return
         }
-        streamResilient(session, first, rangeStart, rangeEndInclusive, totalLength, out, canResume = true)
+        streamResilient(session, lease, first, rangeStart, rangeEndInclusive, totalLength, out, canResume = true)
     }
 
-    private fun serveUnknownLengthUpstream(session: ProxySession, out: OutputStream, head: Boolean) {
-        val first = runCatching { openFullUpstream(session) }.getOrNull()
+    private suspend fun serveUnknownLengthUpstream(session: ProxySession, out: OutputStream, head: Boolean) {
+        val lease = remoteLeases[session.id]
+        val first = lease?.let { runCatching { openFullUpstream(session, it) }.getOrNull() }
         if (first == null) {
             writeStatus(out, 502, "Bad Gateway")
             logger.w(TAG, "Unknown-length upstream open failed")
             return
         }
-        if (looksLikePlaylist(first.request.url.toString(), first.header("Content-Type"))) {
-            closeUpstream(first)
+        if (looksLikePlaylist(first.header("Content-Type"))) {
+            closeUpstream(session.id, first)
             writeStatus(out, 502, "Bad Gateway")
             logger.w(TAG, "Refusing to relay an HLS playlist on a non-HLS session")
             return
         }
-        val contentLength = first.body?.contentLength()?.takeIf { it >= 0 }
+        val contentLength = first.declaredContentLength()
         writeSimpleHeaders(out, 200, "OK", session.contentType, contentLength, acceptRanges = false, extra = null)
         if (head) {
-            closeUpstream(first)
+            closeUpstream(session.id, first)
             return
         }
-        streamResilient(session, first, rangeStart = 0, rangeEndInclusive = null, expectedTotalLength = -1, out = out, canResume = false)
+        streamResilient(session, lease, first, rangeStart = 0, rangeEndInclusive = null, expectedTotalLength = -1, out = out, canResume = false)
     }
 
-    /**
-     * Serve an HLS resource for an HLS session. With no `seg` param this is the master playlist
-     * (`session.upstreamUrl`); a `seg` param resolves to a nested media playlist, segment, key, or
-     * subtitle. Playlists are rewritten so every URI becomes a phone proxy `?seg=<opaque>` URL (via
-     * [HlsRewriter] + the per-session [HlsSegmentRegistry]); other resources are streamed through. The
-     * Jellyfin URL/token never reaches the TV.
-     */
-    private fun serveHls(session: ProxySession, req: RequestLine, segParam: String?, out: OutputStream, head: Boolean) {
-        val originPolicy = TrustedMediaOriginPolicy.fromBaseUrl(session.upstreamUrl)
-        if (originPolicy == null) {
-            writeStatus(out, 502, "Bad Gateway")
-            logger.w(TAG, "Refusing HLS request with an invalid upstream origin")
+    /** Serve source-owned HLS resources without learning their URLs, credentials, or server type. */
+    private suspend fun serveHls(
+        session: ProxySession,
+        req: RequestLine,
+        segParam: String?,
+        out: OutputStream,
+        head: Boolean,
+    ) {
+        val lease = remoteLeases[session.id]
+        if (lease == null) {
+            writeStatus(out, 404, "Not Found")
             return
         }
-        val registry = hlsRegistries.computeIfAbsent(session.id) { _ -> HlsSegmentRegistry() }
-        val resourceUrl = if (segParam == null) session.upstreamUrl else registry.resolve(segParam)
-        val trustedResourceUrl = resourceUrl?.let(originPolicy::trustedAbsolute)
-        if (trustedResourceUrl == null) {
-            writeStatus(out, 404, "Not Found"); return
+        val registry = hlsRegistries.computeIfAbsent(session.id) { HlsSegmentRegistry() }
+        val resourceMap = hlsResources.computeIfAbsent(session.id) { ConcurrentHashMap() }
+        val resource = if (segParam == null) null else registry.resolve(segParam)?.let(resourceMap::get)
+        if (segParam != null && resource == null) {
+            writeStatus(out, 404, "Not Found")
+            return
         }
-        // The top-level playlist is always fetched whole; only `?seg=` resources (segments) honour a
-        // client Range, so we never request a partial playlist.
-        val upstreamRange = if (segParam == null) null else req.rangeHeader
-        logger.trace(TAG, "TV fetched HLS ${if (segParam == null) "master/media playlist" else "segment"}${req.rangeHeader?.let { " range=$it" } ?: ""}")
-        val resp = openHlsUpstream(session, trustedResourceUrl.toString(), upstreamRange, originPolicy)
-        if (resp == null) {
+        val range = if (resource == null || resource.kind == StreamResourceKind.PLAYLIST) {
+            null
+        } else {
+            (HttpRange.parse(req.rangeHeader, -1L) as? RangeParseResult.Satisfiable)?.range
+        }
+        val requestRangeHeader = range?.let(::rangeHeader)
+        logger.trace(TAG, "TV fetched HLS ${if (resource == null) "playlist" else "resource"}${requestRangeHeader?.let { " range=$it" } ?: ""}")
+        val response = openHlsUpstream(session, lease, resource, range)
+        if (response == null) {
             writeStatus(out, 502, "Bad Gateway")
-            logger.w(TAG, "HLS upstream open failed or returned non-success")
+            logger.w(TAG, "HLS source open failed or returned non-success")
             return
         }
         try {
-            val resolvedResourceUrl = resp.request.url
-            if (!originPolicy.isTrusted(resolvedResourceUrl)) {
-                writeStatus(out, 502, "Bad Gateway")
-                logger.w(TAG, "Refusing an HLS redirect outside the trusted upstream origin")
-                return
-            }
-            val contentType = resp.header("Content-Type")
-            if (resp.code == 416) {
-                val totalLength = upstreamRange?.let {
-                    UpstreamRangeVerifier.unsatisfiedTotal(resp.code, resp.headers("Content-Range"))
+            val contentType = response.header("Content-Type")
+            if (response.statusCode == 416) {
+                val totalLength = requestRangeHeader?.let {
+                    UpstreamRangeVerifier.unsatisfiedTotal(response.statusCode, response.headers("Content-Range"))
                 }
                 if (totalLength == null) {
                     writeStatus(out, 502, "Bad Gateway")
-                    logger.w(TAG, "HLS upstream returned an invalid unsatisfied range")
+                    logger.w(TAG, "HLS source returned an invalid unsatisfied range")
                     return
                 }
-                val mime = contentType ?: guessSegmentMime(resolvedResourceUrl.toString())
                 writeHeaders(
                     out,
                     HttpResponsePlan.plan(
                         RangeParseResult.Unsatisfiable(totalLength),
                         totalLength,
-                        mime,
+                        contentType ?: "application/octet-stream",
                         head,
                     ),
                 )
                 return
             }
-            val playlist = looksLikePlaylist(resolvedResourceUrl.toString(), contentType)
+            val playlist = resource == null ||
+                resource.kind == StreamResourceKind.PLAYLIST ||
+                looksLikePlaylist(contentType)
             val responseValid = when {
-                playlist -> upstreamRange == null && resp.code == 200
-                upstreamRange == null -> resp.code == 200 && hasValidContentLength(resp)
-                else -> hasValidContentLength(resp) && UpstreamRangeVerifier.matchesRequestHeader(
-                    statusCode = resp.code,
-                    contentRanges = resp.headers("Content-Range"),
-                    contentLength = declaredContentLength(resp),
-                    requestHeader = upstreamRange,
+                playlist -> range == null && response.statusCode == 200
+                range == null -> response.statusCode == 200 && response.hasValidContentLength()
+                else -> response.hasValidContentLength() && UpstreamRangeVerifier.matchesRequestHeader(
+                    statusCode = response.statusCode,
+                    contentRanges = response.headers("Content-Range"),
+                    contentLength = response.declaredContentLength(),
+                    requestHeader = requireNotNull(requestRangeHeader),
                 )
             }
             if (!responseValid) {
                 writeStatus(out, 502, "Bad Gateway")
-                logger.w(TAG, "HLS upstream did not prove the requested response range")
+                logger.w(TAG, "HLS source did not prove the requested response range")
                 return
             }
             if (playlist) {
-                // Bound the playlist read (§16): a semi-trusted Jellyfin server must not be able to
-                // return an unbounded "playlist" and exhaust the phone heap. Oversized/missing -> 502.
-                val bodyBytes = resp.body?.byteStream()?.let { BoundedBody.readAtMost(it, MAX_PLAYLIST_BYTES) }
+                val bodyBytes = BoundedBody.readAtMost(response.body, MAX_PLAYLIST_BYTES)
                 if (bodyBytes == null) {
                     writeStatus(out, 502, "Bad Gateway")
-                    logger.w(TAG, "HLS playlist missing or exceeded the size cap")
+                    logger.w(TAG, "HLS playlist exceeded the size cap")
                     return
                 }
                 val body = bodyBytes.toString(Charsets.UTF_8)
                 val proxyBase = "http://$boundAddress:$boundPort/session/${session.id}"
-                val rewritten = runCatching {
+                val rewritten = try {
                     val rewriter = HlsRewriter(proxyBase)
                     val rawReferences = rewriter.uriReferences(body, registry.capacity)
-                    val resolvedByRaw = rawReferences.associateWith { uri ->
-                        val nestedUrl = originPolicy.resolve(uri, resolvedResourceUrl)
+                    val resolvedByRaw = LinkedHashMap<String, StreamResourceRef>()
+                    for (uri in rawReferences) {
+                        val nested = lease.resolve(uri, resource).getOrThrow()
                             ?: throw IllegalArgumentException("Untrusted HLS URI")
-                        nestedUrl.toString()
+                        resolvedByRaw[uri] = nested
+                        resourceMap[nested.opaqueId] = nested
                     }
-                    val encodedByUrl = registry.encodeBatch(resolvedByRaw.values)
+                    val encodedById = registry.encodeBatch(resolvedByRaw.values.map { it.opaqueId })
                     rewriter.rewrite(body) { uri ->
-                        encodedByUrl.getValue(resolvedByRaw.getValue(uri))
+                        encodedById.getValue(resolvedByRaw.getValue(uri).opaqueId)
                     }
-                }.getOrElse {
+                } catch (error: Exception) {
                     writeStatus(out, 502, "Bad Gateway")
-                    logger.w(TAG, "Rejected an HLS URI outside the trusted upstream origin")
+                    logger.w(TAG, "Source rejected an HLS resource reference", error)
                     return
                 }
                 val bytes = rewritten.toByteArray(Charsets.UTF_8)
-                writeSimpleHeaders(out, 200, "OK", "application/vnd.apple.mpegurl", bytes.size.toLong(), acceptRanges = false, extra = null)
-                if (!head) { out.write(bytes); out.flush() }
+                writeSimpleHeaders(out, 200, "OK", "application/vnd.apple.mpegurl", bytes.size.toLong(), false, null)
+                if (!head) {
+                    out.write(bytes)
+                    out.flush()
+                }
             } else {
-                val mime = contentType ?: guessSegmentMime(resolvedResourceUrl.toString())
-                val length = declaredContentLength(resp)
-                val code = if (upstreamRange != null) 206 else 200
+                val length = response.declaredContentLength()
+                val code = if (range != null) 206 else 200
                 val reason = if (code == 206) "Partial Content" else "OK"
-                writeSimpleHeaders(out, code, reason, mime, length, acceptRanges = true, extra = resp.header("Content-Range")?.let { "Content-Range" to it })
-                if (!head) resp.body?.byteStream()?.let { copyTo(it, out) }
+                writeSimpleHeaders(
+                    out,
+                    code,
+                    reason,
+                    contentType ?: "application/octet-stream",
+                    length,
+                    acceptRanges = true,
+                    extra = response.header("Content-Range")?.let { "Content-Range" to it },
+                )
+                if (!head) copyTo(response.body, out)
             }
         } finally {
-            closeUpstream(resp)
+            closeUpstream(session.id, response)
         }
     }
 
-    private fun openUpstream(session: ProxySession, rangeHeaderValue: String?): Response =
-        openUpstreamUrl(
-            session.id,
-            session.upstreamUrl,
-            session.upstreamAuthHeader,
-            rangeHeaderValue,
-            TrustedMediaOriginPolicy.fromBaseUrl(session.upstreamUrl)
-                ?: throw IOException("Refusing an invalid upstream origin"),
-        )
-
     /** A full response must start at byte zero; a 206 without a Range request is not safe to relay. */
-    private fun openFullUpstream(session: ProxySession, expectedTotalLength: Long? = null): Response? {
-        val response = openUpstream(session, null)
-        val declaredLength = declaredContentLength(response)
-        val valid = response.code == 200 &&
-            hasValidContentLength(response) &&
+    private suspend fun openFullUpstream(
+        session: ProxySession,
+        lease: StreamLease,
+        expectedTotalLength: Long? = null,
+    ): StreamResponse? {
+        val response = openTracked(session, lease, null)
+        val declaredLength = response.declaredContentLength()
+        val valid = response.statusCode == 200 &&
+            response.hasValidContentLength() &&
             (expectedTotalLength == null || declaredLength == null || declaredLength == expectedTotalLength)
         if (valid) return response
-        closeUpstream(response)
+        closeUpstream(session.id, response)
         return null
     }
 
@@ -503,95 +515,80 @@ class LocalProxyServer(
      * about to advertise downstream. Returning null denotes a protocol-invalid response; I/O failures
      * are intentionally thrown so the retry policy can distinguish them.
      */
-    private fun openVerifiedRangeUpstream(
+    private suspend fun openVerifiedRangeUpstream(
         session: ProxySession,
-        requested: com.adsamcik.streamferry.core.http.ByteRange,
+        lease: StreamLease,
+        requested: ByteRange,
         totalLength: Long,
-    ): Response? {
-        val response = openUpstream(session, "bytes=${requested.start}-${requested.endInclusive}")
-        val valid = hasValidContentLength(response) && UpstreamRangeVerifier.isExact(
-            statusCode = response.code,
+    ): StreamResponse? {
+        val response = openTracked(session, lease, requested)
+        val valid = response.hasValidContentLength() && UpstreamRangeVerifier.isExact(
+            statusCode = response.statusCode,
             contentRanges = response.headers("Content-Range"),
-            contentLength = declaredContentLength(response),
+            contentLength = response.declaredContentLength(),
             requested = requested,
             expectedTotalLength = totalLength,
         )
         if (valid) return response
-        closeUpstream(response)
+        closeUpstream(session.id, response)
         return null
     }
 
-    private fun hasValidContentLength(response: Response): Boolean {
-        val values = response.headers("Content-Length")
-        return values.isEmpty() ||
-            (values.size == 1 && values.single().toLongOrNull()?.let { it >= 0 } == true)
+    private fun StreamResponse.header(name: String): String? =
+        headers.entries.firstOrNull { it.key.equals(name, ignoreCase = true) }?.value
+
+    private fun StreamResponse.headers(name: String): List<String> = listOfNotNull(header(name))
+
+    private fun StreamResponse.hasValidContentLength(): Boolean =
+        header("Content-Length")?.toLongOrNull()?.let { it >= 0 } ?: true
+
+    private fun StreamResponse.declaredContentLength(): Long? =
+        header("Content-Length")?.toLongOrNull()?.takeIf { it >= 0 }
+
+    private fun rangeHeader(range: ByteRange): String =
+        if (range.endInclusive == Long.MAX_VALUE) "bytes=${range.start}-"
+        else "bytes=${range.start}-${range.endInclusive}"
+
+    private suspend fun openTracked(
+        session: ProxySession,
+        lease: StreamLease,
+        range: ByteRange?,
+    ): StreamResponse {
+        val response = lease.open(range).getOrThrow()
+        return trackResponse(session.id, response)
     }
 
-    private fun declaredContentLength(response: Response): Long? =
-        response.headers("Content-Length").singleOrNull()?.toLongOrNull()?.takeIf { it >= 0 }
+    private suspend fun openTracked(
+        session: ProxySession,
+        lease: StreamLease,
+        resource: StreamResourceRef,
+        range: ByteRange?,
+    ): StreamResponse {
+        val response = lease.open(resource, range).getOrThrow()
+        return trackResponse(session.id, response)
+    }
 
-    /**
-     * Open an authenticated upstream request, following only a small number of redirects that remain
-     * on the already-pinned origin. An origin change never receives an Authorization header because no
-     * request is created for it. Calls are tracked before execution so local teardown cancels them.
-     */
-    private fun openUpstreamUrl(
-        sessionId: String,
-        url: String,
-        authHeader: String?,
-        rangeHeaderValue: String?,
-        originPolicy: TrustedMediaOriginPolicy,
-    ): Response {
-        var target = originPolicy.trustedAbsolute(url)
-            ?: throw IOException("Refusing an upstream URL outside the trusted origin")
-        repeat(MAX_UPSTREAM_REDIRECTS + 1) {
-            val builder = Request.Builder().url(target).get()
-            authHeader?.let { builder.header("Authorization", it) }
-            rangeHeaderValue?.let { builder.header("Range", it) }
-            val call = upstreamHttpClient.newCall(builder.build())
-            synchronized(lifecycleLock) {
-                if (stopping || !sessions.isActive(sessionId)) {
-                    throw IOException("Proxy session is no longer active")
-                }
-                activeCallsBySession.computeIfAbsent(sessionId) { ConcurrentHashMap.newKeySet() }.add(call)
+    private fun trackResponse(sessionId: String, response: StreamResponse): StreamResponse {
+        val accepted = synchronized(lifecycleLock) {
+            if (stopping || !sessions.isActive(sessionId)) false
+            else {
+                activeResponses.computeIfAbsent(sessionId) { ConcurrentHashMap.newKeySet() }.add(response)
+                true
             }
-            val response = try {
-                call.execute()
-            } catch (t: Throwable) {
-                untrackCall(call)
-                throw t
-            }
-            val accepted = synchronized(lifecycleLock) {
-                if (stopping || !sessions.isActive(sessionId)) false
-                else {
-                    responseCalls[response] = call
-                    true
-                }
-            }
-            if (!accepted) {
-                runCatching { response.close() }
-                untrackCall(call)
-                throw IOException("Proxy session was revoked while opening upstream")
-            }
-            if (!response.isRedirect) return response
-            val redirect = response.header("Location")?.let { originPolicy.resolve(it, target) }
-            closeUpstream(response)
-            target = redirect ?: throw IOException("Refusing an upstream redirect outside the trusted origin")
         }
-        throw IOException("Too many upstream redirects")
+        if (!accepted) {
+            runCatching { response.close() }
+            throw IOException("Proxy session was revoked while opening source stream")
+        }
+        return response
     }
 
-    /** Unregister the call only after the response body has been closed or cancellation has completed. */
-    private fun closeUpstream(response: Response) {
-        responseCalls.remove(response)?.let(::untrackCall)
+    private fun closeUpstream(sessionId: String, response: StreamResponse) {
+        activeResponses[sessionId]?.let { responses ->
+            responses.remove(response)
+            if (responses.isEmpty()) activeResponses.remove(sessionId, responses)
+        }
         runCatching { response.close() }
-    }
-
-    private fun untrackCall(call: Call) {
-        activeCallsBySession.entries.forEach { (sessionId, calls) ->
-            calls.remove(call)
-            if (calls.isEmpty()) activeCallsBySession.remove(sessionId, calls)
-        }
     }
 
     /**
@@ -599,27 +596,25 @@ class LocalProxyServer(
      * decides). A live transcode segment can be momentarily unavailable (a quick 5xx or a connection reset)
      * right after a re-resolve; a couple of short retries ride that out. A read timeout is NOT retried — the
      * server is just slow to produce the segment, so another 30s attempt would only stall the TV further.
-     * Returns a successful (200/206) [Response] to stream, or null (caller sends 502).
+     * Returns a successful (200/206) source response to stream, or null (caller sends 502).
      */
-    private fun openHlsUpstream(
+    private suspend fun openHlsUpstream(
         session: ProxySession,
-        url: String,
-        rangeHeaderValue: String?,
-        originPolicy: TrustedMediaOriginPolicy,
-    ): Response? {
+        lease: StreamLease,
+        resource: StreamResourceRef?,
+        range: ByteRange?,
+    ): StreamResponse? {
         var attempt = 0
         while (true) {
-            val result = runCatching {
-                openUpstreamUrl(session.id, url, session.upstreamAuthHeader, rangeHeaderValue, originPolicy)
-            }
+            val result = runCatching { if (resource == null) openTracked(session, lease, range) else openTracked(session, lease, resource, range) }
             val response = result.getOrNull()
             if (response != null && (
-                    UpstreamRetry.isSuccess(response.code) ||
-                        (response.code == 416 && rangeHeaderValue != null)
+                    UpstreamRetry.isSuccess(response.statusCode) ||
+                        (response.statusCode == 416 && range != null)
                     )
             ) return response
-            val code = response?.code
-            response?.let(::closeUpstream)
+            val code = response?.statusCode
+            response?.let { closeUpstream(session.id, it) }
             val timedOut = result.exceptionOrNull() is java.io.InterruptedIOException // incl. SocketTimeoutException
             if (attempt >= HLS_OPEN_MAX_RETRIES || !UpstreamRetry.shouldRetryOpen(code, timedOut)) return null
             attempt++
@@ -820,18 +815,9 @@ class LocalProxyServer(
         if (!head) { out.write(bytes); runCatching { out.flush() } }
     }
 
-    private fun looksLikePlaylist(url: String, contentType: String?): Boolean {
-        if (contentType != null && (contentType.contains("mpegurl", true) || contentType.contains("vnd.apple", true))) return true
-        return url.substringBefore('?').endsWith(".m3u8", true)
-    }
-
-    private fun guessSegmentMime(url: String): String = when {
-        url.substringBefore('?').endsWith(".ts", true) -> "video/mp2t"
-        url.substringBefore('?').endsWith(".m4s", true) || url.substringBefore('?').endsWith(".mp4", true) -> "video/mp4"
-        url.substringBefore('?').endsWith(".vtt", true) -> "text/vtt"
-        url.substringBefore('?').endsWith(".aac", true) -> "audio/aac"
-        else -> "application/octet-stream"
-    }
+    private fun looksLikePlaylist(contentType: String?): Boolean =
+        contentType != null &&
+            (contentType.contains("mpegurl", true) || contentType.contains("vnd.apple", true))
 
     private fun queryParam(path: String, key: String): String? {
         val query = path.substringAfter('?', "")
@@ -878,9 +864,10 @@ class LocalProxyServer(
      * stays open across the dip so it never observes the failure. All retry/backoff/offset decisions
      * come from the pure-JVM [ResilientStreamPolicy]; a downstream (TV) failure aborts immediately.
      */
-    private fun streamResilient(
+    private suspend fun streamResilient(
         session: ProxySession,
-        initialResp: Response,
+        lease: StreamLease,
+        initialResp: StreamResponse,
         rangeStart: Long,
         rangeEndInclusive: Long?,
         expectedTotalLength: Long,
@@ -890,15 +877,15 @@ class LocalProxyServer(
         val policy = ResilientStreamPolicy(rangeStart, rangeEndInclusive)
         val watchdog = ThroughputWatchdog()
         val buf = ByteArray(MemoryBufferPolicy.COPY_CHUNK_BYTES)
-        var response: Response? = initialResp
+        var response: StreamResponse? = initialResp
         try {
             while (true) {
                 if (response == null) {
                     val rangeEnd = policy.rangeEndInclusive
                     if (!canResume || rangeEnd == null) return
-                    val requested = com.adsamcik.streamferry.core.http.ByteRange(policy.nextOffset, rangeEnd)
+                    val requested = ByteRange(policy.nextOffset, rangeEnd)
                     response = try {
-                        openVerifiedRangeUpstream(session, requested, expectedTotalLength)
+                        openVerifiedRangeUpstream(session, lease, requested, expectedTotalLength)
                     } catch (_: Exception) {
                         if (!retryOrGiveUp(policy)) return else continue
                     }
@@ -912,13 +899,11 @@ class LocalProxyServer(
                 val resp = response
                 response = null
                 val result = try {
-                    val body = resp.body
-                    if (body == null) StreamResult.UPSTREAM_FAILED
-                    else copyStream(body.byteStream(), out, buf, policy, watchdog)
+                    copyStream(resp.body, out, buf, policy, watchdog)
                 } catch (_: Exception) {
                     StreamResult.UPSTREAM_FAILED
                 } finally {
-                    closeUpstream(resp)
+                    closeUpstream(session.id, resp)
                 }
                 when (result) {
                     StreamResult.COMPLETE, StreamResult.DOWNSTREAM_GONE -> return
@@ -930,7 +915,7 @@ class LocalProxyServer(
                 }
             }
         } finally {
-            response?.let(::closeUpstream)
+            response?.let { closeUpstream(session.id, it) }
             runCatching { out.flush() }
         }
     }
@@ -1052,25 +1037,7 @@ class LocalProxyServer(
         // read timeout is not retried (see openHlsUpstream / UpstreamRetry.shouldRetryOpen).
         private const val HLS_OPEN_MAX_RETRIES = 2
         private const val HLS_OPEN_RETRY_BACKOFF_MS = 250L
-        /** Same-origin redirects are handled manually; this bounds loops without exposing Location. */
-        private const val MAX_UPSTREAM_REDIRECTS = 3
-
-        /** Hard cap on an upstream HLS playlist read into memory (a semi-trusted Jellyfin response). */
+        /** Hard cap on a source HLS playlist read into memory. */
         private const val MAX_PLAYLIST_BYTES = 4 * 1024 * 1024
-
-        /**
-         * Upstream client tuned for spotty links. `readTimeout` bounds how long a stalled upstream
-         * read may hang before it throws — that exception is what triggers the resilient Range-resume
-         * in [streamResilient], so it is kept moderate (detect a real stall, not a brief dip). No
-         * `callTimeout` is set (default 0): a single transfer can legitimately run for a whole movie,
-         * and an overall cap would kill long playbacks. `retryOnConnectionFailure` lets OkHttp retry
-         * connection-establishment hiccups, complementing our higher-level read-resume.
-         */
-        private fun defaultClient(): OkHttpClient = OkHttpClient.Builder()
-            .connectTimeout(15, TimeUnit.SECONDS)
-            .readTimeout(30, TimeUnit.SECONDS)
-            .writeTimeout(30, TimeUnit.SECONDS)
-            .retryOnConnectionFailure(true)
-            .build()
     }
 }

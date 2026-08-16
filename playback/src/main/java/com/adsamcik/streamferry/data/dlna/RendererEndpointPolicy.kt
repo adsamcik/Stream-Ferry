@@ -16,7 +16,7 @@ import javax.net.SocketFactory
 
 /**
  * Trust policy for URLs learned from SSDP/device descriptions. It is deliberately distinct from the
- * user-entered Jellyfin URL policy: renderer endpoints must be private IPv4 peers on one selected
+ * remote-source URL policy: renderer endpoints must be private IPv4 peers on one selected
  * physical LAN and are pinned to the SSDP response source for the renderer descriptor's lifetime.
  */
 class RendererEndpointPolicy(private val networkInfo: NetworkInfoProvider) {

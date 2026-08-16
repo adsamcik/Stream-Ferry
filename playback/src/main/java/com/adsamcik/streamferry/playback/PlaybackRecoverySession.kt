@@ -126,7 +126,7 @@ private fun RecoveryBudgetUsage.consume(kind: RecoveryAttemptKind): RecoveryBudg
 /**
  * Input for the coordinator/UI-owned alternate-protocol attempt. A renderer disconnect or a format
  * rejection can warrant trying a different endpoint after same-endpoint work is exhausted; upstream
- * Jellyfin/server failures cannot, because changing the receiver protocol would not repair the source.
+ * Source/server failures cannot, because changing the receiver protocol would not repair the source.
  */
 data class ProtocolSwitchInput(
     val isLocalSession: Boolean,

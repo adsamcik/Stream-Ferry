@@ -59,7 +59,7 @@ import java.util.Locale
 /**
  * DLNA / UPnP control point (Digital Media Controller) (§11). The Android app discovers MediaRenderers
  * via SSDP, controls them via AVTransport SOAP, and tells the TV to fetch media from the phone proxy
- * URL only (never Jellyfin). All XML is parsed with [SecureXml] (XXE-hardened) off the main thread.
+ * URL only (never a provider URL). All XML is parsed with [SecureXml] (XXE-hardened) off the main thread.
  *
  * No third-party UPnP library is used (dependency rule §11): platform multicast + OkHttp SOAP only.
  */

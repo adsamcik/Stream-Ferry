@@ -55,6 +55,7 @@ import com.adsamcik.streamferry.diagnostics.ReportShare
 import com.adsamcik.streamferry.domain.AccountLibraryScope
 import com.adsamcik.streamferry.domain.MediaLibraryRepository
 import com.adsamcik.streamferry.domain.MediaSource
+import com.adsamcik.streamferry.domain.MediaSourceIds
 import com.adsamcik.streamferry.domain.SecureTokenStore
 import com.adsamcik.streamferry.logging.DiagnosticsLogger
 import com.adsamcik.streamferry.permissions.AndroidNetworkPermissionManager
@@ -71,6 +72,10 @@ import com.adsamcik.streamferry.playback.reporting.DefaultProviderPlaybackReport
 import com.adsamcik.streamferry.playback.session.DefaultPlaybackSessionCoordinator
 import com.adsamcik.streamferry.ui.theme.AppearancePreferences
 import com.adsamcik.streamferry.ui.artwork.ArtworkRefFetcher
+import com.adsamcik.streamferry.source.api.MediaRef
+import com.adsamcik.streamferry.source.api.PlaybackProvider
+import com.adsamcik.streamferry.source.api.PlaybackRequest
+import com.adsamcik.streamferry.source.api.SourceBackend
 import com.adsamcik.streamferry.source.api.SourceRegistry
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -200,7 +205,34 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
     val smartResumeStore: SmartResumeStore by lazy { SmartResumeStore(appContext) }
     val jellyfinWatchMutationStore: JellyfinWatchMutationStore by lazy { JellyfinWatchMutationStore(appContext) }
     val smartResumeTracker: SmartResumeSessionTracker by lazy { SmartResumeSessionTracker(smartResumeStore) }
-    val jellyfinMediaSource: MediaSource by lazy { JellyfinMediaSource(mediaRepository) }
+    private val rawJellyfinMediaSource: MediaSource by lazy { JellyfinMediaSource(mediaRepository) }
+    val jellyfinMediaSource: MediaSource by lazy {
+        object : MediaSource {
+            override val id = rawJellyfinMediaSource.id
+            override val displayName = rawJellyfinMediaSource.displayName
+            override val capabilities = rawJellyfinMediaSource.capabilities
+
+            override suspend fun roots() = currentJellyfinBackend()
+                ?.catalog?.roots()
+                ?: Result.failure(IllegalStateException("No server source is configured"))
+
+            override suspend fun children(parentId: String) = currentJellyfinBackend()
+                ?.let { backend -> backend.catalog.children(MediaRef(backend.identity.id, parentId)) }
+                ?: Result.failure(IllegalStateException("No server source is configured"))
+
+            override suspend fun item(itemId: String) = currentJellyfinBackend()
+                ?.let { backend -> backend.catalog.item(MediaRef(backend.identity.id, itemId)) }
+                ?: Result.failure(IllegalStateException("No server source is configured"))
+
+            override suspend fun search(query: String) = currentJellyfinBackend()
+                ?.catalog?.search(query)
+                ?: Result.failure(IllegalStateException("No server source is configured"))
+
+            override suspend fun continueWatching() = currentJellyfinBackend()
+                ?.catalog?.continueWatching()
+                ?: Result.failure(IllegalStateException("No server source is configured"))
+        }
+    }
     val localMediaSource: LocalMediaSource by lazy {
         LocalMediaSource(
             appContext,
@@ -228,7 +260,7 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
      * after an account/server transition so its immutable source instance id always matches that session.
      */
     fun sourceRegistry(): SourceRegistry {
-        val backends = mutableListOf<com.adsamcik.streamferry.source.api.SourceBackend>(localSourceBackend)
+        val backends = mutableListOf<SourceBackend>(localSourceBackend)
         (authRepository.currentUser.value ?: authRepository.cachedSession.value)?.let { session ->
             val identity = JellyfinSourceBackend.identity(
                 serverId = session.serverId,
@@ -237,7 +269,7 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
             )
             backends += JellyfinSourceBackend(
                 identity = identity,
-                delegate = jellyfinMediaSource,
+                delegate = rawJellyfinMediaSource,
                 artworkProvider = JellyfinArtworkProvider(identity.id, jellyfinClient, httpClient),
                 playback = JellyfinPlaybackProvider(
                     source = identity.id,
@@ -249,8 +281,29 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
         }
         return SourceRegistry(backends)
     }
+
+    private fun currentJellyfinBackend(): SourceBackend? = sourceRegistry().all()
+        .firstOrNull { it.identity.id.provider == JellyfinSourceBackend.PROVIDER_ID }
+
+    /** Routes by canonical source identity; the legacy `remote` fallback migrates old cached items. */
+    private val registeredPlaybackProvider = object : PlaybackProvider {
+        override suspend fun prepare(request: PlaybackRequest) = runCatching {
+            val registry = sourceRegistry()
+            val backend = registry.get(request.media.source)
+                ?: registry.all().singleOrNull { candidate ->
+                    candidate.playback != null && request.media.source.provider.value == MediaSourceIds.REMOTE
+                }
+                ?: error("No playback source is registered for this media")
+            val provider = backend.playback ?: error("This source does not support remote playback")
+            val normalized = if (request.media.source == backend.identity.id) request else {
+                request.copy(media = request.media.copy(source = backend.identity.id))
+            }
+            provider.prepare(normalized).getOrThrow()
+        }
+    }
+
     private val coordinator: DefaultPlaybackSessionCoordinator by lazy {
-        DefaultPlaybackSessionCoordinator(sessionRegistry, proxyServer, reporter, logger)
+        DefaultPlaybackSessionCoordinator(sessionRegistry, proxyServer, logger)
     }
 
     // ----- targets -----
@@ -330,7 +383,7 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
 
     val playbackEngine: PlaybackEngine by lazy {
         PlaybackEngine(
-            playbackProvider = jellyfinRepository,
+            playbackProvider = registeredPlaybackProvider,
             coordinator = coordinator,
             proxy = proxyServer,
             networkInfo = networkInfo,

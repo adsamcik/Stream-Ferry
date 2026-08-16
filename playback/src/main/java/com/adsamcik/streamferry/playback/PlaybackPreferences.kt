@@ -5,7 +5,7 @@ import android.content.Context
 /**
  * Local, app-private playback preferences. Currently the **Prefer original quality (direct play)**
  * toggle: when on (default), the app first tries to stream the original file directly — advertising a
- * broad codec profile so Jellyfin direct-plays/remuxes when the TV can decode it — and only falls back
+ * broad codec profile so a source direct-plays/remuxes when the TV can decode it — and only falls back
  * to a server transcode if the receiver (Cast or DLNA) can't play it. When off, the safe conservative
  * transcode profile is always used (no direct-play attempt or fallback delay). Cleared by "Delete all
  * app data" (§13).
@@ -46,7 +46,7 @@ class PlaybackPreferences(context: Context) {
 
     /**
      * When on (default), finishing an episode automatically starts the next episode in the series (on the
-     * same TV). Off leaves the app on the gallery when an episode ends. Only applies to Jellyfin episodes.
+     * same TV). Off leaves the app on the gallery when an episode ends. Only applies to episodic sources.
      */
     var autoPlayNextEpisode: Boolean
         get() = prefs.getBoolean(KEY_AUTOPLAY_NEXT, true)
@@ -55,8 +55,8 @@ class PlaybackPreferences(context: Context) {
         }
 
     /**
-     * When on (default), the app auto-skips intro/outro/recap segments provided by Jellyfin's Media
-     * Segments API (10.10+, Intro Skipper plugin): it seeks past a segment as soon as playback enters it
+     * When on (default), the app auto-skips intro/outro/recap segments provided by the active source's
+     * segment capability: it seeks past a segment as soon as playback enters it
      * (once per segment). A manual "Skip" button is always offered while inside a segment regardless.
      */
     var autoSkipSegments: Boolean

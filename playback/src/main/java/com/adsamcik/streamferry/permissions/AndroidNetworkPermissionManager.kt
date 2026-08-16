@@ -20,7 +20,7 @@ import kotlinx.coroutines.flow.asStateFlow
  *
  * ACCESS_LOCAL_NETWORK is a runtime permission introduced for local-network access; it is requested
  * and explained when the app needs the TV to fetch from the phone or to discover Cast/DLNA devices.
- * The app must keep Jellyfin browsing usable even when it is denied/revoked (browsing only needs
+ * The app must keep remote-source browsing usable even when it is denied/revoked (browsing only needs
  * INTERNET; only TV playback requires local-network access).
  */
 class AndroidNetworkPermissionManager(context: Context) : NetworkPermissionManager {

@@ -38,7 +38,7 @@ class CoreEdgeCaseTest {
 
     @Test fun allowedSubPathsResolve() {
         val reg = registry()
-        val s = reg.create("u", null, "application/vnd.apple.mpegurl", null, isHls = true)
+        val s = reg.create("application/vnd.apple.mpegurl", isHls = true)
         assertIs<SessionLookup.Ok>(reg.resolve("/session/${s.id}/playlist.m3u8"))
         assertIs<SessionLookup.Ok>(reg.resolve("/session/${s.id}/test"))
         assertIs<SessionLookup.Ok>(reg.resolve("/session/${s.id}/stream"))
@@ -46,7 +46,7 @@ class CoreEdgeCaseTest {
 
     @Test fun queryStringIsStrippedNotLeaked() {
         val reg = registry()
-        val s = reg.create("http://jelly/stream?api_key=secret", "auth", "video/mp4", "ps")
+        val s = reg.create("video/mp4")
         // A trailing query (e.g. Cast appends cache-busting params) must still resolve.
         val r = reg.resolve("/session/${s.id}/stream?foo=bar&t=123")
         assertIs<SessionLookup.Ok>(r)
@@ -62,7 +62,7 @@ class CoreEdgeCaseTest {
 
     @Test fun backslashAndNulRejected() {
         val reg = registry()
-        val s = reg.create("u", null, "video/mp4", null)
+        val s = reg.create("video/mp4")
         assertIs<SessionLookup.Forbidden>(reg.resolve("/session/${s.id}/str\\eam"))
         assertIs<SessionLookup.Forbidden>(reg.resolve("/session/${s.id}/stream\u0000"))
     }
@@ -70,8 +70,8 @@ class CoreEdgeCaseTest {
     @Test fun purgeExpiredRemovesAndCounts() {
         var t = 0L
         val reg = registry { t }
-        reg.create("u", null, "video/mp4", null, ttlMillis = 1000)
-        reg.create("u", null, "video/mp4", null, ttlMillis = 1000)
+        reg.create("video/mp4", ttlMillis = 1000)
+        reg.create("video/mp4", ttlMillis = 1000)
         assertEquals(2, reg.activeCount())
         t = 5000
         assertEquals(2, reg.purgeExpired())

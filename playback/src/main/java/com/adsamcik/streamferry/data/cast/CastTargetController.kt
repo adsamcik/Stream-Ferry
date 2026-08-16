@@ -53,7 +53,7 @@ import kotlin.time.Duration.Companion.milliseconds
  *
  * Discovery enumerates Cast routes via [MediaRouter] (active scan) so the in-app device picker can
  * list them; [connect] selects a route and waits for the [CastSession] to establish. The receiver
- * only ever receives the phone proxy URL + a safe MIME/title — never any Jellyfin URL, token or
+ * only ever receives the phone proxy URL + a safe MIME/title — never any provider URL, token or
  * poster. A [RemoteMediaClient.Callback] surfaces real position / buffering / ended events that drive
  * progress reporting and the adaptive-bitrate controller.
  *
@@ -288,7 +288,7 @@ class CastTargetController(
             .setMetadata(metadata)
         durationSeconds?.let { mediaInfoBuilder.setStreamDuration(it * 1000L) }
         // Cast defaults HLS media to MPEG-TS unless told otherwise. The phone's on-device
-        // transcode is CMAF/fMP4, and Jellyfin can also select fMP4 for HLS profiles, so both
+        // transcode is CMAF/fMP4, and remote sources can also select fMP4 for HLS profiles, so both
         // audio and video segment format must be declared explicitly.
         when (stream.hlsSegmentFormat) {
             HlsSegmentFormat.FMP4 -> {

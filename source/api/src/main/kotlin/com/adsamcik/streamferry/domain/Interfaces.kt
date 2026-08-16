@@ -1,6 +1,5 @@
 package com.adsamcik.streamferry.domain
 
-import com.adsamcik.streamferry.core.session.ProxySession
 import com.adsamcik.streamferry.core.stream.MediaProfile
 import com.adsamcik.streamferry.core.stream.Protocol
 import com.adsamcik.streamferry.core.stream.StreamDecision
@@ -402,13 +401,6 @@ interface SecureTokenStore {
     suspend fun get(serverId: String): String?
     suspend fun remove(serverId: String)
     suspend fun clear()
-}
-
-/** Maps a [ProxySession] to/from a provider play session and a target session (§8). */
-interface PlaybackSessionCoordinator {
-    val active: Flow<ProxySession?>
-    suspend fun start(info: PlaybackInfo, upstream: UpstreamSource, phoneLanIp: String): ProxySession
-    suspend fun stop(reason: String)
 }
 
 interface ProviderPlaybackReporter {

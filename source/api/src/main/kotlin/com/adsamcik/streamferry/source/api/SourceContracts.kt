@@ -146,6 +146,7 @@ data class PlaybackRequest(
     val allowSubtitleBurnIn: Boolean = true,
     val audioTrack: TrackRef? = null,
     val subtitleTrack: TrackRef? = null,
+    val subtitlesDisabled: Boolean = false,
     val startPositionSeconds: Long = 0,
     val maxVideoHeight: Int = 0,
     val preferredVideoCodec: String? = null,
@@ -228,12 +229,20 @@ enum class PlaybackStopReason { USER, COMPLETED, REPLACED, ERROR, SHUTDOWN }
 interface StreamLease {
     val descriptor: StreamDescriptor
     suspend fun open(range: ByteRange? = null): Result<StreamResponse>
-    suspend fun resolve(playlistReference: String): Result<StreamResourceRef?>
+    suspend fun resolve(
+        playlistReference: String,
+        fromPlaylist: StreamResourceRef? = null,
+    ): Result<StreamResourceRef?>
     suspend fun open(resource: StreamResourceRef, range: ByteRange? = null): Result<StreamResponse>
 }
 
+enum class StreamResourceKind { PLAYLIST, MEDIA, UNKNOWN }
+
 @Serializable
-data class StreamResourceRef(val opaqueId: String)
+data class StreamResourceRef(
+    val opaqueId: String,
+    val kind: StreamResourceKind = StreamResourceKind.UNKNOWN,
+)
 
 class StreamResponse(
     val statusCode: Int,

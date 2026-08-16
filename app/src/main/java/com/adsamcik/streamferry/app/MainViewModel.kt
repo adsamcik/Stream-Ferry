@@ -1656,16 +1656,16 @@ class MainViewModel(
         // For online media the engine carries an immutable item identity, so a delayed event can never mark
         // a newer item that reused the same TV. It also needs the account that started it: the client is a
         // singleton and may already be rebound by the time an old renderer emits its final event.
-        val completedItem = completion.item?.takeIf { completion.isJellyfinSession } ?: snapshot.nowPlayingItem
+        val completedItem = completion.item?.takeIf { completion.isSourceSession } ?: snapshot.nowPlayingItem
         val completionOwner = onlinePlaybackOwner
-        if (completion.isJellyfinSession &&
+        if (completion.isSourceSession &&
             (!container.playbackEngine.isCurrentPlaybackGeneration(completion.generation) ||
                 !isActiveOnlinePlaybackOwner(completionOwner))
         ) {
             container.logger.event("playback", "Ignoring a stale completed Jellyfin item")
             return
         }
-        if (completion.isJellyfinSession && completedItem?.sourceId == MediaSourceIds.REMOTE) {
+        if (completion.isSourceSession && completedItem?.sourceId == MediaSourceIds.REMOTE) {
             mutateJellyfinWatchState(
                 item = completedItem,
                 origin = "playback completion",
@@ -1673,7 +1673,7 @@ class MainViewModel(
                 rejectIfPlaying = false,
             )
         }
-        if (!completion.isJellyfinSession) clearCompletedLocalResume()
+        if (!completion.isSourceSession) clearCompletedLocalResume()
 
         if (autoAdvancing) {
             container.logger.event("playlist", "Ignoring duplicate end-of-media signal during a hand-off")
@@ -1693,7 +1693,7 @@ class MainViewModel(
 
         // A downloaded/local completion is allowed to advance an explicit local playlist above, but must
         // not issue a network next-episode lookup after the user has switched Jellyfin accounts.
-        if (!completion.isJellyfinSession) return
+        if (!completion.isSourceSession) return
         val owner = completionOwner ?: return
         val current = completedItem ?: return
         if (!container.playbackPreferences.autoPlayNextEpisode ||

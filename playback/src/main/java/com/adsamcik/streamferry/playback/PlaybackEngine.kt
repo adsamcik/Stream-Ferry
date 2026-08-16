@@ -17,15 +17,18 @@ import com.adsamcik.streamferry.data.proxy.LocalProxyServer
 import com.adsamcik.streamferry.diagnostics.NetworkInfoProvider
 import com.adsamcik.streamferry.domain.DiscoveredTarget
 import com.adsamcik.streamferry.domain.HlsSegmentFormat
-import com.adsamcik.streamferry.domain.ServerPlaybackProvider
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.domain.MediaTrack
 import com.adsamcik.streamferry.domain.PlaybackFailureKind
-import com.adsamcik.streamferry.domain.PlaybackInfo
 import com.adsamcik.streamferry.domain.PlaybackTargetController
 import com.adsamcik.streamferry.domain.PlaybackTargetEvent
 import com.adsamcik.streamferry.domain.RendererStream
 import com.adsamcik.streamferry.source.api.DiagnosticSink
+import com.adsamcik.streamferry.source.api.PlaybackProvider
+import com.adsamcik.streamferry.source.api.PlaybackRequest
+import com.adsamcik.streamferry.source.api.PlaybackStopReason
+import com.adsamcik.streamferry.source.api.ProviderPlaybackSession
+import com.adsamcik.streamferry.source.api.TrackRef
 import com.adsamcik.streamferry.playback.session.DefaultPlaybackSessionCoordinator
 import com.adsamcik.streamferry.core.stream.StreamSelectionService
 import com.adsamcik.streamferry.core.transcode.DeviceEncodeCapabilities
@@ -140,8 +143,8 @@ data class SkipSegment(val label: String, val targetSeconds: Long)
 /** Immutable identity of a genuinely completed renderer session. */
 data class PlaybackCompletion(
     val item: MediaItem?,
-    /** True only when the completed stream had an active Jellyfin playback session. */
-    val isJellyfinSession: Boolean,
+    /** True only when the completed stream had an active source playback session. */
+    val isSourceSession: Boolean,
     /** Exact renderer session; lets consumers reject a buffered event after a newer play begins. */
     val generation: Long,
 )
@@ -157,18 +160,18 @@ private data class LocalPlaybackParams(
 
 /**
  * Orchestrates a single playback session end-to-end (§8, §9):
- *  - resolves a TV-compatible Jellyfin stream (PlaybackInfo) for the chosen quality,
+ *  - asks the active source for a TV-compatible stream session at the chosen quality,
  *  - starts the in-RAM proxy + foreground service and hands the TV ONLY the phone proxy URL,
  *  - tracks position / buffering from the renderer,
  *  - runs the [AdaptiveBitrateController] over real proxy throughput (averaged ≥ 30 s) and, when it
- *    decides, **switches quality mid-stream** by re-resolving PlaybackInfo at the current position and
+ *    decides, **switches quality mid-stream** by replanning at the current position and
  *    reloading the renderer — gradually and intelligently, never thrashing.
  *
  * Security invariant preserved: only the proxy URL is ever passed to the renderer; the controller and
  * throughput meter hold only numbers.
  */
 class PlaybackEngine(
-    private val playbackProvider: ServerPlaybackProvider,
+    private val playbackProvider: PlaybackProvider,
     private val coordinator: DefaultPlaybackSessionCoordinator,
     private val proxy: LocalProxyServer,
     private val networkInfo: NetworkInfoProvider,
@@ -211,7 +214,7 @@ class PlaybackEngine(
     @Volatile private var prefs: StreamPreferences = StreamPreferences()
 
     @Volatile private var adaptive: AdaptiveBitrateController? = null
-    @Volatile private var currentInfo: PlaybackInfo? = null
+    @Volatile private var currentProviderSession: ProviderPlaybackSession? = null
     /** Chosen audio stream index, or null to let the server pick its default. Re-resolves playback. */
     @Volatile private var audioSelection: Int? = null
     /** Chosen subtitle stream index, or null for OFF (no subtitles). A non-null selection is burned in. */
@@ -229,6 +232,8 @@ class PlaybackEngine(
     // (a burn-in/transcode re-resolve can report fewer streams) so the pickers don't vanish mid-session.
     @Volatile private var mediaAudioTracks: List<MediaTrack> = emptyList()
     @Volatile private var mediaSubtitleTracks: List<MediaTrack> = emptyList()
+    @Volatile private var mediaAudioTrackRefs: Map<Int, TrackRef> = emptyMap()
+    @Volatile private var mediaSubtitleTrackRefs: Map<Int, TrackRef> = emptyMap()
     @Volatile private var currentIsHls = false
     /**
      * True when the current stream is a live server-side transcode (HLS for Cast, progressive for DLNA).
@@ -241,7 +246,7 @@ class PlaybackEngine(
     // The on-device transcode target (codec/resolution) currently being produced on the phone, or null
     // when not transcoding on-device — surfaced so the UI can show exactly what's being sent to the TV.
     @Volatile private var onDeviceTranscodeTarget: TranscodeTarget? = null
-    // The probed source format of a LOCAL file (online sources use currentInfo.profile), for the same UI.
+    // The probed source format of a LOCAL file (online sources use the provider descriptor), for the same UI.
     @Volatile private var localSourceProfile: MediaProfile? = null
     // Parameters of the current LOCAL playback, kept so the on-device stream can be reloaded in place (a
     // manual codec change or an auto codec fallback) while reusing the live TV connection. Null = online.
@@ -366,7 +371,7 @@ class PlaybackEngine(
                 // Startup cleanup intentionally clears live source handles. The coordinator can provide
                 // safe source-kind hints so a classified failed attempt remains eligible for handoff.
                 isLocalSession = isLocalSessionHint ?: (localPlayback != null),
-                isOnlineSession = isOnlineSessionHint ?: (currentInfo != null),
+                isOnlineSession = isOnlineSessionHint ?: (currentProviderSession != null),
                 hasAlternateProtocol = hasAlternateProtocol,
                 hasAlreadySwitchedProtocol = current.alternateProtocolReserved || current.attempts.any {
                     it.automaticRecovery == RecoveryAttemptKind.ALTERNATE_PROTOCOL
@@ -401,7 +406,7 @@ class PlaybackEngine(
                 logger.w(TAG, "Ignoring same-endpoint retry with a different protocol")
                 return@withLock false
             }
-            if (currentInfo == null && localPlayback == null) return@withLock false
+            if (currentProviderSession == null && localPlayback == null) return@withLock false
             val reserved = synchronized(recoveryLock) {
                 recoverySession.reserveRecovery(
                     RecoveryAttemptKind.SAME_STREAM_NETWORK,
@@ -466,7 +471,7 @@ class PlaybackEngine(
     }
 
     /** Begin playing [item] to [selectedTarget] via [target]. [resumePositionOverrideSeconds], when set,
-     *  takes precedence over the item's Jellyfin resume point (used by auto-reconnect to resume at the
+     *  takes precedence over the item's source resume point (used by auto-reconnect to resume at the
      *  live position). [onForegrounded] is invoked once the proxy service has entered the foreground —
      *  the caller navigates to the playback screen THEN (not before), so the screen's recomposition can't
      *  delay onStartCommand and blow the startForegroundService() deadline (see docs/PROXY_DESIGN.md). */
@@ -514,6 +519,8 @@ class PlaybackEngine(
         skippedSegments.clear()
         mediaAudioTracks = emptyList()
         mediaSubtitleTracks = emptyList()
+        mediaAudioTrackRefs = emptyMap()
+        mediaSubtitleTrackRefs = emptyMap()
         this@PlaybackEngine.item = item
         this@PlaybackEngine.target = target
         this@PlaybackEngine.selectedTarget = selectedTarget
@@ -545,8 +552,9 @@ class PlaybackEngine(
             monitorJob = scope.launch { monitorLoop() }
             // Fetch skippable segments (intro/outro/recap) off the startup path; empty if unsupported.
             val segItemId = item.id
+            val segmentSession = currentProviderSession
             scope.launch {
-                val segments = runCatching { playbackProvider.mediaSegments(segItemId) }.getOrDefault(emptyList())
+                val segments = runCatching { segmentSession?.mediaSegments().orEmpty() }.getOrDefault(emptyList())
                 if (segments.isNotEmpty() && item?.id == segItemId) {
                     mediaSegments = segments
                     logger.event("playback", "Loaded ${segments.size} skippable segment(s) (intro/outro)")
@@ -609,6 +617,8 @@ class PlaybackEngine(
             skippedSegments.clear()
             mediaAudioTracks = emptyList()
             mediaSubtitleTracks = emptyList()
+            mediaAudioTrackRefs = emptyMap()
+            mediaSubtitleTrackRefs = emptyMap()
             forceTranscodeFallback = false
                 retriedOnce = false
             terminalFailureSurfaced = false
@@ -635,8 +645,9 @@ class PlaybackEngine(
                 applyPreferredLanguageLocked()
                 if (monitorJob?.isActive != true) monitorJob = scope.launch { monitorLoop() }
                 val segItemId = item.id
+                val segmentSession = currentProviderSession
                 scope.launch {
-                    val segments = runCatching { playbackProvider.mediaSegments(segItemId) }.getOrDefault(emptyList())
+                    val segments = runCatching { segmentSession?.mediaSegments().orEmpty() }.getOrDefault(emptyList())
                     if (segments.isNotEmpty() && this@PlaybackEngine.item?.id == segItemId) {
                         mediaSegments = segments
                         publishStatus()
@@ -687,7 +698,7 @@ class PlaybackEngine(
         t.play()
         isPlaying = true
         controlErrorMessage = null
-        reportJellyfinProgressSoon()
+        reportSourceProgressSoon()
     }
 
     suspend fun pause() = mutex.withLock {
@@ -701,7 +712,7 @@ class PlaybackEngine(
         isPlaying = false
         controlErrorMessage = null
         smartResume.checkpoint(SmartResumeCheckpointKind.PAUSED)
-        reportJellyfinProgressSoon()
+        reportSourceProgressSoon()
     }
 
     /** Seek by a relative amount (used by UI, keyboard/media-button, and notification skip actions). */
@@ -769,9 +780,9 @@ class PlaybackEngine(
     }
 
     /**
-     * Play a previously-downloaded, app-private file to [selectedTarget] — works OFFLINE (no Jellyfin).
+     * Play a previously-downloaded, app-private file to [selectedTarget] — works fully offline.
      * The renderer still only ever receives the phone proxy URL; there is no adaptive bitrate (a local
-     * file isn't re-encoded), and nothing is reported to Jellyfin.
+     * file isn't re-encoded), and nothing is reported to a remote source.
      */
     suspend fun playLocal(
         filePath: String,
@@ -884,7 +895,9 @@ class PlaybackEngine(
         )
         val phoneIp = networkInfo.lanIpv4()
             ?: throw PlaybackPreparationException("No phone LAN address is available for the media gateway.")
-        currentInfo = null
+        currentProviderSession = null
+        mediaAudioTrackRefs = emptyMap()
+        mediaSubtitleTrackRefs = emptyMap()
         // An on-device transcode is a full-timeline HLS stream (seekable): reflect that so the seek
         // path (renderer-seek, not server re-resolve) and status/telemetry are correct. A direct-play
         // local file is a plain progressive stream.
@@ -894,7 +907,7 @@ class PlaybackEngine(
         streamStartSeconds = 0
         reportedPositionSeconds = boundedStartPos
         seekSettleTargetSeconds = null
-        noteJellyfinPosition(reportedPositionSeconds)
+        noteSourcePosition(reportedPositionSeconds)
         val streamForTv: RendererStream
         val url: String
         if (transcodeTarget != null) {
@@ -999,7 +1012,7 @@ class PlaybackEngine(
         // A user/media-session seek is newer than any load-time resume correction still waiting for a
         // renderer status. Clear it before issuing the command so recovery can never fight the user.
         pendingRendererResumePosition = null
-        val duration = currentInfo?.runtimeSeconds ?: item?.runtimeSeconds ?: localPlayback?.runtimeSeconds
+        val duration = currentProviderSession?.descriptor?.runtimeSeconds ?: item?.runtimeSeconds ?: localPlayback?.runtimeSeconds
         val pos = PlaybackPositionPolicy.clamp(absoluteSeconds, duration)
         smartResume.noteSeekRequested(pos)
         // Only a progressive (non-HLS) transcode is a non-seekable live stream that must be re-resolved at
@@ -1030,9 +1043,9 @@ class PlaybackEngine(
             t.seekTo(pos)
             reportedPositionSeconds = pos
             armRendererStartSettle(pos)
-            noteJellyfinPosition(pos)
+            noteSourcePosition(pos)
             controlErrorMessage = null
-            reportJellyfinProgressSoon()
+            reportSourceProgressSoon()
             publishStatus()
         }
     }
@@ -1041,7 +1054,7 @@ class PlaybackEngine(
 
     /**
      * Invoked by the permission monitor. Close local exposure before waiting for [mutex], which can be
-     * held by a slow renderer/Jellyfin startup path; the remaining target/session cleanup is idempotent.
+     * held by a slow renderer/source startup path; the remaining target/session cleanup is idempotent.
      */
     suspend fun onLocalNetworkPermissionRevoked() {
         val hadActivePlayback = target != null || proxy.isRunning
@@ -1058,11 +1071,11 @@ class PlaybackEngine(
 
     /**
      * Switch the active audio track to the server stream [index] (null = server default) and re-resolve
-     * playback at the current position. Changing the audio track requires a fresh Jellyfin stream (the
+     * playback at the current position. Changing the audio track requires a fresh source stream (the
      * proxy serves a single track), so this re-resolves like a seek. No-op for a non-online (local) session.
      */
     suspend fun selectAudioTrack(index: Int?) = mutex.withLock {
-        if (currentInfo == null || audioSelection == index) return@withLock
+        if (currentProviderSession == null || audioSelection == index) return@withLock
         logger.event("playback", "Audio track -> ${index ?: "default"}; re-resolving")
         reloadSelectionTransaction(audioSelection, index, { audioSelection = it }) {
             reloadStreamPreservingPosition("audio track change")
@@ -1075,7 +1088,7 @@ class PlaybackEngine(
      * a transcode (burn-in is the only reliable way to show a subtitle through the proxy on Cast + DLNA).
      */
     suspend fun selectSubtitleTrack(index: Int?) = mutex.withLock {
-        if (currentInfo == null || subtitleSelection == index) return@withLock
+        if (currentProviderSession == null || subtitleSelection == index) return@withLock
         logger.event("playback", "Subtitle -> ${index?.let { "track $it (burned in)" } ?: "off"}; re-resolving")
         reloadSelectionTransaction(subtitleSelection, index, { subtitleSelection = it }) {
             reloadStreamPreservingPosition("subtitle change")
@@ -1085,7 +1098,7 @@ class PlaybackEngine(
     /**
      * Pin playback to a specific quality [bitrateBps] (a rung the adaptive controller offers), or return to
      * **Auto** ([bitrateBps] == null) so link-speed adaptation resumes. Pinning re-resolves the stream at
-     * the chosen bitrate at the current position (like an adaptive switch — Jellyfin transcodes to fit) and
+     * the chosen bitrate at the current position (like an adaptive switch) and
      * pauses adaptation until Auto is chosen again. No-op for a non-online (local) session, which has no
      * adaptive controller / bitrate ladder.
      */
@@ -1107,9 +1120,9 @@ class PlaybackEngine(
         val previousReportedPosition = reportedPositionSeconds
         manualQuality = true
         if (!wasManual || target != a.currentBitrateBps) {
-            logger.event("quality", "Quality cap -> ${target / 1000} kbps (manual Jellyfin override)")
+            logger.event("quality", "Quality cap -> ${target / 1000} kbps (manual source override)")
             // An override must re-resolve even when the selected rung matches the current displayed rate:
-            // direct play can have that rate without Jellyfin having applied the requested output cap.
+            // direct play can have that rate without the source having applied the requested output cap.
             try {
                 reloadStream(absolutePositionSeconds, requestedBitrate = target, reason = "manual quality override")
             } catch (failure: Throwable) {
@@ -1132,7 +1145,7 @@ class PlaybackEngine(
      * play or 4K profile; null returns to the saved automatic policy.
      */
     suspend fun selectMaxVideoHeight(height: Int?) = mutex.withLock {
-        if (currentInfo == null || height !in setOf(null, 2160, 1080, 720, 480)) return@withLock
+        if (currentProviderSession == null || height !in setOf(null, 2160, 1080, 720, 480)) return@withLock
         if (manualMaxVideoHeight == height) return@withLock
         val previousHeight = manualMaxVideoHeight
         val previousStreamStart = streamStartSeconds
@@ -1160,14 +1173,14 @@ class PlaybackEngine(
 
     /**
      * Manually pin the video codec used for TRANSCODES (e.g. "hevc", "av1", "vp9", "h264"), or null =
-     * automatic. For an ONLINE source this re-resolves the Jellyfin stream to the chosen codec at the
+     * automatic. For an ONLINE source this replans the stream to the chosen codec at the
      * current position. For a LOCAL on-device transcode it re-encodes the file to the chosen codec and
      * reloads it in place (seamless — reuses the live TV connection). A codec the phone can't encode or the
      * TV can't decode is ignored. No-op for a direct-play local file (there's no transcode to steer).
      */
     suspend fun selectPreferredCodec(codec: String?) = mutex.withLock {
         // Local on-device transcode: steer the phone's encoder and reload in place.
-        if (localPlayback != null && currentInfo == null) {
+        if (localPlayback != null && currentProviderSession == null) {
             if (onDeviceTranscodeTarget == null) return@withLock // direct-play local file: nothing to transcode
             val requested = codec?.let { parseVideoCodec(it) }?.takeIf { it in localTranscodeCodecOptions }
             if (forcedLocalCodec == requested) return@withLock
@@ -1195,7 +1208,7 @@ class PlaybackEngine(
             }
             return@withLock
         }
-        if (currentInfo == null) return@withLock
+        if (currentProviderSession == null) return@withLock
         val requested = codec?.let { parseVideoCodec(it)?.name?.lowercase() ?: return@withLock }
         if (requested != null && requested !in tvVideoCodecs(selectedTarget?.capabilities ?: return@withLock)) {
             logger.w("quality", "Ignoring unsupported TV output format: $requested")
@@ -1266,16 +1279,16 @@ class PlaybackEngine(
     // ----- internals -----
 
     /**
-     * Capabilities to advertise to Jellyfin. For Cast we **optimistically** advertise a broad profile
+     * Capabilities to advertise to the active source. For Cast we **optimistically** advertise a broad profile
      * (HEVC/10-bit/AC3/MKV/…) so the server **direct-plays** when the TV can decode the original, instead
      * of always transcoding to the lowest common denominator. If the receiver then can't decode it,
      * [onTargetEvent] sets [forceTranscodeFallback] and we re-resolve with the safe conservative profile.
      */
     private fun effectiveCaps(): TargetCapabilities {
         val target = selectedTarget ?: error("No target capabilities")
-        // A recovery or explicit Jellyfin override must use only the selected target's proven capabilities;
+        // A recovery or explicit source override must use only the selected target's proven capabilities;
         // the broad direct-play profile is deliberately not an output-format promise.
-        if (forceTranscodeFallback || hasManualJellyfinOverride()) return target.capabilities
+        if (forceTranscodeFallback || hasManualSourceOverride()) return target.capabilities
         return when {
             // Cast advertises a broad optimistic profile (incl. HEVC/10-bit) when preferring direct play.
             target.protocol == Protocol.CAST && prefs.preferDirectPlay -> CAST_DIRECT_PLAY_CAPS
@@ -1295,11 +1308,11 @@ class PlaybackEngine(
         supports10Bit = true,
     )
 
-    private fun hasManualJellyfinOverride(): Boolean =
+    private fun hasManualSourceOverride(): Boolean =
         manualQuality || manualMaxVideoHeight != null || preferredCodec != null
 
     private fun effectiveForceTranscode(): Boolean =
-        prefs.forceTranscode || forceTranscodeFallback || hasManualJellyfinOverride()
+        prefs.forceTranscode || forceTranscodeFallback || hasManualSourceOverride()
 
     private fun effectiveMaxVideoHeight(): Int = manualMaxVideoHeight ?: prefs.maxVideoHeight
 
@@ -1328,7 +1341,7 @@ class PlaybackEngine(
     private suspend fun applyPreferredLanguageLocked() {
         if (languagePreferenceApplied) return
         languagePreferenceApplied = true
-        if (currentInfo == null) return // not an online session; no server track list to match against
+        if (currentProviderSession == null) return // not an online session; no source track list to match against
         val audioIdx = LanguageMatcher.matchIndex(
             mediaAudioTracks.map { TrackLanguage(it.index, it.language) },
             prefs.preferredAudioLanguage,
@@ -1444,7 +1457,7 @@ class PlaybackEngine(
         wasDirectPlay: Boolean,
     ) {
         val t = selectedTarget ?: return
-        val profile = currentInfo?.profile
+        val profile = currentProviderSession?.descriptor?.profile
         if (!shouldPersistTranscodeRequirement(qualifiedFormatEvidence, wasDirectPlay, profile)) {
             logger.event(
                 "playback",
@@ -1487,44 +1500,46 @@ class PlaybackEngine(
         val audioTrackOverride = AudioTrackSelection.requiresServerTranscode(audioSelection, defaultAudioIndex())
         val forceTranscode = effectiveForceTranscode() || audioTrackOverride
         // A manual codec override advertises only that output codec and, through [effectiveForceTranscode],
-        // prevents direct play so Jellyfin must either honor it or return a clear failure.
-        val info = preparePlaybackSource("Jellyfin couldn't prepare this media source.") {
-            playbackProvider.playbackInfo(
-                itemId = item.id,
-                capabilities = caps,
+        // prevents direct play so the source must either honor it or return a clear failure.
+        val providerSession = preparePlaybackSource("The source couldn't prepare this media.") {
+            playbackProvider.prepare(
+                PlaybackRequest(
+                media = item.ref,
+                target = caps,
                 maxBitrateBps = bitrate,
                 forceTranscode = forceTranscode,
                 // A selected subtitle is burned into the video (the only way to show it reliably through the
                 // proxy on both Cast and DLNA), so enable burn-in whenever one is chosen.
                 allowSubtitleBurnIn = burnIn,
-                audioStreamIndex = audioSelection,
-                // null selection = OFF: pass -1 so the server explicitly omits subtitles (not its default).
-                subtitleStreamIndex = subtitleSelection ?: -1,
+                audioTrack = audioSelection?.let(mediaAudioTrackRefs::get),
+                subtitleTrack = subtitleSelection?.let(mediaSubtitleTrackRefs::get),
+                subtitlesDisabled = subtitleSelection == null,
                 startPositionSeconds = positionSeconds,
                 maxVideoHeight = effectiveMaxVideoHeight(),
                 preferredVideoCodec = preferredCodec,
+                ),
             ).getOrThrow()
         }
+        val descriptor = providerSession.descriptor
+        val stream = descriptor.stream
 
         // If this renderer previously rejected this exact direct-play media format, don't hand it the
         // original again — force a transcode from the start (skips the doomed direct-play round-trip +
         // failure wait). One-level re-resolve: the re-entry has effectiveForceTranscode()=true, so it's skipped.
         val known = selectedTarget
         if (known != null && !effectiveForceTranscode() &&
-            rendererCaps.shouldForceTranscode(deviceKey(known), RendererMediaFormat.from(info.profile))
+            rendererCaps.shouldForceTranscode(deviceKey(known), RendererMediaFormat.from(descriptor.profile))
         ) {
             forceTranscodeFallback = true
+            runCatching { providerSession.close(PlaybackStopReason.REPLACED) }
             logger.event("playback", "Renderer previously rejected this format; transcoding from the start")
             resolveAndLoad(positionSeconds, requestedBitrate, initialiseAdaptive, armWatchdog)
             return
         }
-        val upstream = preparePlaybackSource("Jellyfin couldn't resolve the selected media stream.") {
-            playbackProvider.resolveUpstream(info)
-        }
 
         if (initialiseAdaptive) {
-            val ladder = BitrateLadder.forSource(info.sourceBitrateBps)
-            val start = requestedBitrate ?: info.sourceBitrateBps ?: ladder.last()
+            val ladder = BitrateLadder.forSource(descriptor.sourceBitrateBps)
+            val start = requestedBitrate ?: descriptor.sourceBitrateBps ?: ladder.last()
             adaptive = AdaptiveBitrateController(ladder, start, clock = clock)
             // Feed the adaptive controller AND the startup watchdog's byte counter, and learn when the TV
             // bails early (idea 1). Set once per session; reset per-attempt in armStartupWatchdog.
@@ -1532,36 +1547,46 @@ class PlaybackEngine(
             proxy.onDownstreamClosed = { bytes, durationMs, completed -> onDownstreamClosedEarly(bytes, durationMs, completed) }
         }
 
-        currentInfo = info
+        currentProviderSession = providerSession
         // Capture selectable tracks the first time they're known and keep them (a burn-in/transcode
         // re-resolve may report fewer streams) so the pickers stay populated for the whole session.
-        if (info.audioTracks.isNotEmpty()) mediaAudioTracks = info.audioTracks
-        if (info.subtitleTracks.isNotEmpty()) mediaSubtitleTracks = info.subtitleTracks
-        currentIsHls = upstream.isHls
-        currentIsTranscoding = upstream.isTranscoding
+        if (descriptor.audioTracks.isNotEmpty() && mediaAudioTracks.isEmpty()) {
+            mediaAudioTracks = descriptor.audioTracks.mapIndexed { index, track ->
+                MediaTrack(index, track.language, track.label, track.isDefault, track.isForced)
+            }
+            mediaAudioTrackRefs = descriptor.audioTracks.mapIndexed { index, track -> index to track.ref }.toMap()
+        }
+        if (descriptor.subtitleTracks.isNotEmpty() && mediaSubtitleTracks.isEmpty()) {
+            mediaSubtitleTracks = descriptor.subtitleTracks.mapIndexed { index, track ->
+                MediaTrack(index, track.language, track.label, track.isDefault, track.isForced)
+            }
+            mediaSubtitleTrackRefs = descriptor.subtitleTracks.mapIndexed { index, track -> index to track.ref }.toMap()
+        }
+        currentIsHls = stream.isHls
+        currentIsTranscoding = stream.isTranscoding
         // Only a PROGRESSIVE (non-HLS) transcode is a genuine live stream that begins server-side at the
         // requested position (its own t=0 == media position). A direct-play file AND a full-timeline HLS
-        // transcode (Jellyfin VOD HLS lists 0..end regardless of startTimeTicks) are seekable, so the
+        // transcode whose VOD HLS lists the full timeline is seekable, so the
         // renderer positions itself within them and the stream's t=0 is media 0.
-        val serverSideStart = PlaybackPositionPolicy.requiresServerReload(upstream.isTranscoding, upstream.isHls)
+        val serverSideStart = PlaybackPositionPolicy.requiresServerReload(stream.isTranscoding, stream.isHls)
         streamStartSeconds = if (serverSideStart) positionSeconds else 0L
         reportedPositionSeconds = if (serverSideStart) 0L else positionSeconds
         seekSettleTargetSeconds = null // fresh stream: don't let a prior seek's hold suppress its statuses
 
-        val (_, url) = preparePlaybackSource("Couldn't establish the phone-hosted Jellyfin gateway.") {
-            coordinator.startAndBuildUrl(info, upstream, phoneIp, initialPositionSeconds = positionSeconds)
+        val (_, url) = preparePlaybackSource("Couldn't establish the phone-hosted media gateway.") {
+            coordinator.startAndBuildUrl(providerSession, phoneIp, initialPositionSeconds = positionSeconds)
         }
         reportingSessionToken = coordinator.activeReportToken()
-        noteJellyfinPosition(positionSeconds)
+        noteSourcePosition(positionSeconds)
         // Hand the start position to load() so the renderer begins AT it (Cast sets it in the load request;
         // DLNA seeks once playing) for a direct-play file or a full-timeline HLS transcode — no separate,
         // racy post-load seek. A progressive transcode already starts at the position server-side (load 0).
         val loadStart = PlaybackPositionPolicy.rendererLoadPosition(positionSeconds, serverSideStart)
         logger.event(
             "playback",
-            "Loading ${if (upstream.isTranscoding) "transcode" else "direct-play"} " +
-                "(${if (upstream.isHls) "HLS/${upstream.hlsSegmentFormat}" else "progressive"}, " +
-                    "${upstream.contentType}, output=${upstream.outputContainer}) at ${loadStart}s " +
+            "Loading ${if (stream.isTranscoding) "transcode" else "direct-play"} " +
+                "(${if (stream.isHls) "HLS/${stream.hlsSegmentFormat}" else "progressive"}, " +
+                    "${stream.contentType}, output=${stream.outputContainer}) at ${loadStart}s " +
                 "on ${selectedTarget?.displayName} (${selectedTarget?.protocol})",
         )
         recoverySession = recoverySession.beginAttempt(
@@ -1570,9 +1595,9 @@ class PlaybackEngine(
                 endpoint = redactPlaybackEndpoint(phoneIp),
                 protocol = selectedTarget?.protocol?.name,
                 sourceKind = PlaybackAttemptSourceKind.ONLINE,
-                route = if (upstream.isTranscoding) PlaybackAttemptRoute.SERVER_TRANSCODE else PlaybackAttemptRoute.DIRECT,
-                codec = info.profile.videoCodec,
-                container = info.profile.container ?: upstream.outputContainer,
+                route = if (stream.isTranscoding) PlaybackAttemptRoute.SERVER_TRANSCODE else PlaybackAttemptRoute.DIRECT,
+                codec = descriptor.profile.videoCodec,
+                container = descriptor.profile.container ?: stream.outputContainer,
                 capabilitySummary = "hls=${caps.supportsHls};hevc=${caps.supportsHevc};10bit=${caps.supports10Bit}",
                 startPositionSeconds = positionSeconds,
                 audioStreamIndex = audioSelection,
@@ -1587,9 +1612,17 @@ class PlaybackEngine(
         if (!serverSideStart) armRendererStartSettle(loadStart)
         target.load(
             url,
-            upstream.rendererStream,
+            RendererStream(
+                mimeType = stream.contentType,
+                hlsSegmentFormat = when (stream.hlsSegmentFormat) {
+                    com.adsamcik.streamferry.source.api.HlsSegmentFormat.MPEG2_TS -> HlsSegmentFormat.MPEG2_TS
+                    com.adsamcik.streamferry.source.api.HlsSegmentFormat.FMP4 -> HlsSegmentFormat.FMP4
+                    null -> null
+                },
+                isByteSeekable = stream.isByteSeekable,
+            ),
             item.title,
-            info.runtimeSeconds,
+            descriptor.runtimeSeconds,
             startPositionSeconds = loadStart,
             playWhenReady = playWhenReady,
         )
@@ -1660,9 +1693,9 @@ class PlaybackEngine(
         armWatchdog: Boolean = false,
         playWhenReady: Boolean = true,
     ) {
-        // The coordinator reports a terminal position while replacing the Jellyfin session. Record the
+        // The coordinator reports a terminal position while replacing the source session. Record the
         // requested resume point first so a seek, bitrate switch, or recovery cannot save stale progress.
-        noteJellyfinPosition(positionSeconds)
+        noteSourcePosition(positionSeconds)
         val wasReloading = isReloadingStream
         isReloadingStream = true
         try {
@@ -1816,7 +1849,7 @@ class PlaybackEngine(
             }
             return
         }
-        val online = currentInfo != null
+        val online = currentProviderSession != null
         val transcoding = currentIsTranscoding || effectiveForceTranscode()
         val decidedAction = synchronized(recoveryLock) {
             // A single failure often arrives as multiple events (Cast fires onMediaError twice plus an
@@ -1926,15 +1959,15 @@ class PlaybackEngine(
 
     /** An actionable message for a stream that never started, tailored to what we were doing. */
     private fun startupFailureMessage(): String = when {
-        currentInfo == null && currentIsTranscoding ->
+        currentProviderSession == null && currentIsTranscoding ->
             "The TV didn't start playing the on-device transcode. Try a different maximum resolution or " +
                 "format in Settings, or cast a directly-playable file."
         // A local direct-play on a DLNA renderer that never started: on-device transcoding is Cast-only, so
         // don't send the user down that dead end — the file's format simply isn't supported by this TV.
-        currentInfo == null && selectedTarget?.protocol != Protocol.CAST ->
+        currentProviderSession == null && selectedTarget?.protocol != Protocol.CAST ->
             "Your DLNA TV couldn't play this file's format. Try a directly-playable file (H.264/AAC MP4), " +
                 "or cast to a Chromecast, which can transcode on the phone."
-        currentInfo == null ->
+        currentProviderSession == null ->
             "The TV didn't start playing this file. It may not support the format — try enabling on-device " +
                 "transcoding in Settings."
         else -> "The TV didn't start playing."
@@ -1981,12 +2014,12 @@ class PlaybackEngine(
     }
 
     /** Record a position only for the exact online session that produced it. */
-    private fun noteJellyfinPosition(positionSeconds: Long) {
+    private fun noteSourcePosition(positionSeconds: Long) {
         reportingSessionToken?.let { token -> coordinator.notePosition(positionSeconds, expectedToken = token) }
     }
 
     /** Queue an immediate lifecycle update; the periodic monitor remains the steady-state heartbeat. */
-    private fun reportJellyfinProgressSoon() {
+    private fun reportSourceProgressSoon() {
         val token = reportingSessionToken ?: return
         val paused = !isPlaying
         scope.launch { coordinator.reportProgress(isPaused = paused, expectedToken = token) }
@@ -2203,7 +2236,7 @@ class PlaybackEngine(
                 recoverySession = recoverySession.transition(if (event.isPlaying) PlaybackPhase.PLAYING else PlaybackPhase.PAUSED)
                 // Evidence the stream actually started playing on the TV — cancels the startup watchdog.
                 if (event.isPlaying || event.positionSeconds > 0) markPlaybackStarted()
-                noteJellyfinPosition(absolutePositionSeconds)
+                noteSourcePosition(absolutePositionSeconds)
                 smartResume.onRendererStatus(
                     absolutePositionSeconds,
                     item?.runtimeSeconds ?: localPlayback?.runtimeSeconds,
@@ -2249,18 +2282,18 @@ class PlaybackEngine(
                     recoverySession = recoverySession.transition(PlaybackPhase.COMPLETED)
                     lastNote = "Finished"
                     logger.event("playback", "End of media reached at ${absolutePositionSeconds}s")
-                    noteJellyfinPosition(absolutePositionSeconds)
-                    reportJellyfinProgressSoon()
+                    noteSourcePosition(absolutePositionSeconds)
+                    reportSourceProgressSoon()
                     smartResume.complete(smartResumeDeviceContext)
                     // Publish before handing off so the mini-player, notification, and media session stop
                     // advertising stale playback while a next item is being resolved.
                     publishStatus()
-                    // Signal a genuine end-of-media so the ViewModel can sync the exact completed Jellyfin
+                    // Signal a genuine end-of-media so the ViewModel can sync the exact completed source
                     // item and then consider autoplay (a user-stop tears down eventsJob first).
                     _endOfMedia.tryEmit(
                         PlaybackCompletion(
                             item = item,
-                            isJellyfinSession = currentInfo != null,
+                            isSourceSession = currentProviderSession != null,
                             generation = completedPlayGeneration,
                         ),
                     )
@@ -2296,7 +2329,7 @@ class PlaybackEngine(
                 // BEFORE disconnecting the target (stopInternalLocked), so this handler never runs for a
                 // user stop — only for a real, unexpected drop. Flag it so the ViewModel can auto-reconnect
                 // and resume from the last reported position.
-                if (currentInfo != null || localPlayback != null) {
+                if (currentProviderSession != null || localPlayback != null) {
                     connectionLost = true
                     recoverySession = recoverySession
                         .recordFailure(PlaybackFailureStage.ENDPOINT_DISCONNECT, PlaybackFailureCause.ENDPOINT_UNAVAILABLE)
@@ -2467,7 +2500,7 @@ class PlaybackEngine(
         fallbackJob?.cancel(); fallbackJob = null
         proxy.byteListener = null
         proxy.onDownstreamClosed = null
-        // Close the local relay before any renderer/Jellyfin RPC can block. coordinator.stop() repeats
+        // Close the local relay before any renderer/source RPC can block. coordinator.stop() repeats
         // this idempotently while it clears its bookkeeping and performs bounded remote cleanup.
         proxy.stop()
         target?.let {
@@ -2487,7 +2520,11 @@ class PlaybackEngine(
         adaptive = null
         mediaSegments = emptyList()
         skippedSegments.clear()
-        currentInfo = null
+        mediaAudioTracks = emptyList()
+        mediaSubtitleTracks = emptyList()
+        mediaAudioTrackRefs = emptyMap()
+        mediaSubtitleTrackRefs = emptyMap()
+        currentProviderSession = null
         currentIsHls = false
         currentIsTranscoding = false
         onDeviceTranscodeTarget = null
@@ -2534,7 +2571,7 @@ class PlaybackEngine(
     private fun describeOutput(t: TranscodeTarget?): String? {
         if (t != null) return "${codecDisplayName(t.videoCodec.name)} · ${t.maxResolution.maxHeightPx}p · on device"
         if (!currentIsTranscoding) return null // direct play
-        // A server (Jellyfin) transcode: we know the requested codec only when the user pinned one; the
+        // A server-side transcode: we know the requested codec only when the user pinned one; the
         // source profile is NOT the output, so show "auto" rather than mislabel the source codec.
         val codec = preferredCodec?.let { codecDisplayName(it) } ?: "auto"
         return "$codec · ${if (currentIsHls) "HLS" else "progressive"} · server"
@@ -2551,7 +2588,8 @@ class PlaybackEngine(
     private fun publishStatus(error: String? = null) {
         val sel = selectedTarget ?: return
         val a = adaptive
-        val srcProfile = currentInfo?.profile ?: localSourceProfile
+        val descriptor = currentProviderSession?.descriptor
+        val srcProfile = descriptor?.profile ?: localSourceProfile
         val odt = onDeviceTranscodeTarget
         val recovery = recoverySession
         _status.value = PlaybackStatus(
@@ -2562,9 +2600,9 @@ class PlaybackEngine(
             isPlaying = isPlaying,
             isBuffering = isBuffering,
             positionSeconds = absolutePositionSeconds,
-            // For an online session the duration comes from PlaybackInfo; a local session has no
-            // PlaybackInfo, so fall back to the item runtime (probed for on-device files).
-            durationSeconds = currentInfo?.runtimeSeconds ?: item?.runtimeSeconds,
+            // For an online session the duration comes from the source descriptor; a local session
+            // falls back to the item runtime (probed for on-device files).
+            durationSeconds = descriptor?.runtimeSeconds ?: item?.runtimeSeconds,
             streamMode = when {
                 odt != null -> "On-device transcode"
                 !currentIsTranscoding -> "Direct play"
@@ -2579,17 +2617,17 @@ class PlaybackEngine(
             // Codec picker: an online session offers the TV's decodable codecs (server transcodes to the
             // pick); a local on-device transcode offers the TV∩phone-encodable codecs (the phone re-encodes).
             availableVideoCodecs = when {
-                currentInfo != null -> tvVideoCodecs(sel.capabilities)
+                currentProviderSession != null -> tvVideoCodecs(sel.capabilities)
                 odt != null -> localTranscodeCodecOptions.map { it.name.lowercase() }
                 else -> emptyList()
             },
-            preferredVideoCodec = if (currentInfo != null) preferredCodec else forcedLocalCodec?.name?.lowercase(),
-            automaticMaxVideoHeight = currentInfo?.let { prefs.maxVideoHeight },
-            maxVideoHeight = currentInfo?.let { effectiveMaxVideoHeight() },
+            preferredVideoCodec = if (currentProviderSession != null) preferredCodec else forcedLocalCodec?.name?.lowercase(),
+            automaticMaxVideoHeight = currentProviderSession?.let { prefs.maxVideoHeight },
+            maxVideoHeight = currentProviderSession?.let { effectiveMaxVideoHeight() },
             isManualMaxVideoHeight = manualMaxVideoHeight != null,
             videoWidth = srcProfile?.widthPx,
             videoHeight = srcProfile?.heightPx,
-            videoBitrateBps = srcProfile?.videoBitrateBps ?: currentInfo?.sourceBitrateBps,
+            videoBitrateBps = srcProfile?.videoBitrateBps ?: descriptor?.sourceBitrateBps,
             sourceFormat = describeSource(srcProfile),
             outputFormat = describeOutput(odt),
             volume = volume,
@@ -2642,7 +2680,7 @@ class PlaybackEngine(
         /**
          * Broad, optimistic Cast capabilities for the first (direct-play) attempt — the common formats a
          * modern Cast device / TV-with-Chromecast-built-in can usually decode. Advertising these lets
-         * Jellyfin direct-play or lightly remux instead of always transcoding; if the receiver can't
+         * sources direct-play or lightly remux instead of always transcoding; if the receiver can't
          * actually decode the stream, the engine falls back once to a safe server transcode.
          */
         private val CAST_DIRECT_PLAY_CAPS = TargetCapabilities(
