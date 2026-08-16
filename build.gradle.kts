@@ -77,10 +77,20 @@ val checkSourceBoundaries by tasks.registering {
             }
         }
 
+        val providerPrivateApiTerms = listOf(
+            "imageTag",
+            "authHeader",
+            "upstreamUrl",
+            "playSessionId",
+            "mediaSourceId",
+        )
         kotlinFiles("source/api/src/main").forEach { file ->
             file.readLines().forEachIndexed { index, line ->
                 if (line.contains("Jellyfin", ignoreCase = true) || line.contains("Plex", ignoreCase = true)) {
                     violations += "${file.relativeTo(projectDir)}:${index + 1}: provider name in shared API"
+                }
+                if (providerPrivateApiTerms.any(line::contains)) {
+                    violations += "${file.relativeTo(projectDir)}:${index + 1}: provider-private field in shared API"
                 }
             }
         }
