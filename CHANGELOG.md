@@ -12,6 +12,23 @@ there is **no telemetry** and nothing leaves the device unless you share a repor
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-17
+
+### Changed
+- Split the application into explicit core, playback, UI, provider-neutral source API, Jellyfin, and
+  local-source modules so each media provider owns its protocol-specific behavior.
+- Routed playback, artwork, downloads, watch state, resume data, and source errors through
+  provider-owned capabilities and opaque stream leases, keeping shared app and UI contracts
+  provider-neutral.
+- Relicensed Stream Ferry under the PolyForm Noncommercial License 1.0.0 and removed historical MIT
+  license references.
+
+### Fixed
+- Prevented provider credentials, server-shaped identifiers, playback internals, and private artwork
+  metadata from leaking across shared module boundaries.
+- Scoped source identity, resume state, and download preparation consistently across Jellyfin and
+  local media paths.
+
 ## [0.5.0] - 2026-08-15
 
 ### Added
@@ -442,7 +459,8 @@ there is **no telemetry** and nothing leaves the device unless you share a repor
   policy, redaction), the Android app skeleton and Compose UI, CI + release pipelines, and
   documentation.
 
-[Unreleased]: https://github.com/adamnova/video-bridge/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/adamnova/video-bridge/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/adamnova/video-bridge/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/adamnova/video-bridge/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/adamnova/video-bridge/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/adamnova/video-bridge/compare/v0.4.0...v0.4.1
