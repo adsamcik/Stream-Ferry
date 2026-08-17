@@ -30,7 +30,7 @@ class SmartResumeRecordVersioningTest {
     @After fun tearDown() { historyFile.delete() }
 
     private fun v1Fields() = SmartResumeRecordVersioning.StoredFields(
-        sourceType = SmartResumeSourceType.JELLYFIN, mediaId = "movie", displayTitle = "Movie",
+        sourceType = SmartResumeSourceType.REMOTE, mediaId = "movie", displayTitle = "Movie",
         displaySubtitle = null, durationSeconds = 600, serverId = "server", userId = "user", localContentUri = null,
         confirmedPositionSeconds = 120, updatedAtMillis = 99, sessionId = "session", generation = 1, sequence = 1,
         state = SmartResumeRecordState.IN_PROGRESS,
@@ -50,6 +50,16 @@ class SmartResumeRecordVersioningTest {
         assertNull(SmartResumeRecordVersioning.migrate(99, v1Fields()))
         assertNull(SmartResumeRecordVersioning.migrate(2, v1Fields().copy(lastSuccessfulProtocol = "not-a-protocol")))
         assertFalse(SmartResumeRecordVersioning.migrate(1, v1Fields())!!.record.version == 1)
+    }
+
+    @Test fun legacyProviderNamedSourceTypeMigratesToRemote() {
+        val record = SmartResumeRecordVersioning.migrate(1, v1Fields())!!.record
+        val legacy = SmartResumeJsonCodec.encode(record).put("sourceType", "JELLYFIN")
+
+        val decoded = SmartResumeJsonCodec.decode(legacy)!!.record
+
+        assertEquals(SmartResumeSourceType.REMOTE, decoded.sourceType)
+        assertEquals(record.mediaId, decoded.mediaId)
     }
 
     @Test fun legacySingleRecordBecomesAHistoryEnvelope() {
@@ -82,7 +92,7 @@ class SmartResumeRecordVersioningTest {
         store.apply(
             SmartResumeCheckpoint(
                 seed = SmartResumeSeed(
-                    SmartResumeSourceType.JELLYFIN,
+                    SmartResumeSourceType.REMOTE,
                     mediaId = "movie",
                     displayTitle = "Movie",
                     durationSeconds = 600,

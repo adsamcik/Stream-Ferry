@@ -2,6 +2,9 @@ package com.adsamcik.streamferry.logging
 
 import android.util.Log
 import com.adsamcik.streamferry.core.redaction.LogRedactor
+import com.adsamcik.streamferry.core.logging.LogEntry
+import com.adsamcik.streamferry.core.logging.LogLevel
+import com.adsamcik.streamferry.source.api.DiagnosticSink
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -11,20 +14,25 @@ import java.util.Locale
  * Jellyfin URLs, full proxy URLs, auth params and PlaySessionIds can never reach logcat or exports
  * (§13). In release builds, verbose/debug are dropped entirely.
  */
-interface DiagnosticsLogger {
-    fun d(tag: String, message: String)
-    fun i(tag: String, message: String)
-    fun w(tag: String, message: String, t: Throwable? = null)
-    fun e(tag: String, message: String, t: Throwable? = null)
+interface DiagnosticsLogger : DiagnosticSink {
+    override fun d(tag: String, message: String)
+    override fun i(tag: String, message: String)
+    override fun w(tag: String, message: String, error: Throwable?)
+    override fun e(tag: String, message: String, error: Throwable?)
 
     /** Append a structured, already-safe diagnostics entry for the redacted export. */
-    fun event(category: String, message: String)
+    override fun event(category: String, message: String)
+
+    override fun debug(tag: String, message: String) = d(tag, message)
+    override fun info(tag: String, message: String) = i(tag, message)
+    override fun warn(tag: String, message: String, error: Throwable?) = w(tag, message, error)
+    override fun error(tag: String, message: String, error: Throwable?) = e(tag, message, error)
 
     /**
      * Opt-in verbose trace (e.g. Cast/DLNA request/response traffic). Recorded — redacted — only while
      * [traceEnabled] is true, so it's off by default and never bloats the log unless the user asks for it.
      */
-    fun trace(tag: String, message: String)
+    override fun trace(tag: String, message: String)
 
     /** Gates [trace]; toggled by the opt-in "detailed TV communication tracing" setting. */
     var traceEnabled: Boolean

@@ -1,7 +1,7 @@
 package com.adsamcik.streamferry.diagnostics
 
 import com.adsamcik.streamferry.core.diagnostics.EventLogStore
-import com.adsamcik.streamferry.logging.LogEntry
+import com.adsamcik.streamferry.core.logging.LogEntry
 import com.adsamcik.streamferry.logging.formatLogLine
 import java.io.File
 import java.text.SimpleDateFormat

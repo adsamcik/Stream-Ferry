@@ -7,12 +7,14 @@ import com.adsamcik.streamferry.BuildConfig
 import com.adsamcik.streamferry.diagnostics.CrashReporter
 import com.adsamcik.streamferry.logging.DiagnosticsLogger
 import com.adsamcik.streamferry.logging.RedactingLogger
+import com.adsamcik.streamferry.playback.proxy.PlaybackServiceDependencies
+import com.adsamcik.streamferry.playback.proxy.PlaybackServiceOwner
 
 /**
  * Application entry point. Owns the process-wide [DiagnosticsLogger] and the lightweight manual DI
  * container ([AppContainer]). No DI framework is used (dependency policy §14).
  */
-class StreamFerryApplication : Application(), ImageLoaderFactory {
+class StreamFerryApplication : Application(), ImageLoaderFactory, PlaybackServiceOwner {
 
     lateinit var logger: DiagnosticsLogger
         private set
@@ -44,5 +46,11 @@ class StreamFerryApplication : Application(), ImageLoaderFactory {
     /** Provide the container's auth-aware, memory-only image loader to Coil's singleton (§15 posters). */
     override fun newImageLoader(): ImageLoader =
         if (::container.isInitialized) container.imageLoader else ImageLoader.Builder(this).build()
-}
 
+    override fun playbackServiceDependencies(): PlaybackServiceDependencies? =
+        if (::container.isInitialized && ::logger.isInitialized) {
+            PlaybackServiceDependencies(container.mediaSessionController, logger)
+        } else {
+            null
+        }
+}

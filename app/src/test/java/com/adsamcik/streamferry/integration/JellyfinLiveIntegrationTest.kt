@@ -5,9 +5,16 @@ import com.adsamcik.streamferry.core.stream.Protocol
 import com.adsamcik.streamferry.core.stream.TargetCapabilities
 import com.adsamcik.streamferry.data.jellyfin.HttpJellyfinRepository
 import com.adsamcik.streamferry.data.jellyfin.JellyfinClient
+import com.adsamcik.streamferry.data.jellyfin.JellyfinPlaybackProvider
+import com.adsamcik.streamferry.data.jellyfin.JellyfinPlaybackInfo
+import com.adsamcik.streamferry.data.jellyfin.JellyfinPlaybackReporter
+import com.adsamcik.streamferry.data.jellyfin.JellyfinSourceBackend
 import com.adsamcik.streamferry.data.proxy.LocalProxyServer
+import com.adsamcik.streamferry.source.api.MediaRef
+import com.adsamcik.streamferry.source.api.PlaybackRequest
+import com.adsamcik.streamferry.source.api.ProviderPlaybackSession
 import com.adsamcik.streamferry.logging.DiagnosticsLogger
-import com.adsamcik.streamferry.logging.LogEntry
+import com.adsamcik.streamferry.core.logging.LogEntry
 import kotlinx.coroutines.runBlocking
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -96,24 +103,24 @@ class JellyfinLiveIntegrationTest {
 
         val repo = HttpJellyfinRepository(client, logger, http)
         val registry = SessionRegistry()
-        val proxy = LocalProxyServer(registry, logger, http)
+        val proxy = LocalProxyServer(registry, logger)
+        val source = JellyfinSourceBackend.identity("live-integration-server", auth.userId, serverInfo)
+        val playback = JellyfinPlaybackProvider(source.id, repo, NoopReporter(), http)
         val hostPort = proxy.start("127.0.0.1")
         try {
             // 3) H.264 -> Cast: should DIRECT-PLAY; the TV gets video bytes (no token).
-            val di = repo.playbackInfo(h264.id, castCaps, 8_000_000, false, false, null, null, 0).getOrThrow()
-            val du = repo.resolveUpstream(di)
-            assertFalse(du.isHls, "H.264 to a Cast profile should direct-play (not HLS)")
-            val ds = registry.create(du.url, du.authHeader, du.contentType, di.playSessionId, du.isHls)
+            val direct = playback.prepare(PlaybackRequest(MediaRef(source.id, h264.id), castCaps, 8_000_000)).getOrThrow()
+            assertFalse(direct.descriptor.stream.isHls, "H.264 to a Cast profile should direct-play (not HLS)")
+            val ds = register(registry, proxy, direct)
             val directBytes = fetch("http://$hostPort/session/${ds.id}/stream", range = null)
             assertTrue(directBytes.size > 1024, "direct-play should yield video bytes (got ${directBytes.size})")
             assertNoLeak(asText(directBytes), token)
             println("[live] H.264 direct-play OK (${directBytes.size} bytes via proxy)")
 
             // 4) HEVC -> Cast: should TRANSCODE to HLS; the playlist the TV gets is fully rewritten.
-            val ti = repo.playbackInfo(hevc.id, castCaps, 8_000_000, false, false, null, null, 0).getOrThrow()
-            val tu = repo.resolveUpstream(ti)
-            assertTrue(tu.isHls, "HEVC to a Cast (H.264-only) profile should transcode to HLS")
-            val ts = registry.create(tu.url, tu.authHeader, tu.contentType, ti.playSessionId, tu.isHls)
+            val transcode = playback.prepare(PlaybackRequest(MediaRef(source.id, hevc.id), castCaps, 8_000_000)).getOrThrow()
+            assertTrue(transcode.descriptor.stream.isHls, "HEVC to a Cast (H.264-only) profile should transcode to HLS")
+            val ts = register(registry, proxy, transcode)
             val playlist = asText(fetch("http://$hostPort/session/${ts.id}/stream", range = null))
             assertTrue(playlist.contains("#EXTM3U"), "expected an HLS playlist, got:\n${playlist.take(200)}")
             assertTrue(playlist.contains("seg="), "playlist must be rewritten to proxy ?seg= URLs")
@@ -122,10 +129,9 @@ class JellyfinLiveIntegrationTest {
             followHlsAndAssertNoLeak(playlist, token)
 
             // 5) HEVC -> DLNA: should TRANSCODE to a PROGRESSIVE stream (not HLS); TV gets bytes.
-            val pi = repo.playbackInfo(hevc.id, dlnaCaps, null, false, false, null, null, 0).getOrThrow()
-            val pu = repo.resolveUpstream(pi)
-            assertFalse(pu.isHls, "HEVC to a DLNA profile should transcode to a progressive stream, not HLS")
-            val ps = registry.create(pu.url, pu.authHeader, pu.contentType, pi.playSessionId, pu.isHls)
+            val progressive = playback.prepare(PlaybackRequest(MediaRef(source.id, hevc.id), dlnaCaps)).getOrThrow()
+            assertFalse(progressive.descriptor.stream.isHls, "HEVC to a DLNA profile should transcode to a progressive stream, not HLS")
+            val ps = register(registry, proxy, progressive)
             val progBytes = fetch("http://$hostPort/session/${ps.id}/stream", range = null)
             assertTrue(progBytes.size > 1024, "progressive transcode should yield bytes (got ${progBytes.size})")
             assertNoLeak(asText(progBytes), token)
@@ -147,7 +153,7 @@ class JellyfinLiveIntegrationTest {
                 val savedSize = tmp.length()
                 assertTrue(savedSize > 1024, "downloaded file should have bytes (got $savedSize)")
 
-                val local = registry.create("local-file", null, ddu.contentType, null, isHls = false, localFilePath = tmp.absolutePath)
+                val local = registry.create(ddu.contentType, isHls = false, localFilePath = tmp.absolutePath)
                 val localUrl = "http://$hostPort/session/${local.id}/stream"
                 val fullBytes = fetch(localUrl, range = null)
                 assertEquals(savedSize, fullBytes.size.toLong(), "offline proxy should serve the whole local file")
@@ -239,6 +245,16 @@ class JellyfinLiveIntegrationTest {
 
     private class RangedResponse(val code: Int, val body: ByteArray, val contentRange: String?)
 
+    private fun register(
+        registry: SessionRegistry,
+        proxy: LocalProxyServer,
+        providerSession: ProviderPlaybackSession,
+    ) = registry.create(
+        contentType = providerSession.descriptor.stream.contentType,
+        isHls = providerSession.descriptor.stream.isHls,
+        totalLength = providerSession.descriptor.stream.totalLength,
+    ).also { proxy.registerStreamLease(it.id, providerSession.upstream) }
+
     private fun rangedGet(url: String, authHeader: String?, range: String?): RangedResponse {
         val b = Request.Builder().url(url).get()
         authHeader?.let { b.header("Authorization", it) }
@@ -306,5 +322,12 @@ class JellyfinLiveIntegrationTest {
         override fun exportRedacted(): List<String> = emptyList()
         override fun entries(): List<LogEntry> = emptyList()
         override fun clear() {}
+    }
+
+    private class NoopReporter : JellyfinPlaybackReporter {
+        override suspend fun reportStart(info: JellyfinPlaybackInfo) {}
+        override suspend fun reportProgress(info: JellyfinPlaybackInfo, positionSeconds: Long, isPaused: Boolean) {}
+        override suspend fun reportStopped(info: JellyfinPlaybackInfo, positionSeconds: Long) {}
+        override suspend fun stopTranscode(info: JellyfinPlaybackInfo) {}
     }
 }

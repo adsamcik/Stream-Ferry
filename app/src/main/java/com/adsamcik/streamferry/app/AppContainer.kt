@@ -30,9 +30,15 @@ import com.adsamcik.streamferry.data.jellyfin.JellyfinAuthRepository
 import com.adsamcik.streamferry.data.jellyfin.JellyfinClient
 import com.adsamcik.streamferry.data.jellyfin.JellyfinMediaLibraryRepository
 import com.adsamcik.streamferry.data.jellyfin.JellyfinMediaSource
+import com.adsamcik.streamferry.data.jellyfin.JellyfinDownloadProvider
+import com.adsamcik.streamferry.data.jellyfin.JellyfinPlaybackProvider
+import com.adsamcik.streamferry.data.jellyfin.JellyfinArtworkProvider
+import com.adsamcik.streamferry.data.jellyfin.JellyfinSourceBackend
+import com.adsamcik.streamferry.data.jellyfin.JellyfinUserStateProvider
 import com.adsamcik.streamferry.data.jellyfin.JellyfinWatchMutationStore
 import com.adsamcik.streamferry.data.language.ShowLanguageStore
 import com.adsamcik.streamferry.data.local.LocalMediaSource
+import com.adsamcik.streamferry.data.local.LocalSourceBackend
 import com.adsamcik.streamferry.data.local.LocalSourceStore
 import com.adsamcik.streamferry.data.resume.ResumeStore
 import com.adsamcik.streamferry.data.resume.SmartResumeStore
@@ -48,9 +54,10 @@ import com.adsamcik.streamferry.diagnostics.DiagnosticsEventLog
 import com.adsamcik.streamferry.diagnostics.DiagnosticsPreferences
 import com.adsamcik.streamferry.diagnostics.NetworkInfoProvider
 import com.adsamcik.streamferry.diagnostics.ReportShare
-import com.adsamcik.streamferry.domain.JellyfinLibraryScope
+import com.adsamcik.streamferry.domain.AccountLibraryScope
 import com.adsamcik.streamferry.domain.MediaLibraryRepository
 import com.adsamcik.streamferry.domain.MediaSource
+import com.adsamcik.streamferry.domain.MediaSourceIds
 import com.adsamcik.streamferry.domain.SecureTokenStore
 import com.adsamcik.streamferry.logging.DiagnosticsLogger
 import com.adsamcik.streamferry.permissions.AndroidNetworkPermissionManager
@@ -63,9 +70,18 @@ import com.adsamcik.streamferry.playback.PlaybackEngine
 import com.adsamcik.streamferry.playback.PlaybackPreferences
 import com.adsamcik.streamferry.playback.PersistentRendererCapabilityStore
 import com.adsamcik.streamferry.playback.RendererCapabilityStore
-import com.adsamcik.streamferry.playback.reporting.DefaultJellyfinPlaybackReporter
+import com.adsamcik.streamferry.data.jellyfin.DefaultJellyfinPlaybackReporter
 import com.adsamcik.streamferry.playback.session.DefaultPlaybackSessionCoordinator
 import com.adsamcik.streamferry.ui.theme.AppearancePreferences
+import com.adsamcik.streamferry.ui.artwork.ArtworkRefFetcher
+import com.adsamcik.streamferry.source.api.MediaRef
+import com.adsamcik.streamferry.source.api.DownloadFormat
+import com.adsamcik.streamferry.source.api.DownloadProvider
+import com.adsamcik.streamferry.source.api.DownloadStream
+import com.adsamcik.streamferry.source.api.PlaybackProvider
+import com.adsamcik.streamferry.source.api.PlaybackRequest
+import com.adsamcik.streamferry.source.api.SourceBackend
+import com.adsamcik.streamferry.source.api.SourceRegistry
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -154,32 +170,10 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
     val jellyfinConnectionMonitor: JellyfinConnectionMonitor by lazy { JellyfinConnectionMonitor() }
 
     // ----- in-app poster images (Coil) -----
-    /**
-     * Coil image loader for in-app posters/thumbnails (gallery + detail). Uses a dedicated OkHttp client
-     * that injects the Jellyfin Authorization header ONLY for image requests to the configured server
-     * origin. Redirects are disabled here, so an image request can never carry that header elsewhere.
-     * The token stays in a header, never embedded in the URL (hence never in a cache key or a
-     * log). Both memory and disk caching are disabled: a tokenless image URL alone does not distinguish
-     * two accounts on the same server, and a late in-flight response must not repopulate another account's
-     * cache. Posters are shown on THIS phone only and are never given to the TV.
-     */
+    /** The UI carries only opaque artwork refs; the owning source performs every authenticated fetch. */
     val imageLoader: ImageLoader by lazy {
-        val imageClient = httpClient.newBuilder()
-            .followRedirects(false)
-            .followSslRedirects(false)
-            .addInterceptor { chain ->
-                val req = chain.request()
-                val header = jellyfinClient.imageAuthHeader()
-                val authed = if (header != null && jellyfinClient.isTrustedServerUrl(req.url)) {
-                    req.newBuilder().header("Authorization", header).build()
-                } else {
-                    req
-                }
-                chain.proceed(authed)
-            }
-            .build()
         ImageLoader.Builder(appContext)
-            .okHttpClient(imageClient)
+            .components { add(ArtworkRefFetcher.Factory(::sourceRegistry)) }
             .memoryCachePolicy(CachePolicy.DISABLED)
             .diskCachePolicy(CachePolicy.DISABLED)
             .crossfade(true)
@@ -194,7 +188,7 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
                 // scope but never enables a remote request; it only unlocks that account's local metadata.
                 scope = {
                     (authRepository.currentUser.value ?: authRepository.cachedSession.value)
-                        ?.let { JellyfinLibraryScope(it.serverId, it.userId).cacheKey }
+                        ?.let { AccountLibraryScope(it.serverId, it.userId).cacheKey }
                         ?: "unauthenticated"
                 },
                 // A cached session intentionally has no token installed. It may read disk metadata but
@@ -216,7 +210,34 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
     val smartResumeStore: SmartResumeStore by lazy { SmartResumeStore(appContext) }
     val jellyfinWatchMutationStore: JellyfinWatchMutationStore by lazy { JellyfinWatchMutationStore(appContext) }
     val smartResumeTracker: SmartResumeSessionTracker by lazy { SmartResumeSessionTracker(smartResumeStore) }
-    val jellyfinMediaSource: MediaSource by lazy { JellyfinMediaSource(mediaRepository) }
+    private val rawJellyfinMediaSource: MediaSource by lazy { JellyfinMediaSource(mediaRepository) }
+    val jellyfinMediaSource: MediaSource by lazy {
+        object : MediaSource {
+            override val id = rawJellyfinMediaSource.id
+            override val displayName = rawJellyfinMediaSource.displayName
+            override val capabilities = rawJellyfinMediaSource.capabilities
+
+            override suspend fun roots() = currentJellyfinBackend()
+                ?.catalog?.roots()
+                ?: Result.failure(IllegalStateException("No server source is configured"))
+
+            override suspend fun children(parentId: String) = currentJellyfinBackend()
+                ?.let { backend -> backend.catalog.children(MediaRef(backend.identity.id, parentId)) }
+                ?: Result.failure(IllegalStateException("No server source is configured"))
+
+            override suspend fun item(itemId: String) = currentJellyfinBackend()
+                ?.let { backend -> backend.catalog.item(MediaRef(backend.identity.id, itemId)) }
+                ?: Result.failure(IllegalStateException("No server source is configured"))
+
+            override suspend fun search(query: String) = currentJellyfinBackend()
+                ?.catalog?.search(query)
+                ?: Result.failure(IllegalStateException("No server source is configured"))
+
+            override suspend fun continueWatching() = currentJellyfinBackend()
+                ?.catalog?.continueWatching()
+                ?: Result.failure(IllegalStateException("No server source is configured"))
+        }
+    }
     val localMediaSource: LocalMediaSource by lazy {
         LocalMediaSource(
             appContext,
@@ -226,6 +247,7 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
             hasSelectedMediaAccess = { permissions.hasSelectedMediaVideo() },
         )
     }
+    val localSourceBackend: LocalSourceBackend by lazy { LocalSourceBackend(localMediaSource) }
     /** All browsable sources, in display order (Jellyfin first, then on-device). */
     val mediaSources: List<MediaSource> by lazy { listOf(jellyfinMediaSource, localMediaSource) }
     val libraryCache: LibraryCache by lazy { LibraryCache(appContext) }
@@ -237,8 +259,72 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
     private val reporter: DefaultJellyfinPlaybackReporter by lazy {
         DefaultJellyfinPlaybackReporter(jellyfinClient, deviceId, logger, jellyfinConnectionMonitor)
     }
+
+    /**
+     * Concrete source registration lives only in the application composition root. Rebuild the registry
+     * after an account/server transition so its immutable source instance id always matches that session.
+     */
+    fun sourceRegistry(): SourceRegistry {
+        val backends = mutableListOf<SourceBackend>(localSourceBackend)
+        (authRepository.currentUser.value ?: authRepository.cachedSession.value)?.let { session ->
+            val identity = JellyfinSourceBackend.identity(
+                serverId = session.serverId,
+                userId = session.userId,
+                displayName = "Jellyfin",
+            )
+            backends += JellyfinSourceBackend(
+                identity = identity,
+                delegate = rawJellyfinMediaSource,
+                artworkProvider = JellyfinArtworkProvider(identity.id, jellyfinClient, httpClient),
+                downloads = JellyfinDownloadProvider(identity.id, jellyfinRepository, httpClient),
+                userState = JellyfinUserStateProvider(identity.id, jellyfinClient),
+                playback = JellyfinPlaybackProvider(
+                    source = identity.id,
+                    repository = jellyfinRepository,
+                    reporter = reporter,
+                    httpClient = httpClient,
+                ),
+            )
+        }
+        return SourceRegistry(backends)
+    }
+
+    private fun currentJellyfinBackend(): SourceBackend? = sourceRegistry().all()
+        .firstOrNull { it.identity.id.provider == JellyfinSourceBackend.PROVIDER_ID }
+
+    /** Routes by canonical source identity; the legacy `remote` fallback migrates old cached items. */
+    private val registeredPlaybackProvider = object : PlaybackProvider {
+        override suspend fun prepare(request: PlaybackRequest) = runCatching {
+            val registry = sourceRegistry()
+            val backend = registry.get(request.media.source)
+                ?: registry.all().singleOrNull { candidate ->
+                    candidate.playback != null && request.media.source.provider.value == MediaSourceIds.REMOTE
+                }
+                ?: error("No playback source is registered for this media")
+            val provider = backend.playback ?: error("This source does not support remote playback")
+            val normalized = if (request.media.source == backend.identity.id) request else {
+                request.copy(media = request.media.copy(source = backend.identity.id))
+            }
+            provider.prepare(normalized).getOrThrow()
+        }
+    }
+
+    private val registeredDownloadProvider = object : DownloadProvider {
+        override suspend fun prepareDownload(media: MediaRef, format: DownloadFormat): Result<DownloadStream> = runCatching {
+            val registry = sourceRegistry()
+            val backend = registry.get(media.source)
+                ?: registry.all().singleOrNull { candidate ->
+                    candidate.downloads != null && media.source.provider.value == MediaSourceIds.REMOTE
+                }
+                ?: error("No download source is registered for this media")
+            val provider = backend.downloads ?: error("This source does not support downloads")
+            val normalized = if (media.source == backend.identity.id) media else media.copy(source = backend.identity.id)
+            provider.prepareDownload(normalized, format).getOrThrow()
+        }
+    }
+
     private val coordinator: DefaultPlaybackSessionCoordinator by lazy {
-        DefaultPlaybackSessionCoordinator(sessionRegistry, proxyServer, reporter, logger)
+        DefaultPlaybackSessionCoordinator(sessionRegistry, proxyServer, logger)
     }
 
     // ----- targets -----
@@ -318,7 +404,7 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
 
     val playbackEngine: PlaybackEngine by lazy {
         PlaybackEngine(
-            jellyfin = jellyfinRepository,
+            playbackProvider = registeredPlaybackProvider,
             coordinator = coordinator,
             proxy = proxyServer,
             networkInfo = networkInfo,
@@ -338,10 +424,9 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
     private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     val downloader: MediaDownloader by lazy {
         MediaDownloader(
-            jellyfin = jellyfinRepository,
+            downloadProvider = registeredDownloadProvider,
             store = downloadStore,
             queue = downloadQueueStore,
-            httpClient = httpClient,
             logger = logger,
             scope = ioScope,
             // JellyfinClient is a singleton mutable session. A download may make remote requests only

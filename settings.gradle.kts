@@ -24,3 +24,9 @@ dependencyResolutionManagement {
 
 rootProject.name = "StreamFerry"
 include(":app")
+include(":core")
+include(":source:api")
+include(":source:local")
+include(":source:jellyfin")
+include(":playback")
+include(":ui")

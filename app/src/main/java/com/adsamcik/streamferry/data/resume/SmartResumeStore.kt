@@ -198,7 +198,11 @@ internal object SmartResumeJsonCodec {
     fun decode(o: JSONObject): SmartResumeRecordVersioning.Decoded? = SmartResumeRecordVersioning.migrate(
         version = o.getInt("version"),
         fields = SmartResumeRecordVersioning.StoredFields(
-            sourceType = SmartResumeSourceType.valueOf(o.getString("sourceType")), mediaId = o.getString("mediaId"),
+            sourceType = when (val stored = o.getString("sourceType")) {
+                "JELLYFIN" -> SmartResumeSourceType.REMOTE
+                else -> SmartResumeSourceType.valueOf(stored)
+            },
+            mediaId = o.getString("mediaId"),
             displayTitle = o.getString("displayTitle"), displaySubtitle = o.stringOrNull("displaySubtitle"), durationSeconds = o.longOrNull("durationSeconds"),
             serverId = o.stringOrNull("serverId"), userId = o.stringOrNull("userId"), localContentUri = o.stringOrNull("localContentUri"),
             confirmedPositionSeconds = o.getLong("confirmedPositionSeconds"), updatedAtMillis = o.getLong("updatedAtMillis"),

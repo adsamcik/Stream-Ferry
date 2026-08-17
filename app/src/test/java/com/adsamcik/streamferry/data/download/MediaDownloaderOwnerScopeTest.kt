@@ -1,6 +1,7 @@
 package com.adsamcik.streamferry.data.download
 
-import com.adsamcik.streamferry.domain.JellyfinRepository
+import com.adsamcik.streamferry.source.api.DownloadFormat
+import com.adsamcik.streamferry.source.api.DownloadProvider
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.logging.DiagnosticsLogger
 import io.mockk.coEvery
@@ -10,7 +11,6 @@ import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.yield
-import okhttp3.OkHttpClient
 import java.nio.file.Files
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -35,10 +35,9 @@ class MediaDownloaderOwnerScopeTest {
             val queue = DownloadQueueStore.forFilesDir(root)
             queue.add(pending)
             val downloader = MediaDownloader(
-                jellyfin = mockk<JellyfinRepository>(relaxed = true),
+                downloadProvider = mockk<DownloadProvider>(relaxed = true),
                 store = DownloadStore.forFilesDir(root),
                 queue = queue,
-                httpClient = OkHttpClient(),
                 logger = mockk<DiagnosticsLogger>(relaxed = true),
                 scope = backgroundScope,
                 activeOwnerProvider = { activeOwner },
@@ -56,10 +55,10 @@ class MediaDownloaderOwnerScopeTest {
     fun pauseAllCancelsImmediatelyButPreservesResumableState() = runTest {
         val root = Files.createTempDirectory("download-system-pause").toFile()
         try {
-            val jellyfin = mockk<JellyfinRepository>()
+            val downloadProvider = mockk<DownloadProvider>()
             val requestStarted = CompletableDeferred<Unit>()
             coEvery {
-                jellyfin.playbackInfo(any(), any(), any(), any(), any(), any(), any(), any(), any(), any())
+                downloadProvider.prepareDownload(any(), any())
             } coAnswers {
                 requestStarted.complete(Unit)
                 awaitCancellation()
@@ -71,10 +70,9 @@ class MediaDownloaderOwnerScopeTest {
             part.parentFile?.mkdirs()
             part.writeText("existing partial bytes")
             val downloader = MediaDownloader(
-                jellyfin = jellyfin,
+                downloadProvider = downloadProvider,
                 store = store,
                 queue = queue,
-                httpClient = OkHttpClient(),
                 logger = mockk<DiagnosticsLogger>(relaxed = true),
                 scope = backgroundScope,
             )

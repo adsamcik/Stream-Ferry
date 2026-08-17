@@ -121,6 +121,13 @@ android {
 }
 
 dependencies {
+    implementation(project(":core"))
+    implementation(project(":source:api"))
+    implementation(project(":source:local"))
+    implementation(project(":source:jellyfin"))
+    implementation(project(":playback"))
+    implementation(project(":ui"))
+
     // --- AndroidX / Compose ---
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
@@ -141,9 +148,6 @@ dependencies {
 
     // --- Google Cast Sender SDK ---
     implementation(libs.play.services.cast.framework)
-
-    // --- Jellyfin official Kotlin SDK (LGPL-3.0) ---
-    implementation(libs.jellyfin.core)
 
     // --- Networking / serialization ---
     implementation(libs.okhttp)

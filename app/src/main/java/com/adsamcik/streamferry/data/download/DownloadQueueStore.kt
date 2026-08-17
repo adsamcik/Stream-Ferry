@@ -1,8 +1,9 @@
 package com.adsamcik.streamferry.data.download
 
+import com.adsamcik.streamferry.source.api.DownloadFormat
+
 import android.content.Context
 import com.adsamcik.streamferry.core.resilience.UpstreamRetry
-import com.adsamcik.streamferry.data.jellyfin.JellyfinHttpException
 import com.adsamcik.streamferry.domain.MediaItem
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
@@ -88,7 +89,7 @@ object DownloadQueue {
      */
     fun isRecoverableFailure(e: Throwable): Boolean = when (e) {
         is IOException -> true // connection reset / timeout / DNS blip / read failure
-        is JellyfinHttpException -> !e.isUnauthorized && UpstreamRetry.isRetryableStatus(e.code)
+        is MediaDownloader.DownloadHttpException -> UpstreamRetry.isRetryableStatus(e.statusCode)
         else -> false // bad/HLS-only item, definitive 4xx, malformed response — retrying won't help
     }
 }
