@@ -7,7 +7,10 @@ android {
     namespace = "com.adsamcik.streamferry.ui"
     compileSdk = 37
 
-    defaultConfig { minSdk = 34 }
+    defaultConfig {
+        minSdk = 34
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -37,6 +40,7 @@ dependencies {
 
     val composeBom = platform(libs.compose.bom)
     implementation(composeBom)
+    androidTestImplementation(composeBom)
     implementation(libs.compose.ui)
     implementation(libs.compose.ui.graphics)
     implementation(libs.compose.ui.tooling.preview)
@@ -50,4 +54,8 @@ dependencies {
     testImplementation(libs.kotlinx.coroutines.test)
     testImplementation(libs.mockk)
     testImplementation(libs.robolectric)
+
+    androidTestImplementation(libs.androidx.test.junit)
+    androidTestImplementation(libs.androidx.espresso.core)
+    androidTestImplementation(libs.compose.ui.test.junit4)
 }

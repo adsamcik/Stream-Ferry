@@ -137,7 +137,6 @@ dependencies {
 
     val composeBom = platform(libs.compose.bom)
     implementation(composeBom)
-    androidTestImplementation(composeBom)
     implementation(libs.compose.ui)
     implementation(libs.compose.ui.graphics)
     implementation(libs.compose.ui.tooling.preview)
@@ -171,8 +170,4 @@ dependencies {
     testImplementation(libs.mockk)
     testImplementation(libs.robolectric)
 
-    // --- Instrumented / UI tests ---
-    androidTestImplementation(libs.androidx.test.junit)
-    androidTestImplementation(libs.androidx.espresso.core)
-    androidTestImplementation(libs.compose.ui.test.junit4)
 }
