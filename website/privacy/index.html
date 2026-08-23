@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#073f4c" />
+    <meta
+      name="description"
+      content="Stream Ferry privacy policy: no telemetry, analytics, ads, tracking, or developer-operated cloud service."
+    />
+    <link rel="canonical" href="https://adsamcik.github.io/Stream-Ferry/privacy/" />
+    <link rel="icon" href="../assets/app-icon.png" />
+    <link rel="apple-touch-icon" href="../assets/app-icon.png" />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Stream Ferry" />
+    <meta property="og:title" content="Privacy policy — Stream Ferry" />
+    <meta property="og:description" content="No telemetry, analytics, ads, tracking, or developer-operated cloud service." />
+    <meta property="og:url" content="https://adsamcik.github.io/Stream-Ferry/privacy/" />
+    <meta property="og:image" content="https://adsamcik.github.io/Stream-Ferry/og.png" />
+    <meta property="og:image:alt" content="Stream Ferry route from a server through a phone to a TV" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Privacy policy — Stream Ferry" />
+    <meta name="twitter:description" content="No telemetry, analytics, ads, tracking, or developer-operated cloud service." />
+    <meta name="twitter:image" content="https://adsamcik.github.io/Stream-Ferry/og.png" />
+    <title>Privacy policy — Stream Ferry</title>
+    <link rel="stylesheet" href="../styles.css" />
+  </head>
+  <body class="policy-page">
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header">
+      <a class="brand" href="../" aria-label="Stream Ferry home">
+        <span class="brand-mark" aria-hidden="true"><span class="brand-play"></span><span class="brand-current"></span></span>
+        <span>Stream Ferry</span>
+      </a>
+      <nav class="site-nav" aria-label="Primary navigation">
+        <a href="../#how-it-works">How it works</a>
+        <a href="../#features">Features</a>
+        <a href="./" aria-current="page">Privacy</a>
+      </nav>
+      <div class="header-actions">
+        <button class="icon-button theme-toggle" type="button" aria-label="Use dark theme" title="Change color theme">
+          <span class="theme-icon" aria-hidden="true">◐</span>
+        </button>
+        <a class="button button-small button-tonal" href="https://github.com/adsamcik/Stream-Ferry" rel="noreferrer">View on GitHub</a>
+      </div>
+    </header>
+
+    <main id="main">
+      <section class="policy-hero">
+        <div class="policy-hero-copy">
+          <p class="eyebrow"><span class="status-dot"></span> Effective August 23, 2026</p>
+          <h1>Privacy is part<br />of the <span>route.</span></h1>
+          <p>Stream Ferry is designed to move your media—not your personal information. This policy explains what the Android app handles, where it goes, and how you stay in control.</p>
+        </div>
+        <div class="policy-hero-card" aria-hidden="true">
+          <div class="policy-shield"><span>✓</span></div>
+          <strong>Nothing to sell.<br />Nothing to profile.</strong>
+          <small>No telemetry · No analytics · No ads</small>
+        </div>
+      </section>
+
+      <div class="policy-layout">
+        <aside class="policy-nav" aria-label="Privacy policy sections">
+          <p>On this page</p>
+          <a href="#overview">Overview</a>
+          <a href="#data">Data the app handles</a>
+          <a href="#sharing">Where data goes</a>
+          <a href="#storage">Storage and deletion</a>
+          <a href="#permissions">Permissions</a>
+          <a href="#website">This website</a>
+          <a href="#security">Security</a>
+          <a href="#changes">Changes and contact</a>
+        </aside>
+
+        <article class="policy-content">
+          <section id="overview" class="policy-section reveal">
+            <span class="policy-section-number">01</span>
+            <h2>The short version</h2>
+            <div class="policy-lede-card">
+              <strong>Stream Ferry does not operate an account system, analytics service, advertising network, telemetry pipeline, or developer database.</strong>
+              <p>The app handles only the information needed to connect to services and devices you choose. App data remains on your Android device unless you explicitly send it to your Jellyfin server, your selected TV, or another app through Android’s Share action.</p>
+            </div>
+          </section>
+
+          <section id="data" class="policy-section reveal">
+            <span class="policy-section-number">02</span>
+            <h2>Data the app handles</h2>
+            <p>Depending on the features you use, Stream Ferry may handle the following data on your device:</p>
+            <div class="policy-cards">
+              <article>
+                <span aria-hidden="true">⌁</span>
+                <h3>Jellyfin connection data</h3>
+                <p>Your server address, user profile information, encrypted access token, and an app installation identifier used when communicating with Jellyfin. Your password is used only to sign in and is never stored.</p>
+              </article>
+              <article>
+                <span aria-hidden="true">▦</span>
+                <h3>Media and playback data</h3>
+                <p>Library metadata, artwork caches, watch state, local playback history, resume positions, queue state, and optional offline downloads.</p>
+              </article>
+              <article>
+                <span aria-hidden="true">▰</span>
+                <h3>TV and network data</h3>
+                <p>Local device names, addresses, identifiers, capabilities, route preferences, and compatibility results needed to find and control a TV.</p>
+              </article>
+              <article>
+                <span aria-hidden="true">▧</span>
+                <h3>Local video access</h3>
+                <p>Files or folders you select through Android’s system picker, plus device video metadata if you separately choose to allow full video-library access.</p>
+              </article>
+              <article>
+                <span aria-hidden="true">!</span>
+                <h3>Diagnostics</h3>
+                <p>Redacted crash reports and event logs are kept in app-private storage. They never leave your phone unless you explicitly share them.</p>
+              </article>
+            </div>
+          </section>
+
+          <section id="sharing" class="policy-section reveal">
+            <span class="policy-section-number">03</span>
+            <h2>Where data goes</h2>
+            <p>Stream Ferry does not send data to the developer. Information moves only as needed for actions you request:</p>
+            <div class="destination-list">
+              <div><span>1</span><p><strong>Your Jellyfin server</strong> receives sign-in requests, library requests, playback reporting, watch-state changes, and download requests. Its operator controls that server and its privacy practices.</p></div>
+              <div><span>2</span><p><strong>Your selected TV or receiver</strong> receives a temporary, unguessable phone-hosted media URL and playback-control commands over the local network. It does not receive your Jellyfin URL, password, access token, or Authorization header.</p></div>
+              <div><span>3</span><p><strong>Apps you choose through Android Share</strong> receive a diagnostic report only when you deliberately select Share and then choose a destination.</p></div>
+            </div>
+            <div class="policy-note"><span aria-hidden="true">✓</span><p><strong>No sale or advertising use.</strong> Stream Ferry does not sell, rent, monetize, or use your information for advertising or behavioral profiling.</p></div>
+          </section>
+
+          <section id="storage" class="policy-section reveal">
+            <span class="policy-section-number">04</span>
+            <h2>Storage, retention, and deletion</h2>
+            <p>App data is stored in Stream Ferry’s private Android storage. The Jellyfin server address and access token are encrypted with keys protected by Android Keystore. App backup is disabled.</p>
+            <ul class="policy-list">
+              <li><strong>Passwords:</strong> never stored.</li>
+              <li><strong>Live stream buffers:</strong> bounded in memory and removed when the session ends.</li>
+              <li><strong>Playback history:</strong> retained locally for up to 90 days unless you remove it sooner.</li>
+              <li><strong>Offline downloads and cached metadata:</strong> retained until you delete the item, profile, or all app data.</li>
+              <li><strong>Crash reports and diagnostics:</strong> locally capped and removable from Settings.</li>
+            </ul>
+            <h3>Your controls</h3>
+            <p>You can remove one server profile, clear playback history or diagnostics, revoke local-file access in Android, delete individual downloads, or use <strong>Settings → Delete all app data</strong>. Uninstalling the app also removes its private data under Android’s normal uninstall behavior.</p>
+          </section>
+
+          <section id="permissions" class="policy-section reveal">
+            <span class="policy-section-number">05</span>
+            <h2>Android permissions</h2>
+            <p>Stream Ferry asks only for permissions connected to playback and features you choose.</p>
+            <div class="permission-table" role="table" aria-label="Stream Ferry Android permissions">
+              <div class="permission-row" role="row"><strong role="cell">Network and Wi‑Fi state</strong><span role="cell">Connect to your server, choose a safe local route, and keep an active stream available.</span></div>
+              <div class="permission-row" role="row"><strong role="cell">Local network</strong><span role="cell">Find, connect to, and serve media to Cast or DLNA devices on your LAN.</span></div>
+              <div class="permission-row" role="row"><strong role="cell">Notifications</strong><span role="cell">Show playback and download controls while a foreground service is active.</span></div>
+              <div class="permission-row" role="row"><strong role="cell">Video library</strong><span role="cell">Optional. Requested only if you choose “Allow all videos.” Android’s file and folder picker works without it.</span></div>
+            </div>
+            <p class="policy-muted">The app does not request location, camera, microphone, contacts, Bluetooth, accounts, SMS, call logs, or exact-alarm permissions.</p>
+          </section>
+
+          <section id="website" class="policy-section reveal">
+            <span class="policy-section-number">06</span>
+            <h2>This website</h2>
+            <p>This Stream Ferry website contains no analytics, advertising pixels, contact forms, or third-party font requests. It stores only your light/dark theme choice in your browser’s local storage.</p>
+            <p>The site is hosted by GitHub Pages. GitHub may process technical request information, such as IP addresses and browser details, to provide and secure its hosting service. That processing is governed by the <a class="inline-link" href="https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement">GitHub General Privacy Statement</a>.</p>
+          </section>
+
+          <section id="security" class="policy-section reveal">
+            <span class="policy-section-number">07</span>
+            <h2>Security</h2>
+            <p>Remote Jellyfin servers must use HTTPS. Plain HTTP is accepted only for a server you explicitly approve on a trusted local network. Stream Ferry does not disable TLS certificate or hostname validation.</p>
+            <p>The TV-facing stream uses a temporary high-entropy session address bound to the active local-network session. Plain HTTP is used on this local hop because most TVs cannot trust a phone-generated certificate. Anyone who can monitor your LAN may still be able to observe streamed media bytes, so use Stream Ferry only on a network you trust.</p>
+            <p>No system can guarantee absolute security. Stream Ferry limits exposure by keeping tokens out of TV requests, rejecting unknown or expired stream paths, redacting diagnostics, disabling app backup, and closing the phone proxy when playback stops.</p>
+          </section>
+
+          <section id="children" class="policy-section reveal">
+            <span class="policy-section-number">08</span>
+            <h2>Children’s privacy</h2>
+            <p>Stream Ferry is a general-purpose media utility and is not directed to children. Because the developer does not operate an account or data-collection service, Stream Ferry does not knowingly collect personal information from children.</p>
+          </section>
+
+          <section id="changes" class="policy-section reveal">
+            <span class="policy-section-number">09</span>
+            <h2>Changes and contact</h2>
+            <p>If this policy changes, the effective date at the top of this page will change and the updated policy will be committed to the public repository.</p>
+            <p>Questions, privacy requests, and security concerns can be submitted through the repository’s public contact channel:</p>
+            <a class="button button-primary" href="https://github.com/adsamcik/Stream-Ferry/issues">Open a GitHub issue <span aria-hidden="true">→</span></a>
+          </section>
+        </article>
+      </div>
+    </main>
+
+    <footer class="site-footer">
+      <div class="footer-main">
+        <a class="brand" href="../" aria-label="Stream Ferry home">
+          <span class="brand-mark" aria-hidden="true"><span class="brand-play"></span><span class="brand-current"></span></span>
+          <span>Stream Ferry</span>
+        </a>
+        <p>Your Android phone is the private bridge between the videos you choose and the TV you trust.</p>
+        <nav aria-label="Footer navigation">
+          <a href="../#how-it-works">How it works</a>
+          <a href="../#features">Features</a>
+          <a href="./">Privacy policy</a>
+          <a href="https://github.com/adsamcik/Stream-Ferry/releases">Releases</a>
+          <a href="https://github.com/adsamcik/Stream-Ferry">GitHub</a>
+        </nav>
+      </div>
+      <div class="footer-legal">
+        <span>© 2026 Stream Ferry contributors</span>
+        <span>Not affiliated with the Jellyfin project.</span>
+      </div>
+    </footer>
+    <script src="../script.js"></script>
+  </body>
+</html>

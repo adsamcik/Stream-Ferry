@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#073f4c" />
+    <meta
+      name="description"
+      content="Stream Ferry sends Jellyfin and local video to your TV through your Android phone, keeping your server address and credentials off the TV."
+    />
+    <link rel="canonical" href="https://adsamcik.github.io/Stream-Ferry/" />
+    <link rel="icon" href="./assets/app-icon.png" />
+    <link rel="apple-touch-icon" href="./assets/app-icon.png" />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Stream Ferry" />
+    <meta property="og:title" content="Stream Ferry — Your phone is the bridge" />
+    <meta property="og:description" content="Private Jellyfin streaming, from phone to TV." />
+    <meta property="og:url" content="https://adsamcik.github.io/Stream-Ferry/" />
+    <meta property="og:image" content="https://adsamcik.github.io/Stream-Ferry/og.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="Stream Ferry route from a server through a phone to a TV" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Stream Ferry — Your phone is the bridge" />
+    <meta name="twitter:description" content="Private Jellyfin streaming, from phone to TV." />
+    <meta name="twitter:image" content="https://adsamcik.github.io/Stream-Ferry/og.png" />
+    <title>Stream Ferry — Your phone is the bridge</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header">
+      <a class="brand" href="./" aria-label="Stream Ferry home">
+        <span class="brand-mark" aria-hidden="true">
+          <span class="brand-play"></span>
+          <span class="brand-current"></span>
+        </span>
+        <span>Stream Ferry</span>
+      </a>
+      <nav class="site-nav" aria-label="Primary navigation">
+        <a href="#how-it-works">How it works</a>
+        <a href="#features">Features</a>
+        <a href="./privacy/">Privacy</a>
+      </nav>
+      <div class="header-actions">
+        <button class="icon-button theme-toggle" type="button" aria-label="Use dark theme" title="Change color theme">
+          <span class="theme-icon" aria-hidden="true">◐</span>
+        </button>
+        <a class="button button-small button-tonal" href="https://github.com/adsamcik/Stream-Ferry" rel="noreferrer">View on GitHub</a>
+      </div>
+    </header>
+
+    <main id="main">
+      <section class="hero" aria-labelledby="hero-title">
+        <div class="hero-copy">
+          <p class="eyebrow"><span class="status-dot"></span> Android 14+ · Cast + DLNA</p>
+          <h1 id="hero-title">Your phone is<br />the <span>bridge.</span></h1>
+          <p class="hero-lede">
+            Stream Jellyfin and local video to your TV—without handing your server credentials to the biggest screen in the room.
+          </p>
+          <div class="hero-actions">
+            <a class="button button-primary" href="https://github.com/adsamcik/Stream-Ferry/releases/latest">
+              <span aria-hidden="true">↓</span> Get the latest APK
+            </a>
+            <a class="text-link" href="#how-it-works">See the route <span aria-hidden="true">→</span></a>
+          </div>
+          <p class="hero-note">Source available · No ads · No account required</p>
+        </div>
+
+        <div class="hero-stage" aria-label="Stream Ferry routes playback from Jellyfin through your phone to your TV">
+          <div class="shape shape-cyan"></div>
+          <div class="shape shape-gold"></div>
+          <div class="source-chip source-chip-server">
+            <span class="source-icon" aria-hidden="true">◫</span>
+            <span><strong>Jellyfin</strong><small>Your server</small></span>
+          </div>
+          <div class="source-chip source-chip-tv">
+            <span class="source-icon" aria-hidden="true">▰</span>
+            <span><strong>Living room</strong><small>Cast or DLNA</small></span>
+          </div>
+          <div class="route-line route-in" aria-hidden="true"></div>
+          <div class="route-line route-out" aria-hidden="true"></div>
+
+          <div class="phone-shell">
+            <div class="phone-top"><span></span></div>
+            <div class="phone-screen">
+              <div class="app-bar">
+                <span class="mini-mark" aria-hidden="true">S</span>
+                <span>Stream Ferry</span>
+                <span aria-hidden="true">•••</span>
+              </div>
+              <div class="poster" role="img" aria-label="Abstract film poster">
+                <span>THE<br />CROSSING</span>
+                <small>Now streaming</small>
+              </div>
+              <div class="now-playing">
+                <span class="now-label">NOW PLAYING</span>
+                <strong>The Crossing</strong>
+                <span>Living room TV</span>
+                <div class="progress"><span></span></div>
+                <div class="playback-controls" aria-hidden="true"><span>↶</span><span class="pause">Ⅱ</span><span>↷</span></div>
+              </div>
+            </div>
+          </div>
+          <div class="secure-badge"><span aria-hidden="true">✓</span> Credentials stay here</div>
+        </div>
+      </section>
+
+      <section class="route-section section" id="how-it-works" aria-labelledby="route-title">
+        <div class="section-heading reveal">
+          <p class="eyebrow">A deliberately simple route</p>
+          <h2 id="route-title">One small ferry.<br />No secret detours.</h2>
+          <p>Stream Ferry makes your phone the intentional media gateway. The TV sees a temporary phone-hosted stream—not your Jellyfin address or access token.</p>
+        </div>
+
+        <div class="route-board reveal">
+          <article class="route-stop route-stop-one">
+            <div class="route-number">01</div>
+            <div class="route-symbol" aria-hidden="true">▦</div>
+            <p class="route-kicker">Your source</p>
+            <h3>Pick something to watch</h3>
+            <p>Browse Jellyfin, downloads, or video files already on your phone.</p>
+          </article>
+          <div class="route-arrow" aria-hidden="true"><span></span></div>
+          <article class="route-stop route-stop-two">
+            <div class="route-number">02</div>
+            <div class="route-symbol route-symbol-phone" aria-hidden="true">▯</div>
+            <p class="route-kicker">Your phone</p>
+            <h3>Cross the private bridge</h3>
+            <p>The phone opens the source and serves a short-lived, high-entropy stream on your LAN.</p>
+          </article>
+          <div class="route-arrow" aria-hidden="true"><span></span></div>
+          <article class="route-stop route-stop-three">
+            <div class="route-number">03</div>
+            <div class="route-symbol route-symbol-tv" aria-hidden="true">▰</div>
+            <p class="route-kicker">Your screen</p>
+            <h3>Watch on the TV</h3>
+            <p>Cast and DLNA playback stay controllable from one Now Playing screen.</p>
+          </article>
+        </div>
+
+        <div class="route-proof reveal">
+          <span class="proof-icon" aria-hidden="true">⌁</span>
+          <strong>Jellyfin server</strong>
+          <span class="proof-line"><i></i><b>encrypted or trusted LAN</b></span>
+          <strong class="proof-phone">Android phone</strong>
+          <span class="proof-line proof-line-local"><i></i><b>local network only</b></span>
+          <strong>TV</strong>
+        </div>
+      </section>
+
+      <section class="features-section section" id="features" aria-labelledby="features-title">
+        <div class="section-heading section-heading-row reveal">
+          <div>
+            <p class="eyebrow">Built for the whole crossing</p>
+            <h2 id="features-title">A better first mate<br />for movie night.</h2>
+          </div>
+          <p>Browse, route, recover, and control playback without teaching every television how to reach your server.</p>
+        </div>
+
+        <div class="bento-grid">
+          <article class="feature-card feature-private reveal">
+            <div class="feature-icon" aria-hidden="true">✓</div>
+            <p class="feature-label">Private by design</p>
+            <h3>Your login stays off the TV.</h3>
+            <p>Tokens and server details remain on your phone. There are no ads, analytics, telemetry, or developer-operated cloud services.</p>
+            <div class="privacy-orbit" aria-hidden="true">
+              <span class="orbit-phone">▯</span>
+              <span class="orbit-dot dot-one"></span>
+              <span class="orbit-dot dot-two"></span>
+              <span class="orbit-dot dot-three"></span>
+            </div>
+          </article>
+
+          <article class="feature-card feature-routing reveal">
+            <div class="feature-icon" aria-hidden="true">↝</div>
+            <p class="feature-label">Smart routing</p>
+            <h3>Cast or DLNA.<br />One TV row.</h3>
+            <p>Stream Ferry finds the best route and can recover through a compatible fallback without turning playback into a protocol lesson.</p>
+            <div class="protocol-toggle" aria-hidden="true"><span class="active">Cast</span><span>DLNA</span></div>
+          </article>
+
+          <article class="feature-card feature-offline reveal">
+            <div class="feature-icon" aria-hidden="true">↓</div>
+            <p class="feature-label">Ready offline</p>
+            <h3>Take the show with you.</h3>
+            <p>Download an original or compatible MP4, then cast it from app-private storage without the server.</p>
+            <div class="download-visual" aria-hidden="true">
+              <span>72%</span><i><b></b></i><small>Episode downloading</small>
+            </div>
+          </article>
+
+          <article class="feature-card feature-controls reveal">
+            <div class="feature-copy">
+              <div class="feature-icon" aria-hidden="true">Ⅱ</div>
+              <p class="feature-label">One control deck</p>
+              <h3>Stay in the flow.</h3>
+              <p>Resume across launches, autoplay the next episode, adjust TV volume, and recover from a dropped connection.</p>
+            </div>
+            <div class="control-deck" aria-hidden="true">
+              <span class="deck-art"></span>
+              <span class="deck-meta"><b>Northbound</b><small>Living room TV</small></span>
+              <span class="deck-button">Ⅱ</span>
+              <span class="deck-progress"><i></i></span>
+            </div>
+          </article>
+
+          <article class="feature-card feature-local reveal">
+            <div class="feature-icon" aria-hidden="true">▧</div>
+            <p class="feature-label">Local video, too</p>
+            <h3>Open a folder.<br />Send it across.</h3>
+            <p>Choose individual files or folders with Android’s system picker. Full-library access stays optional.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="privacy-callout section reveal" aria-labelledby="privacy-callout-title">
+        <div class="privacy-shape" aria-hidden="true"><span>✓</span></div>
+        <div>
+          <p class="eyebrow">A short privacy story</p>
+          <h2 id="privacy-callout-title">Your media life is<br />not our business.</h2>
+        </div>
+        <div class="privacy-summary">
+          <p>No developer database. No behavioral profile. No silent crash uploads. Data needed to make playback work stays on your phone, goes to the Jellyfin server you choose, or travels across your local network to the TV you select.</p>
+          <a class="button button-light" href="./privacy/">Read the privacy policy <span aria-hidden="true">→</span></a>
+        </div>
+      </section>
+
+      <section class="compatibility-section section" aria-labelledby="compatibility-title">
+        <div class="compatibility-copy reveal">
+          <p class="eyebrow">Made for modern Android</p>
+          <h2 id="compatibility-title">Phone in hand.<br />Big screen ahead.</h2>
+          <p>Stream Ferry supports Android 14 and newer. It connects to Jellyfin, Google Cast receivers, and many DLNA smart TVs on the same Wi‑Fi or LAN.</p>
+          <ul class="check-list">
+            <li><span>✓</span> Jellyfin Quick Connect or password sign-in</li>
+            <li><span>✓</span> Remote HTTPS, trusted LAN, and VPN servers</li>
+            <li><span>✓</span> System media controls and night volume</li>
+          </ul>
+        </div>
+        <div class="compatibility-visual reveal" aria-hidden="true">
+          <div class="visual-tv"><div><span class="visual-play">▶</span></div><i></i></div>
+          <div class="visual-phone"><span>⌁</span><small>Connected</small></div>
+          <span class="visual-signal signal-one"></span>
+          <span class="visual-signal signal-two"></span>
+          <span class="visual-signal signal-three"></span>
+        </div>
+      </section>
+
+      <section class="download-section section reveal" aria-labelledby="download-title">
+        <div class="download-mark" aria-hidden="true">
+          <span class="brand-mark brand-mark-large"><span class="brand-play"></span><span class="brand-current"></span></span>
+        </div>
+        <p class="eyebrow">The next crossing is ready</p>
+        <h2 id="download-title">Send movie night<br />in the right direction.</h2>
+        <p>Download the latest signed APK from GitHub Releases.</p>
+        <div class="download-actions">
+          <a class="button button-primary button-large" href="https://github.com/adsamcik/Stream-Ferry/releases/latest"><span aria-hidden="true">↓</span> Get Stream Ferry</a>
+          <a class="button button-outline button-large" href="https://github.com/adsamcik/Stream-Ferry">Browse the source</a>
+        </div>
+        <small>Android 14+ · Source available under PolyForm Noncommercial 1.0.0</small>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div class="footer-main">
+        <a class="brand" href="./" aria-label="Stream Ferry home">
+          <span class="brand-mark" aria-hidden="true"><span class="brand-play"></span><span class="brand-current"></span></span>
+          <span>Stream Ferry</span>
+        </a>
+        <p>Your Android phone is the private bridge between the videos you choose and the TV you trust.</p>
+        <nav aria-label="Footer navigation">
+          <a href="#how-it-works">How it works</a>
+          <a href="#features">Features</a>
+          <a href="./privacy/">Privacy policy</a>
+          <a href="https://github.com/adsamcik/Stream-Ferry/releases">Releases</a>
+          <a href="https://github.com/adsamcik/Stream-Ferry">GitHub</a>
+        </nav>
+      </div>
+      <div class="footer-legal">
+        <span>© 2026 Stream Ferry contributors</span>
+        <span>Not affiliated with the Jellyfin project.</span>
+      </div>
+    </footer>
+
+    <script src="./script.js"></script>
+  </body>
+</html>

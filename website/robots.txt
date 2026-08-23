@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://adsamcik.github.io/Stream-Ferry/sitemap.xml
