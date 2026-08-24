@@ -186,7 +186,10 @@ internal class PlaybackNotificationFactory(
             Notification.Builder(context, CHANNEL_ID)
                 .setSmallIcon(R.drawable.ic_notification_stream_ferry)
                 .setCategory(Notification.CATEGORY_TRANSPORT)
-                .setVisibility(Notification.VISIBILITY_PRIVATE)
+                // Playback controls must remain available when the phone is locked, including when
+                // the user hides sensitive notification content. The published metadata is already
+                // sanitized and contains only the media title + selected TV name.
+                .setVisibility(Notification.VISIBILITY_PUBLIC)
                 .setOnlyAlertOnce(true)
                 .setShowWhen(false)
                 .setOngoing(true)
