@@ -1,5 +1,6 @@
 package com.adsamcik.streamferry.playback
 
+import com.adsamcik.streamferry.core.stream.Protocol
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -32,8 +33,9 @@ class PlaybackRecoverySessionTest {
         assertEquals(first.attempts.size, state.attempts.size)
         assertTrue(state.generation > first.generation)
     }
-    @Test fun budgetAllowsOneNetworkRetryAndAtMostThreeCompatibilityVariants() {
+    @Test fun budgetAllowsTwoConnectionRetriesAndAtMostThreeCompatibilityVariants() {
         var state = session()
+        state = assertNotNull(state.reserveRecovery(RecoveryAttemptKind.SAME_STREAM_NETWORK, PlaybackPhase.RECONNECTING))
         state = assertNotNull(state.reserveRecovery(RecoveryAttemptKind.SAME_STREAM_NETWORK, PlaybackPhase.RECONNECTING))
         assertNull(state.reserveRecovery(RecoveryAttemptKind.SAME_STREAM_NETWORK, PlaybackPhase.RECONNECTING))
         repeat(3) {
@@ -50,6 +52,57 @@ class PlaybackRecoverySessionTest {
         }
         assertEquals(0, state.budgetStatus.automaticAttemptsRemaining)
         assertFalse(state.budget.canSchedule(state.usage, RecoveryAttemptKind.ALTERNATE_PROTOCOL))
+    }
+
+    @Test fun initialCastConnectionRetriesTwiceThenSelectsPairedDlna() {
+        var state = session()
+        fun decision(hasAlternate: Boolean = true) = decideInitialConnectionRecovery(
+            InitialConnectionRecoveryInput(
+                protocol = Protocol.CAST,
+                hasAlternateProtocol = hasAlternate,
+                failureStage = PlaybackFailureStage.ENDPOINT_CONNECTION,
+                failureCause = PlaybackFailureCause.ENDPOINT_UNAVAILABLE,
+                budget = state.budget,
+                usage = state.usage,
+            ),
+        )
+
+        assertEquals(InitialConnectionRecoveryAction.RETRY_SAME_ENDPOINT, decision())
+        repeat(2) {
+            state = assertNotNull(
+                state.reserveRecovery(RecoveryAttemptKind.SAME_STREAM_NETWORK, PlaybackPhase.RECONNECTING),
+            )
+        }
+        assertEquals(InitialConnectionRecoveryAction.TRY_ALTERNATE_PROTOCOL, decision())
+        assertEquals(InitialConnectionRecoveryAction.SURFACE, decision(hasAlternate = false))
+    }
+
+    @Test fun initialConnectionRetryDoesNotMaskDlnaLoadOrSourceFailures() {
+        val base = InitialConnectionRecoveryInput(
+            protocol = Protocol.DLNA,
+            hasAlternateProtocol = true,
+            failureStage = PlaybackFailureStage.ENDPOINT_CONNECTION,
+            failureCause = PlaybackFailureCause.ENDPOINT_UNAVAILABLE,
+            budget = RecoveryBudget(),
+            usage = RecoveryBudgetUsage(),
+        )
+
+        assertEquals(InitialConnectionRecoveryAction.SURFACE, decideInitialConnectionRecovery(base))
+        assertEquals(
+            InitialConnectionRecoveryAction.SURFACE,
+            decideInitialConnectionRecovery(base.copy(
+                protocol = Protocol.CAST,
+                failureStage = PlaybackFailureStage.RENDERER_LOAD,
+            )),
+        )
+        assertEquals(
+            InitialConnectionRecoveryAction.SURFACE,
+            decideInitialConnectionRecovery(base.copy(
+                protocol = Protocol.CAST,
+                failureStage = PlaybackFailureStage.STREAM_RESOLUTION,
+                failureCause = PlaybackFailureCause.UPSTREAM_OR_SERVER_UNAVAILABLE,
+            )),
+        )
     }
 
     @Test fun protocolFallbackAllowsEndpointDisconnectAfterSameEndpointRecoveryForLocalOrOnline() {
