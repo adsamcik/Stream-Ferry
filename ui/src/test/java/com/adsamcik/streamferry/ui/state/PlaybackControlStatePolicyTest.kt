@@ -71,6 +71,50 @@ class PlaybackControlStatePolicyTest {
         assertNull(cleared.issue)
     }
 
+    @Test fun `unreported volume expiry retains the requested level without an issue`() {
+        val pending = PlaybackControlStatePolicy.requestVolume(PlaybackControlUiState(), 3L, 0.2f, 8L)
+        val expired = PlaybackControlStatePolicy.expireVolumeReconciliation(
+            current = pending,
+            commandId = 3L,
+            rendererVolumeRevision = 8L,
+            rendererVolume = 0.7f,
+        )
+
+        assertNotNull(expired)
+        assertEquals(0.2f, expired.settledLevel)
+        assertFalse(expired.rendererReportedAfterRequest)
+        assertNull(expired.controls.volume)
+        assertNull(expired.controls.issue)
+    }
+
+    @Test fun `mismatching newer volume report wins when reconciliation expires`() {
+        val pending = PlaybackControlStatePolicy.requestVolume(PlaybackControlUiState(), 3L, 0.2f, 8L)
+        val expired = PlaybackControlStatePolicy.expireVolumeReconciliation(
+            current = pending,
+            commandId = 3L,
+            rendererVolumeRevision = 9L,
+            rendererVolume = 0.35f,
+        )
+
+        assertNotNull(expired)
+        assertEquals(0.35f, expired.settledLevel)
+        assertTrue(expired.rendererReportedAfterRequest)
+        assertNull(expired.controls.volume)
+    }
+
+    @Test fun `stale volume expiry cannot retire a newer command`() {
+        val latest = PlaybackControlStatePolicy.requestVolume(PlaybackControlUiState(), 4L, 0.6f, 8L)
+
+        assertNull(
+            PlaybackControlStatePolicy.expireVolumeReconciliation(
+                current = latest,
+                commandId = 3L,
+                rendererVolumeRevision = 8L,
+                rendererVolume = 0.7f,
+            ),
+        )
+    }
+
     private fun renderer(
         playbackRevision: Long = 0L,
         volumeRevision: Long = 0L,

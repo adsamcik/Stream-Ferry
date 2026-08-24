@@ -2229,11 +2229,41 @@ class MainViewModel(
             })
         }
         viewModelScope.launch {
-            delay(PLAYBACK_CONTROL_CONFIRMATION_TIMEOUT_MS)
+            delay(
+                if (kind == PlaybackControlKind.VOLUME) VOLUME_RECONCILIATION_TIMEOUT_MS
+                else PLAYBACK_CONTROL_CONFIRMATION_TIMEOUT_MS,
+            )
+            if (kind == PlaybackControlKind.VOLUME) {
+                var expiryMessage: String? = null
+                _state.update { current ->
+                    val playback = current.playback ?: return@update current
+                    val expiry = PlaybackControlStatePolicy.expireVolumeReconciliation(
+                        current = playback.controls,
+                        commandId = commandId,
+                        rendererVolumeRevision = playback.rendererVolumeRevision,
+                        rendererVolume = playback.volume,
+                    ) ?: return@update current
+                    expiryMessage = if (expiry.rendererReportedAfterRequest) {
+                        "TV reported ${(expiry.settledLevel * 100).toInt()}% instead of the requested volume; " +
+                            "using the renderer value"
+                    } else {
+                        "TV did not report the requested volume within ${VOLUME_RECONCILIATION_TIMEOUT_MS}ms; " +
+                            "keeping the requested value while awaiting eventual reconciliation"
+                    }
+                    current.copy(
+                        playback = playback.copy(
+                            volume = expiry.settledLevel,
+                            controls = expiry.controls,
+                        ),
+                    )
+                }
+                expiryMessage?.let { container.logger.w("playback", it) }
+                return@launch
+            }
             val message = when (kind) {
                 PlaybackControlKind.PLAY_PAUSE -> "The TV didn't confirm the playback change. Try again."
                 PlaybackControlKind.SEEK -> "The TV didn't confirm the new position. Try again."
-                PlaybackControlKind.VOLUME -> "The TV didn't confirm the volume. Try again."
+                PlaybackControlKind.VOLUME -> return@launch // handled above without a false user-facing failure
                 PlaybackControlKind.OPTIONS -> return@launch
             }
             _state.update { current ->
@@ -3913,6 +3943,7 @@ class MainViewModel(
         const val DLNA_SCAN_MS = 6_000L
         const val QUICK_CONNECT_POLL_MS = 3_000L
         const val PLAYBACK_CONTROL_CONFIRMATION_TIMEOUT_MS = 8_000L
+        const val VOLUME_RECONCILIATION_TIMEOUT_MS = 2_000L
         const val REMOTE_VOLUME_STEP = 0.05f
         const val LIBRARY_ERROR = "Couldn't load your library. Check the connection and try again."
         const val SECURE_STORAGE_ERROR =

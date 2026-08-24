@@ -53,6 +53,13 @@ data class RendererPlaybackSnapshot(
     val volume: Float,
 )
 
+/** Result of retiring a volume intent that did not receive a matching renderer report in time. */
+data class VolumeReconciliationExpiry(
+    val controls: PlaybackControlUiState,
+    val settledLevel: Float,
+    val rendererReportedAfterRequest: Boolean,
+)
+
 /** Pure state transitions shared by the ViewModel and regression tests. */
 object PlaybackControlStatePolicy {
     private const val SEEK_CONFIRMATION_TOLERANCE_SECONDS = 3L
@@ -118,6 +125,26 @@ object PlaybackControlStatePolicy {
     ): PlaybackControlUiState {
         if (!ownsPendingCommand(current, kind, commandId) && kind != PlaybackControlKind.OPTIONS) return current
         return clear(current, kind).copy(issue = PlaybackControlIssue(commandId, kind, message))
+    }
+
+    /**
+     * Stop showing a volume command as pending without manufacturing a user-facing failure. When the TV
+     * has not reported anything newer, retain the requested level optimistically. A newer mismatching
+     * report is authoritative, so expose that level instead; a later report can still reconcile either.
+     */
+    fun expireVolumeReconciliation(
+        current: PlaybackControlUiState,
+        commandId: Long,
+        rendererVolumeRevision: Long,
+        rendererVolume: Float,
+    ): VolumeReconciliationExpiry? {
+        val intent = current.volume?.takeIf { it.commandId == commandId } ?: return null
+        val rendererReportedAfterRequest = rendererVolumeRevision > intent.rendererRevisionAtRequest
+        return VolumeReconciliationExpiry(
+            controls = current.copy(volume = null),
+            settledLevel = if (rendererReportedAfterRequest) rendererVolume else intent.targetLevel,
+            rendererReportedAfterRequest = rendererReportedAfterRequest,
+        )
     }
 
     fun clearIssue(current: PlaybackControlUiState): PlaybackControlUiState = current.copy(issue = null)

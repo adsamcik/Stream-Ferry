@@ -470,7 +470,7 @@ class CastTargetController(
                     .getOrNull()
                     ?.takeIf { it.isFinite() && it in 0f..1f }
                     ?: return
-                logger.trace(TAG, "Cast volume report -> ${(reported * 100).toInt()}%")
+                logger.event("cast", "Cast volume report -> ${(reported * 100).toInt()}%")
                 _events.tryEmit(PlaybackTargetEvent.VolumeChanged(reported))
             }
         }
