@@ -427,7 +427,11 @@ private fun PhysicalTv.connectionDetail(): String {
     val summary = connectionSummary()
     val selectedEndpoint = selectEndpoint()
     return if (availableEndpoints.size > 1) {
-        "$summary • ${selectedEndpoint?.protocol?.pickerLabel() ?: "Preferred connection"} selected"
+        when (selectedEndpoint?.protocol) {
+            Protocol.CAST -> "Google Cast first • DLNA fallback after 2 retries"
+            Protocol.DLNA -> "DLNA preferred • Google Cast also available"
+            null -> "$summary • Preferred connection selected"
+        }
     } else {
         val model = selectedEndpoint?.capabilities?.modelName?.trim()?.takeIf(String::isNotEmpty)
         "$summary • ${model ?: "Available now"}"

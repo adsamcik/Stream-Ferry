@@ -1,5 +1,6 @@
 package com.adsamcik.streamferry.playback
 
+import com.adsamcik.streamferry.core.stream.Protocol
 import com.adsamcik.streamferry.domain.PlaybackFailureKind
 
 /** Coarse, UI-safe lifecycle of the one renderer playback session. */
@@ -82,7 +83,8 @@ fun redactPlaybackEndpoint(value: String?): String? = when {
 data class RecoveryBudget(
     /** Includes all automatically scheduled recovery attempts in this session. */
     val maxAutomaticAttempts: Int = 6,
-    val maxSameStreamNetworkRetries: Int = 1,
+    /** Cast startup may spend both retries before the coordinator tries a paired DLNA endpoint. */
+    val maxSameStreamNetworkRetries: Int = 2,
     /** Format, resolution, and alternate-protocol variants share a conservative cap. */
     val maxCompatibilityOrQualityVariants: Int = 3,
 )
@@ -115,6 +117,37 @@ fun RecoveryBudget.canSchedule(usage: RecoveryBudgetUsage, kind: RecoveryAttempt
         RecoveryAttemptKind.ALTERNATE_PROTOCOL ->
             usage.compatibilityOrQualityVariants < maxCompatibilityOrQualityVariants
     }
+}
+
+/** The bounded coordinator action after an initial renderer connection failure. */
+enum class InitialConnectionRecoveryAction { RETRY_SAME_ENDPOINT, TRY_ALTERNATE_PROTOCOL, SURFACE }
+
+data class InitialConnectionRecoveryInput(
+    val protocol: Protocol,
+    val hasAlternateProtocol: Boolean,
+    val failureStage: PlaybackFailureStage,
+    val failureCause: PlaybackFailureCause,
+    val budget: RecoveryBudget,
+    val usage: RecoveryBudgetUsage,
+)
+
+/**
+ * Initial Cast connection failures get two same-endpoint retries before a confidently paired endpoint
+ * may be tried. Load, format, source, and DLNA connection failures stay on their existing recovery paths.
+ */
+fun decideInitialConnectionRecovery(input: InitialConnectionRecoveryInput): InitialConnectionRecoveryAction {
+    val isCastConnectionFailure = input.protocol == Protocol.CAST &&
+        input.failureStage == PlaybackFailureStage.ENDPOINT_CONNECTION &&
+        input.failureCause in setOf(
+            PlaybackFailureCause.ENDPOINT_UNAVAILABLE,
+            PlaybackFailureCause.TRANSIENT_NETWORK,
+        )
+    if (!isCastConnectionFailure) return InitialConnectionRecoveryAction.SURFACE
+    if (input.budget.canSchedule(input.usage, RecoveryAttemptKind.SAME_STREAM_NETWORK)) {
+        return InitialConnectionRecoveryAction.RETRY_SAME_ENDPOINT
+    }
+    return if (input.hasAlternateProtocol) InitialConnectionRecoveryAction.TRY_ALTERNATE_PROTOCOL
+    else InitialConnectionRecoveryAction.SURFACE
 }
 
 private fun RecoveryBudgetUsage.consume(kind: RecoveryAttemptKind): RecoveryBudgetUsage = copy(

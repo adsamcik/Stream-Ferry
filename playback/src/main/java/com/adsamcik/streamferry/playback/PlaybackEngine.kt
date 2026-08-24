@@ -361,7 +361,7 @@ class PlaybackEngine(
         hasAlternateProtocol: Boolean,
         failureStage: PlaybackFailureStage,
         failureCause: PlaybackFailureCause,
-        sameEndpointRecoveryExhausted: Boolean = retriedOnce,
+        sameEndpointRecoveryExhausted: Boolean,
         isLocalSessionHint: Boolean? = null,
         isOnlineSessionHint: Boolean? = null,
     ): PlaybackRecoveryContinuation? = synchronized(recoveryLock) {
@@ -385,6 +385,19 @@ class PlaybackEngine(
         )
         if (continuation != null) recoverySession = continuation.session
         continuation
+    }
+
+    /**
+     * Reserve one coordinator-owned same-endpoint startup retry. The returned continuation carries the
+     * finite budget and redacted attempt history across the failed engine stop/start boundary.
+     */
+    fun reserveSameEndpointContinuation(): PlaybackRecoveryContinuation? = synchronized(recoveryLock) {
+        val reserved = recoverySession.reserveRecovery(
+            RecoveryAttemptKind.SAME_STREAM_NETWORK,
+            PlaybackPhase.RECONNECTING,
+        ) ?: return@synchronized null
+        recoverySession = reserved
+        PlaybackRecoveryContinuation(reserved, RecoveryAttemptKind.SAME_STREAM_NETWORK)
     }
 
     /**
@@ -527,6 +540,7 @@ class PlaybackEngine(
         this@PlaybackEngine.prefs = prefs
         this@PlaybackEngine.autoAdvance = autoAdvance
         lastNote = "Measuring link speed…"
+        var endpointConnected = false
         try {
             // Promote to the foreground FIRST — while the main thread is still quiet (the caller has NOT
             // yet navigated to the playback screen) — and WAIT until the service has actually called
@@ -539,6 +553,7 @@ class PlaybackEngine(
             onForegrounded()
             eventsJob = scope.launch { target.events.collect { onTargetEvent(target, it) } }
             target.connect(selectedTarget)
+            endpointConnected = true
             synchronizeVolumeFromTargetLocked()
             val startPos = PlaybackPositionPolicy.clamp(
                 resumePositionOverrideSeconds ?: item.resumePositionSeconds ?: 0L,
@@ -567,12 +582,17 @@ class PlaybackEngine(
             throw e
         } catch (e: Exception) {
             // Keep a classified terminal checkpoint even though cleanup invalidates the active generation.
-            val cause = if (e.isPreparationFailure()) {
-                PlaybackFailureCause.UPSTREAM_OR_SERVER_UNAVAILABLE
-            } else {
-                PlaybackFailureCause.UNKNOWN
+            val stage = when {
+                e.isPreparationFailure() -> PlaybackFailureStage.STREAM_RESOLUTION
+                !endpointConnected -> PlaybackFailureStage.ENDPOINT_CONNECTION
+                else -> PlaybackFailureStage.RENDERER_LOAD
             }
-            recoverySession = recoverySession.recordFailure(PlaybackFailureStage.STREAM_RESOLUTION, cause).fail()
+            val cause = when {
+                e.isPreparationFailure() -> PlaybackFailureCause.UPSTREAM_OR_SERVER_UNAVAILABLE
+                !endpointConnected -> PlaybackFailureCause.ENDPOINT_UNAVAILABLE
+                else -> PlaybackFailureCause.UNKNOWN
+            }
+            recoverySession = recoverySession.recordFailure(stage, cause).fail()
             smartResume.checkpoint(SmartResumeCheckpointKind.FAILURE, smartResumeDeviceContext)
             // Roll back any partial setup so the user isn't left on a stuck "preparing" screen.
             stopInternalLocked("playback start failed")
@@ -826,6 +846,7 @@ class PlaybackEngine(
         localPlayback = LocalPlaybackParams(filePath, contentType, title, runtimeSeconds, allowClientTranscode)
         forcedLocalCodec = null // a fresh file starts on automatic codec negotiation
         localCodecFallbacksTried.clear()
+        var endpointConnected = false
         try {
             // See play(): foreground FIRST (while the caller is still on the quiet picker screen) and WAIT
             // for startForeground() BEFORE navigating ([onForegrounded]) or starting the renderer handshake,
@@ -834,6 +855,7 @@ class PlaybackEngine(
             onForegrounded()
             eventsJob = scope.launch { target.events.collect { onTargetEvent(target, it) } }
             target.connect(selectedTarget)
+            endpointConnected = true
             synchronizeVolumeFromTargetLocked()
             loadLocalStreamLocked(PlaybackPositionPolicy.clamp(resumePositionSeconds, runtimeSeconds))
             monitorJob = scope.launch { monitorLoop() }
@@ -841,12 +863,17 @@ class PlaybackEngine(
             withContext(NonCancellable) { stopInternalLocked("downloaded playback start cancelled") }
             throw e
         } catch (e: Exception) {
-            val cause = if (e.isPreparationFailure()) {
-                PlaybackFailureCause.UPSTREAM_OR_SERVER_UNAVAILABLE
-            } else {
-                PlaybackFailureCause.UNKNOWN
+            val stage = when {
+                e.isPreparationFailure() -> PlaybackFailureStage.STREAM_RESOLUTION
+                !endpointConnected -> PlaybackFailureStage.ENDPOINT_CONNECTION
+                else -> PlaybackFailureStage.RENDERER_LOAD
             }
-            recoverySession = recoverySession.recordFailure(PlaybackFailureStage.RENDERER_LOAD, cause).fail()
+            val cause = when {
+                e.isPreparationFailure() -> PlaybackFailureCause.UPSTREAM_OR_SERVER_UNAVAILABLE
+                !endpointConnected -> PlaybackFailureCause.ENDPOINT_UNAVAILABLE
+                else -> PlaybackFailureCause.UNKNOWN
+            }
+            recoverySession = recoverySession.recordFailure(stage, cause).fail()
             smartResume.checkpoint(SmartResumeCheckpointKind.FAILURE, smartResumeDeviceContext)
             stopInternalLocked("downloaded playback start failed")
             logger.e("playback", "Playback start failed", e)

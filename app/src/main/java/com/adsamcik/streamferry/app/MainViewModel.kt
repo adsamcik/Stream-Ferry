@@ -49,6 +49,8 @@ import com.adsamcik.streamferry.physical.PhysicalTvAggregator
 import com.adsamcik.streamferry.physical.PhysicalTvReconnectMatch
 import com.adsamcik.streamferry.physical.PhysicalTvReconnectPolicy
 import com.adsamcik.streamferry.physical.PhysicalTvResumeMatcher
+import com.adsamcik.streamferry.playback.InitialConnectionRecoveryAction
+import com.adsamcik.streamferry.playback.InitialConnectionRecoveryInput
 import com.adsamcik.streamferry.playback.PlaybackStatus
 import com.adsamcik.streamferry.playback.PlaybackQueue
 import com.adsamcik.streamferry.playback.PlaylistEntry
@@ -59,6 +61,7 @@ import com.adsamcik.streamferry.playback.PlaybackPhase
 import com.adsamcik.streamferry.playback.PlaybackPreparationException
 import com.adsamcik.streamferry.playback.PlaybackPositionPolicy
 import com.adsamcik.streamferry.playback.PlaybackRecoveryContinuation
+import com.adsamcik.streamferry.playback.decideInitialConnectionRecovery
 import com.adsamcik.streamferry.ui.navigation.GalleryBrowseTarget
 import com.adsamcik.streamferry.ui.navigation.GalleryLoadRequest
 import com.adsamcik.streamferry.ui.navigation.GalleryLoadRequestGate
@@ -1571,27 +1574,48 @@ class MainViewModel(
                 // startup completion resurrect the now-invalid session or stop a newer account's play.
                 container.logger.event("playback", "Discarded a play start after its Jellyfin account changed")
             }
-        }.onFailure { e ->
-            if (e is CancellationException) {
-                throw e
-            } else if (isSessionExpired(e)) {
+        }.onFailure { initialFailure ->
+            if (initialFailure is CancellationException) {
+                throw initialFailure
+            } else if (isSessionExpired(initialFailure)) {
                 if (onlinePlaybackOwner == onlineOwnerForAttempt) onlinePlaybackOwner = null
                 handleSessionExpired()
             } else {
+                val context = reconnectContext
+                val retryResult = if (context != null) {
+                    retryInitialCastConnection(context, initialFailure, pendingPlayback)
+                } else {
+                    Result.failure(initialFailure)
+                }
+                if (retryResult.isSuccess) {
+                    if (onlineOwnerForAttempt == null || isActiveOnlinePlaybackOwner(onlineOwnerForAttempt)) {
+                        smartResumeOverrideSeconds = null
+                        started = true
+                        container.logger.event("playback", "Initial Google Cast connection recovered after retry")
+                    } else {
+                        container.logger.event("playback", "Discarded a retried play start after its Jellyfin account changed")
+                    }
+                    return@onFailure
+                }
+                val failure = retryResult.exceptionOrNull() ?: initialFailure
+                if (isSessionExpired(failure)) {
+                    if (onlinePlaybackOwner == onlineOwnerForAttempt) onlinePlaybackOwner = null
+                    handleSessionExpired()
+                    return@onFailure
+                }
                 // Surface the ACTUAL cause (redacted) instead of a misleading "same Wi-Fi" message.
                 // A Jellyfin HTTP failure is already logged with its parsed reason at the jellyfin layer
                 // (JellyfinClient.exec); only log here for non-HTTP failures (Cast/DLNA/proxy) so the
                 // diagnostics export doesn't carry the same error twice.
-                val reason = LogRedactor.redact(bestFailureReason(e)).take(180)
+                val reason = LogRedactor.redact(bestFailureReason(failure)).take(180)
                 val latestFailureCause = container.playbackEngine.recoverySnapshot().attempts.lastOrNull()?.failureCause
                 val upstreamFailure = latestFailureCause == PlaybackFailureCause.UPSTREAM_OR_SERVER_UNAVAILABLE ||
-                    generateSequence(e) { it.cause }.any {
+                    generateSequence(failure) { it.cause }.any {
                         it is SourceHttpException || it is PlaybackPreparationException
                     }
                 if (!upstreamFailure) {
-                    container.logger.w("Playback", "Couldn't start playback", e)
+                    container.logger.w("Playback", "Couldn't start playback", failure)
                 }
-                val context = reconnectContext
                 var switched = false
                 if (context != null && !upstreamFailure) {
                     val generation = ++reconnectGeneration
@@ -3018,6 +3042,62 @@ class MainViewModel(
         is ReconnectContext.Local -> copy(physicalTv = physicalTv)
     }
 
+    /** Retry only an initial Cast connect handshake, never a source/format/load failure. */
+    private suspend fun retryInitialCastConnection(
+        context: ReconnectContext,
+        initialFailure: Throwable,
+        pendingPlayback: PlaybackUiState,
+    ): Result<Unit> {
+        var failure = initialFailure
+        while (currentCoroutineContext().isActive) {
+            val snapshot = container.playbackEngine.recoverySnapshot()
+            val latest = snapshot.attempts.lastOrNull() ?: return Result.failure(failure)
+            val action = decideInitialConnectionRecovery(
+                InitialConnectionRecoveryInput(
+                    protocol = context.endpoint.protocol,
+                    hasAlternateProtocol = context.endpoint.protocol == Protocol.CAST &&
+                        context.physicalTv.dlnaEndpoint != null,
+                    failureStage = latest.failureStage ?: PlaybackFailureStage.UNKNOWN,
+                    failureCause = latest.failureCause ?: PlaybackFailureCause.UNKNOWN,
+                    budget = snapshot.budget,
+                    usage = snapshot.usage,
+                ),
+            )
+            if (action != InitialConnectionRecoveryAction.RETRY_SAME_ENDPOINT) {
+                return Result.failure(failure)
+            }
+            val retryNumber = snapshot.usage.sameStreamNetworkRetries + 1
+            val continuation = container.playbackEngine.reserveSameEndpointContinuation()
+                ?: return Result.failure(failure)
+            _state.update { current ->
+                current.copy(
+                    route = Route.PLAYBACK,
+                    playback = (current.playback ?: pendingPlayback).copy(
+                        phase = PlaybackPhase.RECONNECTING,
+                        adaptiveNote = "Google Cast didn't connect — retrying ($retryNumber/${snapshot.budget.maxSameStreamNetworkRetries})…",
+                        errorMessage = null,
+                        isTerminal = false,
+                    ),
+                    errorMessage = null,
+                )
+            }
+            container.logger.event(
+                "playback",
+                "Google Cast connect failed; retrying same endpoint ($retryNumber/${snapshot.budget.maxSameStreamNetworkRetries})",
+            )
+            delay(INITIAL_CAST_CONNECT_RETRY_DELAY_MS * retryNumber)
+            try {
+                playContext(context, context.endpoint, lastPlaybackPositionSeconds, continuation)
+                return Result.success(Unit)
+            } catch (c: CancellationException) {
+                throw c
+            } catch (error: Exception) {
+                failure = error
+            }
+        }
+        throw CancellationException("Initial Cast connection retry was cancelled")
+    }
+
     private suspend fun playContext(
         context: ReconnectContext,
         endpoint: DiscoveredTarget,
@@ -3838,6 +3918,7 @@ class MainViewModel(
         const val SECURE_STORAGE_ERROR =
             "Couldn't update secure storage. Check available device storage, restart the app, and try again."
         const val SEARCH_DEBOUNCE_MS = 350L
+        const val INITIAL_CAST_CONNECT_RETRY_DELAY_MS = 1_000L
         const val RECONNECT_DELAY_MS = 2_000L
         const val RESUME_SAVE_INTERVAL_MS = 5_000L
         const val NANOS_PER_MILLISECOND = 1_000_000L
