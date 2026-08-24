@@ -592,7 +592,7 @@ class PlaybackEngine(
                 !endpointConnected -> PlaybackFailureCause.ENDPOINT_UNAVAILABLE
                 else -> PlaybackFailureCause.UNKNOWN
             }
-            recoverySession = recoverySession.recordFailure(stage, cause).fail()
+            recordStartupFailure(stage, cause, PlaybackAttemptSourceKind.ONLINE)
             smartResume.checkpoint(SmartResumeCheckpointKind.FAILURE, smartResumeDeviceContext)
             // Roll back any partial setup so the user isn't left on a stuck "preparing" screen.
             stopInternalLocked("playback start failed")
@@ -873,7 +873,7 @@ class PlaybackEngine(
                 !endpointConnected -> PlaybackFailureCause.ENDPOINT_UNAVAILABLE
                 else -> PlaybackFailureCause.UNKNOWN
             }
-            recoverySession = recoverySession.recordFailure(stage, cause).fail()
+            recordStartupFailure(stage, cause, PlaybackAttemptSourceKind.LOCAL)
             smartResume.checkpoint(SmartResumeCheckpointKind.FAILURE, smartResumeDeviceContext)
             stopInternalLocked("downloaded playback start failed")
             logger.e("playback", "Playback start failed", e)
@@ -1431,6 +1431,26 @@ class PlaybackEngine(
 
     private fun Throwable.isPreparationFailure(): Boolean =
         generateSequence(this) { it.cause }.any { it is PlaybackPreparationException }
+
+    /** A connect handshake can fail before normal media resolution creates its first load attempt. */
+    private fun recordStartupFailure(
+        stage: PlaybackFailureStage,
+        cause: PlaybackFailureCause,
+        sourceKind: PlaybackAttemptSourceKind,
+    ) {
+        if (stage == PlaybackFailureStage.ENDPOINT_CONNECTION) {
+            recoverySession = recoverySession.beginAttempt(
+                PlaybackAttemptDescriptor(
+                    generation = 0,
+                    protocol = selectedTarget?.protocol?.name,
+                    sourceKind = sourceKind,
+                    reason = "endpoint connection",
+                    automaticRecovery = pendingRecoveryKind,
+                ),
+            )
+        }
+        recoverySession = recoverySession.recordFailure(stage, cause).fail()
+    }
 
     /**
      * Fail closed on foreground-service setup. The local proxy is not a best-effort convenience: it owns
