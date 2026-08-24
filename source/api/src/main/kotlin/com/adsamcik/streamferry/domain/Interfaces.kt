@@ -207,6 +207,8 @@ data class TargetDiscoveryMetadata(
 sealed interface PlaybackTargetEvent {
     data object Connected : PlaybackTargetEvent
     data class StatusChanged(val positionSeconds: Long, val isPlaying: Boolean) : PlaybackTargetEvent
+    /** Authoritative normalized master-volume report from the active renderer session. */
+    data class VolumeChanged(val level: Float) : PlaybackTargetEvent
     /** The renderer started/stopped rebuffering (a stall). Feeds the adaptive-bitrate controller. */
     data class BufferingChanged(val isBuffering: Boolean) : PlaybackTargetEvent
     /** A transport command failed without making the playable stream itself terminal (for example resume seek). */

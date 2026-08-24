@@ -734,11 +734,20 @@ class PlaybackEngine(
         t.setVolume(requested)
         rendererVolume = rendererVolume.acceptExplicit(requested)
         val reported = runCatching { t.readCurrentVolume() }
-            .onFailure { logger.w(TAG, "TV accepted a volume command but did not confirm its level", it) }
+            .onFailure {
+                logger.w(TAG, "TV volume command was sent but immediate reconciliation failed; awaiting renderer status", it)
+            }
             .getOrNull()
-        if (reported != null) {
-            rendererVolume = rendererVolume.acceptReported(reported)
+        val immediateConfirmation = rendererVolume.acceptReportedIfMatching(requested, reported)
+        if (immediateConfirmation != null) {
+            rendererVolume = immediateConfirmation
             rendererVolumeRevision.incrementAndGet()
+        } else if (reported != null) {
+            logger.trace(
+                TAG,
+                "TV still reports ${(reported * 100).toInt()}% after requesting ${(requested * 100).toInt()}%; " +
+                    "keeping the requested level while awaiting reconciliation",
+            )
         }
         publishStatus()
     }
@@ -2244,6 +2253,16 @@ class PlaybackEngine(
                     smartResumeDeviceContext,
                 )
                 maybeAutoSkip()
+                publishStatus()
+            }
+            is PlaybackTargetEvent.VolumeChanged -> {
+                val reconciled = rendererVolume.acceptReported(event.level)
+                if (!reconciled.isSynchronized) {
+                    logger.w(TAG, "Ignoring invalid renderer volume report")
+                    return
+                }
+                rendererVolume = reconciled
+                rendererVolumeRevision.incrementAndGet()
                 publishStatus()
             }
             is PlaybackTargetEvent.BufferingChanged -> {

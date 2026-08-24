@@ -29,4 +29,19 @@ class RendererVolumeStateTest {
         assertTrue(selected.isSynchronized)
         assertEquals(.62f, selected.level)
     }
+
+    @Test fun staleImmediateReportDoesNotReplaceARequestedVolume() {
+        val requested = RendererVolumeState(level = .35f, isSynchronized = true).acceptExplicit(.70f)
+
+        assertNull(requested.acceptReportedIfMatching(expected = .70f, reported = .35f))
+        assertEquals(.70f, requested.level)
+    }
+
+    @Test fun matchingImmediateReportConfirmsTheReceiverLevel() {
+        val requested = RendererVolumeState().acceptExplicit(.70f)
+        val confirmed = requested.acceptReportedIfMatching(expected = .70f, reported = .695f)
+
+        assertEquals(.695f, confirmed?.level)
+        assertTrue(confirmed?.isSynchronized == true)
+    }
 }

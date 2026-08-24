@@ -3,6 +3,7 @@ package com.adsamcik.streamferry.data.cast
 import android.content.Context
 import androidx.mediarouter.media.MediaRouteSelector
 import androidx.mediarouter.media.MediaRouter
+import com.google.android.gms.cast.Cast
 import com.google.android.gms.cast.CastDevice
 import com.google.android.gms.cast.CastMediaControlIntent
 import com.google.android.gms.cast.HlsSegmentFormat as CastHlsSegmentFormat
@@ -101,6 +102,13 @@ class CastTargetController(
         val generation: Long,
     )
 
+    /** Volume callbacks belong to the exact session that received the registration. */
+    private data class CastListenerRegistration(
+        val session: CastSession,
+        val listener: Cast.Listener,
+        val generation: Long,
+    )
+
     /** Stable identity resolved from the requested MediaRouter route before selecting it. */
     private data class RequestedCastRoute(
         val routeId: String,
@@ -132,6 +140,7 @@ class CastTargetController(
 
     private var mediaCallbackRegistration: MediaCallbackRegistration? = null
     private var sessionListenerRegistration: SessionListenerRegistration? = null
+    private var castListenerRegistration: CastListenerRegistration? = null
     private val callbackScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var suspensionWatchdogJob: Job? = null
     /** Keeps durable progress current while the Cast SDK is quiet during steady playback. */
@@ -254,6 +263,7 @@ class CastTargetController(
                 }
                 if (!isCurrentGeneration(generation)) error("Cast connection was superseded.")
                 bindActiveSession(requestedRoute, connectedSession, generation)
+                registerCastListener(connectedSession, generation)
                 registerMediaCallback()
                 registerSessionListener(ctx, connectedSession, generation)
                 logger.event("connect", "Cast session connected -> ${target.displayName}")
@@ -363,6 +373,10 @@ class CastTargetController(
     override suspend fun setVolume(level: Float) = withContext(Dispatchers.Main) {
         val activeClient = requireActiveMediaClient()
         activeClient.session.volume = level.coerceIn(0f, 1f).toDouble()
+        // setVolume() is a void asynchronous Cast request. Ask for fresh device status, but reconcile only
+        // from Cast.Listener.onVolumeChanged instead of immediately trusting the session's cached getter.
+        runCatching { activeClient.session.requestStatus() }
+            .onFailure { logger.w(TAG, "Couldn't request Cast status after setting volume", it) }
         if (!isActiveMediaClient(activeClient)) error("Cast session changed while setting volume.")
     }
 
@@ -438,6 +452,37 @@ class CastTargetController(
         val registration = sessionListenerRegistration ?: return
         registration.manager.removeSessionManagerListener(registration.listener, CastSession::class.java)
         sessionListenerRegistration = null
+    }
+
+    /**
+     * CastSession.setVolume has no per-command result. Device-volume callbacks are the SDK's eventual,
+     * receiver-originated state signal and also capture changes made by another sender or a TV remote.
+     */
+    private fun registerCastListener(expectedSession: CastSession, generation: Long) {
+        val existing = castListenerRegistration
+        if (existing?.session === expectedSession && existing.generation == generation) return
+        removeCastListener()
+        val listener = object : Cast.Listener() {
+            override fun onVolumeChanged() {
+                if (!isTrackedActiveSession(expectedSession, generation)) return
+                val reported = runCatching { expectedSession.volume.toFloat() }
+                    .onFailure { logger.w(TAG, "Couldn't read Cast volume after its change callback", it) }
+                    .getOrNull()
+                    ?.takeIf { it.isFinite() && it in 0f..1f }
+                    ?: return
+                logger.trace(TAG, "Cast volume report -> ${(reported * 100).toInt()}%")
+                _events.tryEmit(PlaybackTargetEvent.VolumeChanged(reported))
+            }
+        }
+        castListenerRegistration = CastListenerRegistration(expectedSession, listener, generation)
+        expectedSession.addCastListener(listener)
+    }
+
+    private fun removeCastListener() {
+        val registration = castListenerRegistration ?: return
+        castListenerRegistration = null
+        runCatching { registration.session.removeCastListener(registration.listener) }
+            .onFailure { logger.w(TAG, "Couldn't unregister Cast listener: ${it.message ?: it.javaClass.simpleName}") }
     }
 
     /**
@@ -810,6 +855,7 @@ class CastTargetController(
     private fun detachActiveSession(clearTerminalDisconnectMarker: Boolean = true) {
         cancelPositionHeartbeat()
         unregisterMediaCallback()
+        removeCastListener()
         removeSessionListener()
         activeBinding = null
         if (clearTerminalDisconnectMarker) terminalDisconnectGeneration = null
