@@ -12,6 +12,10 @@ there is **no telemetry** and nothing leaves the device unless you share a repor
 
 ## [Unreleased]
 
+### Fixed
+- Synchronized natural Cast completion back to the phone as an authoritative final playback update,
+  preventing a finished video from retaining a stale partial progress position.
+
 ## [0.6.0] - 2026-08-17
 
 ### Changed

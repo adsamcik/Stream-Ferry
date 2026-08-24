@@ -2276,12 +2276,29 @@ class PlaybackEngine(
                     // mistake this completion for a newer stream that has reused the same TV connection.
                     val completedPlayGeneration = playGeneration
                     completedGeneration = completedPlayGeneration
+                    val lastRendererPosition = absolutePositionSeconds
+                    val duration = currentProviderSession?.descriptor?.runtimeSeconds
+                        ?: item?.runtimeSeconds
+                        ?: localPlayback?.runtimeSeconds
+                    val completedPosition = PlaybackPositionPolicy.completedPosition(lastRendererPosition, duration)
+                    // A progressive transcode may use a server-side timeline offset. Collapse that split
+                    // representation at completion so every consumer sees one canonical absolute endpoint.
+                    streamStartSeconds = 0L
+                    reportedPositionSeconds = completedPosition
                     isPlaying = false
                     isBuffering = false
                     seekSettleTargetSeconds = null
+                    // Ended is an authoritative renderer transport/timeline transition just like a status
+                    // callback. Without a new revision, MainViewModel intentionally retains its prior
+                    // confirmed position and playing state, which can leave a finished Cast at 50%.
+                    rendererPlaybackRevision.incrementAndGet()
                     recoverySession = recoverySession.transition(PlaybackPhase.COMPLETED)
                     lastNote = "Finished"
-                    logger.event("playback", "End of media reached at ${absolutePositionSeconds}s")
+                    logger.event(
+                        "playback",
+                        "End of media reached at ${absolutePositionSeconds}s " +
+                            "(last renderer position ${lastRendererPosition}s)",
+                    )
                     noteSourcePosition(absolutePositionSeconds)
                     reportSourceProgressSoon()
                     smartResume.complete(smartResumeDeviceContext)

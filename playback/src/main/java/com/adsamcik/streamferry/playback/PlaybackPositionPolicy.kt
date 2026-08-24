@@ -16,4 +16,13 @@ object PlaybackPositionPolicy {
     /** A server-positioned progressive stream starts at renderer time zero; full timelines start at the media time. */
     fun rendererLoadPosition(positionSeconds: Long, requiresServerReload: Boolean): Long =
         if (requiresServerReload) 0L else positionSeconds.coerceAtLeast(0L)
+
+    /**
+     * A renderer's natural end-of-media signal is stronger than its last sampled clock position. When
+     * the source has a valid duration, finalize the timeline at that duration so a quiet/missed final
+     * position update cannot leave completed playback looking half watched. Unknown timelines retain
+     * the last non-negative renderer position instead of inventing an endpoint.
+     */
+    fun completedPosition(lastPositionSeconds: Long, durationSeconds: Long?): Long =
+        durationSeconds?.takeIf { it > 0L } ?: lastPositionSeconds.coerceAtLeast(0L)
 }

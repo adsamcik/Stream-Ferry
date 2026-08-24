@@ -28,4 +28,13 @@ class PlaybackPositionPolicyTest {
         assertEquals(0L, PlaybackPositionPolicy.rendererLoadPosition(735L, requiresServerReload = true))
         assertEquals(735L, PlaybackPositionPolicy.rendererLoadPosition(735L, requiresServerReload = false))
     }
+
+    @Test fun `natural completion finalizes a known timeline despite a stale renderer clock`() {
+        assertEquals(1_000L, PlaybackPositionPolicy.completedPosition(500L, 1_000L))
+    }
+
+    @Test fun `natural completion retains the last position when the timeline is unknown`() {
+        assertEquals(500L, PlaybackPositionPolicy.completedPosition(500L, null))
+        assertEquals(0L, PlaybackPositionPolicy.completedPosition(-1L, null))
+    }
 }
