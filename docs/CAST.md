@@ -56,6 +56,24 @@ route, then atomically installs its session/client callback binding before repor
 suspension, the Cast SDK owns recovery; the app only receives a terminal disconnect after resume failure
 or session end, so it cannot race the SDK with a second full reload.
 
+## Volume control and reconciliation
+
+Android's `CastSession.setVolume()` is an asynchronous `void` request, not a result-bearing media command.
+An immediate `CastSession.getVolume()` can therefore still expose the SDK's prior cached value and is not
+proof that the receiver rejected the requested level.
+
+The active Cast session owns a generation-bound `Cast.Listener`. Its `onVolumeChanged()` callback emits an
+authoritative normalized volume event to the playback engine, including changes originating from another
+sender or the TV. After setting volume, the controller also requests fresh Cast status, while the engine
+accepts an immediate read only when it already matches the requested level.
+
+The UI keeps the requested level optimistically while waiting for this reconciliation. A matching report
+retires the pending state immediately. After two seconds, a newer mismatching renderer report wins; with no
+new report, the UI keeps the requested value without presenting a false failure or returning the slider to
+its old position. The timeout and every eventual Cast volume report are recorded in diagnostics, and any
+later receiver report remains authoritative, so delayed or failed communication is still observable and
+correctable without disrupting a volume command that audibly succeeded.
+
 ## Media load
 
 The receiver receives **only the phone proxy URL** — never a Jellyfin URL or token. The `MediaInfo`
