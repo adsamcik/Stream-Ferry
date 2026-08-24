@@ -74,18 +74,20 @@ lifecycle. They keep separate low-level providers where their capabilities diffe
 
 Recovery is a finite policy, not an open-ended search:
 
-1. A transient stream/network error retries the same stream once. It does not transcode merely because
-   the network failed.
-2. Direct-play startup incompatibility may use one conservative Jellyfin server transcode.
-3. A failing server transcode may step down through meaningful resolution caps while budget remains.
-4. The existing admitted local-file Cast transcode may try another phone/receiver-compatible codec.
-5. After same-endpoint work is exhausted, one alternate endpoint of the same confidently merged TV may
+1. An initial Google Cast connection failure retries the same Cast endpoint twice. If both retries fail,
+   a confidently paired DLNA endpoint for the same TV is tried automatically.
+2. A transient error after the renderer connects retries the same stream once. It does not transcode merely
+   because the network failed.
+3. Direct-play startup incompatibility may use one conservative Jellyfin server transcode.
+4. A failing server transcode may step down through meaningful resolution caps while budget remains.
+5. The existing admitted local-file Cast transcode may try another phone/receiver-compatible codec.
+6. After same-endpoint work is exhausted, one alternate endpoint of the same confidently merged TV may
    be reserved and tried. The reservation itself is single-use, so cancellation before load cannot cycle.
-6. Otherwise the session becomes terminal on Now Playing.
+7. Otherwise the session becomes terminal on Now Playing.
 
 Budgets are deliberately modest:
 
-- same-stream network recovery: 1;
+- same-endpoint connection/network recovery: 2 total (an established stream error spends at most 1);
 - compatibility/quality/protocol variants: 3 shared;
 - alternate protocol: 1 total;
 - total automatic attempts: at most 6 (normally fewer because only eligible candidates are generated).
@@ -161,6 +163,8 @@ whether first frame, controls, confirmed resume, cleanup, and diagnostics behave
 - [ ] LG DLNA: the same, including reload/Stop ordering.
 - [ ] One TV exposing Cast and DLNA: one row only when evidence is confident; force a failure and verify
       alternate protocol resumes at confirmed progress.
+- [ ] Initial Cast connection failure: verify two bounded Cast retries, then automatic DLNA handoff on a
+      confidently paired TV; a source/load failure must not be mislabeled as a connection retry.
 - [ ] Separate Chromecast attached to a DLNA TV: separate rows; neither endpoint controls the other.
 - [ ] Temporary Wi-Fi loss: one same-endpoint retry; no unnecessary transcode; Stop prevents later work.
 - [ ] Incompatible original media: conservative server transcode, then lower resolution when eligible.
