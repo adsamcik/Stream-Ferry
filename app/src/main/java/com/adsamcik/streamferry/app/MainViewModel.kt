@@ -62,6 +62,7 @@ import com.adsamcik.streamferry.playback.PlaybackPreparationException
 import com.adsamcik.streamferry.playback.PlaybackPositionPolicy
 import com.adsamcik.streamferry.playback.PlaybackRecoveryContinuation
 import com.adsamcik.streamferry.playback.decideInitialConnectionRecovery
+import com.adsamcik.streamferry.playback.endpointConnectionRetries
 import com.adsamcik.streamferry.ui.navigation.GalleryBrowseTarget
 import com.adsamcik.streamferry.ui.navigation.GalleryLoadRequest
 import com.adsamcik.streamferry.ui.navigation.GalleryLoadRequestGate
@@ -3096,15 +3097,15 @@ class MainViewModel(
             if (action != InitialConnectionRecoveryAction.RETRY_SAME_ENDPOINT) {
                 return Result.failure(failure)
             }
-            val retryNumber = snapshot.usage.sameStreamNetworkRetries + 1
-            val continuation = container.playbackEngine.reserveSameEndpointContinuation()
+            val retryNumber = snapshot.usage.endpointConnectionRetries(context.endpoint.protocol) + 1
+            val continuation = container.playbackEngine.reserveEndpointConnectionContinuation(context.endpoint.protocol)
                 ?: return Result.failure(failure)
             _state.update { current ->
                 current.copy(
                     route = Route.PLAYBACK,
                     playback = (current.playback ?: pendingPlayback).copy(
                         phase = PlaybackPhase.RECONNECTING,
-                        adaptiveNote = "Google Cast didn't connect — retrying ($retryNumber/${snapshot.budget.maxSameStreamNetworkRetries})…",
+                        adaptiveNote = "Google Cast didn't connect — retrying ($retryNumber/${snapshot.budget.maxEndpointConnectionRetriesPerProtocol})…",
                         errorMessage = null,
                         isTerminal = false,
                     ),
@@ -3113,7 +3114,7 @@ class MainViewModel(
             }
             container.logger.event(
                 "playback",
-                "Google Cast connect failed; retrying same endpoint ($retryNumber/${snapshot.budget.maxSameStreamNetworkRetries})",
+                "Google Cast connect failed; retrying same endpoint ($retryNumber/${snapshot.budget.maxEndpointConnectionRetriesPerProtocol})",
             )
             delay(INITIAL_CAST_CONNECT_RETRY_DELAY_MS * retryNumber)
             try {

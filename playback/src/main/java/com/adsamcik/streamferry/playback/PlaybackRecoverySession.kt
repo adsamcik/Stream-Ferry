@@ -46,7 +46,13 @@ enum class PlaybackAttemptSourceKind { ONLINE, LOCAL, ON_DEVICE_TRANSCODE }
 enum class PlaybackAttemptRoute { DIRECT, SERVER_TRANSCODE, ON_DEVICE_TRANSCODE }
 
 /** The bounded classes of automatic work. Explicit user changes do not consume this budget. */
-enum class RecoveryAttemptKind { SAME_STREAM_NETWORK, FORMAT_COMPATIBILITY, LOWER_RESOLUTION, ALTERNATE_PROTOCOL }
+enum class RecoveryAttemptKind {
+    ENDPOINT_CONNECTION,
+    SAME_STREAM_NETWORK,
+    FORMAT_COMPATIBILITY,
+    LOWER_RESOLUTION,
+    ALTERNATE_PROTOCOL,
+}
 
 /** A source/phone-gateway preparation failure that changing the TV protocol cannot repair. */
 class PlaybackPreparationException(message: String, cause: Throwable? = null) : Exception(message, cause)
@@ -83,14 +89,17 @@ fun redactPlaybackEndpoint(value: String?): String? = when {
 data class RecoveryBudget(
     /** Includes all automatically scheduled recovery attempts in this session. */
     val maxAutomaticAttempts: Int = 6,
-    /** Cast startup may spend both retries before the coordinator tries a paired DLNA endpoint. */
-    val maxSameStreamNetworkRetries: Int = 2,
+    /** Each protocol receives its own finite connect-handshake allowance. */
+    val maxEndpointConnectionRetriesPerProtocol: Int = 2,
+    /** An established stream still retries a transient network failure only once. */
+    val maxSameStreamNetworkRetries: Int = 1,
     /** Format, resolution, and alternate-protocol variants share a conservative cap. */
     val maxCompatibilityOrQualityVariants: Int = 3,
 )
 
 data class RecoveryBudgetUsage(
     val automaticAttempts: Int = 0,
+    val endpointConnectionRetries: Map<Protocol, Int> = emptyMap(),
     val sameStreamNetworkRetries: Int = 0,
     val compatibilityOrQualityVariants: Int = 0,
 )
@@ -111,6 +120,8 @@ fun RecoveryBudget.status(usage: RecoveryBudgetUsage): RecoveryBudgetStatus = Re
 fun RecoveryBudget.canSchedule(usage: RecoveryBudgetUsage, kind: RecoveryAttemptKind): Boolean {
     if (usage.automaticAttempts >= maxAutomaticAttempts) return false
     return when (kind) {
+        // A protocol is required to apply its independent counter; use canScheduleEndpointConnectionRetry.
+        RecoveryAttemptKind.ENDPOINT_CONNECTION -> false
         RecoveryAttemptKind.SAME_STREAM_NETWORK -> usage.sameStreamNetworkRetries < maxSameStreamNetworkRetries
         RecoveryAttemptKind.FORMAT_COMPATIBILITY,
         RecoveryAttemptKind.LOWER_RESOLUTION,
@@ -118,6 +129,15 @@ fun RecoveryBudget.canSchedule(usage: RecoveryBudgetUsage, kind: RecoveryAttempt
             usage.compatibilityOrQualityVariants < maxCompatibilityOrQualityVariants
     }
 }
+
+fun RecoveryBudgetUsage.endpointConnectionRetries(protocol: Protocol): Int =
+    endpointConnectionRetries[protocol] ?: 0
+
+fun RecoveryBudget.canScheduleEndpointConnectionRetry(
+    usage: RecoveryBudgetUsage,
+    protocol: Protocol,
+): Boolean = usage.automaticAttempts < maxAutomaticAttempts &&
+    usage.endpointConnectionRetries(protocol) < maxEndpointConnectionRetriesPerProtocol
 
 /** The bounded coordinator action after an initial renderer connection failure. */
 enum class InitialConnectionRecoveryAction { RETRY_SAME_ENDPOINT, TRY_ALTERNATE_PROTOCOL, SURFACE }
@@ -132,18 +152,17 @@ data class InitialConnectionRecoveryInput(
 )
 
 /**
- * Initial Cast connection failures get two same-endpoint retries before a confidently paired endpoint
- * may be tried. Load, format, source, and DLNA connection failures stay on their existing recovery paths.
+ * Initial connection failures get two same-endpoint retries per protocol before a confidently paired
+ * alternate may be tried. Load, format, and source failures stay on their existing recovery paths.
  */
 fun decideInitialConnectionRecovery(input: InitialConnectionRecoveryInput): InitialConnectionRecoveryAction {
-    val isCastConnectionFailure = input.protocol == Protocol.CAST &&
-        input.failureStage == PlaybackFailureStage.ENDPOINT_CONNECTION &&
+    val isEndpointConnectionFailure = input.failureStage == PlaybackFailureStage.ENDPOINT_CONNECTION &&
         input.failureCause in setOf(
             PlaybackFailureCause.ENDPOINT_UNAVAILABLE,
             PlaybackFailureCause.TRANSIENT_NETWORK,
         )
-    if (!isCastConnectionFailure) return InitialConnectionRecoveryAction.SURFACE
-    if (input.budget.canSchedule(input.usage, RecoveryAttemptKind.SAME_STREAM_NETWORK)) {
+    if (!isEndpointConnectionFailure) return InitialConnectionRecoveryAction.SURFACE
+    if (input.budget.canScheduleEndpointConnectionRetry(input.usage, input.protocol)) {
         return InitialConnectionRecoveryAction.RETRY_SAME_ENDPOINT
     }
     return if (input.hasAlternateProtocol) InitialConnectionRecoveryAction.TRY_ALTERNATE_PROTOCOL
@@ -153,7 +172,11 @@ fun decideInitialConnectionRecovery(input: InitialConnectionRecoveryInput): Init
 private fun RecoveryBudgetUsage.consume(kind: RecoveryAttemptKind): RecoveryBudgetUsage = copy(
     automaticAttempts = automaticAttempts + 1,
     sameStreamNetworkRetries = sameStreamNetworkRetries + if (kind == RecoveryAttemptKind.SAME_STREAM_NETWORK) 1 else 0,
-    compatibilityOrQualityVariants = compatibilityOrQualityVariants + if (kind != RecoveryAttemptKind.SAME_STREAM_NETWORK) 1 else 0,
+    compatibilityOrQualityVariants = compatibilityOrQualityVariants + if (kind in setOf(
+        RecoveryAttemptKind.FORMAT_COMPATIBILITY,
+        RecoveryAttemptKind.LOWER_RESOLUTION,
+        RecoveryAttemptKind.ALTERNATE_PROTOCOL,
+    )) 1 else 0,
 )
 
 /**
@@ -239,6 +262,21 @@ data class PlaybackRecoverySession(
     fun reserveRecovery(kind: RecoveryAttemptKind, phase: PlaybackPhase): PlaybackRecoverySession? {
         if (!budget.canSchedule(usage, kind) || this.phase == PlaybackPhase.STOPPED) return null
         return copy(phase = phase, usage = usage.consume(kind))
+    }
+    /** Reserve one of the two connect retries owned independently by [protocol]. */
+    fun reserveEndpointConnectionRetry(protocol: Protocol): PlaybackRecoveryContinuation? {
+        if (phase == PlaybackPhase.STOPPED ||
+            !budget.canScheduleEndpointConnectionRetry(usage, protocol)
+        ) return null
+        val retryCount = usage.endpointConnectionRetries(protocol) + 1
+        val reserved = copy(
+            phase = PlaybackPhase.RECONNECTING,
+            usage = usage.copy(
+                automaticAttempts = usage.automaticAttempts + 1,
+                endpointConnectionRetries = usage.endpointConnectionRetries + (protocol to retryCount),
+            ),
+        )
+        return PlaybackRecoveryContinuation(reserved, RecoveryAttemptKind.ENDPOINT_CONNECTION)
     }
     /** Reserve the single alternate-protocol continuation before the coordinator launches it. */
     fun reserveAlternateProtocol(input: ProtocolSwitchInput): PlaybackRecoveryContinuation? {

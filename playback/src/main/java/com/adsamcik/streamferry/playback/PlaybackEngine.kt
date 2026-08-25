@@ -391,14 +391,13 @@ class PlaybackEngine(
      * Reserve one coordinator-owned same-endpoint startup retry. The returned continuation carries the
      * finite budget and redacted attempt history across the failed engine stop/start boundary.
      */
-    fun reserveSameEndpointContinuation(): PlaybackRecoveryContinuation? = synchronized(recoveryLock) {
-        val reserved = recoverySession.reserveRecovery(
-            RecoveryAttemptKind.SAME_STREAM_NETWORK,
-            PlaybackPhase.RECONNECTING,
-        ) ?: return@synchronized null
-        recoverySession = reserved
-        PlaybackRecoveryContinuation(reserved, RecoveryAttemptKind.SAME_STREAM_NETWORK)
-    }
+    fun reserveEndpointConnectionContinuation(protocol: Protocol): PlaybackRecoveryContinuation? =
+        synchronized(recoveryLock) {
+            val continuation = recoverySession.reserveEndpointConnectionRetry(protocol)
+                ?: return@synchronized null
+            recoverySession = continuation.session
+            continuation
+        }
 
     /**
      * Reconnect the current endpoint once without creating a fresh playback session or resetting its
@@ -1826,6 +1825,7 @@ class PlaybackEngine(
             return action
         }
         val phase = when (kind) {
+            RecoveryAttemptKind.ENDPOINT_CONNECTION,
             RecoveryAttemptKind.SAME_STREAM_NETWORK -> PlaybackPhase.RECONNECTING
             RecoveryAttemptKind.FORMAT_COMPATIBILITY,
             RecoveryAttemptKind.LOWER_RESOLUTION -> PlaybackPhase.CHANGING_STREAM
