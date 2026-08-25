@@ -16,8 +16,9 @@ there is **no telemetry** and nothing leaves the device unless you share a repor
 - Kept Google Cast volume controls stable when the Android Sender SDK applies a volume request without
   immediately echoing the new device state; the app now reconciles eventual receiver reports and records
   missing or mismatched reports in diagnostics instead of showing a false failure and snapping backward.
-- Retry an initial Google Cast connection twice before automatically switching to the confidently paired
-  DLNA endpoint on the same TV, with the fallback visible in the TV picker.
+- Retried initial Google Cast and DLNA connections twice per protocol before automatically switching to
+  the confidently paired alternate endpoint on the same TV. Per-protocol counters and a single-switch
+  reservation prevent cycling when both TV services remain broken until the TV is restarted.
 - Synchronized natural Cast completion back to the phone as an authoritative final playback update,
   preventing a finished video from retaining a stale partial progress position.
 

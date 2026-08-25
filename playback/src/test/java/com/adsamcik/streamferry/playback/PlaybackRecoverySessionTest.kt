@@ -33,9 +33,8 @@ class PlaybackRecoverySessionTest {
         assertEquals(first.attempts.size, state.attempts.size)
         assertTrue(state.generation > first.generation)
     }
-    @Test fun budgetAllowsTwoConnectionRetriesAndAtMostThreeCompatibilityVariants() {
+    @Test fun budgetAllowsOneEstablishedNetworkRetryAndAtMostThreeCompatibilityVariants() {
         var state = session()
-        state = assertNotNull(state.reserveRecovery(RecoveryAttemptKind.SAME_STREAM_NETWORK, PlaybackPhase.RECONNECTING))
         state = assertNotNull(state.reserveRecovery(RecoveryAttemptKind.SAME_STREAM_NETWORK, PlaybackPhase.RECONNECTING))
         assertNull(state.reserveRecovery(RecoveryAttemptKind.SAME_STREAM_NETWORK, PlaybackPhase.RECONNECTING))
         repeat(3) {
@@ -54,11 +53,11 @@ class PlaybackRecoverySessionTest {
         assertFalse(state.budget.canSchedule(state.usage, RecoveryAttemptKind.ALTERNATE_PROTOCOL))
     }
 
-    @Test fun initialCastConnectionRetriesTwiceThenSelectsPairedDlna() {
+    @Test fun castAndDlnaConnectionRetriesAreIndependentAndCannotCycle() {
         var state = session()
-        fun decision(hasAlternate: Boolean = true) = decideInitialConnectionRecovery(
+        fun decision(protocol: Protocol, hasAlternate: Boolean = true) = decideInitialConnectionRecovery(
             InitialConnectionRecoveryInput(
-                protocol = Protocol.CAST,
+                protocol = protocol,
                 hasAlternateProtocol = hasAlternate,
                 failureStage = PlaybackFailureStage.ENDPOINT_CONNECTION,
                 failureCause = PlaybackFailureCause.ENDPOINT_UNAVAILABLE,
@@ -66,18 +65,32 @@ class PlaybackRecoverySessionTest {
                 usage = state.usage,
             ),
         )
-
-        assertEquals(InitialConnectionRecoveryAction.RETRY_SAME_ENDPOINT, decision())
-        repeat(2) {
-            state = assertNotNull(
-                state.reserveRecovery(RecoveryAttemptKind.SAME_STREAM_NETWORK, PlaybackPhase.RECONNECTING),
-            )
+        fun reserveConnectionRetry(protocol: Protocol) {
+            val continuation = assertNotNull(state.reserveEndpointConnectionRetry(protocol))
+            state = state.stop().continueFrom(continuation)
         }
-        assertEquals(InitialConnectionRecoveryAction.TRY_ALTERNATE_PROTOCOL, decision())
-        assertEquals(InitialConnectionRecoveryAction.SURFACE, decision(hasAlternate = false))
+
+        assertEquals(InitialConnectionRecoveryAction.RETRY_SAME_ENDPOINT, decision(Protocol.CAST))
+        repeat(2) { reserveConnectionRetry(Protocol.CAST) }
+        assertEquals(InitialConnectionRecoveryAction.TRY_ALTERNATE_PROTOCOL, decision(Protocol.CAST))
+        assertEquals(InitialConnectionRecoveryAction.SURFACE, decision(Protocol.CAST, hasAlternate = false))
+
+        // Exhausting Cast does not spend DLNA's allowance.
+        assertEquals(InitialConnectionRecoveryAction.RETRY_SAME_ENDPOINT, decision(Protocol.DLNA))
+        val switch = assertNotNull(state.reserveAlternateProtocol(protocolSwitchInput(state)))
+        state = state.stop().continueFrom(switch)
+        repeat(2) { reserveConnectionRetry(Protocol.DLNA) }
+
+        assertEquals(2, state.usage.endpointConnectionRetries(Protocol.CAST))
+        assertEquals(2, state.usage.endpointConnectionRetries(Protocol.DLNA))
+        assertEquals(5, state.usage.automaticAttempts)
+        assertEquals(InitialConnectionRecoveryAction.TRY_ALTERNATE_PROTOCOL, decision(Protocol.DLNA))
+        assertNull(state.reserveEndpointConnectionRetry(Protocol.CAST))
+        assertNull(state.reserveEndpointConnectionRetry(Protocol.DLNA))
+        assertNull(state.reserveAlternateProtocol(protocolSwitchInput(state)))
     }
 
-    @Test fun initialConnectionRetryDoesNotMaskDlnaLoadOrSourceFailures() {
+    @Test fun connectionRetryIsSymmetricButDoesNotMaskLoadOrSourceFailures() {
         val base = InitialConnectionRecoveryInput(
             protocol = Protocol.DLNA,
             hasAlternateProtocol = true,
@@ -87,7 +100,7 @@ class PlaybackRecoverySessionTest {
             usage = RecoveryBudgetUsage(),
         )
 
-        assertEquals(InitialConnectionRecoveryAction.SURFACE, decideInitialConnectionRecovery(base))
+        assertEquals(InitialConnectionRecoveryAction.RETRY_SAME_ENDPOINT, decideInitialConnectionRecovery(base))
         assertEquals(
             InitialConnectionRecoveryAction.SURFACE,
             decideInitialConnectionRecovery(base.copy(
@@ -154,7 +167,9 @@ class PlaybackRecoverySessionTest {
     }
 
     @Test fun continuationPreservesUsageHistoryAndMonotonicGeneration() {
-        val original = assertNotNull(session().reserveRecovery(RecoveryAttemptKind.SAME_STREAM_NETWORK, PlaybackPhase.RECONNECTING))
+        val base = session()
+        val connectionContinuation = assertNotNull(base.reserveEndpointConnectionRetry(Protocol.CAST))
+        val original = base.stop().continueFrom(connectionContinuation)
         val continuation = assertNotNull(original.reserveAlternateProtocol(
             ProtocolSwitchInput(
                 isLocalSession = false,
@@ -171,6 +186,8 @@ class PlaybackRecoverySessionTest {
         val continued = original.stop().continueFrom(continuation)
 
         assertEquals(2, continued.usage.automaticAttempts)
+        assertEquals(1, continued.usage.endpointConnectionRetries(Protocol.CAST))
+        assertEquals(0, continued.usage.endpointConnectionRetries(Protocol.DLNA))
         assertEquals(original.attempts, continued.attempts)
         assertTrue(continued.generation > original.generation)
         assertTrue(continued.alternateProtocolReserved)
@@ -188,4 +205,16 @@ class PlaybackRecoverySessionTest {
             ),
         ))
     }
+
+    private fun protocolSwitchInput(state: PlaybackRecoverySession) = ProtocolSwitchInput(
+        isLocalSession = false,
+        isOnlineSession = true,
+        hasAlternateProtocol = true,
+        hasAlreadySwitchedProtocol = state.alternateProtocolReserved,
+        sameEndpointRecoveryExhausted = true,
+        failureStage = PlaybackFailureStage.ENDPOINT_CONNECTION,
+        failureCause = PlaybackFailureCause.ENDPOINT_UNAVAILABLE,
+        budget = state.budget,
+        usage = state.usage,
+    )
 }
