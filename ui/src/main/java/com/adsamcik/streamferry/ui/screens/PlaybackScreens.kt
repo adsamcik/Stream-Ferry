@@ -429,7 +429,7 @@ private fun PhysicalTv.connectionDetail(): String {
     return if (availableEndpoints.size > 1) {
         when (selectedEndpoint?.protocol) {
             Protocol.CAST -> "Google Cast first • DLNA fallback after 2 retries"
-            Protocol.DLNA -> "DLNA preferred • Google Cast also available"
+            Protocol.DLNA -> "DLNA first • Google Cast fallback after 2 retries"
             null -> "$summary • Preferred connection selected"
         }
     } else {

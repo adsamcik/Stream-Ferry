@@ -1584,7 +1584,7 @@ class MainViewModel(
             } else {
                 val context = reconnectContext
                 val retryResult = if (context != null) {
-                    retryInitialCastConnection(context, initialFailure, pendingPlayback)
+                    retryEndpointConnection(context, initialFailure, pendingPlayback)
                 } else {
                     Result.failure(initialFailure)
                 }
@@ -1592,7 +1592,10 @@ class MainViewModel(
                     if (onlineOwnerForAttempt == null || isActiveOnlinePlaybackOwner(onlineOwnerForAttempt)) {
                         smartResumeOverrideSeconds = null
                         started = true
-                        container.logger.event("playback", "Initial Google Cast connection recovered after retry")
+                        container.logger.event(
+                            "playback",
+                            "Initial ${context?.endpoint?.protocol?.connectionLabel() ?: "TV"} connection recovered after retry",
+                        )
                     } else {
                         container.logger.event("playback", "Discarded a retried play start after its Jellyfin account changed")
                     }
@@ -3028,6 +3031,16 @@ class MainViewModel(
     private fun controllerFor(target: DiscoveredTarget) =
         if (target.protocol == Protocol.CAST) container.castController else container.dlnaController
 
+    private fun PhysicalTv.alternateEndpoint(protocol: Protocol): DiscoveredTarget? = when (protocol) {
+        Protocol.CAST -> dlnaEndpoint
+        Protocol.DLNA -> castEndpoint
+    }
+
+    private fun Protocol.connectionLabel(): String = when (this) {
+        Protocol.CAST -> "Google Cast"
+        Protocol.DLNA -> "DLNA"
+    }
+
     private fun smartResumeDeviceContext(
         physicalTv: PhysicalTv,
         endpoint: DiscoveredTarget,
@@ -3073,8 +3086,8 @@ class MainViewModel(
         is ReconnectContext.Local -> copy(physicalTv = physicalTv)
     }
 
-    /** Retry only an initial Cast connect handshake, never a source/format/load failure. */
-    private suspend fun retryInitialCastConnection(
+    /** Retry only a Cast or DLNA connect handshake, never a source/format/load failure. */
+    private suspend fun retryEndpointConnection(
         context: ReconnectContext,
         initialFailure: Throwable,
         pendingPlayback: PlaybackUiState,
@@ -3086,8 +3099,7 @@ class MainViewModel(
             val action = decideInitialConnectionRecovery(
                 InitialConnectionRecoveryInput(
                     protocol = context.endpoint.protocol,
-                    hasAlternateProtocol = context.endpoint.protocol == Protocol.CAST &&
-                        context.physicalTv.dlnaEndpoint != null,
+                    hasAlternateProtocol = context.physicalTv.alternateEndpoint(context.endpoint.protocol) != null,
                     failureStage = latest.failureStage ?: PlaybackFailureStage.UNKNOWN,
                     failureCause = latest.failureCause ?: PlaybackFailureCause.UNKNOWN,
                     budget = snapshot.budget,
@@ -3100,12 +3112,13 @@ class MainViewModel(
             val retryNumber = snapshot.usage.endpointConnectionRetries(context.endpoint.protocol) + 1
             val continuation = container.playbackEngine.reserveEndpointConnectionContinuation(context.endpoint.protocol)
                 ?: return Result.failure(failure)
+            val protocolLabel = context.endpoint.protocol.connectionLabel()
             _state.update { current ->
                 current.copy(
                     route = Route.PLAYBACK,
                     playback = (current.playback ?: pendingPlayback).copy(
                         phase = PlaybackPhase.RECONNECTING,
-                        adaptiveNote = "Google Cast didn't connect — retrying ($retryNumber/${snapshot.budget.maxEndpointConnectionRetriesPerProtocol})…",
+                        adaptiveNote = "$protocolLabel didn't connect — retrying ($retryNumber/${snapshot.budget.maxEndpointConnectionRetriesPerProtocol})…",
                         errorMessage = null,
                         isTerminal = false,
                     ),
@@ -3114,9 +3127,9 @@ class MainViewModel(
             }
             container.logger.event(
                 "playback",
-                "Google Cast connect failed; retrying same endpoint ($retryNumber/${snapshot.budget.maxEndpointConnectionRetriesPerProtocol})",
+                "$protocolLabel connect failed; retrying same endpoint ($retryNumber/${snapshot.budget.maxEndpointConnectionRetriesPerProtocol})",
             )
-            delay(INITIAL_CAST_CONNECT_RETRY_DELAY_MS * retryNumber)
+            delay(ENDPOINT_CONNECT_RETRY_DELAY_MS * retryNumber)
             try {
                 playContext(context, context.endpoint, lastPlaybackPositionSeconds, continuation)
                 return Result.success(Unit)
@@ -3126,7 +3139,7 @@ class MainViewModel(
                 failure = error
             }
         }
-        throw CancellationException("Initial Cast connection retry was cancelled")
+        throw CancellationException("Endpoint connection retry was cancelled")
     }
 
     private suspend fun playContext(
@@ -3424,10 +3437,7 @@ class MainViewModel(
         failureCause: PlaybackFailureCause,
         generation: Long,
     ): Boolean {
-        val alternate = when (context.endpoint.protocol) {
-            Protocol.CAST -> context.physicalTv.dlnaEndpoint
-            Protocol.DLNA -> context.physicalTv.castEndpoint
-        } ?: return false
+        val alternate = context.physicalTv.alternateEndpoint(context.endpoint.protocol) ?: return false
         val continuation = container.playbackEngine.reserveAlternateProtocolContinuation(
             hasAlternateProtocol = true,
             failureStage = failureStage,
@@ -3450,22 +3460,32 @@ class MainViewModel(
                 ),
             )
         }
-        return try {
+        val recovered = try {
             playContext(alternateContext, alternate, lastPlaybackPositionSeconds, continuation)
-            if (generation != reconnectGeneration) return false
-            _state.update {
-                it.copy(
-                    selectedPhysicalTv = alternateContext.physicalTv,
-                    selectedTarget = alternate,
-                )
-            }
             true
         } catch (c: CancellationException) {
             throw c
         } catch (error: Exception) {
             container.logger.w("playback", "Alternate TV protocol failed", error)
-            false
+            val pendingPlayback = _state.value.playback ?: return false
+            val retryResult = retryEndpointConnection(alternateContext, error, pendingPlayback)
+            retryResult.exceptionOrNull()?.let {
+                container.logger.w(
+                    "playback",
+                    "${alternate.protocol.connectionLabel()} alternate-endpoint recovery exhausted",
+                    it,
+                )
+            }
+            retryResult.isSuccess
         }
+        if (!recovered || generation != reconnectGeneration) return false
+        _state.update {
+            it.copy(
+                selectedPhysicalTv = alternateContext.physicalTv,
+                selectedTarget = alternate,
+            )
+        }
+        return true
     }
 
     /** Release renderer/proxy resources while retaining a stable, actionable Now Playing error card. */
@@ -3950,7 +3970,7 @@ class MainViewModel(
         const val SECURE_STORAGE_ERROR =
             "Couldn't update secure storage. Check available device storage, restart the app, and try again."
         const val SEARCH_DEBOUNCE_MS = 350L
-        const val INITIAL_CAST_CONNECT_RETRY_DELAY_MS = 1_000L
+        const val ENDPOINT_CONNECT_RETRY_DELAY_MS = 1_000L
         const val RECONNECT_DELAY_MS = 2_000L
         const val RESUME_SAVE_INTERVAL_MS = 5_000L
         const val NANOS_PER_MILLISECOND = 1_000_000L
