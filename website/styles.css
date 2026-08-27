@@ -402,34 +402,35 @@ h1 span::after {
   transform: translateX(-50%) rotate(2deg);
 }
 
-.phone-top {
-  position: absolute;
-  z-index: 5;
-  top: 18px;
-  left: 50%;
-  display: flex;
-  width: 72px;
-  height: 23px;
-  align-items: center;
-  justify-content: flex-end;
-  border-radius: 20px;
-  background: #071416;
-  transform: translateX(-50%);
-}
-
-.phone-top span {
-  width: 7px;
-  height: 7px;
-  margin-right: 8px;
-  border-radius: 50%;
-  background: #1f3d42;
-}
-
 .phone-screen {
-  min-height: 590px;
+  aspect-ratio: 9 / 16;
   overflow: hidden;
   border-radius: 37px;
   background: #eef5f5;
+}
+
+.hero-app-capture {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.capture-badge {
+  position: absolute;
+  z-index: 6;
+  right: -20px;
+  bottom: 28px;
+  border: 1px solid rgba(255, 255, 255, 0.55);
+  border-radius: 14px 14px 5px 14px;
+  background: rgba(7, 20, 22, 0.9);
+  box-shadow: 0 10px 28px rgba(0, 31, 36, 0.2);
+  color: #eafcff;
+  font-size: 9px;
+  font-weight: 850;
+  letter-spacing: 0.09em;
+  padding: 8px 10px;
+  text-transform: uppercase;
 }
 
 :root[data-theme="dark"] .source-chip,
@@ -1398,156 +1399,6 @@ h1 span::after {
 .reveal.revealed {
   opacity: 1;
   transform: translateY(0);
-}
-
-.app-bar {
-  display: flex;
-  height: 64px;
-  align-items: center;
-  justify-content: space-between;
-  padding: 18px 21px 8px;
-  color: #233638;
-  font-size: 12px;
-  font-weight: 800;
-}
-
-.mini-mark {
-  display: inline-flex;
-  width: 26px;
-  height: 26px;
-  align-items: center;
-  justify-content: center;
-  border-radius: 9px 9px 9px 3px;
-  background: var(--primary-dark);
-  color: var(--primary-container);
-  font-size: 13px;
-  font-weight: 900;
-}
-
-.poster {
-  position: relative;
-  height: 260px;
-  margin: 8px 14px 0;
-  overflow: hidden;
-  border-radius: 30px 30px 10px 30px;
-  background:
-    radial-gradient(circle at 70% 32%, rgba(255, 224, 135, 0.92) 0 9%, transparent 9.5%),
-    linear-gradient(145deg, transparent 0 45%, rgba(79, 216, 232, 0.82) 46% 52%, transparent 53%),
-    linear-gradient(160deg, #012e36 5%, #006874 57%, #13aabb 100%);
-  box-shadow: inset 0 -70px 70px rgba(0, 31, 36, 0.33);
-  color: white;
-}
-
-.poster::before,
-.poster::after {
-  position: absolute;
-  border-radius: 50%;
-  background: rgba(255, 255, 255, 0.22);
-  content: "";
-}
-
-.poster::before {
-  top: 68px;
-  left: -45px;
-  width: 180px;
-  height: 180px;
-}
-
-.poster::after {
-  top: -43px;
-  right: -22px;
-  width: 122px;
-  height: 122px;
-}
-
-.poster > span {
-  position: absolute;
-  z-index: 2;
-  bottom: 37px;
-  left: 22px;
-  font-size: 32px;
-  font-weight: 900;
-  letter-spacing: -0.05em;
-  line-height: 0.82;
-}
-
-.poster small {
-  position: absolute;
-  z-index: 2;
-  bottom: 13px;
-  left: 23px;
-  opacity: 0.8;
-  font-size: 9px;
-  font-weight: 800;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-}
-
-.now-playing {
-  display: flex;
-  align-items: center;
-  flex-direction: column;
-  padding: 22px 25px 25px;
-}
-
-.now-playing .now-label {
-  color: var(--primary);
-  font-size: 9px;
-  font-weight: 900;
-  letter-spacing: 0.13em;
-}
-
-.now-playing strong {
-  margin-top: 6px;
-  font-size: 20px;
-  letter-spacing: -0.03em;
-}
-
-.now-playing > span:not(.now-label) {
-  margin-top: 3px;
-  color: var(--outline);
-  font-size: 11px;
-}
-
-.progress {
-  width: 100%;
-  height: 6px;
-  margin-top: 20px;
-  overflow: hidden;
-  border-radius: 8px;
-  background: #cad6d8;
-}
-
-.progress span {
-  display: block;
-  width: 42%;
-  height: 100%;
-  border-radius: inherit;
-  background: var(--primary);
-}
-
-.playback-controls {
-  display: flex;
-  width: 100%;
-  margin-top: 19px;
-  align-items: center;
-  justify-content: center;
-  gap: 28px;
-  color: #40575b;
-  font-size: 18px;
-  font-weight: 800;
-}
-
-.playback-controls .pause {
-  display: inline-flex;
-  width: 58px;
-  height: 58px;
-  align-items: center;
-  justify-content: center;
-  border-radius: 22px 22px 10px 22px;
-  background: var(--primary);
-  color: white;
-  font-size: 20px;
 }
 
 .source-chip,
