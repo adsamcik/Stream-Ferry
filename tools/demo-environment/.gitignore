@@ -1,0 +1,6 @@
+media/*
+!media/.gitkeep
+.demo-server.json
+*.log
+__pycache__/
+*.pyc

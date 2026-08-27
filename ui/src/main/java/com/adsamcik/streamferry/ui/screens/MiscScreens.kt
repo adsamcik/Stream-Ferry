@@ -536,7 +536,7 @@ fun AboutScreen(appVersion: String) {
         AboutFactCard(
             icon = Icons.Rounded.PrivacyTip,
             title = "Private by design",
-            body = "No telemetry, analytics, ads, or tracking. Credentials and playback history stay on this phone.",
+            body = "No developer analytics, first-party telemetry backend, ads, or tracking. Google Cast SDK sends anonymous Cast interaction and app/device metadata to Google. Credentials and playback history stay on this phone.",
         )
         AboutFactCard(
             icon = Icons.Rounded.Devices,

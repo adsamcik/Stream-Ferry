@@ -6,7 +6,7 @@
     <meta name="theme-color" content="#073f4c" />
     <meta
       name="description"
-      content="Stream Ferry privacy policy: no telemetry, analytics, ads, tracking, or developer-operated cloud service."
+      content="Stream Ferry privacy policy, including local data handling, Jellyfin connections, TV playback, and Google Cast SDK disclosures."
     />
     <link rel="canonical" href="https://adsamcik.github.io/Stream-Ferry/privacy/" />
     <link rel="icon" href="../assets/app-icon.png" />
@@ -14,13 +14,13 @@
     <meta property="og:type" content="website" />
     <meta property="og:site_name" content="Stream Ferry" />
     <meta property="og:title" content="Privacy policy — Stream Ferry" />
-    <meta property="og:description" content="No telemetry, analytics, ads, tracking, or developer-operated cloud service." />
+    <meta property="og:description" content="How Stream Ferry handles local data, Jellyfin connections, TV playback, and Google Cast SDK data." />
     <meta property="og:url" content="https://adsamcik.github.io/Stream-Ferry/privacy/" />
     <meta property="og:image" content="https://adsamcik.github.io/Stream-Ferry/og.png" />
     <meta property="og:image:alt" content="Stream Ferry route from a server through a phone to a TV" />
     <meta name="twitter:card" content="summary_large_image" />
     <meta name="twitter:title" content="Privacy policy — Stream Ferry" />
-    <meta name="twitter:description" content="No telemetry, analytics, ads, tracking, or developer-operated cloud service." />
+    <meta name="twitter:description" content="How Stream Ferry handles local data, Jellyfin connections, TV playback, and Google Cast SDK data." />
     <meta name="twitter:image" content="https://adsamcik.github.io/Stream-Ferry/og.png" />
     <title>Privacy policy — Stream Ferry</title>
     <link rel="stylesheet" href="../styles.css" />
@@ -55,7 +55,7 @@
         <div class="policy-hero-card" aria-hidden="true">
           <div class="policy-shield"><span>✓</span></div>
           <strong>Nothing to sell.<br />Nothing to profile.</strong>
-          <small>No telemetry · No analytics · No ads</small>
+          <small>No developer analytics · No ads · No profiles</small>
         </div>
       </section>
 
@@ -78,7 +78,7 @@
             <h2>The short version</h2>
             <div class="policy-lede-card">
               <strong>Stream Ferry does not operate an account system, analytics service, advertising network, telemetry pipeline, or developer database.</strong>
-              <p>The app handles only the information needed to connect to services and devices you choose. App data remains on your Android device unless you explicitly send it to your Jellyfin server, your selected TV, or another app through Android’s Share action.</p>
+              <p>The app handles information needed to connect to services and devices you choose. App data remains on your Android device unless a feature sends it to your Jellyfin server, selected TV, Android Share destination, or—when Cast support is initialized—Google’s Cast SDK log service as described below.</p>
             </div>
           </section>
 
@@ -112,6 +112,11 @@
                 <h3>Diagnostics</h3>
                 <p>Redacted crash reports and event logs are kept in app-private storage. They never leave your phone unless you explicitly share them.</p>
               </article>
+              <article>
+                <span aria-hidden="true">⌁</span>
+                <h3>Google Cast SDK data</h3>
+                <p>Google states that its Cast Sender SDK automatically collects anonymous discovery and session events, mobile-device information, SDK metadata, and client-app metadata to improve Cast. Google says the data is encrypted in transit, retained briefly before aggregation, and not used to model a specific user.</p>
+              </article>
             </div>
           </section>
 
@@ -123,7 +128,9 @@
               <div><span>1</span><p><strong>Your Jellyfin server</strong> receives sign-in requests, library requests, playback reporting, watch-state changes, and download requests. Its operator controls that server and its privacy practices.</p></div>
               <div><span>2</span><p><strong>Your selected TV or receiver</strong> receives a temporary, unguessable phone-hosted media URL and playback-control commands over the local network. It does not receive your Jellyfin URL, password, access token, or Authorization header.</p></div>
               <div><span>3</span><p><strong>Apps you choose through Android Share</strong> receive a diagnostic report only when you deliberately select Share and then choose a destination.</p></div>
+              <div><span>4</span><p><strong>Google’s Cast SDK log service</strong> receives anonymous Cast interaction and app/device metadata when Cast support is used. Google says this collection cannot be disabled or deleted by the app developer or user.</p></div>
             </div>
+            <p>See Google’s current <a class="inline-link" href="https://developers.google.com/cast/docs/android_sender/data_disclosure">Cast SDK data-disclosure guidance</a> for the SDK’s own description of this processing.</p>
             <div class="policy-note"><span aria-hidden="true">✓</span><p><strong>No sale or advertising use.</strong> Stream Ferry does not sell, rent, monetize, or use your information for advertising or behavioral profiling.</p></div>
           </section>
 

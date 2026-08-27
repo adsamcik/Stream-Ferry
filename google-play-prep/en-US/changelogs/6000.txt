@@ -1,0 +1,6 @@
+Initial Google Play release preparation for Stream Ferry 0.6.0.
+
+• Browse Jellyfin libraries and videos stored on your phone.
+• Send playback to compatible Cast and DLNA/UPnP devices.
+• Control playback, queues, downloads, and privacy settings from the phone.
+• Relay or transcode media when direct playback is unavailable.

@@ -11,6 +11,7 @@ import android.os.Looper
 import androidx.core.content.ContextCompat
 import coil.ImageLoader
 import coil.request.CachePolicy
+import com.adsamcik.streamferry.BuildConfig
 import com.google.android.gms.cast.framework.CastContext
 import com.google.android.gms.tasks.Task
 import com.adsamcik.streamferry.core.session.SessionRegistry
@@ -18,6 +19,7 @@ import com.adsamcik.streamferry.data.cache.CachingMediaLibraryRepository
 import com.adsamcik.streamferry.data.cache.JellyfinConnectionMonitor
 import com.adsamcik.streamferry.data.cache.LibraryCache
 import com.adsamcik.streamferry.data.cast.CastTargetController
+import com.adsamcik.streamferry.data.dlna.ConfiguredDlnaRenderer
 import com.adsamcik.streamferry.data.dlna.DlnaTargetController
 import com.adsamcik.streamferry.data.download.DownloadService
 import com.adsamcik.streamferry.data.download.DownloadedJellyfinMediaLibraryRepository
@@ -392,7 +394,24 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
     // Cast becomes available, instead of holding an early null for the whole process lifetime.
     val castController: CastTargetController by lazy { CastTargetController(appContext, { cachedCastContext }, logger) }
     val dlnaController: DlnaTargetController by lazy {
-        DlnaTargetController(logger, networkInfo, httpClient, localNetworkGate::requireAccess)
+        val demoRenderers = if (BuildConfig.DEMO_ENVIRONMENT) {
+            listOf(
+                ConfiguredDlnaRenderer(
+                    descriptionUrl = BuildConfig.DEMO_RENDERER_URL,
+                    identity = "uuid:stream-ferry-demo-tv::urn:schemas-upnp-org:device:MediaRenderer:1",
+                    sourceAddress = "10.0.2.2",
+                ),
+            )
+        } else {
+            emptyList()
+        }
+        DlnaTargetController(
+            logger = logger,
+            network = networkInfo,
+            httpClient = httpClient,
+            requireLocalNetworkAccess = localNetworkGate::requireAccess,
+            configuredRenderers = demoRenderers,
+        )
     }
 
     // ----- on-device hardware transcoding (Media3) -----

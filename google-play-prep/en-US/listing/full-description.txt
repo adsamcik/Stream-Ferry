@@ -1,0 +1,27 @@
+Your phone is the bridge.
+
+Stream Ferry sends videos from Jellyfin or your Android device to a compatible TV while your phone stays in control. Choose a source, pick a screen on your network, then manage playback from the app.
+
+BUILT FOR THE LIVING ROOM
+
+• Browse Jellyfin libraries and local videos in one focused Android app.
+• Discover Cast and DLNA/UPnP playback devices on your local network.
+• Keep play, pause, seek, volume, and queue controls close at hand.
+• Let the phone relay or transcode media when a TV cannot play the source directly.
+• Save selected media for offline use on the phone.
+
+PRIVACY BY DESIGN
+
+Jellyfin server details and credentials stay on your phone. Stream Ferry has no ads, developer-operated analytics service, account system, or developer cloud backend. Local crash reports remain on the device unless you explicitly share them.
+
+The Google Cast SDK sends anonymous Cast interaction, device, and app metadata to Google for aggregate SDK improvement. See the privacy policy for details.
+
+WHAT YOU NEED
+
+• Android 14 or newer.
+• For Jellyfin: access to your own Jellyfin server.
+• For TV playback: a compatible Cast or DLNA/UPnP device on the same network.
+
+Compatibility depends on the TV, receiver, network, media format, and server configuration. Local-only playback works without a Jellyfin account.
+
+Stream Ferry is source-available and free for personal use. It is not affiliated with or endorsed by Jellyfin, Google, or TV manufacturers.

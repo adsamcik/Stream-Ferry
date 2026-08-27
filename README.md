@@ -116,12 +116,20 @@ See [docs/BUILD.md](docs/BUILD.md). On a host with Google Maven access:
 
 The pure-JVM core subset can also be verified directly with `kotlinc` (procedure in docs/BUILD.md).
 
+For repeatable screenshots, foreground-service declaration videos, and regression testing without a
+real Jellyfin server or television, use the opt-in
+[local demo environment](tools/demo-environment/README.md). Its receiver configuration is debug-only
+and cannot be enabled in a release build.
+
 ## Privacy
 
-No telemetry, analytics, ads, cloud services, or tracking. The access token and the Jellyfin server
-URL are stored encrypted (Android Keystore, AES-256-GCM); passwords are never stored. "Delete all app
-data" removes profiles, tokens, metadata, playback history, target/compatibility data, diagnostics,
-settings, and active buffers.
+Stream Ferry operates no developer analytics, first-party telemetry backend, ads, cloud service, or
+tracking. The Google Cast Sender SDK separately sends anonymous Cast interaction and app/device
+metadata to Google for aggregate SDK improvement, as described in Google's
+[Cast SDK data disclosure](https://developers.google.com/cast/docs/android_sender/data_disclosure).
+The access token and Jellyfin server URL are stored encrypted (Android Keystore, AES-256-GCM);
+passwords are never stored. "Delete all app data" removes profiles, tokens, metadata, playback
+history, target/compatibility data, diagnostics, settings, and active buffers.
 
 ## License
 

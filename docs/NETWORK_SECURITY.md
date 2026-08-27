@@ -50,8 +50,10 @@ and permits cleartext at the platform layer; the actual https/LAN-http policy is
 
 Never logged: tokens, passwords, Authorization headers, Jellyfin URLs (normal logs), full phone proxy
 URLs, upstream stream URLs, auth query params, `PlaySessionId` (normal logs), and — in privacy mode —
-user IDs / LAN IPs. `LogRedactor` enforces this and is unit-tested. No telemetry, analytics, ads,
-cloud services, or tracking. Diagnostic exports are opt-in and redacted.
+user IDs / LAN IPs. `LogRedactor` enforces this and is unit-tested. Stream Ferry operates no
+developer analytics, first-party telemetry backend, ads, cloud service, or tracking. The Google Cast
+Sender SDK separately sends anonymous Cast interaction and app/device metadata to Google for
+aggregate SDK improvement. Diagnostic exports are opt-in and redacted.
 
 **Crash reports** are captured on-device by an uncaught-exception handler (`diagnostics.CrashReporter`)
 and written to app-private storage (`filesDir/crashes/`). The whole report — header plus the full

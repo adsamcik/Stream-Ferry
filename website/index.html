@@ -39,6 +39,7 @@
       </a>
       <nav class="site-nav" aria-label="Primary navigation">
         <a href="#how-it-works">How it works</a>
+        <a href="#app-tour">App tour</a>
         <a href="#features">Features</a>
         <a href="./privacy/">Privacy</a>
       </nav>
@@ -149,6 +150,68 @@
         </div>
       </section>
 
+      <section class="screenshots-section" id="app-tour" aria-labelledby="screenshots-title">
+        <div class="section screenshots-heading reveal">
+          <div>
+            <p class="eyebrow">Captured from the real app</p>
+            <h2 id="screenshots-title">The actual deck.<br />No movie magic.</h2>
+          </div>
+          <p>These screens come straight from Stream Ferry running on Android. From a privacy-first welcome to local files, playback preferences, and offline copies, what you see is what you install.</p>
+        </div>
+
+        <div class="screenshot-rail" aria-label="Stream Ferry app screenshots">
+          <figure class="screenshot-card screenshot-card-welcome reveal">
+            <div class="screenshot-frame">
+              <img src="./assets/screenshots/welcome.png" width="1080" height="1920" loading="lazy" decoding="async" alt="Stream Ferry welcome screen explaining that the phone is the private media gateway" />
+            </div>
+            <figcaption><span>01</span><strong>Start with trust</strong><small>The route is clear before the first connection.</small></figcaption>
+          </figure>
+
+          <figure class="screenshot-card screenshot-card-library reveal">
+            <div class="screenshot-frame">
+              <img src="./assets/screenshots/library.png" width="1080" height="1920" loading="lazy" decoding="async" alt="Stream Ferry demo Jellyfin library showing two Big Buck Bunny items with real poster artwork" />
+            </div>
+            <figcaption><span>02</span><strong>Browse the real library</strong><small>Artwork and metadata arrive through the Jellyfin path.</small></figcaption>
+          </figure>
+
+          <figure class="screenshot-card screenshot-card-target reveal">
+            <div class="screenshot-frame">
+              <img src="./assets/screenshots/target-picker.png" width="1080" height="1920" loading="lazy" decoding="async" alt="Stream Ferry Choose a TV screen showing the local Stream Ferry Demo TV DLNA receiver" />
+            </div>
+            <figcaption><span>03</span><strong>Choose the big screen</strong><small>Cast and DLNA receivers meet in one clear picker.</small></figcaption>
+          </figure>
+
+          <figure class="screenshot-card screenshot-card-playback reveal">
+            <div class="screenshot-frame">
+              <img src="./assets/screenshots/playback.png" width="1080" height="1920" loading="lazy" decoding="async" alt="Stream Ferry Now Playing screen controlling Big Buck Bunny on the demo DLNA television" />
+            </div>
+            <figcaption><span>04</span><strong>Run the crossing</strong><small>Seek, pause, adjust TV volume, or stop from one deck.</small></figcaption>
+          </figure>
+
+          <figure class="screenshot-card screenshot-card-settings reveal">
+            <div class="screenshot-frame">
+              <img src="./assets/screenshots/settings.png" width="1080" height="1920" loading="lazy" decoding="async" alt="Stream Ferry settings with theme and playback preferences" />
+            </div>
+            <figcaption><span>05</span><strong>Tune the crossing</strong><small>Expressive controls for playback and language.</small></figcaption>
+          </figure>
+
+          <figure class="screenshot-card screenshot-card-manage reveal">
+            <div class="screenshot-frame">
+              <img src="./assets/screenshots/privacy-controls.png" width="1080" height="1920" loading="lazy" decoding="async" alt="Stream Ferry About screen disclosing its privacy model and Google Cast SDK metadata" />
+            </div>
+            <figcaption><span>06</span><strong>Know the route</strong><small>The privacy model and Cast SDK disclosure stay easy to find.</small></figcaption>
+          </figure>
+
+          <figure class="screenshot-card screenshot-card-downloads reveal">
+            <div class="screenshot-frame">
+              <img src="./assets/screenshots/downloads.png" width="1080" height="1920" loading="lazy" decoding="async" alt="Stream Ferry details screen showing a Big Buck Bunny copy downloaded and available offline" />
+            </div>
+            <figcaption><span>07</span><strong>Carry it offline</strong><small>Downloaded copies stay ready when the server is not.</small></figcaption>
+          </figure>
+        </div>
+        <p class="capture-note">Captured from Stream Ferry 0.6.0 on an Android 16 emulator. The demo library uses <a href="https://peach.blender.org/" rel="noreferrer">Big Buck Bunny</a> and its poster under CC BY 3.0; no app UI was recreated for this page.</p>
+      </section>
+
       <section class="features-section section" id="features" aria-labelledby="features-title">
         <div class="section-heading section-heading-row reveal">
           <div>
@@ -163,7 +226,7 @@
             <div class="feature-icon" aria-hidden="true">✓</div>
             <p class="feature-label">Private by design</p>
             <h3>Your login stays off the TV.</h3>
-            <p>Tokens and server details remain on your phone. There are no ads, analytics, telemetry, or developer-operated cloud services.</p>
+            <p>Tokens and server details remain on your phone. Stream Ferry has no ads, developer-run analytics, telemetry backend, or developer-operated cloud service.</p>
             <div class="privacy-orbit" aria-hidden="true">
               <span class="orbit-phone">▯</span>
               <span class="orbit-dot dot-one"></span>
@@ -221,7 +284,7 @@
           <h2 id="privacy-callout-title">Your media life is<br />not our business.</h2>
         </div>
         <div class="privacy-summary">
-          <p>No developer database. No behavioral profile. No silent crash uploads. Data needed to make playback work stays on your phone, goes to the Jellyfin server you choose, or travels across your local network to the TV you select.</p>
+          <p>No developer database. No behavioral profile. No silent crash uploads. Playback data goes only where the feature requires it; Google’s Cast SDK separately sends anonymous Cast interaction and app/device metadata to Google.</p>
           <a class="button button-light" href="./privacy/">Read the privacy policy <span aria-hidden="true">→</span></a>
         </div>
       </section>
@@ -270,6 +333,7 @@
         <p>Your Android phone is the private bridge between the videos you choose and the TV you trust.</p>
         <nav aria-label="Footer navigation">
           <a href="#how-it-works">How it works</a>
+          <a href="#app-tour">App tour</a>
           <a href="#features">Features</a>
           <a href="./privacy/">Privacy policy</a>
           <a href="https://github.com/adsamcik/Stream-Ferry/releases">Releases</a>
