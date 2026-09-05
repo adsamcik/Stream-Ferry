@@ -56,14 +56,21 @@ class ProxyPlaybackService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
 
+    override fun onCreate() {
+        super.onCreate()
+        logger?.event("service", "Playback service created")
+    }
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        logger?.event("service", "Playback service command ${intent?.action?.substringAfterLast('.')} id=$startId")
         when (intent?.action) {
             ACTION_START -> startForegroundPlayback(
                 intent.getLongExtra(EXTRA_FOREGROUND_LATCH_TOKEN, NO_FOREGROUND_LATCH_TOKEN),
+                startId,
             )
-            ACTION_STOP -> stopSelfSafely()
+            ACTION_STOP -> stopSelfSafely(startId)
             PlaybackNotificationFactory.ACTION_PLAY,
             PlaybackNotificationFactory.ACTION_PAUSE,
             PlaybackNotificationFactory.ACTION_STOP,
@@ -75,14 +82,14 @@ class ProxyPlaybackService : Service() {
                 // intent) must STILL satisfy the start-foreground contract before we bail out, or the
                 // system raises ForegroundServiceDidNotStartInTimeException.
                 enterForeground(fallbackNotification())
-                stopSelfSafely()
+                stopSelfSafely(startId)
             }
         }
         // Do NOT auto-restart if the system kills us with no pending intent.
         return START_NOT_STICKY
     }
 
-    private fun startForegroundPlayback(foregroundLatchToken: Long) {
+    private fun startForegroundPlayback(foregroundLatchToken: Long, startId: Int) {
         // The system gives a service started with startForegroundService() only a few seconds to call
         // startForeground(). On a real Cast/DLNA connection the main thread is busy with the SDK
         // handshake, so do the cheapest possible thing FIRST: foreground with a dependency-free
@@ -90,10 +97,21 @@ class ProxyPlaybackService : Service() {
         // builds a MediaSession + a full MediaStyle notification). Only THEN upgrade to the rich
         // playback-controls notification. Missing this deadline crashed on some devices (e.g. Galaxy
         // S24 / Android 16) with ForegroundServiceDidNotStartInTimeException.
-        enterForeground(fallbackNotification(), foregroundLatchToken)
+        enterForeground(fallbackNotification())
         logForegroundLatency()
-        val c = controller ?: run { stopSelfSafely(); return } // nothing to keep alive
-        acquireLocks()
+        val c = controller ?: run { stopSelfSafely(startId); return }
+        try {
+            acquireLocks()
+        } catch (error: Exception) {
+            logger?.e(TAG, "Playback CPU lock unavailable; refusing unprotected playback", error)
+            stopSelfSafely(startId)
+            return
+        }
+        activeInstance = this
+        if (foregroundLatchToken != NO_FOREGROUND_LATCH_TOKEN) {
+            ProxyForegroundLatch.signalForegrounded(foregroundLatchToken)
+        }
+        logger?.event("service", "Playback foreground ownership confirmed id=$startId cpuLock=${wakeLock?.isHeld == true}")
         runCatching { enterForeground(c.currentNotification()) }
     }
 
@@ -117,33 +135,28 @@ class ProxyPlaybackService : Service() {
 
     private fun enterForeground(
         notification: Notification,
-        foregroundLatchToken: Long = NO_FOREGROUND_LATCH_TOKEN,
     ) {
         startForegroundCompat(
             PlaybackNotificationFactory.NOTIFICATION_ID,
             notification,
             ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
         )
-        // Release the playback engine, which armed this latch and is deliberately blocked BEFORE the
-        // (main-thread-saturating) renderer handshake until the startForegroundService() obligation is met.
-        if (foregroundLatchToken != NO_FOREGROUND_LATCH_TOKEN) {
-            ProxyForegroundLatch.signalForegrounded(foregroundLatchToken)
-        }
     }
 
     /** Cheap, dependency-free notification used to enter the foreground within the deadline (then upgraded). */
     private fun fallbackNotification(): Notification = PlaybackNotificationFactory.fallback(this)
 
-    private fun stopSelfSafely() {
-        // The PlaybackSessionCoordinator owns proxy.stop(); here we release our wake/Wi-Fi locks and
-        // leave the foreground state.
-        releaseLocks()
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
+    private fun stopSelfSafely(startId: Int) {
+        // An old STOP must not demote a newer START already queued by Android. Destruction
+        // releases the locks; do not call stopForeground/releaseLocks before this guard.
+        val stopped = stopSelfResult(startId)
+        logger?.event("service", "Playback service stop id=$startId accepted=$stopped")
     }
 
     override fun onDestroy() {
+        if (activeInstance === this) activeInstance = null
         releaseLocks()
+        logger?.event("service", "Playback service destroyed; locks released")
         super.onDestroy()
     }
 
@@ -157,24 +170,21 @@ class ProxyPlaybackService : Service() {
     @Suppress("WakelockTimeout") // intentionally held for the whole casting session, released on stop.
     private fun acquireLocks() {
         if (wakeLock == null) {
-            runCatching {
-                wakeLock = getSystemService(PowerManager::class.java)
-                    ?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$WAKE_TAG:cpu")
-                    ?.apply { setReferenceCounted(false); acquire() }
-            }
+            wakeLock = checkNotNull(getSystemService(PowerManager::class.java))
+                .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$WAKE_TAG:cpu")
+                .apply { setReferenceCounted(false); acquire() }
         }
+        check(wakeLock?.isHeld == true) { "CPU wake lock was not acquired" }
         if (wifiLock == null) {
             runCatching {
-                // Keep Wi-Fi associated + awake while casting. On API 34+ (our min is 34) the low-latency
-                // / no-power-save *tuning* only applies with the screen ON — there is no public API to
-                // force Wi-Fi out of power-save with the screen off — but holding the lock still keeps the
-                // radio up so it doesn't sleep/disassociate when the device idles; the partial wake lock
-                // above covers the CPU. Together they materially improve screen-off casting reliability.
+                // This optimization is active only in the foreground with the screen on.
+                // Screen-off playback relies on the foreground service and CPU lock, not
+                // a promise that this Wi-Fi lock bypasses Android's power-management policy.
                 val mode = WifiManager.WIFI_MODE_FULL_LOW_LATENCY
                 wifiLock = applicationContext.getSystemService(WifiManager::class.java)
                     ?.createWifiLock(mode, "$WAKE_TAG:wifi")
                     ?.apply { setReferenceCounted(false); acquire() }
-            }
+            }.onFailure { logger?.w(TAG, "Wi-Fi latency optimization unavailable", it) }
         }
     }
 
@@ -186,6 +196,8 @@ class ProxyPlaybackService : Service() {
     }
 
     companion object {
+        @Volatile private var activeInstance: ProxyPlaybackService? = null
+        fun isForegroundActive(): Boolean = activeInstance != null
         private const val WAKE_TAG = "StreamFerry:ProxyPlayback"
         private const val TAG = "ProxyPlaybackService"
         const val ACTION_START = "com.adsamcik.streamferry.action.START"
@@ -258,9 +270,10 @@ class ProxyPlaybackService : Service() {
         }
 
         fun stop(context: Context) {
-            runCatching {
-                context.startService(Intent(context, ProxyPlaybackService::class.java).setAction(ACTION_STOP))
-            }
+            // Synchronously revoke Android's started-service ownership before the next start.
+            // Queuing ACTION_STOP via startService can create a service merely to stop it,
+            // then destroy a replacement START which has already confirmed its latch.
+            context.stopService(Intent(context, ProxyPlaybackService::class.java))
         }
     }
 }
