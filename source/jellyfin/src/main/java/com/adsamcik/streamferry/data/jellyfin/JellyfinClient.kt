@@ -352,13 +352,20 @@ class JellyfinClient(
      * server predates the API or the item hasn't been analysed, so playback is unaffected either way.
      */
     override suspend fun mediaSegments(itemId: String): List<MediaSegment> = withContext(Dispatchers.IO) {
-        runCatching {
-            val url = get(
-                path("MediaSegments", itemId),
-                "includeSegmentTypes" to "Intro,Outro,Recap,Preview,Commercial",
-            )
-            json.decodeFromString(MediaSegmentsResult.serializer(), exec(url)).items.mapNotNull { it.toSegment() }
-        }.getOrElse { emptyList() }
+        catchingNonCancel {
+            // The optional enum collection does not accept a comma-separated value on 10.11.
+            // Request all segments and let the mapper ignore types this client doesn't support.
+            val request = get(path("MediaSegments", itemId))
+            json.decodeFromString(MediaSegmentsResult.serializer(), exec(request, logTerminalFailure = false))
+                .items.mapNotNull { it.toSegment()?.takeIf { segment -> segment.type != SegmentType.UNKNOWN } }
+        }.getOrElse { error ->
+            if (error is JellyfinHttpException && error.code == 404) {
+                logger.d("jellyfin", "Media segments unavailable for this server or item")
+            } else {
+                logger.w("jellyfin", "Media segment lookup failed (${error.javaClass.simpleName})")
+            }
+            emptyList()
+        }
     }
 
     /**
