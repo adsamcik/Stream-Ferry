@@ -28,6 +28,7 @@ sealed interface ForegroundServiceStartResult {
  */
 interface PlaybackServiceController {
     fun stop()
+    fun isForegroundActive(): Boolean
 
     /**
      * Request the service and suspend until it has actually called `startForeground()`. The engine must
@@ -49,6 +50,7 @@ class AndroidPlaybackServiceController(context: Context) : PlaybackServiceContro
     private val appContext = context.applicationContext
 
     override fun stop() = ProxyPlaybackService.stop(appContext)
+    override fun isForegroundActive(): Boolean = ProxyPlaybackService.isForegroundActive()
 
     override suspend fun startAndAwaitForegrounded(timeoutMs: Long): ForegroundServiceStartResult {
         // Arm the latch BEFORE asking Android to start the service. The request token is carried in the

@@ -25,6 +25,7 @@ class PlaybackEngineIncidentTest {
         val provider = mockk<PlaybackProvider>()
         val logger = mockk<DiagnosticSink>(relaxed = true)
         val coordinator = mockk<DefaultPlaybackSessionCoordinator>(relaxed = true)
+        val service = mockk<PlaybackServiceController>(relaxed = true)
         val movie = MediaItem("movie", "Movie", null, 3600, null, null, false)
         val selected = DiscoveredTarget("tv", "TV", Protocol.CAST, TargetCapabilities(Protocol.CAST), null)
         val engine: PlaybackEngine
@@ -48,7 +49,7 @@ class PlaybackEngineIncidentTest {
             }
             coEvery { coordinator.startAndBuildUrl(any(), any(), any()) } returns
                 (SessionRegistry().create("video/mp4", false, 100_000) to "http://127.0.0.1/session/test/stream")
-            val service = mockk<PlaybackServiceController>(relaxed = true)
+            every { service.isForegroundActive() } returns true
             coEvery { service.startAndAwaitForegrounded(any()) } returns
                 ForegroundServiceStartResult.Foregrounded(ProxyForegroundStartPath.START_SERVICE)
             val network = mockk<com.adsamcik.streamferry.diagnostics.NetworkInfoProvider>()
@@ -112,6 +113,33 @@ class PlaybackEngineIncidentTest {
             assertEquals(30L, f.engine.status.value?.positionSeconds)
             f.emit(PlaybackTargetEvent.StatusChanged(30, true)); runCurrent()
             assertEquals(true, f.engine.status.value?.isPlaying)
+        } finally { f.engine.stop(); runCurrent() }
+    }
+
+    @Test fun `lost foreground service is restored without reloading the TV stream`() = runTest {
+        val f = Fixture(this)
+        try {
+            f.start(); runCurrent()
+            f.emit(PlaybackTargetEvent.StatusChanged(1, true)); runCurrent()
+            every { f.service.isForegroundActive() } returns false
+            advanceTimeBy(5000); runCurrent()
+            coVerify(exactly = 2) { f.service.startAndAwaitForegrounded(any()) }
+            coVerify(exactly = 1) { f.provider.prepare(any()) }
+            assertNotNull(f.engine.status.value)
+        } finally { f.engine.stop(); runCurrent() }
+    }
+
+    @Test fun `rejected foreground restoration stops background relay`() = runTest {
+        val f = Fixture(this)
+        try {
+            f.start(); runCurrent()
+            f.emit(PlaybackTargetEvent.StatusChanged(1, true)); runCurrent()
+            every { f.service.isForegroundActive() } returns false
+            coEvery { f.service.startAndAwaitForegrounded(any()) } returns
+                ForegroundServiceStartResult.StartRejected(IllegalStateException("rejected"))
+            advanceTimeBy(5000); runCurrent()
+            coVerify { f.coordinator.stop("foreground service failed") }
+            assertNull(f.engine.status.value)
         } finally { f.engine.stop(); runCurrent() }
     }
 }

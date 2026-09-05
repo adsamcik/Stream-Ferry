@@ -2102,6 +2102,24 @@ class PlaybackEngine(
     private suspend fun monitorLoop() {
         while (scope.isActive) {
             delay(MONITOR_INTERVAL_MS)
+            val protected = mutex.withLock {
+                if (target == null) return@withLock false
+                try {
+                    if (!serviceController.isForegroundActive()) {
+                        logger.w("service", "Playback lost foreground ownership; restoring before continuing")
+                        ensureProxyServiceForegrounded()
+                    }
+                    true
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    logger.e("service", "Could not restore foreground ownership; stopping unprotected relay", error)
+                    // Teardown cancels this monitor too; complete resource cleanup despite that cancellation.
+                    withContext(NonCancellable) { stopInternalLocked("foreground service failed") }
+                    false
+                }
+            }
+            if (!protected) return
             try {
                 mutex.withLock { evaluateNightVolumeLocked() }
             } catch (e: CancellationException) {
