@@ -161,11 +161,9 @@ class ProxyPlaybackService : Service() {
     }
 
     /**
-     * Acquire a partial CPU wake lock + a high-performance Wi-Fi lock for the duration of active
-     * casting, so the phone keeps serving the proxy stream to the TV with the screen off / app
-     * backgrounded. The phone is a media *server* here (it plays no local audio), so nothing else holds
-     * the CPU/Wi-Fi awake — without these, Doze CPU-idle and Wi-Fi power-save stall the byte stream the
-     * TV pulls from the in-RAM proxy. Idempotent; both are released in [releaseLocks].
+     * Keep the CPU awake while serving the TV, including with the screen off. The Wi-Fi latency lock
+     * is an additional screen-on optimization; it cannot guarantee screen-off radio behavior.
+     * Idempotent; both locks are released in [releaseLocks].
      */
     @Suppress("WakelockTimeout") // intentionally held for the whole casting session, released on stop.
     private fun acquireLocks() {
