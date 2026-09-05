@@ -3823,6 +3823,9 @@ class MainViewModel(
                 appendLine("buffering:         ${np.buffering}")
             }
             appendLine()
+            appendLine("--- Android process exits (historical; may precede this build) ---")
+            appendLine(container.crashReporter.systemExitReport())
+            appendLine()
             appendLine("--- recent events (redacted) ---")
             // Persisted, current-build events — survives app restarts, so a report shared after the
             // playbacks the user wants to show includes them (the in-memory ring is wiped on relaunch).

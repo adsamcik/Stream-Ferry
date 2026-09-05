@@ -87,6 +87,9 @@ class CrashReporter(
 
     fun count(): Int = store.count()
 
+    /** Historical OS terminations, which cannot be captured by the Java crash handler. */
+    fun systemExitReport(): String = ProcessExitDiagnostics.read(appContext)
+
     /** Count of stored reports from the CURRENT build (what latest-build sharing would include). */
     fun countForCurrentBuild(): Int = store.countForVersion(versionCode)
 

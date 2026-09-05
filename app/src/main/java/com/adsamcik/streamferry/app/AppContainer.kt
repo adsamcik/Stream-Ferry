@@ -479,6 +479,10 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
     }
 
     init {
+        logger.event("process", "App process started pid=${android.os.Process.myPid()}")
+        ioScope.launch {
+            crashReporter.systemExitReport().lineSequence().forEach { logger.event("previous-exit", it) }
+        }
         // Apply the persisted opt-in TV-tracing preference so detailed Cast/DLNA traffic is captured
         // from app start if the user previously enabled it.
         runCatching { logger.traceEnabled = diagnosticsPreferences.tvTracingEnabled }
