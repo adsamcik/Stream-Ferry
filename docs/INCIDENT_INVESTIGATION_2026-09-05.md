@@ -16,8 +16,8 @@ provable termination cause in the supplied evidence.
 
 | Incident | Last persisted event before reinitialization | Next initialization | What can be established |
 | --- | --- | --- | --- |
-| First | 21:41:25.339: TV volume reaches 15% (line 490) | 21:58:30.031: Cast SDK initialized; auth and library restore follow (491–494) | A fresh app/container initialization follows a 17m 4.692s logging gap. The previous session was directly playing *Deadly Climb*. The log does not give the exit time or reason. |
-| Second | 21:58:47.405: buffering ends at the resumed position of 1016s (546) | 22:18:15.267: Cast SDK initialized; auth and library restore follow (547–550) | Another initialization follows a 19m 27.862s logging gap. Direct playback had resumed successfully. Again, the exit time and reason are absent. |
+| First | 21:41:25.339: TV volume reaches 15% (line 490) | 21:58:30.031: Cast SDK initialized; auth and library restore follow (491–494) | The user confirms reopening seconds after the shutdown, placing the exit shortly before 21:58:30. The 17m 4.692s logging gap is not app downtime. The previous session was directly playing *Deadly Climb*. |
+| Second | 21:58:47.405: buffering ends at the resumed position of 1016s (546) | 22:18:15.267: Cast SDK initialized; auth and library restore follow (547–550) | The user confirms reopening seconds after the shutdown, placing the exit shortly before 22:18:15. The 19m 27.862s logging gap is not app downtime. Direct playback had resumed successfully. |
 
 `AppContainer.initializeCastContext()` caches its successful initialization and
 does not repeat it on ordinary Activity recreation (AppContainer.kt:338–357).
@@ -26,6 +26,22 @@ restarts rather than two playback-screen errors. They identify reopen times,
 not the instants the process died. Quiet progressive streaming need not generate
 new events for many minutes. The saved 1016s resume point also shows that the last
 printed event is not necessarily the last successful playback activity.
+
+**User clarification:** both reopenings occurred seconds after the respective
+crashes/shutdowns. This narrows the exit windows to shortly before 21:58:30 and
+22:18:15. Measured from each session's first confirmed PLAYING state, those are
+roughly 18 and 19.5 minutes into the respective playback sessions, allowing for
+the short reopening delay. These are elapsed session times, not proof of
+uninterrupted playback. The failures therefore occurred well after startup; the
+21:40:15 handled Cast error was about 18 minutes before the first exit.
+
+The tighter timing warrants checking sustained-playback failures, but does not
+prove a fixed timer, memory leak or OS background restriction. The app's proxy
+session registry uses a 4-hour idle expiry and 24-hour hard ceiling, with no
+production override at construction or session creation. The playback service
+acquires its wake lock without a timed expiry. Those particular application
+timeouts do not explain an exit after approximately 18–20 minutes. An Android
+exit record or saved crash stack remains necessary to identify the actual cause.
 
 There is **no fatal exception, ANR, out-of-memory message, native crash, or OS kill
 reason** in the attachment. The earlier `IllegalStateException` at 21:40:15 is a
