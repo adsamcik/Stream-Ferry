@@ -15,6 +15,10 @@ defects explain playback symptoms: a stuck recovery flag, invalid media-segment
 query serialization, retries after proxy shutdown, and a seek-status ordering race.
 Two initial direct streams also fail and recover through transcoding.
 
+**Fix follow-up:** The confirmed code defects have now been corrected on `main`.
+See [implementation and validation](INCIDENT_FIXES_2026-09-05.md). The analysis
+below preserves the original incident evidence and pre-fix source references.
+
 ## The two shutdowns: Android CPU-policy kills confirmed
 
 The phone became available over ADB during the follow-up investigation. Read-only
@@ -284,8 +288,9 @@ This investigation reviewed the entire supplied excerpt and relevant current
 source, verified official API/status meanings, executed the live HTTP query
 comparison, and retrieved historical termination evidence from the affected phone.
 It did not induce either process exit or run a new physical TV playback test.
-No production code was changed, and no claim of exhaustive application-wide
-correctness follows from this incident review. Previously recorded issues in
+Production fixes were subsequently implemented as described in the linked
+follow-up; no claim of exhaustive application-wide correctness follows from this
+incident review. Previously recorded issues in
 [general validation](VALIDATION_2026-09-05.md) and
 [watch-state validation](WATCH_STATE_VALIDATION_2026-09-05.md) remain separate
 findings; this excerpt neither revalidates nor disproves them.
