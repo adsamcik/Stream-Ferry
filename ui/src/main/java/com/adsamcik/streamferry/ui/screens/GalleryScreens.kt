@@ -4,7 +4,6 @@ import android.content.res.Configuration
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Spring
@@ -44,6 +43,7 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
@@ -69,12 +69,14 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.FilledTonalIconButton
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -97,6 +99,9 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
@@ -524,23 +529,20 @@ private fun LibraryHome(
 
     LazyVerticalGrid(
         state = gridState,
-        columns = if (compact) GridCells.Fixed(2) else GridCells.Adaptive(minSize = 150.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        columns = if (compact) GridCells.Fixed(2) else GridCells.Adaptive(minSize = 200.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
         contentPadding = PaddingValues(bottom = 20.dp),
         modifier = Modifier.fillMaxSize(),
     ) {
         item(span = { GridItemSpan(maxLineSpan) }) {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                if (compact) {
-                    PhoneGalleryHeader(
-                        title = "Library",
-                        onBack = null,
-                        onSearch = onOpenSearch,
-                        searchVisible = searchOpen,
-                        showSourceUnavailableNotice = remoteUnavailable,
-                        onRetrySource = viewModel::refreshGallery,
-                    )
+            Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                LibraryHomeHeader(
+                    onSearch = onOpenSearch,
+                    showSearch = compact && !searchOpen,
+                )
+                if (compact && remoteUnavailable) {
+                    SourceUnavailableHeaderNotice(onRetry = viewModel::refreshGallery)
                 }
                 SourceSwitcher(viewModel.sources, state.activeSourceId, viewModel::selectSource)
                 if (!compact || searchOpen) {
@@ -581,7 +583,7 @@ private fun LibraryHome(
                 EmptyLibraryPrompt(state, viewModel, isLocalSource)
             }
             else -> items(entries, key = { it.id }, contentType = { "media" }) { item ->
-                if (compact && item.isFolder) {
+                if (item.isFolder) {
                     LibraryTile(
                         item = item,
                         posterUrl = item.artwork,
@@ -684,7 +686,12 @@ internal fun LibrarySearchTextField(
         label = { Text(label) },
         leadingIcon = { Icon(Icons.Rounded.Search, contentDescription = null) },
         singleLine = true,
-        shape = RoundedCornerShape(20.dp),
+        shape = CircleShape,
+        colors = OutlinedTextFieldDefaults.colors(
+            focusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+            unfocusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+            unfocusedBorderColor = androidx.compose.ui.graphics.Color.Transparent,
+        ),
         keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
         keyboardActions = KeyboardActions(onSearch = { onImeSearch() }),
         trailingIcon = {
@@ -701,6 +708,34 @@ internal fun LibrarySearchTextField(
             .focusRequester(focusRequester)
             .testTag("library-search-field"),
     )
+}
+
+@Composable
+private fun LibraryHomeHeader(onSearch: () -> Unit, showSearch: Boolean) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 4.dp),
+        horizontalArrangement = Arrangement.spacedBy(16.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(
+                "STREAM FERRY",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.primary,
+            )
+            Text("Your library", style = MaterialTheme.typography.displaySmall)
+            Text(
+                "Pick a video. Make it a TV night.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        if (showSearch) {
+            FilledTonalIconButton(onClick = onSearch, modifier = Modifier.size(56.dp)) {
+                Icon(Icons.Rounded.Search, contentDescription = "Search library", modifier = Modifier.size(26.dp))
+            }
+        }
+    }
 }
 
 @Composable
@@ -811,20 +846,58 @@ private fun LibrarySectionTitle(title: String) {
 
 @Composable
 private fun RemoteLoginPrompt(viewModel: UiController) {
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text("Connect to your media server to browse it here, or switch to \"On this device\" above.")
-        Button(onClick = { viewModel.navigate(Route.SERVER_SETUP) }) { Text("Connect a server") }
+    Surface(
+        shape = MaterialTheme.shapes.extraLarge,
+        color = MaterialTheme.colorScheme.secondaryContainer,
+        contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+    ) {
+        Column(Modifier.fillMaxWidth().padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Icon(Icons.Rounded.VideoLibrary, contentDescription = null, modifier = Modifier.size(32.dp))
+            Text("Your next watch starts here", style = MaterialTheme.typography.headlineSmall)
+            Text(
+                "Connect your media server to bring your movies and shows together. You can also browse videos on this device.",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Button(
+                onClick = { viewModel.navigate(Route.SERVER_SETUP) },
+                modifier = Modifier.heightIn(min = 48.dp),
+            ) { Text("Connect a server") }
+        }
     }
 }
 
 @Composable
 private fun EmptyLibraryPrompt(state: AppUiState, viewModel: UiController, isLocalSource: Boolean) {
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        if (isLocalSource) {
-            Text("No on-device videos yet. Add a folder or files above, or allow access to all your videos.")
-        } else {
-            Text(if (state.errorMessage != null) "Couldn't load this view." else "Nothing to show here yet.")
-            Button(onClick = { viewModel.refreshGallery() }) { Text("Retry") }
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.extraLarge,
+        color = MaterialTheme.colorScheme.surfaceContainerLow,
+    ) {
+        Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Icon(
+                if (isLocalSource) Icons.Rounded.PhoneAndroid else Icons.Rounded.VideoLibrary,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(32.dp),
+            )
+            Text(
+                if (isLocalSource) "A bigger screen awaits" else "Nothing here yet",
+                style = MaterialTheme.typography.headlineSmall,
+            )
+            Text(
+                if (isLocalSource) {
+                    "Add a folder or videos above to start your library, or allow access to videos on this device."
+                } else if (state.errorMessage != null) {
+                    "Couldn't load this view. Try refreshing your library."
+                } else {
+                    "Refresh to check for movies and shows from your server."
+                },
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            if (!isLocalSource) {
+                FilledTonalButton(onClick = viewModel::refreshGallery) { Text("Refresh library") }
+            }
         }
     }
 }
@@ -849,26 +922,15 @@ private fun playlistAddAction(
 @Composable
 private fun SourceSwitcher(sources: List<Pair<String, String>>, activeId: String, onSelect: (String) -> Unit) {
     if (sources.size < 2) return
-    Column(
-        modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
+    Surface(
+        modifier = Modifier.fillMaxWidth().selectableGroup(),
+        shape = MaterialTheme.shapes.large,
+        color = MaterialTheme.colorScheme.surfaceContainer,
     ) {
-        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-            Text(
-                text = "Browse from",
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold,
-            )
-            Text(
-                text = "Choose where your library and search results come from",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
         if (sources.size <= 2) {
             Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.fillMaxWidth().padding(6.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
                 sources.forEach { (id, name) ->
                     SourceOption(
@@ -881,14 +943,17 @@ private fun SourceSwitcher(sources: List<Pair<String, String>>, activeId: String
                 }
             }
         } else {
-            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            LazyRow(
+                contentPadding = PaddingValues(6.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
                 items(sources, key = { it.first }) { (id, name) ->
                     SourceOption(
                         id = id,
                         name = name,
                         selected = id == activeId,
                         onClick = { onSelect(id) },
-                        modifier = Modifier.width(220.dp),
+                        modifier = Modifier.width(200.dp),
                     )
                 }
             }
@@ -916,27 +981,22 @@ private fun SourceOption(
     )
     val containerColor by animateColorAsState(
         targetValue = if (selected) {
-            MaterialTheme.colorScheme.primaryContainer
+            MaterialTheme.colorScheme.primary
         } else {
-            MaterialTheme.colorScheme.surfaceContainerHigh
+            MaterialTheme.colorScheme.surfaceContainer
         },
         animationSpec = tween(220),
         label = "source-option-container",
     )
     val contentColor by animateColorAsState(
         targetValue = if (selected) {
-            MaterialTheme.colorScheme.onPrimaryContainer
+            MaterialTheme.colorScheme.onPrimary
         } else {
             MaterialTheme.colorScheme.onSurface
         },
         animationSpec = tween(220),
         label = "source-option-content",
     )
-    val description = when (id) {
-        MediaSourceIds.REMOTE -> "Stream from your server"
-        MediaSourceIds.LOCAL -> "Videos stored on this phone"
-        else -> "Browse this media source"
-    }
     val icon = when (id) {
         MediaSourceIds.REMOTE -> Icons.Rounded.Dns
         MediaSourceIds.LOCAL -> Icons.Rounded.PhoneAndroid
@@ -947,58 +1007,28 @@ private fun SourceOption(
         onClick = { if (!selected) onClick() },
         interactionSource = interactionSource,
         modifier = modifier
-            .heightIn(min = 104.dp)
+            .heightIn(min = 64.dp)
+            .semantics {
+                this.selected = selected
+                role = Role.Tab
+            }
             .graphicsLayer {
                 scaleX = scale
                 scaleY = scale
             },
-        shape = RoundedCornerShape(24.dp),
+        shape = if (selected) MaterialTheme.shapes.large else MaterialTheme.shapes.medium,
         colors = CardDefaults.cardColors(containerColor = containerColor, contentColor = contentColor),
-        border = BorderStroke(
-            width = if (selected) 2.dp else 1.dp,
-            color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant,
-        ),
-        elevation = CardDefaults.cardElevation(defaultElevation = if (selected) 3.dp else 0.dp),
     ) {
-        Column(
-            modifier = Modifier.fillMaxWidth().padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 18.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Surface(
-                    modifier = Modifier.size(34.dp),
-                    shape = CircleShape,
-                    color = if (selected) {
-                        MaterialTheme.colorScheme.primary
-                    } else {
-                        MaterialTheme.colorScheme.secondaryContainer
-                    },
-                    contentColor = if (selected) {
-                        MaterialTheme.colorScheme.onPrimary
-                    } else {
-                        MaterialTheme.colorScheme.onSecondaryContainer
-                    },
-                ) {
-                    Box(contentAlignment = Alignment.Center) {
-                        Icon(icon, contentDescription = null, modifier = Modifier.size(20.dp))
-                    }
-                }
-                Box(Modifier.weight(1f))
-                AnimatedVisibility(visible = selected) {
-                    Icon(Icons.Rounded.Check, contentDescription = "Selected", modifier = Modifier.size(20.dp))
-                }
-            }
+            Icon(if (selected) Icons.Rounded.Check else icon, contentDescription = null, modifier = Modifier.size(20.dp))
             Text(
                 text = name,
-                style = MaterialTheme.typography.titleSmall,
-                fontWeight = FontWeight.Bold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Text(
-                text = description,
-                style = MaterialTheme.typography.labelSmall,
-                color = contentColor.copy(alpha = 0.78f),
+                style = MaterialTheme.typography.labelLarge,
+                modifier = Modifier.weight(1f),
                 maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
             )
@@ -1028,12 +1058,12 @@ private fun LocalAccessActions(viewModel: UiController) {
             .fillMaxWidth()
             .horizontalScroll(rememberScrollState()),
     ) {
-        OutlinedButton(
+        FilledTonalButton(
             onClick = { folderPicker.launch(null) },
-        ) { Text("Add a folder") }
-        OutlinedButton(
+        ) { Text("Add folder") }
+        FilledTonalButton(
             onClick = { filesPicker.launch(arrayOf("video/*")) },
-        ) { Text("Add individual videos") }
+        ) { Text("Add videos") }
         if (!viewModel.mediaPermissionGranted()) {
             OutlinedButton(
                 onClick = { permissionLauncher.launch(viewModel.readMediaVideoPermissions) },
@@ -1333,23 +1363,32 @@ private fun LibraryTile(
     onClick: () -> Unit,
 ) {
     Card(
-        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
-        shape = RoundedCornerShape(24.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.large,
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
     ) {
-        Column(Modifier.padding(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Surface(
-                shape = RoundedCornerShape(18.dp),
+                shape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp, bottomEnd = 8.dp, bottomStart = 20.dp),
                 color = MaterialTheme.colorScheme.primaryContainer,
                 modifier = Modifier.fillMaxWidth().aspectRatio(16f / 10f),
             ) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Text(
-                        text = item.title.take(2).uppercase(),
-                        style = MaterialTheme.typography.headlineSmall,
-                        fontWeight = FontWeight.ExtraBold,
-                        color = MaterialTheme.colorScheme.onPrimaryContainer,
-                    )
+                    Surface(
+                        modifier = Modifier.size(56.dp).graphicsLayer { rotationZ = -12f },
+                        shape = MaterialTheme.shapes.large,
+                        color = MaterialTheme.colorScheme.primary,
+                        contentColor = MaterialTheme.colorScheme.onPrimary,
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(
+                                Icons.Rounded.VideoLibrary,
+                                contentDescription = null,
+                                modifier = Modifier.size(32.dp).graphicsLayer { rotationZ = 12f },
+                            )
+                        }
+                    }
                     if (posterUrl != null) {
                         AsyncImage(
                             model = posterUrl,
@@ -1361,14 +1400,30 @@ private fun LibraryTile(
                     WatchStateOverlay(item)
                 }
             }
-            Text(
-                text = item.title,
-                style = MaterialTheme.typography.titleSmall,
-                fontWeight = FontWeight.Bold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                color = MaterialTheme.colorScheme.onSecondaryContainer,
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(start = 4.dp, bottom = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = item.title,
+                    modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.titleMedium,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Surface(
+                    shape = CircleShape,
+                    color = MaterialTheme.colorScheme.secondaryContainer,
+                    contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                ) {
+                    Icon(
+                        Icons.AutoMirrored.Rounded.KeyboardArrowRight,
+                        contentDescription = null,
+                        modifier = Modifier.padding(6.dp).size(20.dp),
+                    )
+                }
+            }
             ItemAvailabilityLabel(availability)
         }
     }
@@ -2234,6 +2289,46 @@ internal fun formatClock(seconds: Long): String {
 // ---------------------------------------------------------------------------------------------------
 // Design-time @Preview composables (no ViewModel required); R8 strips them from the release build.
 // ---------------------------------------------------------------------------------------------------
+
+@Preview(name = "Library · light", showBackground = true, widthDp = 360)
+@Preview(name = "Library · dark", showBackground = true, widthDp = 360, uiMode = Configuration.UI_MODE_NIGHT_YES)
+@Preview(name = "Library · large text", showBackground = true, widthDp = 360, fontScale = 1.5f)
+@Composable
+private fun LibraryHomeComponentsPreview() {
+    StreamFerryTheme(dynamicColor = false) {
+        Surface(color = MaterialTheme.colorScheme.surface) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                LibraryHomeHeader(onSearch = {}, showSearch = true)
+                SourceSwitcher(
+                    sources = listOf(MediaSourceIds.REMOTE to "Jellyfin", MediaSourceIds.LOCAL to "On this device"),
+                    activeId = MediaSourceIds.REMOTE,
+                    onSelect = {},
+                )
+                LibrarySectionTitle("Your libraries")
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    listOf("Movies", "TV shows").forEach { title ->
+                        Box(Modifier.weight(1f)) {
+                            LibraryTile(
+                                item = MediaItem(
+                                    id = title,
+                                    title = title,
+                                    year = null,
+                                    runtimeSeconds = null,
+                                    overview = null,
+                                    resumePositionSeconds = null,
+                                    isFolder = true,
+                                    type = "CollectionFolder",
+                                ),
+                                posterUrl = null,
+                                onClick = {},
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 @Preview(name = "Media card", showBackground = true, widthDp = 200)
 @Preview(name = "Media card · dark", showBackground = true, widthDp = 200, uiMode = Configuration.UI_MODE_NIGHT_YES)

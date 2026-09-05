@@ -28,6 +28,7 @@ import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
@@ -172,7 +173,7 @@ fun AppRoot(
         val effectsMotion = MaterialTheme.motionScheme.defaultEffectsSpec<Float>()
 
         Scaffold(
-            containerColor = MaterialTheme.colorScheme.surfaceContainerLowest,
+            containerColor = MaterialTheme.colorScheme.surface,
             contentWindowInsets = WindowInsets.safeDrawing,
             topBar = {
                 if (!galleryOwnsPhoneHeader) {
@@ -181,7 +182,7 @@ fun AppRoot(
                             title = { Text(titleFor(state.route), fontWeight = FontWeight.Bold, maxLines = 1) },
                             navigationIcon = { if (showUpNavigation && back != null) IconBack(back) },
                             colors = TopAppBarDefaults.topAppBarColors(
-                                containerColor = MaterialTheme.colorScheme.surfaceContainer,
+                                containerColor = MaterialTheme.colorScheme.surface,
                                 titleContentColor = MaterialTheme.colorScheme.onSurface,
                             ),
                         )
@@ -296,7 +297,7 @@ private fun ScreenContent(
     }
     val outerPadding = when {
         expanded -> 24.dp
-        state.route == Route.GALLERY -> 12.dp
+        state.route == Route.GALLERY -> 16.dp
         else -> 16.dp
     }
     val topPadding = if (!expanded && state.route == Route.GALLERY) 8.dp else 12.dp
@@ -423,26 +424,31 @@ private fun RouteContent(
 @Composable
 private fun CompactNavigation(state: AppUiState, viewModel: UiController) {
     val selected = NavigationStatePolicy.topLevelFor(state.route)
-    NavigationBar {
-        NavigationBarItem(
-            selected = selected == TopLevelDestination.LIBRARY,
-            onClick = { viewModel.navigate(Route.GALLERY) },
-            icon = { Icon(Icons.Rounded.VideoLibrary, contentDescription = null) },
-            label = { Text("Library") },
-        )
-        NavigationBarItem(
-            selected = selected == TopLevelDestination.SETTINGS,
-            onClick = { viewModel.navigate(Route.SETTINGS) },
-            icon = { Icon(Icons.Rounded.Settings, contentDescription = null) },
-            label = { Text("Settings") },
-        )
+    Surface(
+        shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
+        color = MaterialTheme.colorScheme.surfaceContainer,
+    ) {
+        NavigationBar(containerColor = MaterialTheme.colorScheme.surfaceContainer, tonalElevation = 0.dp) {
+            NavigationBarItem(
+                selected = selected == TopLevelDestination.LIBRARY,
+                onClick = { viewModel.navigate(Route.GALLERY) },
+                icon = { Icon(Icons.Rounded.VideoLibrary, contentDescription = null) },
+                label = { Text("Library") },
+            )
+            NavigationBarItem(
+                selected = selected == TopLevelDestination.SETTINGS,
+                onClick = { viewModel.navigate(Route.SETTINGS) },
+                icon = { Icon(Icons.Rounded.Settings, contentDescription = null) },
+                label = { Text("Settings") },
+            )
+        }
     }
 }
 
 @Composable
 private fun WideNavigation(state: AppUiState, viewModel: UiController) {
     val selected = NavigationStatePolicy.topLevelFor(state.route)
-    NavigationRail {
+    NavigationRail(containerColor = MaterialTheme.colorScheme.surface) {
         NavigationRailItem(
             selected = selected == TopLevelDestination.LIBRARY,
             onClick = { viewModel.navigate(Route.GALLERY) },
@@ -515,7 +521,7 @@ private fun MiniPlayer(
         color = if (playback.isTerminal) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.tertiaryContainer,
         contentColor = if (playback.isTerminal) MaterialTheme.colorScheme.onErrorContainer else MaterialTheme.colorScheme.onTertiaryContainer,
         shape = MaterialTheme.shapes.extraLarge,
-        shadowElevation = 6.dp,
+        shadowElevation = 2.dp,
     ) {
         Column {
             Row(
