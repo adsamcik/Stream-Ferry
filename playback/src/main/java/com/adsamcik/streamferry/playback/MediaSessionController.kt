@@ -71,6 +71,13 @@ class MediaSessionController(
     val token: MediaSession.Token get() = session.sessionToken
 
     private val notificationFactory = PlaybackNotificationFactory(appContext, session.sessionToken, contentIntent)
+    private data class MetadataKey(val title: String, val target: String, val duration: Long?)
+    private data class NotificationKey(
+        val title: String, val target: String, val phase: PlaybackNotificationFactory.Phase,
+        val playPause: Boolean, val skip: Boolean,
+    )
+    private var lastMetadataKey: MetadataKey? = null
+    private var lastNotificationKey: NotificationKey? = null
 
     @Volatile
     private var lastNotification: Notification = notificationFactory.build(
@@ -101,29 +108,36 @@ class MediaSessionController(
         timelineSeekEnabled = controls?.canSeekTimeline == true
         remoteVolumeEnabled = status?.volumeSupported == true
         if (remoteVolumeEnabled) {
-            remoteVolumeProvider.setCurrentVolume((status!!.volume * MAX_VOLUME).roundToInt().coerceIn(0, MAX_VOLUME))
+            val volume = (status!!.volume * MAX_VOLUME).roundToInt().coerceIn(0, MAX_VOLUME)
+            if (remoteVolumeProvider.currentVolume != volume) remoteVolumeProvider.setCurrentVolume(volume)
         }
         if (status == null) {
             session.setPlaybackState(stateOf(PlaybackState.STATE_STOPPED, 0, false, canPlayPause = false, canSkip = false, canSeek = false))
             session.isActive = false
+            lastNotificationKey = null
+            lastMetadataKey = null
             return
         }
-        session.isActive = true
+        if (!session.isActive) session.isActive = true
         val title = MetadataSanitizer.receiverTitle(status.title)
         val targetName = MetadataSanitizer.normalize(status.targetName, MAX_DEVICE_NAME_UTF8_BYTES)
             .ifBlank { appContext.getString(R.string.notif_your_tv) }
-        val metadata = MediaMetadata.Builder()
-            .putString(MediaMetadata.METADATA_KEY_TITLE, title)
-            .putString(MediaMetadata.METADATA_KEY_DISPLAY_TITLE, title)
-            .putString(MediaMetadata.METADATA_KEY_ARTIST, targetName)
-            .putString(MediaMetadata.METADATA_KEY_DISPLAY_SUBTITLE, targetName)
-            .apply {
-                status.durationSeconds
-                    ?.takeIf { it > 0L }
-                    ?.let { putLong(MediaMetadata.METADATA_KEY_DURATION, it * 1000) }
-            }
-            .build()
-        session.setMetadata(metadata)
+        val metadataKey = MetadataKey(title, targetName, status.durationSeconds)
+        if (metadataKey != lastMetadataKey) {
+            val metadata = MediaMetadata.Builder()
+                .putString(MediaMetadata.METADATA_KEY_TITLE, title)
+                .putString(MediaMetadata.METADATA_KEY_DISPLAY_TITLE, title)
+                .putString(MediaMetadata.METADATA_KEY_ARTIST, targetName)
+                .putString(MediaMetadata.METADATA_KEY_DISPLAY_SUBTITLE, targetName)
+                .apply {
+                    status.durationSeconds
+                        ?.takeIf { it > 0L }
+                        ?.let { putLong(MediaMetadata.METADATA_KEY_DURATION, it * 1000) }
+                }
+                .build()
+            session.setMetadata(metadata)
+            lastMetadataKey = metadataKey
+        }
         val playerState = when {
             controls?.isTransitioning == true -> PlaybackState.STATE_CONNECTING
             status.isBuffering -> PlaybackState.STATE_BUFFERING
@@ -146,6 +160,10 @@ class MediaSessionController(
             status.isPlaying -> PlaybackNotificationFactory.Phase.PLAYING
             else -> PlaybackNotificationFactory.Phase.PAUSED
         }
+        // Position/throughput reports still update PlaybackState for the lock-screen timeline.
+        // They do not change the notification content and must not rebuild/repost it every second.
+        val notificationKey = NotificationKey(title, targetName, phase, playPauseEnabled, skipEnabled)
+        if (notificationKey == lastNotificationKey) return
         lastNotification = notificationFactory.build(
             title = title,
             targetName = targetName,
@@ -154,6 +172,7 @@ class MediaSessionController(
             canSkip = skipEnabled,
         )
         runCatching { notificationManager.notify(PlaybackNotificationFactory.NOTIFICATION_ID, lastNotification) }
+            .onSuccess { lastNotificationKey = notificationKey }
     }
 
     /** The current notification (the foreground service uses it for `startForeground`). */
