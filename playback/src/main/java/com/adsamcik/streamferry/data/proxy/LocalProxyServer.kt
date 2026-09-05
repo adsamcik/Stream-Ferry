@@ -24,6 +24,10 @@ import com.adsamcik.streamferry.source.api.StreamResourceKind
 import com.adsamcik.streamferry.source.api.StreamResourceRef
 import com.adsamcik.streamferry.source.api.StreamResponse
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
@@ -217,7 +221,13 @@ class LocalProxyServer(
             s.launch {
                 try {
                     handle(client)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: IOException) {
+                    // Stop can close an accepted socket before its handler obtains either stream.
+                    if (s.isActive && !stopping) logger.w(TAG, "Relay socket unavailable", error)
                 } finally {
+                    runCatching { client.close() }
                     activeClients.remove(client)
                     connectionLimiter.release(ip)
                 }
@@ -232,6 +242,9 @@ class LocalProxyServer(
             val out: OutputStream = counting
             val startMs = System.currentTimeMillis()
             var servedMedia = false
+            var sessionId: String? = null
+            var completed = false
+            val downstreamClosed = onDownstreamClosed
             try {
                 val req = RequestLine.read(sock.getInputStream()) ?: run {
                     writeStatus(out, 400, "Bad Request"); return
@@ -250,12 +263,21 @@ class LocalProxyServer(
                     is SessionLookup.Expired -> writeStatus(out, 410, "Gone")
                     is SessionLookup.Forbidden -> writeStatus(out, 403, "Forbidden")
                     is SessionLookup.Ok -> {
+                        sessionId = lookup.session.id
                         servedMedia = req.method == "GET" // a real playback fetch, not a HEAD probe
                         serve(lookup.session, req, out)
+                        out.flush()
+                        completed = true
                     }
                 }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (e: Exception) {
-                logger.w(TAG, "Request handling error", e)
+                if (!currentCoroutineContext().isActive || stopping || sessionId?.let { !sessions.isActive(it) } == true) {
+                    logger.trace(TAG, "Relay closed after session teardown")
+                } else {
+                    logger.w(TAG, "Request handling error", e)
+                }
             } finally {
                 runCatching { out.flush() }
                 // Report the outcome of a real media fetch so the engine can spot a TV that bailed early.
@@ -263,9 +285,19 @@ class LocalProxyServer(
                     val elapsedMs = System.currentTimeMillis() - startMs
                     // Always-on connection summary: a shared report can distinguish a TV that never fetched
                     // (no such line) from one that fetched N bytes then closed (couldn't decode / stalled).
-                    logger.trace(TAG, "TV connection closed: ${counting.count} bytes in ${elapsedMs}ms (clean=${!counting.writeFailed})")
-                    runCatching {
-                        onDownstreamClosed?.invoke(counting.count, elapsedMs, !counting.writeFailed)
+                    val cancelled = !currentCoroutineContext().isActive || stopping || sessionId?.let { !sessions.isActive(it) } == true
+                    val outcome = when {
+                        cancelled -> "cancelled"
+                        counting.writeFailed -> "downstream_closed"
+                        completed -> "complete"
+                        else -> "upstream_failed"
+                    }
+                    val clean = outcome == "complete"
+                    logger.trace(TAG, "TV connection closed: ${counting.count} bytes in ${elapsedMs}ms (clean=$clean outcome=$outcome)")
+                    // An upstream failure is not evidence that the TV cannot decode the format.
+                    // Never deliver a revoked stream's outcome to the replacement playback session.
+                    if (!cancelled && (completed || counting.writeFailed)) runCatching {
+                        downstreamClosed?.invoke(counting.count, elapsedMs, clean)
                     }
                 }
             }
@@ -313,7 +345,7 @@ class LocalProxyServer(
         val requestedRange = (rangeResult as? RangeParseResult.Satisfiable)?.range
         val rangeStart = requestedRange?.start ?: 0L
         val rangeEndInclusive = requestedRange?.endInclusive ?: totalLength - 1
-        val first = runCatching {
+        val first = catchingNonCancel {
             if (requestedRange != null) {
                 openVerifiedRangeUpstream(session, lease, requestedRange, totalLength)
             } else {
@@ -346,7 +378,7 @@ class LocalProxyServer(
 
     private suspend fun serveUnknownLengthUpstream(session: ProxySession, out: OutputStream, head: Boolean) {
         val lease = remoteLeases[session.id]
-        val first = lease?.let { runCatching { openFullUpstream(session, it) }.getOrNull() }
+        val first = lease?.let { catchingNonCancel { openFullUpstream(session, it) }.getOrNull() }
         if (first == null) {
             writeStatus(out, 502, "Bad Gateway")
             logger.w(TAG, "Unknown-length upstream open failed")
@@ -554,6 +586,7 @@ class LocalProxyServer(
         lease: StreamLease,
         range: ByteRange?,
     ): StreamResponse {
+        ensureSessionActive(session)
         val response = lease.open(range).getOrThrow()
         return trackResponse(session.id, response)
     }
@@ -564,6 +597,7 @@ class LocalProxyServer(
         resource: StreamResourceRef,
         range: ByteRange?,
     ): StreamResponse {
+        ensureSessionActive(session)
         val response = lease.open(resource, range).getOrThrow()
         return trackResponse(session.id, response)
     }
@@ -578,9 +612,24 @@ class LocalProxyServer(
         }
         if (!accepted) {
             runCatching { response.close() }
-            throw IOException("Proxy session was revoked while opening source stream")
+            throw CancellationException("Proxy session was revoked while opening source stream")
         }
         return response
+    }
+
+    private suspend fun ensureSessionActive(session: ProxySession) {
+        currentCoroutineContext().ensureActive()
+        if (stopping || !sessions.isActive(session.id)) {
+            throw CancellationException("Proxy session revoked")
+        }
+    }
+
+    private inline fun <T> catchingNonCancel(block: () -> T): Result<T> = try {
+        Result.success(block())
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (error: Exception) {
+        Result.failure(error)
     }
 
     private fun closeUpstream(sessionId: String, response: StreamResponse) {
@@ -606,7 +655,8 @@ class LocalProxyServer(
     ): StreamResponse? {
         var attempt = 0
         while (true) {
-            val result = runCatching { if (resource == null) openTracked(session, lease, range) else openTracked(session, lease, resource, range) }
+            ensureSessionActive(session)
+            val result = catchingNonCancel { if (resource == null) openTracked(session, lease, range) else openTracked(session, lease, resource, range) }
             val response = result.getOrNull()
             if (response != null && (
                     UpstreamRetry.isSuccess(response.statusCode) ||
@@ -618,7 +668,7 @@ class LocalProxyServer(
             val timedOut = result.exceptionOrNull() is java.io.InterruptedIOException // incl. SocketTimeoutException
             if (attempt >= HLS_OPEN_MAX_RETRIES || !UpstreamRetry.shouldRetryOpen(code, timedOut)) return null
             attempt++
-            runCatching { Thread.sleep(HLS_OPEN_RETRY_BACKOFF_MS * attempt) }
+            delay(HLS_OPEN_RETRY_BACKOFF_MS * attempt)
         }
     }
 
@@ -845,7 +895,7 @@ class LocalProxyServer(
 
         override fun write(b: Int) = track { out.write(b); count++ }
         override fun write(b: ByteArray, off: Int, len: Int) = track { out.write(b, off, len); count += len }
-        override fun flush() = out.flush()
+        override fun flush() = track { out.flush() }
         override fun close() = out.close()
 
         private inline fun track(block: () -> Unit) {
@@ -880,38 +930,47 @@ class LocalProxyServer(
         var response: StreamResponse? = initialResp
         try {
             while (true) {
+                ensureSessionActive(session)
                 if (response == null) {
                     val rangeEnd = policy.rangeEndInclusive
-                    if (!canResume || rangeEnd == null) return
+                    if (!canResume || rangeEnd == null) throw IOException("Upstream transfer ended before completion")
                     val requested = ByteRange(policy.nextOffset, rangeEnd)
                     response = try {
                         openVerifiedRangeUpstream(session, lease, requested, expectedTotalLength)
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
                     } catch (_: Exception) {
-                        if (!retryOrGiveUp(policy)) return else continue
+                        ensureSessionActive(session)
+                        if (!retryOrGiveUp(policy)) throw IOException("Upstream resume attempts exhausted") else continue
                     }
                     // A protocol-invalid resume response (for example a 200 from byte zero) must never
                     // be spliced into the renderer response. End rather than retrying corrupted bytes.
                     if (response == null) {
                         logger.w(TAG, "Upstream did not honour the resume range; ending transfer")
-                        return
+                        throw IOException("Upstream did not honour the resume range")
                     }
                 }
                 val resp = response
                 response = null
                 val result = try {
-                    copyStream(resp.body, out, buf, policy, watchdog)
+                    copyStream(session, resp.body, out, buf, policy, watchdog)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
                 } catch (_: Exception) {
                     StreamResult.UPSTREAM_FAILED
                 } finally {
                     closeUpstream(session.id, resp)
                 }
+                ensureSessionActive(session)
                 when (result) {
                     StreamResult.COMPLETE, StreamResult.DOWNSTREAM_GONE -> return
                     StreamResult.UPSTREAM_STALLED -> {
                         logger.w(TAG, "Upstream throughput collapsed (slow-trickle); ending transfer")
-                        return
+                        throw IOException("Upstream throughput stalled")
                     }
-                    StreamResult.UPSTREAM_FAILED -> if (!retryOrGiveUp(policy)) return
+                    StreamResult.UPSTREAM_FAILED -> {
+                        if (!canResume || !retryOrGiveUp(policy)) throw IOException("Upstream transfer failed")
+                    }
                 }
             }
         } finally {
@@ -920,8 +979,8 @@ class LocalProxyServer(
         }
     }
 
-    /** Apply the resilience policy after an upstream failure; sleeps the backoff. @return continue? */
-    private fun retryOrGiveUp(policy: ResilientStreamPolicy): Boolean {
+    /** Apply the resilience policy after an upstream failure; cancellation interrupts the backoff. */
+    private suspend fun retryOrGiveUp(policy: ResilientStreamPolicy): Boolean {
         val roll = ThreadLocalRandom.current().nextDouble()
         return when (val decision = policy.onRecoverableFailure(roll)) {
             is ResilientStreamPolicy.Decision.GiveUp -> {
@@ -929,7 +988,7 @@ class LocalProxyServer(
                 false
             }
             is ResilientStreamPolicy.Decision.Retry -> {
-                if (decision.delayMillis > 0) runCatching { Thread.sleep(decision.delayMillis) }
+                if (decision.delayMillis > 0) delay(decision.delayMillis)
                 // Offset is logged as a plain number; no URL/token is ever emitted here.
                 logger.d(TAG, "Reconnecting upstream (attempt ${decision.attempt}) at offset ${decision.resumeFromOffset}")
                 true
@@ -942,7 +1001,8 @@ class LocalProxyServer(
      * whole file. Honours the requested end bound and records progress against [policy] so a resume
      * knows the next byte. Returns how the copy ended.
      */
-    private fun copyStream(
+    private suspend fun copyStream(
+        session: ProxySession,
         input: InputStream,
         out: OutputStream,
         buf: ByteArray,
@@ -952,6 +1012,7 @@ class LocalProxyServer(
         input.use { ins ->
             var sinceFlush = 0L
             while (true) {
+                ensureSessionActive(session)
                 val n = ins.read(buf)
                 if (n < 0) {
                     // Clean EOF only counts as complete when we have delivered the whole window
