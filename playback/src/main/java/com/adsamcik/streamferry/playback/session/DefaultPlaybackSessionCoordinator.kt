@@ -9,6 +9,12 @@ import com.adsamcik.streamferry.source.api.PlaybackEvent
 import com.adsamcik.streamferry.source.api.PlaybackStopReason
 import com.adsamcik.streamferry.source.api.ProviderPlaybackSession
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
@@ -27,7 +33,9 @@ class DefaultPlaybackSessionCoordinator(
     private val sessions: SessionRegistry,
     private val proxy: LocalProxyServer,
     private val logger: DiagnosticSink,
+    dispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) {
+    private val reportingScope = CoroutineScope(SupervisorJob() + dispatcher)
 
     private val _active = MutableStateFlow<ProxySession?>(null)
     val active = _active.asStateFlow()
@@ -36,6 +44,7 @@ class DefaultPlaybackSessionCoordinator(
         val token: Long,
         val providerSession: ProviderPlaybackSession,
         val positionSeconds: Long,
+        val startReported: CompletableDeferred<Unit> = CompletableDeferred(),
     )
 
     private val reportStateLock = Any()
@@ -62,6 +71,7 @@ class DefaultPlaybackSessionCoordinator(
     /** Report progress for the exact active session; queued work from a prior item is rejected by token. */
     suspend fun reportProgress(isPaused: Boolean, expectedToken: Long? = null) = mutex.withLock {
         val active = reportingSnapshot(expectedToken) ?: return@withLock
+        active.startReported.await()
         runBoundedRemoteCleanup("report progress") {
             active.providerSession.report(
                 PlaybackEvent.Progress(active.positionSeconds, isPaused),
@@ -85,7 +95,17 @@ class DefaultPlaybackSessionCoordinator(
         proxy.registerStreamLease(session.id, providerSession.upstream)
         val reporting = beginReporting(providerSession, initialPositionSeconds)
         _active.value = session
-        providerSession.report(PlaybackEvent.Started(reporting.positionSeconds))
+        // Server reporting must not delay the renderer load (a slow first request used to add
+        // several seconds here). Preserve Started -> Progress -> Stopped ordering for this token.
+        reportingScope.launch {
+            try {
+                runBoundedRemoteCleanup("report started") {
+                    providerSession.report(PlaybackEvent.Started(reporting.positionSeconds))
+                }
+            } finally {
+                reporting.startReported.complete(Unit)
+            }
+        }
         val url = "http://$hostPort/session/${session.id}/stream"
         logger.event("session", "Session started (online); proxy URL issued to TV (redacted)")
         session to url
@@ -141,6 +161,7 @@ class DefaultPlaybackSessionCoordinator(
         _active.value = null
 
         if (reporting != null && session != null) {
+            reporting.startReported.await()
             runBoundedRemoteCleanup("report stopped") {
                 reporting.providerSession.report(PlaybackEvent.Stopped(reporting.positionSeconds))
             }
