@@ -58,6 +58,7 @@ import java.time.ZoneId
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
@@ -190,8 +191,9 @@ class PlaybackEngine(
     private val nightVolumePolicyProvider: () -> NightVolumePolicy = { NightVolumePolicy.Off },
     /** Fresh local-network permission check for UI, notification, autoplay, and reconnect paths. */
     private val requireLocalNetworkAccess: () -> Unit = {},
+    private val dispatcher: CoroutineDispatcher = Dispatchers.Default,
 ) {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val scope = CoroutineScope(SupervisorJob() + dispatcher)
     // Evaluated lazily (thread-safe) on first on-device-transcode use, always from an off-main path.
     private val deviceEncodeCaps: DeviceEncodeCapabilities by lazy { deviceEncodeCapsProvider() }
     private val mutex = Mutex()
@@ -408,7 +410,7 @@ class PlaybackEngine(
      */
     suspend fun retrySameEndpointAfterDisconnect(
         refreshedEndpoint: DiscoveredTarget? = null,
-    ): Boolean = withContext(Dispatchers.Default) {
+    ): Boolean = withContext(dispatcher) {
         mutex.withLock {
             requireLocalNetworkAccess()
             if (!connectionLost) return@withLock false
@@ -498,7 +500,7 @@ class PlaybackEngine(
         smartResumeDeviceContext: SmartResumeDeviceContext? = null,
         onForegrounded: () -> Unit = {},
         recoveryContinuation: PlaybackRecoveryContinuation? = null,
-    ) = withContext(Dispatchers.Default) {
+    ) = withContext(dispatcher) {
         // Run playback startup OFF the main thread. The Cast/DLNA controllers switch to Main internally
         // for each SDK call, so the main thread stays free BETWEEN them for the foreground service to
         // call startForeground() within its deadline — otherwise the system raises
@@ -613,7 +615,7 @@ class PlaybackEngine(
         prefs: StreamPreferences,
         smartResumeSeed: SmartResumeSeed? = null,
         autoAdvance: Boolean = false,
-    ): Boolean = withContext(Dispatchers.Default) {
+    ): Boolean = withContext(dispatcher) {
         mutex.withLock {
             requireLocalNetworkAccess()
             val tgt = target
@@ -825,7 +827,7 @@ class PlaybackEngine(
         selectedTarget: DiscoveredTarget,
         onForegrounded: () -> Unit = {},
         recoveryContinuation: PlaybackRecoveryContinuation? = null,
-    ) = withContext(Dispatchers.Default) {
+    ) = withContext(dispatcher) {
         // Off the main thread so the foreground service can foreground within its deadline (see play()).
         mutex.withLock {
         requireLocalNetworkAccess()
@@ -1075,9 +1077,22 @@ class PlaybackEngine(
             // the renderer seeks the stream itself. Do not move the scrubber until the command succeeds:
             // a rejected Cast seek must remain visible to the caller instead of looking like a completed
             // jump. Afterwards, guard against an older status poll snapping the confirmed target back.
-            t.seekTo(pos)
+            // A Cast status can arrive before the command result. Retire the previous
+            // seek's guard before dispatch so that the new confirmation is not discarded.
+            val previousTarget = seekSettleTargetSeconds
+            val previousDeadline = seekSettleUntilMs
+            seekSettleTargetSeconds = pos
+            seekSettleUntilMs = clock() + SEEK_SETTLE_WINDOW_MS
+            try {
+                t.seekTo(pos)
+            } catch (error: Exception) {
+                if (seekSettleTargetSeconds == pos) {
+                    seekSettleTargetSeconds = previousTarget
+                    seekSettleUntilMs = previousDeadline
+                }
+                throw error
+            }
             reportedPositionSeconds = pos
-            armRendererStartSettle(pos)
             noteSourcePosition(pos)
             controlErrorMessage = null
             reportSourceProgressSoon()
@@ -1791,24 +1806,27 @@ class PlaybackEngine(
                     logger.trace(TAG, "Ignoring stale recovery reload for generation $expectedGeneration")
                     return@withLock
                 }
-                runCatching { reloadStream(resumeAt, requestedBitrate, reason, armWatchdog = true) }
-                    .onFailure {
-                        if (it !is CancellationException) {
-                            logger.e("playback", "Recovery reload failed ($reason); giving up", it)
-                            recoverySession = if (it.isPreparationFailure()) {
-                                recoverySession
-                                    .recordFailure(
-                                        PlaybackFailureStage.STREAM_RESOLUTION,
-                                        PlaybackFailureCause.UPSTREAM_OR_SERVER_UNAVAILABLE,
-                                    )
-                                    .fail()
-                            } else {
-                                recoverySession.fail()
-                            }
-                            smartResume.checkpoint(SmartResumeCheckpointKind.FAILURE, smartResumeDeviceContext)
-                            publishStatus(error = "Couldn't start playback.")
-                        }
+                try {
+                    reloadStream(resumeAt, requestedBitrate, reason, armWatchdog = true)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    logger.e("playback", "Recovery reload failed ($reason); giving up", error)
+                    recoverySession = if (error.isPreparationFailure()) {
+                        recoverySession.recordFailure(
+                            PlaybackFailureStage.STREAM_RESOLUTION,
+                            PlaybackFailureCause.UPSTREAM_OR_SERVER_UNAVAILABLE,
+                        ).fail()
+                    } else {
+                        recoverySession.fail()
                     }
+                    smartResume.checkpoint(SmartResumeCheckpointKind.FAILURE, smartResumeDeviceContext)
+                    publishStatus(error = "Couldn't start playback.")
+                } finally {
+                    // This job owns the claim made by handlePlaybackFailure. reloadStream
+                    // restores its caller's value (true), so the owner must release it.
+                    isReloadingStream = false
+                }
             }
         }
     }
