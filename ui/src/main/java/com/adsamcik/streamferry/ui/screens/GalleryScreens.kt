@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.aspectRatio
@@ -929,7 +930,7 @@ private fun SourceSwitcher(sources: List<Pair<String, String>>, activeId: String
     ) {
         if (sources.size <= 2) {
             Row(
-                modifier = Modifier.fillMaxWidth().padding(6.dp),
+                modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Min).padding(6.dp),
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
                 sources.forEach { (id, name) ->
@@ -938,7 +939,7 @@ private fun SourceSwitcher(sources: List<Pair<String, String>>, activeId: String
                         name = name,
                         selected = id == activeId,
                         onClick = { onSelect(id) },
-                        modifier = Modifier.weight(1f),
+                        modifier = Modifier.weight(1f).fillMaxHeight(),
                     )
                 }
             }
@@ -1020,7 +1021,7 @@ private fun SourceOption(
         colors = CardDefaults.cardColors(containerColor = containerColor, contentColor = contentColor),
     ) {
         Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 18.dp),
+            modifier = Modifier.fillMaxWidth().weight(1f).padding(horizontal = 12.dp, vertical = 18.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
