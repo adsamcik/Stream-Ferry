@@ -396,7 +396,7 @@ class LocalProxyServer(
             closeUpstream(session.id, first)
             return
         }
-        streamResilient(session, lease, first, rangeStart = 0, rangeEndInclusive = null, expectedTotalLength = -1, out = out, canResume = false)
+        streamResilient(session, lease, first, rangeStart = 0, rangeEndInclusive = contentLength?.minus(1), expectedTotalLength = -1, out = out, canResume = false)
     }
 
     /** Serve source-owned HLS resources without learning their URLs, credentials, or server type. */
@@ -486,6 +486,7 @@ class LocalProxyServer(
                     val rawReferences = rewriter.uriReferences(body, registry.capacity)
                     val resolvedByRaw = LinkedHashMap<String, StreamResourceRef>()
                     for (uri in rawReferences) {
+                        ensureSessionActive(session)
                         val nested = lease.resolve(uri, resource).getOrThrow()
                             ?: throw IllegalArgumentException("Untrusted HLS URI")
                         resolvedByRaw[uri] = nested
@@ -495,6 +496,8 @@ class LocalProxyServer(
                     rewriter.rewrite(body) { uri ->
                         encodedById.getValue(resolvedByRaw.getValue(uri).opaqueId)
                     }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
                 } catch (error: Exception) {
                     writeStatus(out, 502, "Bad Gateway")
                     logger.w(TAG, "Source rejected an HLS resource reference", error)
@@ -519,7 +522,7 @@ class LocalProxyServer(
                     acceptRanges = true,
                     extra = response.header("Content-Range")?.let { "Content-Range" to it },
                 )
-                if (!head) copyTo(response.body, out)
+                if (!head) copyTo(session, response.body, out, length)
             }
         } finally {
             closeUpstream(session.id, response)
@@ -673,14 +676,22 @@ class LocalProxyServer(
     }
 
     /** Copy a (segment/key/subtitle) body downstream through the bounded buffer; abort if the TV leaves. */
-    private fun copyTo(input: InputStream, out: OutputStream) {
+    private suspend fun copyTo(session: ProxySession, input: InputStream, out: OutputStream, expectedLength: Long? = null) {
         input.use { ins ->
             val buf = ByteArray(MemoryBufferPolicy.COPY_CHUNK_BYTES)
+            var copied = 0L
             while (true) {
-                val n = ins.read(buf)
-                if (n < 0) break
+                ensureSessionActive(session)
+                val remaining = expectedLength?.let { it - copied } ?: Long.MAX_VALUE
+                if (remaining == 0L) break
+                val n = ins.read(buf, 0, minOf(buf.size.toLong(), remaining).toInt())
+                if (n < 0) {
+                    if (expectedLength != null && copied < expectedLength) throw IOException("Upstream body ended before declared length")
+                    break
+                }
                 try {
                     out.write(buf, 0, n)
+                    copied += n
                     byteListener?.invoke(n.toLong())
                 } catch (e: Exception) {
                     return // downstream (TV) disconnected
@@ -695,7 +706,7 @@ class LocalProxyServer(
      * byte-range / seek support is provided via [HttpResponsePlan] + a [RandomAccessFile]. The file path
      * is fixed on the session (never taken from the request), so there is no path-traversal surface.
      */
-    private fun serveLocalFile(session: ProxySession, req: RequestLine, out: OutputStream, head: Boolean) {
+    private suspend fun serveLocalFile(session: ProxySession, req: RequestLine, out: OutputStream, head: Boolean) {
         val path = session.localFilePath!!
         if (path.startsWith("content://")) {
             serveContentUri(session, path, req, out, head)
@@ -729,9 +740,10 @@ class LocalProxyServer(
             val buf = ByteArray(MemoryBufferPolicy.COPY_CHUNK_BYTES)
             var remaining = endInclusive - start + 1
             while (remaining > 0) {
+                ensureSessionActive(session)
                 val toRead = minOf(remaining, buf.size.toLong()).toInt()
                 val n = raf.read(buf, 0, toRead)
-                if (n < 0) break
+                if (n < 0) throw IOException("Local file ended before declared length")
                 try {
                     out.write(buf, 0, n)
                     byteListener?.invoke(n.toLong())
@@ -749,7 +761,7 @@ class LocalProxyServer(
      * support, by opening it as a seekable file descriptor. The URI is fixed on the session (never taken
      * from the request) and is opened on the phone only — the TV receives just the proxy URL.
      */
-    private fun serveContentUri(session: ProxySession, uriString: String, req: RequestLine, out: OutputStream, head: Boolean) {
+    private suspend fun serveContentUri(session: ProxySession, uriString: String, req: RequestLine, out: OutputStream, head: Boolean) {
         val resolver = contentResolver
         if (resolver == null) {
             writeStatus(out, 500, "Internal Server Error")
@@ -765,7 +777,7 @@ class LocalProxyServer(
             if (total < 0) {
                 // Length unknown: can't satisfy ranges, stream the whole entity (no seek).
                 writeSimpleHeaders(out, 200, "OK", session.contentType, null, acceptRanges = false, extra = null)
-                if (!head) FileInputStream(pfd.fileDescriptor).use { copyTo(it, out) }
+                if (!head) FileInputStream(pfd.fileDescriptor).use { copyTo(session, it, out) }
                 return
             }
             val rangeResult = HttpRange.parse(req.rangeHeader, total)
@@ -792,10 +804,11 @@ class LocalProxyServer(
                 val bb = ByteBuffer.wrap(buf)
                 var remaining = endInclusive - start + 1
                 while (remaining > 0) {
+                    ensureSessionActive(session)
                     bb.clear()
                     if (remaining < buf.size) bb.limit(remaining.toInt())
                     val n = channel.read(bb)
-                    if (n < 0) break
+                    if (n < 0) throw IOException("Local content ended before declared length")
                     try {
                         out.write(buf, 0, n)
                         byteListener?.invoke(n.toLong())

@@ -41,9 +41,9 @@ class LocalProxyCancellationTest {
         coEvery { lease.open(range = any()) } returns Result.success(StreamResponse(200, mapOf("Content-Length" to "8"), body))
     }
 
-    private fun request(address: String, id: String): Socket = Socket("127.0.0.1", address.substringAfter(':').toInt()).apply {
+    private fun request(address: String, id: String, query: String = ""): Socket = Socket("127.0.0.1", address.substringAfter(':').toInt()).apply {
         soTimeout = 3000
-        getOutputStream().write("GET /session/$id/stream HTTP/1.1\r\nHost: localhost\r\n\r\n".toByteArray())
+        getOutputStream().write("GET /session/$id/stream$query HTTP/1.1\r\nHost: localhost\r\n\r\n".toByteArray())
         getOutputStream().flush()
     }
 
@@ -107,6 +107,47 @@ class LocalProxyCancellationTest {
             }
             assertTrue(log.finished.await(2, TimeUnit.SECONDS))
             assertTrue(log.outcomes.single().contains("clean=true outcome=complete"))
+        } finally { proxy.stop() }
+    }
+
+    @Test fun `progressive response with newly declared length cannot claim truncated body completed`() {
+        val sessions = SessionRegistry()
+        val log = Log()
+        val proxy = LocalProxyServer(sessions, log)
+        val session = sessions.create("video/mp4")
+        val source = lease(ByteArrayInputStream("part".toByteArray()))
+        every { source.descriptor } returns StreamDescriptor("video/mp4", "mp4", isTranscoding = true, isByteSeekable = false, totalLength = null)
+        proxy.registerStreamLease(session.id, source)
+        try {
+            request(proxy.start("127.0.0.1"), session.id).use { it.getInputStream().readBytes() }
+            assertTrue(log.finished.await(2, TimeUnit.SECONDS))
+            assertTrue(log.outcomes.single().contains("clean=false outcome=upstream_failed"))
+            coVerify(exactly = 1) { source.open(range = any()) }
+        } finally { proxy.stop() }
+    }
+
+    @Test fun `truncated HLS resource is upstream failure rather than clean completion`() {
+        val sessions = SessionRegistry()
+        val log = Log()
+        val proxy = LocalProxyServer(sessions, log)
+        val session = sessions.create("application/vnd.apple.mpegurl", isHls = true)
+        val source = mockk<StreamLease>()
+        val segment = StreamResourceRef("segment", StreamResourceKind.MEDIA)
+        val playlist = "#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:10,\nsegment.ts\n#EXT-X-ENDLIST\n"
+        coEvery { source.open(range = any()) } returns Result.success(StreamResponse(
+            200, mapOf("Content-Type" to "application/vnd.apple.mpegurl"), ByteArrayInputStream(playlist.toByteArray()),
+        ))
+        coEvery { source.resolve(any(), any()) } returns Result.success(segment)
+        coEvery { source.open(segment, any()) } returns Result.success(StreamResponse(
+            200, mapOf("Content-Type" to "video/mp2t", "Content-Length" to "8"), ByteArrayInputStream("part".toByteArray()),
+        ))
+        proxy.registerStreamLease(session.id, source)
+        try {
+            val address = proxy.start("127.0.0.1")
+            val root = request(address, session.id).use { it.getInputStream().readBytes().decodeToString() }
+            val opaque = assertNotNull(Regex("seg=([A-Za-z0-9_-]+)").find(root)).groupValues[1]
+            request(address, session.id, "?seg=$opaque").use { it.getInputStream().readBytes() }
+            assertTrue(log.outcomes.last().contains("clean=false outcome=upstream_failed"))
         } finally { proxy.stop() }
     }
 }
