@@ -1,0 +1,32 @@
+Read-only evidence captured on 2026-09-05 from Samsung SM-S928B, Android 16.
+Package: com.adsamcik.streamferry.debug
+Installed version: 0.6.0 (6000), targetSdk=37, lastUpdateTime=2026-09-05 20:41:10.
+Only the two relevant exit entries and app-specific kill lines are retained here.
+
+Source: adb shell dumpsys activity exit-info com.adsamcik.streamferry.debug
+
+ApplicationExitInfo #0:
+  timestamp=2026-09-05 22:16:54.672 pid=11993 realUid=10275 packageUid=10275 definingUid=10275 user=0
+  process=com.adsamcik.streamferry.debug reason=9 (EXCESSIVE RESOURCE USAGE) subreason=7 (EXCESSIVE CPU USAGE) status=0
+  importance=400 pss=0.00 rss=163MB description=excessive cpu 8390 during 300109 dur=1089986 limit=2 state=empty trace=null
+ApplicationExitInfo #1:
+  timestamp=2026-09-05 21:56:52.600 pid=31231 realUid=10275 packageUid=10275 definingUid=10275 user=0
+  process=com.adsamcik.streamferry.debug reason=9 (EXCESSIVE RESOURCE USAGE) subreason=7 (EXCESSIVE CPU USAGE) status=0
+  importance=400 pss=0.00 rss=213MB description=excessive cpu 13080 during 300108 dur=953436 limit=2 state=empty trace=null
+
+Source: adb logcat -b system -b events -d -v threadtime (filtered locally)
+
+09-05 21:56:52.600  3006  3213 I ActivityManager: Killing 31231:com.adsamcik.streamferry.debug/u0a275 (adj 910): excessive cpu 13080 during 300108 dur=953436 limit=2
+09-05 22:16:54.672  3006  3213 I ActivityManager: Killing 11993:com.adsamcik.streamferry.debug/u0a275 (adj 900): excessive cpu 8390 during 300109 dur=1089986 limit=2
+09-05 22:16:54.673  3006  3213 I am_kill : [0,11993,com.adsamcik.streamferry.debug,900,excessive cpu 8390 during 300109 dur=1089986 limit=2,162452]
+09-05 22:16:54.747  3006  8137 I am_proc_died: [0,11993,com.adsamcik.streamferry.debug,900,15,279,2272]
+
+Current settings at collection (not a historical settings audit):
+adb shell dumpsys deviceidle whitelist, matching lines:
+user,com.adsamcik.streamferry.debug,10275
+user,com.adsamcik.streamferry,10271
+adb shell cmd appops get --user 0 com.adsamcik.streamferry.debug RUN_ANY_IN_BACKGROUND:
+RUN_ANY_IN_BACKGROUND: allow
+
+adb shell run-as com.adsamcik.streamferry.debug ls files/crashes:
+crash-20260725-195401-259.txt

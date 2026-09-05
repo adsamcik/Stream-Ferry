@@ -1,102 +1,157 @@
 # Playback issues and two reported shutdowns
 
 Investigation date: 2026-09-05. Source reviewed: `7e14d1d` on `main`.
-Evidence: the supplied 550-line event-log excerpt, 21:32:03.691–22:18:17.127.
-Line numbers below refer to that attachment. It has no build/device header, crash
-report, stack trace, process ID, or Android exit record. Code attribution assumes
-the installed build contains the reviewed implementation; its log messages match.
+Evidence: the supplied 550-line event-log excerpt, 21:32:03.691–22:18:17.127,
+user clarification that both failures happened with the screen off, and subsequent
+read-only ADB collection from the affected phone. Event line numbers below refer
+to the original attachment. Installed build: debug 0.6.0 (6000), Android 16.
+Exact installed source revision is unavailable; code attribution uses the reviewed
+implementation, whose log messages match.
 
-**Result:** four actionable implementation defects explain several playback
-symptoms: a stuck recovery flag, invalid media-segment query serialization, retries
-after proxy shutdown, and a seek-status ordering race. Two initial direct streams
-also fail and recover through transcoding. Neither reported app shutdown has a
-provable termination cause in the supplied evidence.
+**Result:** Android killed both processes for excessive CPU usage while classified
+as cached/background. Active playback lacked lasting foreground-service protection;
+an unguarded service Stop/Start race is the leading code-level suspect. Four further
+defects explain playback symptoms: a stuck recovery flag, invalid media-segment
+query serialization, retries after proxy shutdown, and a seek-status ordering race.
+Two initial direct streams also fail and recover through transcoding.
 
-## The two shutdowns
+## The two shutdowns: Android CPU-policy kills confirmed
 
-| Incident | Last persisted event before reinitialization | Next initialization | What can be established |
-| --- | --- | --- | --- |
-| First | 21:41:25.339: TV volume reaches 15% (line 490) | 21:58:30.031: Cast SDK initialized; auth and library restore follow (491–494) | The user confirms reopening seconds after the shutdown, placing the exit shortly before 21:58:30. The 17m 4.692s logging gap is not app downtime. The previous session was directly playing *Deadly Climb*. |
-| Second | 21:58:47.405: buffering ends at the resumed position of 1016s (546) | 22:18:15.267: Cast SDK initialized; auth and library restore follow (547–550) | The user confirms reopening seconds after the shutdown, placing the exit shortly before 22:18:15. The 19m 27.862s logging gap is not app downtime. Direct playback had resumed successfully. |
+The phone became available over ADB during the follow-up investigation. Read-only
+exit history and system logcat identify **the same termination reason for both
+incidents** on Samsung SM-S928B, Android 16, package
+`com.adsamcik.streamferry.debug`, version 0.6.0 (6000), last updated 20:41:10.
+The user confirms that the screen was off and that they reopened the app seconds
+after noticing each shutdown.
 
-`AppContainer.initializeCastContext()` caches its successful initialization and
-does not repeat it on ordinary Activity recreation (AppContainer.kt:338–357).
-Together with authentication restoration, these markers strongly support process
-restarts rather than two playback-screen errors. They identify reopen times,
-not the instants the process died. Quiet progressive streaming need not generate
-new events for many minutes. The saved 1016s resume point also shows that the last
-printed event is not necessarily the last successful playback activity.
+| Incident | Android kill time / PID | Recorded reason | CPU measurement | Next app initialization |
+| --- | --- | --- | --- | --- |
+| First | 21:56:52.600 / 31231 | EXCESSIVE RESOURCE USAGE (9), EXCESSIVE CPU USAGE (7), importance=400 | 13,080ms CPU / 300,108ms elapsed = **4.36%**, limit=2 | 21:58:30.031 |
+| Second | 22:16:54.672 / 11993 | EXCESSIVE RESOURCE USAGE (9), EXCESSIVE CPU USAGE (7), importance=400 | 8,390ms CPU / 300,109ms elapsed = **2.80%**, limit=2 | 22:18:15.267 |
 
-**User clarification:** both reopenings occurred seconds after the respective
-crashes/shutdowns. This narrows the exit windows to shortly before 21:58:30 and
-22:18:15. Measured from each session's first confirmed PLAYING state, those are
-roughly 18 and 19.5 minutes into the respective playback sessions, allowing for
-the short reopening delay. These are elapsed session times, not proof of
-uninterrupted playback. The failures therefore occurred well after startup; the
-21:40:15 handled Cast error was about 18 minutes before the first exit.
+Both Android exit records have `trace=null`. System `ActivityManager` independently
+logs the same kills, with cached OOM adjustments 910 and 900. These are **OS kills
+for CPU consumption while classified as cached**, not Java exception crashes,
+foreground-service start timeouts, or low-memory kills. The 2% threshold is the
+policy recorded for these incidents, not a universal limit for media playback.
+The percentages are CPU time divided by the measured interval, not whole-phone
+CPU utilization. They do not demonstrate a runaway 100% CPU loop.
 
-The tighter timing warrants checking sustained-playback failures, but does not
-prove a fixed timer, memory leak or OS background restriction. The app's proxy
-session registry uses a 4-hour idle expiry and 24-hour hard ceiling, with no
-production override at construction or session creation. The playback service
-acquires its wake lock without a timed expiry. Those particular application
-timeouts do not explain an exit after approximately 18–20 minutes. An Android
-exit record or saved crash stack remains necessary to identify the actual cause.
+The [retained, app-specific evidence](evidence/2026-09-05-android-exits.txt) contains
+the exact records and matching kill lines. Android documents importance 400 as
+[cached/expendable](https://developer.android.com/reference/android/app/ActivityManager.RunningAppProcessInfo#IMPORTANCE_CACHED).
+The [AOSP excessive-CPU check](https://android.googlesource.com/platform/frameworks/base/+/5f00e89989392c9ae00b360e1388d0179dfb36d7/services/core/java/com/android/server/am/ActivityManagerService.java)
+compares interval CPU consumption against the configured percentage and terminates
+qualifying processes with this reason/subreason. The device's own records establish
+that this policy ran here; no assumption about generic Samsung battery behavior
+is required.
 
-There is **no fatal exception, ANR, out-of-memory message, native crash, or OS kill
-reason** in the attachment. The earlier `IllegalStateException` at 21:40:15 is a
-handled TV command failure: playback resumes at 21:40:18 and the app continues
-through several later operations. `APP_ERROR` there is a Cast receiver error,
-not an Android process-crash diagnosis.
+### Reconciling the user's timing with the logs
 
-The historically troublesome foreground-service startup deadline is **not
-supported as the cause here**. All seven recorded starts use `startService`,
-successfully enter the foreground, and take 3–21ms. The last starts before the
-two reinitializations take 21ms and 3ms. This does not establish that the service
-remained alive throughout each gap, but none of these starts missed promotion.
+Actual kill-to-initialization gaps are **97.431s** and **80.595s**. The user reopened
+seconds after the visible playback shutdown; that does not require the phone
+process to have died only seconds earlier. A TV consuming already-buffered media
+after losing its phone-hosted source could account for that delay. Buffer depth
+was not captured, so this is an explanation consistent with the observations,
+not a measured fact. Android's kill timestamps supersede the earlier estimate
+that placed process death seconds before each reopening.
 
-The recovery-flag defect below is serious, but it does not explain these two
-exits: both immediately preceding playback sessions use direct streaming, and
-the previous fallback flag is reset when starting a new item.
+Both preceding sessions directly streamed *Deadly Climb*. The last persisted
+events (21:41:25.339 and 21:58:47.405) occurred long before the kills. They were not
+termination markers. Ordinary progressive streaming can be quiet in the event
+log. The saved 1016s resume point was also close to the first actual kill:
+progressing from 65s at 21:40:57 would reach about 1020s by 21:56:52, assuming
+continuous playback. That supports, but does not prove, buffering after source loss.
 
-### Why the current diagnostics cannot distinguish causes
+### P1 — Active playback lost foreground-service protection
 
-- `CrashReporter.kt:38–73` records uncaught Java/Kotlin exceptions in private
-  `files/crashes/` storage, separately from the event log. Its debug crash screen
-  can deliberately terminate the dying main process after saving a report. That
-  kill is a consequence of an uncaught exception, not its original cause.
-- The supplied text contains only event lines. It does not establish whether
-  separate crash reports exist. Current exports include only reports whose version
-  code matches the installed build (`MainViewModel.kt:3831–3840`), so an intervening
-  version-code change can hide older reports without deleting them.
-- Event snapshots normally flush every 10 seconds and asynchronously on Activity
-  stop. Abrupt termination can lose the most recent events; this is not a precise
-  crash-time recorder (`AppContainer.kt:505–519,616`).
-- No implementation reads `ActivityManager.getHistoricalProcessExitReasons()`.
-  Android's [ApplicationExitInfo](https://developer.android.com/reference/android/app/ApplicationExitInfo)
-  distinguishes Java/native crashes, ANRs, memory pressure and other exits. On
-  some devices memory-pressure kills appear as a signal rather than LOW_MEMORY;
-  the reason, status, description and available trace must be considered together.
-- `ProxyPlaybackService` returns `START_NOT_STICKY` (line 82), so process death
-  does not automatically recreate this playback service. That explains why an
-  actual kill can leave casting stopped; it does not explain what killed it.
+The service-start latch is satisfied in both sessions, yet the process is cached
+when killed. A successful one-time `startForeground()` call therefore did not
+establish that foreground-service ownership survived for the stream's lifetime.
+The immediate defect to address is active streaming/monitoring continuing in a
+process Android considers expendable. Reducing CPU alone would leave that
+lifecycle failure in place.
 
-**Evidence still required:** the complete diagnostics export including its
-build/device header and crash section, plus **Diagnostics → Share crash logs**.
-If no crash was recorded, obtain Android exit history for the installed package
-(`com.adsamcik.streamferry`, or `.debug`) and available crash/ANR logs. Read-only
-ADB collection, once the phone is connected:
+**Strong code-level suspect: overlapping service Stop and Start.**
 
-```powershell
-adb shell dumpsys activity exit-info com.adsamcik.streamferry
-adb shell dumpsys activity exit-info com.adsamcik.streamferry.debug
-adb logcat -b crash -d -v threadtime
-```
+1. Every `PlaybackEngine.play()` first calls `stopInternalLocked()` (509), even
+   when there is no prior active stream.
+2. Teardown calls `serviceController.stop()` (2599).
+3. `ProxyPlaybackService.stop()` sends `startService(ACTION_STOP)` (262–265).
+   This queues a service command and returns without waiting for teardown; it can
+   even create a service only to ask it to stop.
+4. Playback immediately calls `startAndAwaitForegrounded()` for ACTION_START.
+5. ACTION_STOP calls `stopSelfSafely()`, which releases locks, calls
+   `stopForeground()`, then unconditional `stopSelf()` (66,137–142). It ignores
+   the request's `startId`. An older STOP can therefore stop a service for which
+   a newer START has already been registered or queued.
+6. The latch signals from `enterForeground()` without a lasting service-lifecycle
+   check (122–131). The engine then keeps its independent process-owned proxy,
+   monitor, reporting and status-publication coroutines alive. `onDestroy()` only
+   releases locks; it neither invalidates that confirmation nor notifies the
+   engine that protection is gone (145–147).
 
-Use the matching package and correlate exit timestamps with the two reopenings.
-At investigation time, `adb devices -l` returned **no devices**, so those records
-could not be collected. The app's own stored crash report is preferable when
-available, particularly for debug builds that launch their separate crash screen.
+Android's [start-ID-aware stopping contract](https://developer.android.com/reference/android/app/Service#stopSelfResult(int))
+exists specifically to avoid stopping when a newer start request has not yet been
+delivered. The unsafe ordering is confirmed in the source. **Its occurrence in
+these two historical sessions is not yet directly proven:** the retained logs do
+not contain their precise service-destruction/command sequence. Do not present
+this candidate race as an already reproduced root cause.
+
+A later session, outside the original attachment, has an OS-confirmed FGS start at
+22:18:48.180 and explicit STOP_FOREGROUND at 22:28:27.539. Thus the installed
+service can remain registered; the evidence fits intermittent lifecycle loss,
+not a manifest that always prevents foreground operation. No such retained OS
+lifecycle pair establishes ownership throughout the two failed sessions.
+
+Fix direction: serialize service ownership with the playback generation, avoid
+starting a service just to stop it, and prevent stale stop commands from releasing
+locks or demoting a newer session. Using start-ID-aware stopping must also guard
+`stopForeground()` and lock release; replacing only the final `stopSelf()` is
+insufficient. Log service create/start/stop/destroy with IDs and generations,
+invalidate stale latch completions, and react explicitly if an active session
+loses its service. Verify immediate Stop→Start, initial playback with no existing
+service, rapid item replacement and screen-off playback on this phone.
+
+### Screen-off and battery findings
+
+- `MainActivity.onStop()` only flushes diagnostics and checkpoints resume
+  (107–113). No screen-off handler was found that intentionally stops playback.
+- At capture, both release and debug packages are already on the user's
+  device-idle exemption list; debug `RUN_ANY_IN_BACKGROUND` is `allow`. The
+  historical setting at the kill instant is not separately logged, but advising
+  the user simply to enable unrestricted battery use is not an established fix.
+- The service tries to acquire a partial CPU wake lock and a low-latency Wi-Fi
+  lock. Both failures are silently swallowed (159–177), and the foreground latch
+  is signalled before acquisition. The log cannot establish successful lock
+  acquisition or continued ownership.
+- The [Wi-Fi lock API](https://developer.android.com/reference/android/net/wifi/WifiManager#WIFI_MODE_FULL_LOW_LATENCY)
+  says this mode is active only with the screen on and the app foregrounded.
+  The source comment claiming that holding it still guarantees screen-off radio
+  association is unsupported. Switching to HIGH_PERF is not a general fix on
+  API 34+, where that mode is replaced by LOW_LATENCY. This is a screen-off
+  reliability limitation, not the recorded cause of either process kill.
+- Generic [Doze restrictions](https://developer.android.com/training/monitoring-device-state/doze-standby)
+  can restrict networking and wake locks, subject to exemptions. They do not by
+  themselves establish a process death. Here the Android CPU-kill evidence is
+  stronger and more specific than a Doze hypothesis.
+
+### Why no corresponding app crash report appeared
+
+Only an old July 25 file is present in private `files/crashes/`; no September 5
+Java/Kotlin report exists. The uncaught-exception handler cannot capture an OS
+CPU-policy kill. The app also never imports Android `ApplicationExitInfo`, so its
+own report omitted the decisive cause. Event snapshots normally flush every ten
+seconds, and a kill may discard the latest events. `START_NOT_STICKY` explains
+why Android did not automatically recreate the playback service after death.
+
+Read-only device evidence is saved under ignored
+`build/incident-investigation-2026-09-05/`: exit history, app-specific system log
+matches, service events, and the second/third session's persisted event files.
+No battery setting, permission, installed application or playback state was changed
+by collection. No new playback or crash was induced. Remaining investigation is
+about the exact service-loss mechanism and which background work accounts for
+the CPU consumption, rather than the now-confirmed OS termination reason.
 
 ## Confirmed implementation defects
 
@@ -218,15 +273,17 @@ status arrives before the second command completion.
 
 ## Scope and next priorities
 
-Prioritize the stuck recovery flag, then the segment query, cancelled relay retries,
-and rapid-seek ordering. Collect stored crash reports/Android exit history before
-assigning a cause to either process exit. Add exit-history capture, process/session
-identifiers and service lifecycle breadcrumbs to future diagnostics so ordinary
-crashes and system kills can be distinguished from playback failures.
+Prioritize preserving foreground-service ownership throughout active playback and
+validating the Stop/Start race. Then address the stuck recovery flag, segment query,
+cancelled relay retries and rapid-seek ordering. Add exit-history capture and
+process/session/service identifiers so future reports distinguish OS kills from
+playback failures. Profile background CPU after lifecycle protection is correct;
+the current measurements alone do not isolate a hot loop or prove a memory leak.
 
 This investigation reviewed the entire supplied excerpt and relevant current
-source, verified official API/status meanings, and executed the live HTTP query
-comparison. It did not reproduce either process exit or run physical TV playback.
+source, verified official API/status meanings, executed the live HTTP query
+comparison, and retrieved historical termination evidence from the affected phone.
+It did not induce either process exit or run a new physical TV playback test.
 No production code was changed, and no claim of exhaustive application-wide
 correctness follows from this incident review. Previously recorded issues in
 [general validation](VALIDATION_2026-09-05.md) and
