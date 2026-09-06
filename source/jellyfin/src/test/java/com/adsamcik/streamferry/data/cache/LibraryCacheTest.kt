@@ -30,10 +30,29 @@ class LibraryCacheTest {
     }
 
     @Test
+    fun metadataSinkReceivesOrderedAndPatchedRemoteState() = runTest {
+        val writes = mutableListOf<Pair<String, List<MediaItem>>>()
+        val cache = LibraryCache(context,
+            fileWriter = { file, text -> file.parentFile?.mkdirs(); file.writeText(text) },
+            onItemsChanged = { scope, items -> writes += scope to items },
+        )
+        val old = media("one", "One").copy(played = false, resumePositionSeconds = 300)
+        val fresh = old.copy(played = true, resumePositionSeconds = null)
+        val early = cache.beginRemoteWrite("scope")
+        val late = cache.beginRemoteWrite("scope")
+        cache.put(late, "b", listOf(fresh))
+        cache.put(early, "a", listOf(old))
+        assertEquals(listOf("scope" to listOf(fresh), "scope" to listOf(fresh)), writes)
+        cache.patchItem("scope", old.id) { it.copy(played = false, resumePositionSeconds = null) }
+        cache.put(cache.beginRemoteWrite("scope"), "c", listOf(old))
+        assertEquals(listOf(old.copy(resumePositionSeconds = null)), writes.last().second)
+    }
+
+    @Test
     fun newestItemSurvivesOlderListsAndCacheRecreation() = runTest {
         var now = 100L
         fun cache() = LibraryCache(context, fileWriter = { file, text ->
-            file.parentFile.mkdirs()
+            file.parentFile?.mkdirs()
             file.writeText(text)
         }, clock = { now })
         val old = media("one", "One").copy(played = false, resumePositionSeconds = 300)

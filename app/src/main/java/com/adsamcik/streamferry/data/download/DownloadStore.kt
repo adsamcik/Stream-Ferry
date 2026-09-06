@@ -2,6 +2,7 @@ package com.adsamcik.streamferry.data.download
 
 import android.content.Context
 import com.adsamcik.streamferry.core.download.DownloadPaths
+import com.adsamcik.streamferry.domain.AccountLibraryScope
 import com.adsamcik.streamferry.domain.MediaItem
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
@@ -86,6 +87,23 @@ class DownloadStore private constructor(filesDir: File) {
             val updated = (loadPlayableUnlocked().filterNot { it.identity == entry.identity } + entry)
                 .sortedBy { it.title.lowercase() }
             writeIndex(updated)
+        }
+    }
+
+    /** Update existing copies atomically, preserving files and ownership. Called in library-cache write order. */
+    suspend fun syncLibraryMetadata(scope: String, items: List<MediaItem>) = mutex.withLock {
+        if (items.isEmpty()) return@withLock
+        withContext(Dispatchers.IO) {
+            val byId = items.associateBy { it.id }
+            val current = loadPlayableUnlocked()
+            val updated = current.map { entry ->
+                val owner = entry.owner
+                val item = byId[entry.itemId]
+                if (owner != null && item != null &&
+                    AccountLibraryScope(owner.serverId, owner.userId).cacheKey == scope
+                ) entry.copy(mediaItem = item) else entry
+            }
+            if (updated != current) writeIndex(updated)
         }
     }
 

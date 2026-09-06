@@ -2,6 +2,7 @@ package com.adsamcik.streamferry.data.download
 
 import com.adsamcik.streamferry.source.api.DownloadFormat
 
+import com.adsamcik.streamferry.domain.AccountLibraryScope
 import com.adsamcik.streamferry.domain.MediaItem
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
@@ -26,6 +27,33 @@ class DownloadMetadataTest {
         subtitle = "Director's cut",
     )
     private val owner = DownloadOwner(serverId = "server-a", userId = "user-a")
+
+    @Test
+    fun libraryRefreshUpdatesOnlyExistingCopiesInTheExactAccount() = runBlocking {
+        val root = Files.createTempDirectory("download-metadata-sync").toFile()
+        try {
+            val store = DownloadStore.forFilesDir(root)
+            val owners = listOf(owner, owner.copy(userId = "other"), owner.copy(serverId = "other"), null)
+            val entries = owners.mapIndexed { index, account ->
+                DownloadEntry(media.id, media.title, "$index.mp4", "video/mp4", sizeBytes = 1,
+                    owner = account, mediaItem = media).also {
+                    store.fileFor(it).apply { parentFile?.mkdirs(); writeBytes(byteArrayOf(1)) }
+                    store.upsert(it)
+                }
+            }
+            val fresh = media.copy(played = true, resumePositionSeconds = null)
+            val scope = AccountLibraryScope(owner.serverId, owner.userId).cacheKey
+            store.syncLibraryMetadata(scope, listOf(fresh, fresh.copy(id = "not-downloaded")))
+            assertEquals(entries[0].copy(mediaItem = fresh), store.get(owner, media.id))
+            entries.drop(1).forEach { assertEquals(it, store.get(it.itemId, it.owner)) }
+            assertEquals(4, store.list().size)
+            store.remove(owner, media.id)
+            store.syncLibraryMetadata(scope, listOf(fresh))
+            assertNull(store.get(owner, media.id), "A refresh cannot recreate a removed download")
+        } finally {
+            root.deleteRecursively()
+        }
+    }
 
     @Test
     fun completedAndPendingMetadataRoundTrip() {

@@ -26,6 +26,8 @@ class LibraryCache(
     // Production uses Android AtomicFile. The seam keeps filesystem transformation tests deterministic
     // under Robolectric, whose Android-35 AtomicFile shadow does not commit the staged .new file.
     private val fileWriter: ((File, String) -> Unit)? = null,
+    // Runs under the cache mutex so dependent metadata stores observe the same per-item write order.
+    private val onItemsChanged: suspend (String, List<MediaItem>) -> Unit = { _, _ -> },
     // Keep this last so existing LibraryCache(context) { clock } calls remain source-compatible.
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
@@ -142,6 +144,7 @@ class LibraryCache(
                     }
                 }
             }
+            if (wrote) onItemsChanged(scope, patchedItems)
             // Return exactly what was stored so callers also cannot publish a stale in-flight response.
             patchedItems
         }

@@ -197,6 +197,7 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
                 connectionMonitor = jellyfinConnectionMonitor,
             ),
             downloadStore = downloadStore,
+            canRefreshDownloads = { authRepository.currentUser.value != null },
             owner = {
                 (authRepository.currentUser.value ?: authRepository.cachedSession.value)
                     ?.let { DownloadOwner(it.serverId, it.userId) }
@@ -250,7 +251,11 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
     val localSourceBackend: LocalSourceBackend by lazy { LocalSourceBackend(localMediaSource) }
     /** All browsable sources, in display order (Jellyfin first, then on-device). */
     val mediaSources: List<MediaSource> by lazy { listOf(jellyfinMediaSource, localMediaSource) }
-    val libraryCache: LibraryCache by lazy { LibraryCache(appContext) }
+    val libraryCache: LibraryCache by lazy {
+        LibraryCache(appContext, onItemsChanged = { scope, items ->
+            downloadStore.syncLibraryMetadata(scope, items)
+        })
+    }
     val downloadStore: DownloadStore by lazy { DownloadStore(appContext) }
     val downloadQueueStore: DownloadQueueStore by lazy { DownloadQueueStore(appContext) }
     private val jellyfinRepository: HttpJellyfinRepository by lazy {

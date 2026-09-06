@@ -10,6 +10,7 @@ import com.adsamcik.streamferry.core.stream.MediaProfile
 import com.adsamcik.streamferry.data.cache.CachingMediaLibraryRepository
 import com.adsamcik.streamferry.data.cache.JellyfinConnectionMonitor
 import com.adsamcik.streamferry.data.cache.LibraryCache
+import com.adsamcik.streamferry.data.download.DownloadedJellyfinMediaLibraryRepository
 import com.adsamcik.streamferry.data.download.DownloadEntry
 import com.adsamcik.streamferry.data.download.DownloadIdentity
 import com.adsamcik.streamferry.data.download.DownloadOwner
@@ -103,10 +104,13 @@ class LiveWatchStateValidationTest {
         assertEquals(300L, item.resumePositionSeconds, "Fixture needs a 20-minute synthetic video")
 
         val context = RuntimeEnvironment.getApplication()
-        cache = LibraryCache(context, fileWriter = { file, text -> file.parentFile.mkdirs(); file.writeText(text) })
-        cache.clear()
         downloads = DownloadStore(context)
         downloads.clear()
+        cache = LibraryCache(context,
+            fileWriter = { file, text -> file.parentFile?.mkdirs(); file.writeText(text) },
+            onItemsChanged = downloads::syncLibraryMetadata,
+        )
+        cache.clear()
         journal = JellyfinWatchMutationStore(context).also { it.clear() }
         resumes = ResumeStore(context).also { it.clear() }
         history = SmartResumeStore(context).also { it.clear() }
@@ -119,8 +123,13 @@ class LiveWatchStateValidationTest {
         resumes.save(DownloadIdentity(owner, item.id).resumeKey, 300, 1200)
 
         users.value = session
-        val source = JellyfinMediaSource(CachingMediaLibraryRepository(
-            JellyfinMediaLibraryRepository(client, logger), cache, { scopeKey }, { users.value == session }, monitor,
+        val source = JellyfinMediaSource(DownloadedJellyfinMediaLibraryRepository(
+            delegate = CachingMediaLibraryRepository(
+                JellyfinMediaLibraryRepository(client, logger), cache, { scopeKey }, { users.value == session }, monitor,
+            ),
+            downloadStore = downloads,
+            owner = { users.value?.let { DownloadOwner(it.serverId, it.userId) } },
+            canRefreshDownloads = { users.value == session },
         ))
         val identity = JellyfinSourceBackend.identity(session.serverId, session.userId, "Validation")
         val provider = JellyfinUserStateProvider(identity.id, client)
@@ -323,6 +332,18 @@ class LiveWatchStateValidationTest {
         eventually { vm.state.value.searchResults.any { it.id == item.id && it.played } }
         assertTrue(assertNotNull(downloads.get(owner, item.id)?.mediaItem).played,
             "A successful remote refresh must not leave the offline copy with stale watch state")
+    }
+
+    @Test
+    fun downloadedShelfRefreshFetchesExternalWatchedAndPartialProgressChanges() = runBlocking {
+        seedRemote(true, 0)
+        val shelf = DownloadedJellyfinMediaLibraryRepository.OFFLINE_DOWNLOADS_ROOT_ID
+        assertTrue(container.jellyfinMediaSource.children(shelf).getOrThrow().single().played)
+        seedRemote(false, 450)
+        val refreshed = container.jellyfinMediaSource.children(shelf).getOrThrow().single()
+        assertFalse(refreshed.played)
+        assertEquals(450L, refreshed.resumePositionSeconds)
+        assertEquals(refreshed, downloads.get(owner, item.id)?.mediaItem)
     }
 
     @Test

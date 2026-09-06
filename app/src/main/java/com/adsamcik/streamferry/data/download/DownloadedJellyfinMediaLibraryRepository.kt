@@ -15,6 +15,7 @@ class DownloadedJellyfinMediaLibraryRepository(
     private val delegate: MediaLibraryRepository,
     private val downloadStore: DownloadStore,
     private val owner: () -> DownloadOwner?,
+    private val canRefreshDownloads: () -> Boolean = { false },
 ) : MediaLibraryRepository {
 
     override suspend fun videoLibraries(): Result<List<MediaItem>> {
@@ -36,6 +37,13 @@ class DownloadedJellyfinMediaLibraryRepository(
     override suspend fun children(parentId: String): Result<List<MediaItem>> {
         if (parentId != OFFLINE_DOWNLOADS_ROOT_ID) return delegate.children(parentId)
         val requestOwner = owner()
+        // This virtual folder has no remote parent. Refresh its members explicitly so an external
+        // watch-state edit is discoverable even when the user browses only the Downloaded shelf.
+        for (item in downloadedItems(requestOwner)) {
+            if (owner() != requestOwner) return Result.failure(DownloadedScopeChangedException())
+            if (!canRefreshDownloads()) break
+            delegate.item(item.id) // The caching delegate synchronizes successful ordered metadata writes.
+        }
         val downloaded = downloadedItems(requestOwner)
         return if (owner() == requestOwner) Result.success(downloaded)
         else Result.failure(DownloadedScopeChangedException())
