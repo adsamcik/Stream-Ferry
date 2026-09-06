@@ -2,6 +2,9 @@
 
 Date: 2026-09-05. Application: Stream Ferry 0.6.0.
 
+**Follow-up:** the four defects below were fixed on September 6; see
+[fixes and verification](WATCH_STATE_FIXES_2026-09-06.md). The findings below describe the original validation.
+
 **Result: not ready to sign off as fully synchronized.** Manual mark watched,
 explicit progress reset, online automatic completion, and failed-write replay pass.
 Four defects remain in offline/download synchronization and cached state freshness.
