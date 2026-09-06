@@ -8,8 +8,8 @@ still applies. No uploader, endpoint, analytics SDK or native Crashpad dependenc
 | --- | --- |
 | App, source, playback, proxy, downloads, discovery and service events | Existing `DiagnosticSink` producers feed `TraceboxDiagnosticsLogger`; Tracebox alone owns the durable bounded store and optional Logcat mirror. |
 | Detailed Cast/DLNA traffic | Existing opt-in switch plus Tracebox's log-level policy. Redaction runs before recording; long Unicode messages are split without breaking code points. |
-| Fatal JVM and handled exceptions | Tracebox handler installed during `attachBaseContext`; handled exceptions retain structural type/frames without raw exception messages. |
-| ANRs and Android process exits | Tracebox watchdog and exit reconciliation. Historical exits are not attributed to the current app build. |
+| Fatal JVM and handled exceptions | Tracebox handler installed during `attachBaseContext`; bounded cause chains and handled suppressed exceptions retain structural type/frames without raw exception messages. Reduced OOM summaries still trigger crash review. |
+| ANRs and Android process exits | Tracebox watchdog and exit reconciliation, including historical PSS/RSS memory observations. Historical exits are not attributed to the current app build. |
 | Network/playback snapshot | Refreshed before opening package review, then recorded through the same sink. Target names, media titles and URLs are excluded from this snapshot. |
 | Browsing | Bounded Tracebox history queries on IO; event timestamps and build codes are carried in the app's static envelope. There is no second in-memory or disk log store. |
 | Save/share | Tracebox's exact-package disclosure and approval, followed by Android save/share. Packages use `.tbdiag` and may include retained historical evidence. No automatic upload. |
@@ -57,7 +57,7 @@ and private storage identities. Reads never approve an export.
 
 ## Verification
 
-Run `:app:assembleDebug :app:testDebugUnitTest :ui:testDebugUnitTest :app:lintDebug :ui:lintDebug`
+Run `:app:assembleDebug :app:assembleRelease :app:testDebugUnitTest :ui:testDebugUnitTest :app:lintDebug :ui:lintDebug`
 and the root `checkSourceBoundaries` task. Tracebox's runtime, export and ANR/exit unit suites cover
 the library changes. App tests exercise tracing gates, redaction before Tracebox, long Unicode
 messages, build filtering, history readback, and retention of legacy files on import failure.
