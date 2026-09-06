@@ -16,6 +16,7 @@ class DownloadedJellyfinMediaLibraryRepository(
     private val downloadStore: DownloadStore,
     private val owner: () -> DownloadOwner?,
     private val canRefreshDownloads: () -> Boolean = { false },
+    private val isRemoteUnavailable: () -> Boolean = { false },
 ) : MediaLibraryRepository {
 
     override suspend fun videoLibraries(): Result<List<MediaItem>> {
@@ -43,6 +44,9 @@ class DownloadedJellyfinMediaLibraryRepository(
             if (owner() != requestOwner) return Result.failure(DownloadedScopeChangedException())
             if (!canRefreshDownloads()) break
             delegate.item(item.id) // The caching delegate synchronizes successful ordered metadata writes.
+            // One offline fallback is enough; do not repeat the connection timeout for every title.
+            // Check after the request so a later explicit refresh can probe for recovery.
+            if (isRemoteUnavailable()) break
         }
         val downloaded = downloadedItems(requestOwner)
         return if (owner() == requestOwner) Result.success(downloaded)

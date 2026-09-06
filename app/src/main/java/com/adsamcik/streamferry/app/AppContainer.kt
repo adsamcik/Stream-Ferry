@@ -54,6 +54,7 @@ import com.adsamcik.streamferry.diagnostics.DiagnosticsEventLog
 import com.adsamcik.streamferry.diagnostics.DiagnosticsPreferences
 import com.adsamcik.streamferry.diagnostics.NetworkInfoProvider
 import com.adsamcik.streamferry.diagnostics.ReportShare
+import com.adsamcik.streamferry.domain.SourceAvailability
 import com.adsamcik.streamferry.domain.AccountLibraryScope
 import com.adsamcik.streamferry.domain.MediaLibraryRepository
 import com.adsamcik.streamferry.domain.MediaSource
@@ -198,6 +199,7 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
             ),
             downloadStore = downloadStore,
             canRefreshDownloads = { authRepository.currentUser.value != null },
+            isRemoteUnavailable = { jellyfinConnectionMonitor.status.value == SourceAvailability.UNAVAILABLE },
             owner = {
                 (authRepository.currentUser.value ?: authRepository.cachedSession.value)
                     ?.let { DownloadOwner(it.serverId, it.userId) }

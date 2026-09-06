@@ -11,6 +11,42 @@ import kotlin.test.assertTrue
 class DownloadedJellyfinMediaLibraryRepositoryTest {
 
     @Test
+    fun unavailableShelfRefreshStopsAfterOneProbeAndRetriesOnNextRefresh() = runBlocking {
+        val root = Files.createTempDirectory("downloaded-refresh-recovery").toFile()
+        try {
+            val owner = DownloadOwner("server", "user")
+            val store = DownloadStore.forFilesDir(root)
+            val items = listOf(media("one", "One"), media("two", "Two"))
+            items.forEach { store.savePlayable(owner, it) }
+            var unavailable = false
+            var recovered = false
+            var live = true
+            var calls = 0
+            val delegate = object : MediaLibraryRepository by EmptyRepository() {
+                override suspend fun item(itemId: String): Result<MediaItem> {
+                    calls++
+                    unavailable = !recovered
+                    // Like the caching delegate, a transport error can still return a cached item.
+                    return Result.success(items.single { it.id == itemId })
+                }
+            }
+            val repository = DownloadedJellyfinMediaLibraryRepository(delegate, store, { owner },
+                canRefreshDownloads = { live }, isRemoteUnavailable = { unavailable })
+            val shelf = DownloadedJellyfinMediaLibraryRepository.OFFLINE_DOWNLOADS_ROOT_ID
+            assertEquals(items, repository.children(shelf).getOrThrow())
+            assertEquals(1, calls)
+            recovered = true
+            assertEquals(items, repository.children(shelf).getOrThrow())
+            assertEquals(3, calls, "A fresh request must probe again and continue after recovery")
+            live = false
+            assertEquals(items, repository.children(shelf).getOrThrow())
+            assertEquals(3, calls, "A cache-only session must not attempt remote refresh")
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
     fun offlineDownloadsRemainBrowsableAndSearchableWhenDelegateIsUnavailable() = runBlocking {
         val root = Files.createTempDirectory("downloaded-jellyfin-library").toFile()
         try {
