@@ -2787,12 +2787,12 @@ class MainViewModel(
 
     private fun JellyfinWatchMutation.session() = UserSession(userId = userId, serverId = serverId)
 
-    private fun JellyfinWatchMutation.clearsResume(): Boolean =
-        kind != JellyfinWatchMutationKind.MARK_UNPLAYED
+    // Jellyfin clears PlaybackPositionTicks for both native played/unplayed actions and reset.
+    private fun JellyfinWatchMutation.clearsResume(): Boolean = true
 
     private fun JellyfinWatchMutation.transform(): (MediaItem) -> MediaItem = when (kind) {
         JellyfinWatchMutationKind.MARK_PLAYED -> { item -> item.withWatchState(played = true) }
-        JellyfinWatchMutationKind.MARK_UNPLAYED -> { item -> item.withWatchState(played = false) }
+        JellyfinWatchMutationKind.MARK_UNPLAYED -> { item -> item.withProgressReset() }
         JellyfinWatchMutationKind.RESET_PROGRESS -> { item -> item.withProgressReset() }
     }
 
