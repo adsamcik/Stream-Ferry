@@ -30,6 +30,35 @@ class LibraryCacheTest {
     }
 
     @Test
+    fun newestItemSurvivesOlderListsAndCacheRecreation() = runTest {
+        var now = 100L
+        fun cache() = LibraryCache(context, fileWriter = { file, text ->
+            file.parentFile.mkdirs()
+            file.writeText(text)
+        }, clock = { now })
+        val old = media("one", "One").copy(played = false, resumePositionSeconds = 300)
+        val fresh = old.copy(played = true, resumePositionSeconds = null)
+        val cache = cache()
+        cache.put("scope", "a", listOf(old))
+        now = 200L
+        cache.put("scope", "b", listOf(fresh))
+        val reopened = cache()
+        assertEquals(fresh, reopened.item("scope", "one"))
+        assertEquals(listOf(fresh), reopened.search("scope", "One"))
+        assertEquals(listOf(fresh), reopened.get("scope", "a"))
+        assertEquals(100L, reopened.getRecord("scope", "a")?.cachedAtMillis)
+    }
+
+    @Test
+    fun missingIndexRecoversNewestTimestampInsteadOfFilenameOrder() = runTest {
+        val old = media("one", "One").copy(played = false)
+        val fresh = old.copy(played = true)
+        writeLegacyList("scope", "a", listOf(old), 1000L)
+        writeLegacyList("scope", "b", listOf(fresh), 2000L)
+        assertEquals(fresh, LibraryCache(context).item("scope", "one"))
+    }
+
+    @Test
     fun putWritesTimestampedRecordAndKeepsListReadCompatibility() = runTest {
         val cache = LibraryCache(context) { 123_456L }
         val entries = listOf(media("one", "One"))

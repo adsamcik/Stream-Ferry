@@ -155,7 +155,7 @@ class LibraryCache(
      * their filesystem modification time becomes the best available cache timestamp.
      */
     suspend fun getRecord(scope: String, key: String): Record? = mutex.withLock {
-        withContext(Dispatchers.IO) { readRecord(fileFor(scope, key)) }
+        withContext(Dispatchers.IO) { readCurrentRecord(scope, key) }
     }
 
     /**
@@ -169,7 +169,7 @@ class LibraryCache(
     ): RecordState? = mutex.withLock {
         require(refreshAfterMillis >= 0L) { "refreshAfterMillis must be non-negative" }
         withContext(Dispatchers.IO) {
-            readRecord(fileFor(scope, key))?.let { record ->
+            readCurrentRecord(scope, key)?.let { record ->
                 val age = (clock() - record.cachedAtMillis).coerceAtLeast(0L)
                 RecordState(record, age, age >= refreshAfterMillis)
             }
@@ -320,6 +320,13 @@ class LibraryCache(
     }
     private fun fileFor(scope: String, key: String) = File(scopeDir(scope), safe(key) + ".json")
 
+    /** Keep list membership and freshness, using the latest known metadata for each member. */
+    private fun readCurrentRecord(scope: String, key: String): Record? {
+        val record = readRecord(fileFor(scope, key)) ?: return null
+        val indexed = indexForLookup(scopeDir(scope)).associateBy { it.id }
+        return record.copy(items = record.items.map { indexed[it.id] ?: it })
+    }
+
     private fun readRecord(file: File): Record? {
         if (!file.isFile) return null
         val text = runCatching { file.readText() }.getOrNull() ?: return null
@@ -347,16 +354,17 @@ class LibraryCache(
             runCatching { writeIndex(dir, records) }
             return records
         }
-        val reconciled = mergeById(index, records)
+        // Recover missing entries, but never replace an indexed item with an older list snapshot.
+        val reconciled = mergeById(records, index)
         if (reconciled != index) runCatching { writeIndex(dir, reconciled) }
         return reconciled
     }
 
     private fun rebuildIndex(dir: File): List<MediaItem> {
         val byId = LinkedHashMap<String, MediaItem>()
-        recordFiles(dir).sortedBy { it.name }.forEach { file ->
-            readRecord(file)?.items?.forEach { item -> byId[item.id] = item }
-        }
+        recordFiles(dir).mapNotNull { file -> readRecord(file)?.let { file.name to it } }
+            .sortedWith(compareBy({ it.second.cachedAtMillis }, { it.first }))
+            .forEach { (_, record) -> record.items.forEach { item -> byId[item.id] = item } }
         return byId.values.toList()
     }
 
