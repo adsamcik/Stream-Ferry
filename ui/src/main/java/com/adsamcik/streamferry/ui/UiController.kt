@@ -98,9 +98,8 @@ interface UiController {
     fun localNetworkPermissionSettingsIntent(): Intent
     fun refreshDiagnostics()
     fun setTvTracingEnabled(enabled: Boolean)
-    fun diagnosticsForExport(): String
-    fun crashReportsForExport(): String
+    suspend fun prepareDiagnostics()
+    fun clearDiagnostics()
     fun dismissCrashAlert()
-    fun clearCrashLogs()
     fun deleteAllData()
 }

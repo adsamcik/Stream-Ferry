@@ -52,7 +52,6 @@ import com.adsamcik.streamferry.data.proxy.LocalProxyServer
 import com.adsamcik.streamferry.data.security.KeystoreTokenStore
 import com.adsamcik.streamferry.data.security.ServerConfigStore
 import com.adsamcik.streamferry.diagnostics.CrashReporter
-import com.adsamcik.streamferry.diagnostics.DiagnosticsEventLog
 import com.adsamcik.streamferry.diagnostics.DiagnosticsPreferences
 import com.adsamcik.streamferry.diagnostics.NetworkInfoProvider
 import com.adsamcik.streamferry.diagnostics.ReportShare
@@ -131,15 +130,6 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
     val nightVolumeSettingsStore: NightVolumeSettingsStore by lazy { NightVolumeSettingsStore(appContext) }
     val physicalTvAssociations: PhysicalTvAssociationStore by lazy {
         PersistentPhysicalTvAssociationStore(appContext)
-    }
-
-    /**
-     * Persists the redacted event log to disk so a shared diagnostics report survives app restarts (the
-     * logger's in-memory ring is wiped on process death). Build-tagged; the export includes only the
-     * current build's events. See [DiagnosticsEventLog].
-     */
-    val diagnosticsEventLog: DiagnosticsEventLog by lazy {
-        DiagnosticsEventLog(appContext.filesDir, appVersionCode()) { logger.entries() }
     }
 
     private val httpClient: OkHttpClient by lazy {
@@ -451,6 +441,17 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
 
     // ----- optional: offline downloads -----
     private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val legacyMigration = ioScope.launch {
+        try {
+            dev.tracebox.Tracebox.current()?.let {
+                com.adsamcik.streamferry.diagnostics.LegacyDiagnosticsMigration.migrate(appContext, it)
+            }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            logger.w("diagnostics", "Legacy diagnostics import will retry on the next launch")
+        }
+    }
     val downloader: MediaDownloader by lazy {
         MediaDownloader(
             downloadProvider = registeredDownloadProvider,
@@ -509,9 +510,9 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
 
     init {
         logger.event("process", "App process started pid=${android.os.Process.myPid()}")
-        ioScope.launch {
-            crashReporter.systemExitReport().lineSequence().forEach { logger.event("previous-exit", it) }
-        }
+        logger.event("environment", "app=${appVersionName()} build=${appVersionCode()} " +
+            "sdk=${android.os.Build.VERSION.SDK_INT} android=${android.os.Build.VERSION.RELEASE} " +
+            "manufacturer=${android.os.Build.MANUFACTURER} model=${android.os.Build.MODEL}")
         // Apply the persisted opt-in TV-tracing preference so detailed Cast/DLNA traffic is captured
         // from app start if the user previously enabled it.
         runCatching { logger.traceEnabled = diagnosticsPreferences.tvTracingEnabled }
@@ -535,21 +536,11 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
                 if (!granted) runCatching { playbackEngine.onLocalNetworkPermissionRevoked() }
             }
         }
-        // Persist the redacted event log to disk on a slow cadence so a shared report survives app
-        // restarts (the in-memory ring is otherwise lost on process death). Change-detected, so it's a
-        // no-op when idle; also flushed on demand before a report is built and when playback stops.
-        ioScope.launch {
-            while (isActive) {
-                delay(DIAGNOSTICS_FLUSH_INTERVAL_MS)
-                runCatching { diagnosticsEventLog.flush() }
-            }
-        }
     }
 
-    /** Persist the current event log to disk now (before building a report, on playback stop, etc.). */
+    /** Drain queued Tracebox writes on an IO dispatcher at lifecycle boundaries. */
     fun flushDiagnostics() {
-        // Off the main thread: callers include UI lifecycle (onStop) and the playback-stop path.
-        ioScope.launch { runCatching { diagnosticsEventLog.flush() } }
+        ioScope.launch { runCatching { logger.entries() } }
     }
 
     /**
@@ -599,8 +590,24 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
         logger.i("Diagnostics", if (enabled) "TV communication tracing enabled" else "TV communication tracing disabled")
     }
 
-    /** Clears all secrets + in-memory state (Settings → Delete all app data, §13). */
+    /** Stop import before deletion so legacy files cannot repopulate an erased recorder. */
+    suspend fun clearDiagnostics() = kotlinx.coroutines.withContext(Dispatchers.IO) {
+        legacyMigration.cancel()
+        legacyMigration.join()
+        logger.clear()
+        com.adsamcik.streamferry.core.diagnostics.CrashReportStore(java.io.File(appContext.filesDir, "crashes")).clear()
+        com.adsamcik.streamferry.core.diagnostics.EventLogStore(java.io.File(appContext.filesDir, "events")).clear()
+        check(com.adsamcik.streamferry.core.diagnostics.CrashReportStore(java.io.File(appContext.filesDir, "crashes")).reports().isEmpty())
+        check(com.adsamcik.streamferry.core.diagnostics.EventLogStore(java.io.File(appContext.filesDir, "events")).sessions().isEmpty())
+        ReportShare.clearCachedReports(appContext)
+        diagnosticsPreferences.clear()
+        logger.traceEnabled = false
+    }
+
+    /** Clears all secrets and app-owned state (Settings → Delete all app data). */
     suspend fun deleteAllData() {
+        legacyMigration.cancel()
+        legacyMigration.join()
         runCatching { playbackEngine.stop() }
         runCatching { downloader.cancelAllAndJoin() } // stop downloads before wiping their store
         authRepository.deleteAllData()
@@ -621,8 +628,6 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
         runCatching { smartResumeStore.clear() }
         savedQueueStore.clear()
         runCatching { jellyfinWatchMutationStore.clear() }
-        runCatching { crashReporter.clear() } // crash reports are app data too
-        runCatching { diagnosticsEventLog.clear() } // persisted event log is app data too
         runCatching { diagnosticsPreferences.clear() }
         runCatching { playbackPreferences.clear() }
         runCatching { appearancePreferences.clear() }
@@ -631,7 +636,7 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
         runCatching { nightVolumeSettingsStore.clear() }
         runCatching { physicalTvAssociations.clear() }
         logger.traceEnabled = false
-        logger.clear()
+        clearDiagnostics()
     }
 
     fun appVersionName(): String = appVersion()
@@ -647,7 +652,6 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
         const val DEVICE_PREFS = "jellyfin_bridge_device"
         const val KEY_DEVICE_ID = "device_id"
         const val LOCAL_NETWORK_PERMISSION_POLL_MS = 1_000L
-        const val DIAGNOSTICS_FLUSH_INTERVAL_MS = 10_000L
         const val CAST_INIT_TIMEOUT_MS = 2_000L
     }
 }

@@ -14,8 +14,6 @@ import androidx.compose.ui.text.font.FontWeight
 import android.content.ClipData
 import android.content.Intent
 import android.content.res.Configuration
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -66,17 +64,13 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
-import com.adsamcik.streamferry.diagnostics.ReportExport
-import com.adsamcik.streamferry.diagnostics.ReportShare
 import com.adsamcik.streamferry.core.logging.LogEntry
 import com.adsamcik.streamferry.core.logging.LogLevel
 import com.adsamcik.streamferry.ui.state.AppUiState
 import com.adsamcik.streamferry.ui.theme.StreamFerryTheme
 import java.text.SimpleDateFormat
 import java.util.Date
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import java.util.Locale
 
 private enum class DiagFilter(val label: String) {
@@ -93,56 +87,27 @@ private val CONNECTION_CATEGORIES = setOf("discovery", "connect", "session", "pl
 fun DiagnosticsScreen(
     state: AppUiState,
     onRefresh: () -> Unit,
-    onClearCrashes: () -> Unit,
-    crashReportText: () -> String,
-    diagnosticsText: () -> String,
+    onClearDiagnostics: () -> Unit,
+    onReviewDiagnostics: () -> Unit,
     onToggleTvTracing: (Boolean) -> Unit,
 ) {
     val d = state.diagnostics
+    var confirmDelete by remember { mutableStateOf(false) }
+    if (confirmDelete) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { confirmDelete = false },
+            title = { Text("Delete all diagnostics?") },
+            text = { Text("Deletes event and crash evidence, legacy reports, and cached exports. Recording stays disabled until you enable it in the report controls.") },
+            confirmButton = { androidx.compose.material3.TextButton(onClick = { confirmDelete = false; onClearDiagnostics() }) { Text("Delete") } },
+            dismissButton = { androidx.compose.material3.TextButton(onClick = { confirmDelete = false }) { Text("Cancel") } },
+        )
+    }
     val context = LocalContext.current
     val clipboard = LocalClipboard.current
     val clipboardScope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
     val focusManager = LocalFocusManager.current
     val keyboard = LocalSoftwareKeyboardController.current
-
-    val saveDiagnosticsLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.CreateDocument("text/plain"),
-    ) { uri ->
-        // Build the report + write the file off the main thread (file reads + I/O would jank the UI).
-        uri?.let { target ->
-            clipboardScope.launch {
-                val result = withContext(Dispatchers.IO) {
-                    ReportExport.writeUtf8(diagnosticsText()) {
-                        context.contentResolver.openOutputStream(target)
-                    }
-                }
-                snackbarHostState.showSnackbar(
-                    message = if (result.isSuccess) "Diagnostics report saved."
-                    else "Couldn't save the diagnostics report. Choose another location and try again.",
-                    withDismissAction = result.isFailure,
-                )
-            }
-        }
-    }
-    val saveCrashLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.CreateDocument("text/plain"),
-    ) { uri ->
-        uri?.let { target ->
-            clipboardScope.launch {
-                val result = withContext(Dispatchers.IO) {
-                    ReportExport.writeUtf8(crashReportText()) {
-                        context.contentResolver.openOutputStream(target)
-                    }
-                }
-                snackbarHostState.showSnackbar(
-                    message = if (result.isSuccess) "Crash logs saved."
-                    else "Couldn't save the crash logs. Choose another location and try again.",
-                    withDismissAction = result.isFailure,
-                )
-            }
-        }
-    }
 
     var selectedFilter by remember { mutableStateOf(DiagFilter.ALL) }
     var searchQuery by remember { mutableStateOf("") }
@@ -183,32 +148,12 @@ fun DiagnosticsScreen(
                             "Report details leave your device only when you choose to share them.",
                         style = MaterialTheme.typography.bodySmall,
                     )
-                    Button(
-                        onClick = {
-                            // Read crash files + build the report off the main thread, then share on main.
-                            clipboardScope.launch {
-                                val result = runCatching {
-                                    val text = withContext(Dispatchers.IO) { diagnosticsText() }
-                                    check(text.isNotBlank()) { "The diagnostics report is empty." }
-                                    val shareIntent = withContext(Dispatchers.IO) {
-                                        ReportShare.createIntent(context, text, "Stream Ferry diagnostics report")
-                                    }
-                                    context.startActivity(Intent.createChooser(shareIntent, "Share report"))
-                                }
-                                if (result.isFailure) {
-                                    snackbarHostState.showSnackbar(
-                                        "Couldn't open the diagnostics share sheet. Try saving the report instead.",
-                                        withDismissAction = true,
-                                    )
-                                }
-                            }
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                    ) { Text("Share report") }
-                    OutlinedButton(
-                        onClick = { saveDiagnosticsLauncher.launch("stream-ferry-report.txt") },
-                        modifier = Modifier.fillMaxWidth(),
-                    ) { Text("Save report…") }
+                    Button(onClick = onReviewDiagnostics, modifier = Modifier.fillMaxWidth()) {
+                        Text("Review, save or share report")
+                    }
+                    OutlinedButton(onClick = { confirmDelete = true }, modifier = Modifier.fillMaxWidth()) {
+                        Text("Delete all diagnostics")
+                    }
                 }
             }
         }
@@ -274,33 +219,8 @@ fun DiagnosticsScreen(
                 Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("Crash reports: ${d.crashCount}", style = MaterialTheme.typography.titleSmall)
                     if (d.crashCount > 0) {
-                        Button(
-                            onClick = {
-                                clipboardScope.launch {
-                                    val result = runCatching {
-                                        val text = withContext(Dispatchers.IO) { crashReportText() }
-                                        check(text.isNotBlank()) { "The crash report is empty." }
-                                        val shareIntent = withContext(Dispatchers.IO) {
-                                            ReportShare.createIntent(context, text, "Stream Ferry crash report")
-                                        }
-                                        context.startActivity(Intent.createChooser(shareIntent, "Share crash report"))
-                                    }
-                                    if (result.isFailure) {
-                                        snackbarHostState.showSnackbar(
-                                            "Couldn't open the crash-log share sheet. Try saving the logs instead.",
-                                            withDismissAction = true,
-                                        )
-                                    }
-                                }
-                            },
-                            modifier = Modifier.fillMaxWidth(),
-                        ) { Text("Share crash logs") }
-                        OutlinedButton(
-                            onClick = { saveCrashLauncher.launch("stream-ferry-crash.txt") },
-                            modifier = Modifier.fillMaxWidth(),
-                        ) { Text("Save crash logs…") }
-                        OutlinedButton(onClick = onClearCrashes, modifier = Modifier.fillMaxWidth()) {
-                            Text("Clear crash logs")
+                        Button(onClick = onReviewDiagnostics, modifier = Modifier.fillMaxWidth()) {
+                            Text("Review crash evidence")
                         }
                         d.latestCrash?.let { crash ->
                             Text("Most recent crash:", style = MaterialTheme.typography.bodySmall)

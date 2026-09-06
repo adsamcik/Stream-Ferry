@@ -80,19 +80,13 @@ All problems — not only crashes — are captured by the redacting `Diagnostics
 entries** (`LogEntry`: timestamp, `LogLevel`, category, redacted message). The **Diagnostics screen**
 (Settings → Diagnostics) is built for browsing and issue reporting:
 
-- A prominent **"Report an issue"** card → **Share report** / **Save report…**: one comprehensive,
-  fully-redacted plain-text report (app/device/Android header, a network section, a services section,
-  a now-playing section while a session is active, the full event log, and the crash appendix).
-  **Share report** writes that report to the app-private cache and shares it as a temporary
-  `FileProvider` attachment rather than putting its text in an `Intent` extra; this preserves complete
-  multi-megabyte reports without exceeding Android's activity-launch Binder limit.
-  The report's **event log is read from app-private persistence** (`DiagnosticsEventLog` →
-  `EventLogStore`, `filesDir/events`), **not** the in-memory ring, so a report generated in a fresh
-  launch (e.g. after casting, once the process has been killed in the background) still contains the
-  earlier playback/transcode/TV-communication events. The log is saved per session on a slow cadence
-  (change-detected), on playback stop, when the app is stopped, and just before a report is built. Like
-  crashes, only the **current build's** events are included, files are excluded from backup
-  (`allowBackup=false`), bounded to the newest few sessions, and removed by "Delete all app data".
+- **Report an issue → Review, save or share report** opens Tracebox's package disclosure and
+  approval flow. The `.tbdiag` package contains bounded durable events, refreshed operational
+  facts, crashes and historical Android exit evidence. Nothing uploads automatically. Tracebox
+  owns persistence directly; there is no periodic text-file writer. The local event browser filters
+  the running build, while packages can include older evidence labelled with its provenance.
+  **Delete all diagnostics** clears the recorder, legacy reports and cached exports and leaves
+  recording disabled. See [Tracebox diagnostics](TRACEBOX.md) for migration and decoding details.
 - **Snapshot cards**: App & device, Network (VPN active, Wi-Fi connected/available, redacted LAN IP +
   proxy address, Cast availability), Permissions (local-network, notifications), and Now-playing
   (target/protocol/mode/bitrate/throughput/position/buffering) while casting. The local-network row is

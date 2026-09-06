@@ -2,11 +2,17 @@
 
 ## Requirements
 
-- JDK 17+.
+- JDK 21 (Java 17 application bytecode).
+- Initialize the pinned Tracebox source with `git submodule update --init --recursive`.
 - Android SDK Platform 37 + build-tools 37.0.0 (installed on the build host).
 - Gradle wrapper and Android Gradle Plugin versions are pinned in the repository; use the wrapper.
 - **Network access to `google()` / `maven.google.com`**, or a complete warm dependency cache — see
   Android dependency availability below.
+
+Tracebox is built from the exact Git submodule revision at `vendor/tracebox`, using a Gradle composite
+build. It requires no GitHub Packages credentials or Maven Local artifacts. For coordinated local
+library work, pass `-PtraceboxSourceDir=/absolute/path/to/Tracebox/src`; normal builds and CI use the
+pin. Push the Tracebox commit before pushing a parent commit that references it.
 
 ## Standard commands (run on a machine with Google Maven access)
 

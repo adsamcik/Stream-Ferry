@@ -9,8 +9,6 @@ import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.activity.compose.BackHandler
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -81,8 +79,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import com.adsamcik.streamferry.core.volume.NightVolumePolicy
-import com.adsamcik.streamferry.diagnostics.ReportExport
-import com.adsamcik.streamferry.diagnostics.ReportShare
+import dev.tracebox.ui.compose.TraceboxDiagnosticsActivity
 import com.adsamcik.streamferry.domain.SourceAvailability
 import com.adsamcik.streamferry.domain.MediaSourceIds
 import com.adsamcik.streamferry.playback.PlaybackPhase
@@ -108,9 +105,7 @@ import com.adsamcik.streamferry.ui.state.AppUiState
 import com.adsamcik.streamferry.ui.state.displayedIsPlaying
 import com.adsamcik.streamferry.ui.state.displayedPositionSeconds
 import com.adsamcik.streamferry.ui.state.Route
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 private val compactNavigationBreakpoint = 600.dp
 private val compactHeightBreakpoint = 480.dp
@@ -273,7 +268,7 @@ fun AppRoot(
         state.crashAlertCount?.let { count ->
             CrashAlertDialog(
                 count = count,
-                reportText = { viewModel.crashReportsForExport() },
+                onReview = { context.startActivity(TraceboxDiagnosticsActivity.intent(context)) },
                 onDismiss = { viewModel.dismissCrashAlert() },
             )
         }
@@ -359,6 +354,7 @@ private fun RouteContent(
     onNightVolumePolicyChange: (NightVolumePolicy) -> Unit,
     compact: Boolean,
 ) {
+    val diagnosticsScope = rememberCoroutineScope()
     when (state.route) {
         Route.WELCOME -> WelcomeScreen(
             state.loggedIn,
@@ -382,9 +378,13 @@ private fun RouteContent(
         Route.DIAGNOSTICS -> DiagnosticsScreen(
             state = state,
             onRefresh = { viewModel.refreshDiagnostics() },
-            onClearCrashes = { viewModel.clearCrashLogs() },
-            crashReportText = { viewModel.crashReportsForExport() },
-            diagnosticsText = { viewModel.diagnosticsForExport() },
+            onClearDiagnostics = viewModel::clearDiagnostics,
+            onReviewDiagnostics = {
+                diagnosticsScope.launch {
+                    viewModel.prepareDiagnostics()
+                    context.startActivity(TraceboxDiagnosticsActivity.intent(context))
+                }
+            },
             onToggleTvTracing = { viewModel.setTvTracingEnabled(it) },
         )
         Route.SETTINGS -> ExpressiveSettingsScreen(
@@ -660,64 +660,12 @@ private fun ErrorBanner(
 }
 
 @Composable
-private fun CrashAlertDialog(count: Int, reportText: () -> String, onDismiss: () -> Unit) {
-    val context = LocalContext.current
-    val scope = rememberCoroutineScope()
-    var exportError by remember { mutableStateOf<String?>(null) }
-    val saveLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.CreateDocument("text/plain"),
-    ) { uri ->
-        uri?.let { target ->
-            scope.launch {
-                val result = withContext(Dispatchers.IO) {
-                    ReportExport.writeUtf8(reportText()) {
-                        context.contentResolver.openOutputStream(target)
-                    }
-                }
-                if (result.isSuccess) onDismiss()
-                else exportError = "Couldn't save the crash report. Choose another location and try again."
-            }
-        }
-    }
-    val plural = if (count == 1) "" else "s"
+private fun CrashAlertDialog(count: Int, onReview: () -> Unit, onDismiss: () -> Unit) {
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Crash detected") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Stream Ferry recorded $count crash report$plural from a previous run. Secrets are stripped before export.")
-                Button(
-                    onClick = {
-                        scope.launch {
-                            val result = runCatching {
-                                val text = withContext(Dispatchers.IO) { reportText() }
-                                check(text.isNotBlank()) { "The crash report is empty." }
-                                val shareIntent = withContext(Dispatchers.IO) {
-                                    ReportShare.createIntent(context, text, "Stream Ferry crash report")
-                                }
-                                context.startActivity(Intent.createChooser(shareIntent, "Share crash report"))
-                            }
-                            if (result.isSuccess) onDismiss()
-                            else exportError = "Couldn't open the crash-report share sheet. Try saving it instead."
-                        }
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                ) { Text("Share crash report") }
-                OutlinedButton(
-                    onClick = { saveLauncher.launch("stream-ferry-crash.txt") },
-                    modifier = Modifier.fillMaxWidth(),
-                ) { Text("Save to a file…") }
-                exportError?.let { message ->
-                    Text(
-                        message,
-                        color = MaterialTheme.colorScheme.error,
-                        style = MaterialTheme.typography.bodySmall,
-                        modifier = Modifier.semantics { liveRegion = LiveRegionMode.Assertive },
-                    )
-                }
-            }
-        },
-        confirmButton = {},
+        text = { Text("Stream Ferry recorded $count crash report(s). Review the local evidence before saving or sharing it.") },
+        confirmButton = { TextButton(onClick = { onReview(); onDismiss() }) { Text("Review report") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Not now") } },
     )
 }

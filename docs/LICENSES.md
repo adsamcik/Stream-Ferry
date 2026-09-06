@@ -12,6 +12,8 @@ below is the curated summary.
 | Component | License | Notes |
 | --- | --- | --- |
 | **Stream Ferry-owned code** | **PolyForm-Noncommercial-1.0.0** | Source available for noncommercial purposes; see [App license](#app-license). |
+| Tracebox | Apache-2.0 | Managed runtime and Compose UI; pinned source and notices in `vendor/tracebox`. Native Crashpad binaries are not packaged. |
+| desugar_jdk_libs_nio | GPLv2 with Classpath Exception | Android core library desugaring. |
 | Android Gradle Plugin, AndroidX, Compose | Apache-2.0 | Permissive. |
 | Kotlin, kotlinx-coroutines, kotlinx-serialization | Apache-2.0 | Permissive. |
 | OkHttp | Apache-2.0 | Permissive. |

@@ -1,12 +1,23 @@
 package com.adsamcik.streamferry.app
 
 import android.app.Application
+import android.content.Context
+import dev.tracebox.Tracebox
+import dev.tracebox.TraceboxConfiguration
+import dev.tracebox.api.TraceboxPolicy
+import dev.tracebox.api.LogLevel
+import dev.tracebox.api.TraceboxHandle
+import dev.tracebox.api.CaptureKind
+import dev.tracebox.ui.compose.TraceboxDiagnosticsUi
+import dev.tracebox.ui.compose.TraceboxDiagnosticsUiConfiguration
+import dev.tracebox.ui.compose.TraceboxPackageActions
+import dev.tracebox.ui.compose.TraceboxPrimaryAction
 import coil.ImageLoader
 import coil.ImageLoaderFactory
 import com.adsamcik.streamferry.BuildConfig
 import com.adsamcik.streamferry.diagnostics.CrashReporter
 import com.adsamcik.streamferry.logging.DiagnosticsLogger
-import com.adsamcik.streamferry.logging.RedactingLogger
+import com.adsamcik.streamferry.logging.TraceboxDiagnosticsLogger
 import com.adsamcik.streamferry.playback.proxy.PlaybackServiceDependencies
 import com.adsamcik.streamferry.playback.proxy.PlaybackServiceOwner
 
@@ -25,23 +36,37 @@ class StreamFerryApplication : Application(), ImageLoaderFactory, PlaybackServic
     lateinit var container: AppContainer
         private set
 
+    lateinit var tracebox: TraceboxHandle
+        private set
+
+    override fun attachBaseContext(base: Context) {
+        super.attachBaseContext(base)
+        tracebox = Tracebox.install(this, TraceboxConfiguration.Builder()
+            .setInitialPolicy(diagnosticsPolicy())
+            .setPersistRequestedProfile(true)
+            .build())
+    }
+
     override fun onCreate() {
         super.onCreate()
-        // The debug-only ":crash" process only hosts CrashActivity (which reads the report file
-        // directly), so skip the full app init there.
-        if (getProcessName().endsWith(":crash")) return
-        // Install the crash handler FIRST, before any other init, so even a failure while building
-        // the container is captured to a redacted, app-private crash report.
-        crashReporter = CrashReporter(
-            context = this,
-            appVersion = BuildConfig.VERSION_NAME,
-            versionCode = BuildConfig.VERSION_CODE.toString(),
-            isDebug = BuildConfig.DEBUG,
-        )
-        crashReporter.install()
-        logger = RedactingLogger(debugBuild = BuildConfig.DEBUG)
+        TraceboxDiagnosticsUi.configure(TraceboxDiagnosticsUiConfiguration(
+            primaryAction = TraceboxPrimaryAction.REVIEW_ONLY,
+            packageActions = TraceboxPackageActions(upload = false, deleteAllData = false),
+            advancedControls = dev.tracebox.ui.compose.TraceboxAdvancedControls(
+                captureKinds = diagnosticsPolicy().captures,
+            ),
+            defaultPolicy = diagnosticsPolicy(),
+        ))
+        crashReporter = CrashReporter(tracebox, packageManager.getPackageInfo(packageName, 0).lastUpdateTime)
+        logger = TraceboxDiagnosticsLogger(tracebox, BuildConfig.VERSION_CODE.toString())
         container = AppContainer(this, logger, crashReporter)
     }
+
+    private fun diagnosticsPolicy() = TraceboxPolicy(
+        minimumLogLevel = LogLevel.VERBOSE,
+        mirrorToLogcat = BuildConfig.DEBUG,
+        captures = setOf(CaptureKind.JVM_CRASH, CaptureKind.HANDLED_EXCEPTION, CaptureKind.ANR, CaptureKind.OS_EXIT),
+    )
 
     /** Provide the container's auth-aware, memory-only image loader to Coil's singleton (§15 posters). */
     override fun newImageLoader(): ImageLoader =

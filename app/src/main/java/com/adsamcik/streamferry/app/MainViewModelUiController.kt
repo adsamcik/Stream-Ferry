@@ -101,9 +101,8 @@ class MainViewModelUiController(
     override fun localNetworkPermissionSettingsIntent(): Intent = viewModel.localNetworkPermissionSettingsIntent()
     override fun refreshDiagnostics() { viewModel.refreshDiagnostics() }
     override fun setTvTracingEnabled(enabled: Boolean) = viewModel.setTvTracingEnabled(enabled)
-    override fun diagnosticsForExport() = viewModel.diagnosticsForExport()
-    override fun crashReportsForExport() = viewModel.crashReportsForExport()
+    override suspend fun prepareDiagnostics() { viewModel.prepareDiagnostics() }
+    override fun clearDiagnostics() { viewModel.clearDiagnostics() }
     override fun dismissCrashAlert() { viewModel.dismissCrashAlert() }
-    override fun clearCrashLogs() { viewModel.clearCrashLogs() }
     override fun deleteAllData() = viewModel.deleteAllData()
 }

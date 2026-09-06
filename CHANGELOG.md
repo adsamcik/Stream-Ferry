@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Move all app-owned diagnostic capture, durable events, crashes, ANRs and process-exit evidence to
+  offline Tracebox. Preserve opt-in TV tracing and local event browsing.
+- Review `.tbdiag` packages before save/share; remove the custom text export and crash handler.
+- Import recent legacy evidence with readback verification. Deletion stops import, clears both
+  stores and cached exports, and leaves recording disabled.
+
+
 All notable changes to **Stream Ferry** are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),

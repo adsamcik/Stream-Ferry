@@ -1,0 +1,3 @@
+[submodule "vendor/tracebox"]
+	path = vendor/tracebox
+	url = https://github.com/adsamcik/Tracebox.git

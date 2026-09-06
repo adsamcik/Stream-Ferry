@@ -70,16 +70,13 @@ Implemented end-to-end:
   renderer-confirmed progress and stable previous-TV identity without persisting live sessions or proxy
   URLs. Night volume is off by default, reduction-only, sparse, and stops adjusting after a manual
   phone-side change.
-- **On-device crash reports** — an uncaught-exception handler writes a **redacted** crash report
-  (stack trace + app/device info, secrets stripped) to app-private storage; view, share or clear them
-  from **Settings → Diagnostics**. Sharing includes only reports from the **latest build** (crashes from
-  before an app update are kept but excluded, so a shared report is relevant to the running version). No
-  telemetry — reports never leave the phone unless you share them.
-- **Persistent diagnostics event log** — the redacted event log (playback/transcode decisions, TV
-  communication when tracing is on) is periodically saved to app-private storage per session, so a report
-  shared **after** the app is restarted still contains earlier playback events (not just the current
-  launch). Like crashes, a shared report includes only the **latest build's** events, is excluded from
-  backup, and is removed by "Delete all app data".
+- **Tracebox diagnostics** — app-owned events, playback/network traces, handled exceptions,
+  fatal JVM crashes, ANRs and Android process exits use one bounded, offline Tracebox store.
+  Detailed TV tracing remains opt-in. The event browser shows the running build's events;
+  reviewed `.tbdiag` packages include retained historical evidence with its provenance.
+  **Settings → Diagnostics → Review, save or share report** opens the exact-package review flow.
+  Nothing uploads automatically. **Delete all diagnostics** clears Tracebox, legacy reports and
+  cached exports and leaves recording disabled. See [the migration notes](docs/TRACEBOX.md).
 
 - Kotlin · Jetpack Compose · Material 3 · ViewModel/coroutines/Flow.
 - `minSdk 34` (Android 14) · `targetSdk 37` / `compileSdk 37` (Android 17 — SDK verified present).

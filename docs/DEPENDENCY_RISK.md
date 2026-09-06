@@ -15,6 +15,8 @@ dependency verification metadata and Gradle Wrapper validation are required.
 
 | Dependency | Version | Source | License | Why needed | Risk notes |
 | --- | --- | --- | --- | --- | --- |
+| Tracebox managed runtime and Compose diagnostics UI | Git submodule pin (`vendor/tracebox`) | Reviewed source composite | Apache-2.0 | One offline diagnostics store and approved exports | Alpha; local history extension. No native artifact, networking or uploader. |
+| desugar_jdk_libs_nio | 2.1.5 | google() | GPLv2 + Classpath Exception | Tracebox NIO compatibility | Android toolchain dependency; core library desugaring enabled. |
 | Android Gradle Plugin | 9.2.1 | google() | Apache-2.0 | Build Android app, compileSdk 37 | Official Google; requires Gradle ≥ 9.4.1. |
 | Kotlin plugin / stdlib | 2.4.0 | mavenCentral() | Apache-2.0 | Language | Official JetBrains; matches build host. |
 | Compose Compiler plugin | 2.4.0 | mavenCentral() | Apache-2.0 | Compose | Bundled with Kotlin plugin. |
@@ -39,7 +41,7 @@ dependency verification metadata and Gradle Wrapper validation are required.
 
 No DLNA/UPnP library is used: SSDP, device-description parsing and AVTransport SOAP are implemented
 with platform APIs + the hardened `SecureXml` parser to avoid abandoned/unmaintained DLNA libraries
-(§11 dependency rule). No standalone analytics/ad/DI/logging-helper libraries are included. The
+(§11 dependency rule). Tracebox is the sole diagnostics library. No standalone analytics, advertising or DI libraries are included. The
 Google Cast Sender SDK has its documented anonymous SDK data collection. The only image loader
 is Coil (in-app posters/thumbnails, memory-cache only); the only media-processing library is AndroidX
 Media3 Transformer (on-device transcoding) — both first-party/official.

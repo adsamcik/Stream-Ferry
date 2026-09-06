@@ -4074,67 +4074,26 @@ class MainViewModel(
         refreshDiagnostics()
     }
 
-    /** The full redacted diagnostics log + a device/app context header, for share/save. */
-    fun diagnosticsForExport(): String {
-        val d = _state.value.diagnostics
-        return buildString {
-            appendLine("=== Stream Ferry diagnostics report ===")
-            appendLine("time:              ${java.time.OffsetDateTime.now()}")
-            appendLine("app:               ${d.appVersion} (${container.appVersionCode()}) [${d.buildType}]")
-            appendLine("device:            ${d.deviceModel}")
-            appendLine("android:           ${d.androidVersion}")
-            appendLine("sdk:               ${d.sdkInfo}")
-            appendLine()
-            appendLine("--- network ---")
-            appendLine("vpn active:        ${d.vpnActive}")
-            appendLine("wifi connected:    ${d.wifiConnected}")
-            appendLine("wifi available:    ${d.wifiNetworkAvailable}")
-            appendLine("lan ip:            ${d.lanIpRedacted}")
-            appendLine("proxy:             ${d.proxyAddressRedacted.ifBlank { "not running" }}")
-            appendLine()
-            appendLine("--- services ---")
-            appendLine("cast (gms):        ${d.googlePlayServices}")
-            appendLine("local-net perm:    ${d.localNetworkPermission}")
-            appendLine("notifications:     ${if (d.notificationsGranted) "granted" else "denied"}")
-            appendLine("background:        ${if (d.backgroundUnrestricted) "unrestricted" else "battery-optimized (may stall screen-off)"}")
-            appendLine("tv tracing:        ${d.tvTracingEnabled}")
+    /** Record current operational facts before Tracebox prepares the reviewed package. */
+    suspend fun prepareDiagnostics() {
+        refreshDiagnostics().join()
+        withContext(Dispatchers.IO) {
+            val d = _state.value.diagnostics
+            container.logger.event("snapshot", "vpn=${d.vpnActive} wifi=${d.wifiConnected} wifiAvailable=${d.wifiNetworkAvailable} " +
+                "cast=${d.googlePlayServices} notifications=${d.notificationsGranted} backgroundUnrestricted=${d.backgroundUnrestricted} " +
+                "localNetwork=${d.localNetworkPermission}")
             d.nowPlaying?.let { np ->
-                appendLine()
-                appendLine("--- now playing ---")
-                appendLine("target:            ${np.target}")
-                appendLine("protocol:          ${np.protocol}")
-                appendLine("mode:              ${np.mode}")
-                appendLine("bitrate:           ${np.bitrateKbps} kbps")
-                appendLine("throughput:        ${np.throughputKbps} kbps")
-                appendLine("position:          ${np.positionLabel}")
-                appendLine("buffering:         ${np.buffering}")
-            }
-            appendLine()
-            appendLine("--- Android process exits (historical; may precede this build) ---")
-            appendLine(container.crashReporter.systemExitReport())
-            appendLine()
-            appendLine("--- recent events (redacted) ---")
-            // Persisted, current-build events — survives app restarts, so a report shared after the
-            // playbacks the user wants to show includes them (the in-memory ring is wiped on relaunch).
-            val log = container.diagnosticsEventLog.exportForCurrentBuild()
-            if (log.isEmpty()) appendLine("(no entries)") else log.forEach { appendLine(it) }
-            if (d.crashCount > 0) {
-                appendLine()
-                appendLine("--- crash reports (latest build only, redacted) ---")
-                appendLine(runCatching { container.crashReporter.combinedReportForCurrentBuild() }.getOrDefault("(failed to read crash reports)"))
+                container.logger.event("snapshot", "protocol=${np.protocol} mode=${np.mode} bitrateKbps=${np.bitrateKbps} " +
+                    "throughputKbps=${np.throughputKbps} position=${np.positionLabel} buffering=${np.buffering}")
             }
         }
     }
 
-    /** Combined redacted crash reports from the LATEST build for the share sheet (empty when none). */
-    fun crashReportsForExport(): String = runCatching { container.crashReporter.combinedReportForCurrentBuild() }.getOrDefault("")
-
-    /** Dismiss the startup "crash detected" prompt for this session (reports stay in Diagnostics). */
     fun dismissCrashAlert() = _state.update { it.copy(crashAlertCount = null) }
 
-    fun clearCrashLogs() = viewModelScope.launch {
-        withContext(Dispatchers.IO) { runCatching { container.crashReporter.clear() } }
-        _state.update { it.copy(crashAlertCount = null) }
+    fun clearDiagnostics() = viewModelScope.launch {
+        val result = withContext(Dispatchers.IO) { runCatching { container.clearDiagnostics() } }
+        _state.update { it.copy(crashAlertCount = null, errorMessage = if (result.isFailure) "Could not delete all diagnostics. Please try again." else null) }
         refreshDiagnostics()
     }
 
