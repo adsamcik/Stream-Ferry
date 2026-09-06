@@ -11,6 +11,8 @@ Follow-up to [the September 5 validation](WATCH_STATE_VALIDATION_2026-09-05.md).
 
 ## Verification
 
+These results cover the watched-state changes through `6361240`. Separate saved-queue work merged into the shared main worktree during final reporting; its additional behavior is outside this validation. The watched-state fixes remain present after that merge.
+
 - All **16 live Jellyfin acceptance checks passed**, with zero failures or skips. This includes all five assertions that failed in the original validation.
 - The full unit suite reported **654 tests: 635 passed, 19 skipped, zero failures/errors**. The 19 skips are the 16 opt-in watched-state checks (already exercised in the separate live run) plus three existing optional live-server tests.
 - The final debug APK built successfully. `lintDebug` and `checkSourceBoundaries` passed. The final lint run used a fresh single-worker Gradle process after the AndroidX experimental-annotation checker crashed in a reused process while analyzing unchanged UI code.
