@@ -36,6 +36,9 @@ Implemented end-to-end:
 - **Playback history** — a private, searchable screen under **Settings → Playback history** keeps the
   last 90 days of renderer-confirmed Jellyfin, downloaded, and local items, including exactly where
   playback stopped. Resume, watch again, remove one entry, or clear the history without deleting media.
+- **Saved queues** — build a queue from the library before choosing a TV, save it under a name, and
+  resume it over multiple sessions from **Library → Queues**. The working queue, item order, and
+  unfinished item's playback position are saved automatically on this device. See [docs/QUEUES.md](docs/QUEUES.md).
 - **Physical-TV picker** — live Cast (MediaRouter) + DLNA (SSDP) discoveries are conservatively
   aggregated into one TV row only when stable evidence is confident. Tapping the TV starts playback;
   Cast versus DLNA is normally an internal choice.
@@ -120,7 +123,7 @@ The pure-JVM core subset can also be verified directly with `kotlinc` (procedure
 
 No telemetry, analytics, ads, cloud services, or tracking. The access token and the Jellyfin server
 URL are stored encrypted (Android Keystore, AES-256-GCM); passwords are never stored. "Delete all app
-data" removes profiles, tokens, metadata, playback history, target/compatibility data, diagnostics,
+data" removes profiles, tokens, metadata, playback history, saved queues, target/compatibility data, diagnostics,
 settings, and active buffers.
 
 ## License
