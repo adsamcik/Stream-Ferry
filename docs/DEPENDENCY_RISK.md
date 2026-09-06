@@ -39,7 +39,8 @@ dependency verification metadata and Gradle Wrapper validation are required.
 
 No DLNA/UPnP library is used: SSDP, device-description parsing and AVTransport SOAP are implemented
 with platform APIs + the hardened `SecureXml` parser to avoid abandoned/unmaintained DLNA libraries
-(§11 dependency rule). No analytics/ad/DI/logging-helper libraries are included. The only image loader
+(§11 dependency rule). No standalone analytics/ad/DI/logging-helper libraries are included. The
+Google Cast Sender SDK has its documented anonymous SDK data collection. The only image loader
 is Coil (in-app posters/thumbnails, memory-cache only); the only media-processing library is AndroidX
 Media3 Transformer (on-device transcoding) — both first-party/official.
 

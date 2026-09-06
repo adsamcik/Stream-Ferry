@@ -30,6 +30,14 @@ private fun versionCodeFor(version: String): Int {
 
 val resolvedVersionName = providers.gradleProperty("versionName").get()
 val resolvedVersionCode = versionCodeFor(resolvedVersionName)
+val demoEnvironmentEnabled = providers.gradleProperty("demoEnvironment")
+    .map { value -> value.toBooleanStrictOrNull() ?: error("demoEnvironment must be true or false") }
+    .getOrElse(false)
+val demoRendererUrl = providers.gradleProperty("demoRendererUrl")
+    .getOrElse("http://10.0.2.2:8097/device.xml")
+val quotedDemoRendererUrl = "\"" + demoRendererUrl
+    .replace("\\", "\\\\")
+    .replace("\"", "\\\"") + "\""
 
 android {
     namespace = "com.adsamcik.streamferry"
@@ -46,6 +54,8 @@ android {
         versionName = resolvedVersionName
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
+        buildConfigField("boolean", "DEMO_ENVIRONMENT", "false")
+        buildConfigField("String", "DEMO_RENDERER_URL", "\"\"")
     }
 
     signingConfigs {
@@ -66,6 +76,8 @@ android {
         debug {
             applicationIdSuffix = ".debug"
             isMinifyEnabled = false
+            buildConfigField("boolean", "DEMO_ENVIRONMENT", demoEnvironmentEnabled.toString())
+            buildConfigField("String", "DEMO_RENDERER_URL", quotedDemoRendererUrl)
             // Debug-only network_security_config enables a user trust anchor for LAN testing.
             // It must NEVER ship in release (see src/release manifest + docs/NETWORK_SECURITY.md).
         }

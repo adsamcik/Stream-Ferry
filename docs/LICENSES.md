@@ -1,11 +1,13 @@
 # Licenses and Third-Party Notices
 
-No telemetry, analytics, ads, cloud services, or tracking are included. Stream Ferry-owned code is
-source available under PolyForm Noncommercial 1.0.0, while third-party components retain their own
-terms. All runtime dependencies are permissively licensed except the Jellyfin SDK (LGPL-3.0) and the
-closed-source Google Cast SDK (allowed exception). A machine-generated license report should be
-produced at the online build via `./gradlew :app:dependencies` plus a license plugin or the AndroidX
-OSS-licenses output; the table below is the curated summary.
+No developer analytics, first-party telemetry backend, ads, cloud service, or tracking are included
+in Stream Ferry-owned code. The Google Cast Sender SDK has its own anonymous SDK data collection.
+Stream Ferry-owned code is source available under PolyForm Noncommercial 1.0.0, while third-party
+components retain their own terms. All runtime dependencies are permissively licensed except the
+Jellyfin SDK (LGPL-3.0) and the closed-source Google Cast SDK (allowed exception). A
+machine-generated license report should be produced at the online build via
+`./gradlew :app:dependencies` plus a license plugin or the AndroidX OSS-licenses output; the table
+below is the curated summary.
 
 | Component | License | Notes |
 | --- | --- | --- |

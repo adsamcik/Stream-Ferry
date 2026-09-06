@@ -57,6 +57,17 @@ import java.net.SocketTimeoutException
 import java.util.Locale
 
 /**
+ * One explicitly configured local renderer. This is empty in production and lets opt-in debug/test
+ * environments exercise the normal description validation and SOAP control path without relying on
+ * multicast delivery through an emulator's virtual router.
+ */
+data class ConfiguredDlnaRenderer(
+    val descriptionUrl: String,
+    val identity: String,
+    val sourceAddress: String,
+)
+
+/**
  * DLNA / UPnP control point (Digital Media Controller) (§11). The Android app discovers MediaRenderers
  * via SSDP, controls them via AVTransport SOAP, and tells the TV to fetch media from the phone proxy
  * URL only (never a provider URL). All XML is parsed with [SecureXml] (XXE-hardened) off the main thread.
@@ -69,6 +80,8 @@ class DlnaTargetController(
     private val httpClient: OkHttpClient = OkHttpClient(),
     /** Fresh local-network permission check; no cached UI decision is trusted. */
     private val requireLocalNetworkAccess: () -> Unit = {},
+    /** Optional deterministic peers for debug/integration environments; release wiring leaves this empty. */
+    private val configuredRenderers: List<ConfiguredDlnaRenderer> = emptyList(),
 ) : PlaybackTargetController {
 
     override val protocol = Protocol.DLNA
@@ -121,7 +134,25 @@ class DlnaTargetController(
         requireLocalNetworkAccess()
         val lock = network.multicastLock("dlna-discovery")?.also { it.setReferenceCounted(false); it.acquire() }
         try {
-            ssdpSearch(timeoutMillis)
+            val configured = describeConfiguredRenderers(timeoutMillis)
+            val multicast = try {
+                ssdpSearch(timeoutMillis)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                if (configured.isEmpty()) throw error
+                logger.w(TAG, "SSDP discovery failed; keeping configured local renderer(s)", error)
+                emptyList()
+            }
+            val multicastEndpoints = rendererEndpoints
+            val configuredById = configured.associateBy { it.target.id }
+            rendererEndpoints = multicastEndpoints + configured.associate { it.target.id to it.renderer }
+            (configured.map { it.target } + multicast.filterNot { it.id in configuredById }).also { targets ->
+                if (configured.isNotEmpty()) {
+                    logger.event("discovery", "Configured DLNA fixtures: ${configured.size} renderer(s)")
+                }
+                logger.trace(TAG, "DLNA discovery combined ${targets.size} renderer(s)")
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -130,6 +161,25 @@ class DlnaTargetController(
             throw e
         } finally {
             runCatching { if (lock?.isHeld == true) lock.release() }
+        }
+    }
+
+    private fun describeConfiguredRenderers(timeoutMillis: Long): List<DescribedRenderer> = configuredRenderers.mapNotNull { fixture ->
+        val source = runCatching { InetAddress.getByName(fixture.sourceAddress) }.getOrNull()
+        if (source == null) {
+            logger.w(TAG, "Configured renderer has an invalid source address — skipped")
+            null
+        } else {
+            runCatching {
+                describe(
+                    location = fixture.descriptionUrl,
+                    usn = fixture.identity,
+                    sourceAddress = source,
+                    remainingMillis = timeoutMillis.coerceAtLeast(1),
+                )
+            }.onFailure { error ->
+                logger.w(TAG, "Configured renderer description failed (${error.javaClass.simpleName})", error)
+            }.getOrNull()
         }
     }
 
