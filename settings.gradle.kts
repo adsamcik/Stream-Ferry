@@ -1,3 +1,5 @@
+import java.util.Properties
+
 pluginManagement {
     repositories {
         // Supply-chain policy (§14): only Google + Maven Central. No JitPack/jcenter/mavenLocal.
@@ -30,6 +32,29 @@ val traceboxSource = providers.gradleProperty("traceboxSourceDir").orNull ?: "ve
 check(file("$traceboxSource/settings.gradle.kts").isFile) {
     "Tracebox sources are missing. Run git submodule update --init --recursive."
 }
+
+// Included builds do not inherit the root build's local.properties. Android Studio normally
+// configures only this root, leaving Tracebox without an SDK (and D8 sync transforms without
+// their boot classpath). Bootstrap the vendored build using only sdk.dir, never other local data.
+// An external Tracebox checkout owns its own SDK configuration.
+if (!providers.gradleProperty("traceboxSourceDir").isPresent) {
+    val rootLocalProperties = Properties().apply {
+        providers.fileContents(layout.settingsDirectory.file("local.properties")).asText.orNull
+            ?.reader()?.use { load(it) }
+    }
+    val traceboxLocalFile = file("$traceboxSource/local.properties")
+    val traceboxLocalProperties = Properties().apply {
+        if (traceboxLocalFile.isFile) traceboxLocalFile.inputStream().use { load(it) }
+    }
+    val sdkDir = rootLocalProperties.getProperty("sdk.dir")?.takeIf { it.isNotBlank() }
+    if (sdkDir != null && traceboxLocalProperties.getProperty("sdk.dir").isNullOrBlank()) {
+        traceboxLocalProperties.setProperty("sdk.dir", file(sdkDir).absolutePath)
+        traceboxLocalFile.outputStream().use {
+            traceboxLocalProperties.store(it, "Local SDK configuration for the included Tracebox build; do not commit.")
+        }
+    }
+}
+
 includeBuild(traceboxSource) {
     dependencySubstitution {
         listOf("tracebox", "tracebox-api", "tracebox-core", "tracebox-storage", "tracebox-directboot",

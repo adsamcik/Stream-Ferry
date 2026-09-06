@@ -14,6 +14,17 @@ build. It requires no GitHub Packages credentials or Maven Local artifacts. For 
 library work, pass `-PtraceboxSourceDir=/absolute/path/to/Tracebox/src`; normal builds and CI use the
 pin. Push the Tracebox commit before pushing a parent commit that references it.
 
+Android Studio writes the SDK path to the root `local.properties`. The settings script also seeds
+`vendor/tracebox/local.properties` with that `sdk.dir` when the vendored build has no SDK path of its
+own. Both files remain ignored by Git; no other root properties are copied. Existing Tracebox SDK
+paths are preserved, so update both files if you move the SDK. CI can continue using `ANDROID_HOME`.
+An external checkout selected with `-PtraceboxSourceDir=...` must provide its own `local.properties`
+or use `ANDROID_HOME`.
+
+If sync reports `D8BackportedMethodsGenerator` parameters with "no value available", run
+`./gradlew :app:assembleDebug --stacktrace` to expose the underlying error. A missing SDK in an
+included build can surface as this D8 error during Android Studio sync.
+
 ## Standard commands (run on a machine with Google Maven access)
 
 ```bash
