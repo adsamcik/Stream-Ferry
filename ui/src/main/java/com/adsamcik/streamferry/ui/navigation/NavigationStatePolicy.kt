@@ -22,6 +22,7 @@ object NavigationStatePolicy {
         Route.GALLERY,
         Route.DOWNLOADS,
         Route.HISTORY,
+        Route.QUEUES,
         Route.SETTINGS,
         Route.SERVERS,
         Route.DIAGNOSTICS,
@@ -56,7 +57,7 @@ object NavigationStatePolicy {
     fun sanitizeDownloadsOrigin(origin: Route, availability: Availability): Route = when (origin) {
         Route.MEDIA_DETAIL -> if (availability.hasSelectedItem) Route.MEDIA_DETAIL else Route.GALLERY
         Route.PLAYBACK -> if (availability.hasActivePlayback) Route.PLAYBACK else Route.GALLERY
-        Route.GALLERY, Route.HISTORY, Route.SETTINGS, Route.SERVERS, Route.DIAGNOSTICS, Route.ABOUT -> origin
+        Route.GALLERY, Route.HISTORY, Route.QUEUES, Route.SETTINGS, Route.SERVERS, Route.DIAGNOSTICS, Route.ABOUT -> origin
         Route.WELCOME, Route.SERVER_SETUP, Route.LOGIN, Route.TARGET_PICKER, Route.DOWNLOADS -> Route.GALLERY
     }
 
@@ -74,7 +75,7 @@ object NavigationStatePolicy {
     fun restoreDownloadsOrigin(value: String?): Route {
         val parsed = value?.let { encoded -> runCatching { Route.valueOf(encoded) }.getOrNull() }
         return when (parsed) {
-            Route.GALLERY, Route.HISTORY, Route.SETTINGS, Route.SERVERS, Route.DIAGNOSTICS, Route.ABOUT -> parsed
+            Route.GALLERY, Route.HISTORY, Route.QUEUES, Route.SETTINGS, Route.SERVERS, Route.DIAGNOSTICS, Route.ABOUT -> parsed
             else -> Route.GALLERY
         }
     }

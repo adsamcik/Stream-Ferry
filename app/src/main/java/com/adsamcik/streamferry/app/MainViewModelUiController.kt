@@ -63,6 +63,11 @@ class MainViewModelUiController(
     override fun prepareCastDownload(itemId: String) { viewModel.prepareCastDownload(itemId) }
     override fun clearDownloadSelection() { viewModel.clearDownloadSelection() }
     override fun enqueue(item: MediaItem) = viewModel.enqueue(item)
+    override fun saveQueue(name: String) = viewModel.saveQueue(name)
+    override fun loadQueue(id: String) = viewModel.loadQueue(id)
+    override fun deleteQueue(id: String) = viewModel.deleteQueue(id)
+    override fun newQueue() = viewModel.newQueue()
+    override fun resumeQueue() = viewModel.resumeQueue()
     override fun removePlaylistEntry(entryId: Long) = viewModel.removePlaylistEntry(entryId)
     override fun clearPlaylist() = viewModel.clearPlaylist()
     override fun skipToNextPlaylistItem() = viewModel.skipToNextPlaylistItem()

@@ -208,6 +208,9 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
     val localSourceStore: LocalSourceStore by lazy { LocalSourceStore(appContext) }
     val resumeStore: ResumeStore by lazy { ResumeStore(appContext) }
     val smartResumeStore: SmartResumeStore by lazy { SmartResumeStore(appContext) }
+    val savedQueueStore by lazy {
+        com.adsamcik.streamferry.data.queue.SavedQueueStore(java.io.File(appContext.noBackupFilesDir, "playback_queues_v1.json"))
+    }
     val jellyfinWatchMutationStore: JellyfinWatchMutationStore by lazy { JellyfinWatchMutationStore(appContext) }
     val smartResumeTracker: SmartResumeSessionTracker by lazy { SmartResumeSessionTracker(smartResumeStore) }
     private val rawJellyfinMediaSource: MediaSource by lazy { JellyfinMediaSource(mediaRepository) }
@@ -590,6 +593,7 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
         }.onFailure { logger.w("privacy", "Could not clear the persisted installation identifier") }
         runCatching { resumeStore.clear() }
         runCatching { smartResumeStore.clear() }
+        savedQueueStore.clear()
         runCatching { jellyfinWatchMutationStore.clear() }
         runCatching { crashReporter.clear() } // crash reports are app data too
         runCatching { diagnosticsEventLog.clear() } // persisted event log is app data too

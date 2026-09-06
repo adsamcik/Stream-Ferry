@@ -573,6 +573,13 @@ private fun LibraryHome(
             LibrarySectionTitle(if (isLocalSource) "On this device" else "Your libraries")
         }
 
+        item(key = "queues", span = { GridItemSpan(maxLineSpan) }) {
+            OutlinedButton(onClick = { viewModel.navigate(Route.QUEUES) }, modifier = Modifier.fillMaxWidth()) {
+                Icon(Icons.Rounded.VideoLibrary, contentDescription = null)
+                Text("  Queues · ${state.queues.working.size} items in current queue")
+            }
+        }
+
         when {
             needsRemoteLogin -> item(span = { GridItemSpan(maxLineSpan) }) {
                 RemoteLoginPrompt(viewModel)
@@ -906,13 +913,13 @@ private fun EmptyLibraryPrompt(state: AppUiState, viewModel: UiController, isLoc
 private fun MediaItem.localThumbnailUri(): String? =
     if (sourceId == MediaSourceIds.LOCAL && !isFolder) id else null
 
-/** A quick queue affordance appears only while a playback session is available to return to. */
+/** Build a queue while browsing, including cached titles to play when their source reconnects. */
 private fun playlistAddAction(
     state: AppUiState,
     viewModel: UiController,
     item: MediaItem,
 ): (() -> Unit)? = if (
-    state.playback != null && !item.isFolder && state.availabilityFor(item) != SourceItemAvailability.UNAVAILABLE
+    !item.isFolder && (item.sourceId != MediaSourceIds.REMOTE || state.canBrowseRemote)
 ) {
     { viewModel.enqueue(item) }
 } else {
@@ -2222,7 +2229,7 @@ private fun DetailPlaybackDock(
             }
             OutlinedButton(
                 onClick = onAddToPlaylist,
-                enabled = offlinePreferred || onlinePlayable,
+                enabled = true,
                 modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
                 shape = RoundedCornerShape(18.dp),
             ) {

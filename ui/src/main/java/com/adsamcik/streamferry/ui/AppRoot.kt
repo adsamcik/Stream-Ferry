@@ -121,6 +121,7 @@ private val selfScrollingRoutes = setOf(
     Route.PLAYBACK,
     Route.DOWNLOADS,
     Route.HISTORY,
+    Route.QUEUES,
     Route.DIAGNOSTICS,
     Route.SETTINGS,
 )
@@ -132,6 +133,7 @@ private val upNavigationRoutes = setOf(
     Route.PLAYBACK,
     Route.DOWNLOADS,
     Route.HISTORY,
+    Route.QUEUES,
     Route.DIAGNOSTICS,
     Route.ABOUT,
     Route.SERVERS,
@@ -369,6 +371,7 @@ private fun RouteContent(
         Route.MEDIA_DETAIL -> MediaDetailScreen(state, viewModel, onChooseTv = onScanDevices, compact = compact)
         Route.TARGET_PICKER -> TargetPickerScreen(state, viewModel, onRescan = onScanDevices)
         Route.PLAYBACK -> PlaybackScreen(state, viewModel)
+        Route.QUEUES -> com.adsamcik.streamferry.ui.screens.QueuesScreen(state, viewModel)
         Route.DOWNLOADS -> DownloadsScreen(state, viewModel, onCast = onScanDevices)
         Route.HISTORY -> PlaybackHistoryScreen(
             items = state.playbackHistory,
@@ -756,6 +759,7 @@ private fun backActionFor(state: AppUiState, viewModel: UiController): (() -> Un
     })
     Route.DIAGNOSTICS -> ({ viewModel.navigate(Route.SETTINGS) })
     Route.HISTORY -> ({ viewModel.navigate(Route.SETTINGS) })
+    Route.QUEUES -> ({ viewModel.navigate(Route.GALLERY) })
     Route.SETTINGS -> ({ viewModel.navigate(Route.GALLERY) })
     Route.ABOUT -> ({ viewModel.navigate(Route.SETTINGS) })
     Route.SERVERS -> ({ viewModel.navigate(Route.SETTINGS) })
@@ -770,7 +774,7 @@ private fun IconBack(onClick: () -> Unit) {
 
 private fun routeDepth(route: Route): Int = when (route) {
     Route.WELCOME, Route.GALLERY, Route.SETTINGS -> 0
-    Route.SERVER_SETUP, Route.MEDIA_DETAIL, Route.DOWNLOADS, Route.HISTORY, Route.DIAGNOSTICS, Route.SERVERS, Route.ABOUT -> 1
+    Route.SERVER_SETUP, Route.MEDIA_DETAIL, Route.DOWNLOADS, Route.HISTORY, Route.QUEUES, Route.DIAGNOSTICS, Route.SERVERS, Route.ABOUT -> 1
     Route.LOGIN, Route.TARGET_PICKER -> 2
     Route.PLAYBACK -> 3
 }
@@ -785,6 +789,7 @@ private fun titleFor(route: Route): String = when (route) {
     Route.PLAYBACK -> "Now Playing"
     Route.DOWNLOADS -> "Downloads"
     Route.HISTORY -> "Playback history"
+    Route.QUEUES -> "Queues"
     Route.DIAGNOSTICS -> "Troubleshooting"
     Route.SETTINGS -> "Settings"
     Route.ABOUT -> "About and licences"

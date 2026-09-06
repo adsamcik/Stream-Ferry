@@ -98,6 +98,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.sync.Mutex
@@ -127,6 +129,7 @@ class MainViewModel(
             activeSourceId = NavigationStatePolicy.restoreSource(savedStateHandle[STATE_SOURCE]),
             searchQuery = savedStateHandle[STATE_SEARCH_QUERY] ?: "",
             themeMode = container.appearancePreferences.themeMode,
+            queues = container.savedQueueStore.read(),
             backgroundPlaybackUnrestricted = container.permissions.isBatteryOptimizationExempt(),
         ),
     )
@@ -204,7 +207,13 @@ class MainViewModel(
     // status->null "ended" branch so the mini-player and playback screen do not flicker away mid-handoff.
     @Volatile private var autoAdvancing = false
     /** Monotonic session-local id: duplicate media entries remain independently removable/repeatable. */
-    private var playlistEntrySequence = 0L
+    private var playlistEntrySequence = _state.value.queues.maxEntryId
+    private val queuePersistenceMutex = Mutex()
+    private var pendingQueueEntry: PlaylistEntry? = null
+    private var attemptQueueEntry: PlaylistEntry? = null
+    private var playingQueueEntryId: Long? = null
+    private var lastQueuePlaybackRevision = 0L
+    private var queueSelectionGeneration = 0L
     /** Rejects late completions/timeouts after a newer control intent supersedes an older one. */
     private var playbackControlCommandSequence = 0L
     private var lastPlaybackPositionSeconds: Long = 0L
@@ -251,6 +260,22 @@ class MainViewModel(
 
     init {
         viewModelScope.launch {
+            state.map { it.queues }.distinctUntilChanged().drop(1).collect { queues ->
+                queuePersistenceMutex.withLock {
+                    if (!deletingAllData && queues == _state.value.queues) {
+                        try {
+                            withContext(Dispatchers.IO) { container.savedQueueStore.write(queues) }
+                        } catch (c: CancellationException) {
+                            throw c
+                        } catch (error: Exception) {
+                            container.logger.w("playlist", "Could not save queues", error)
+                            _state.update { it.copy(errorMessage = "Couldn't save your queues. Free some device storage and try again.") }
+                        }
+                    }
+                }
+            }
+        }
+        viewModelScope.launch {
             state.collect { current ->
                 savedStateHandle[STATE_ROUTE] = NavigationStatePolicy.persistRoute(current.route)
                 savedStateHandle[STATE_DOWNLOADS_ORIGIN] = current.downloadsBackRoute.name
@@ -272,6 +297,7 @@ class MainViewModel(
                 if (playbackStopping) return@collect
                 if (status != null) {
                     lastPlaybackPositionSeconds = status.positionSeconds
+                    checkpointQueue(status)
                     // The engine may have probed a missing SAF/MediaStore duration. Retain that authoritative
                     // timeline so near-end local checkpoints are removed instead of resurfacing as resume.
                     if (currentResumeKey != null && status.durationSeconds?.let { it > 0L } == true) {
@@ -763,6 +789,10 @@ class MainViewModel(
 
     fun logout() {
         cancelQuickConnect()
+        container.playbackEngine.status.value?.let { checkpointQueue(it, force = true) }
+        playingQueueEntryId = null
+        pendingQueueEntry = null
+        queueSelectionGeneration++
         viewModelScope.launch {
             try {
                 stopOnlinePlaybackForJellyfinSessionTransition("signing out")
@@ -772,7 +802,7 @@ class MainViewModel(
                 pauseDownloadsForAuthTransition()
                 container.authRepository.logout()
                 container.jellyfinConnectionMonitor.reset()
-                _state.value = AppUiState()
+                _state.value = AppUiState(queues = _state.value.queues)
             } catch (c: CancellationException) {
                 throw c
             } catch (e: SecureStorageException) {
@@ -793,6 +823,11 @@ class MainViewModel(
         cancelWatchStateMutationsForSessionTransition()
         val hadOnlinePlayback = onlinePlaybackOwner != null || reconnectContext is ReconnectContext.Online
         if (!hadOnlinePlayback) return
+
+        container.playbackEngine.status.value?.let { checkpointQueue(it, force = true) }
+        playingQueueEntryId = null
+        pendingQueueEntry = null
+        queueSelectionGeneration++
 
         onlinePlaybackOwner = null
         cancelReconnect()
@@ -1002,6 +1037,9 @@ class MainViewModel(
     }
 
     fun onItemClicked(item: MediaItem) {
+        pendingQueueEntry = null
+        smartResumeOverrideSeconds = null
+        queueSelectionGeneration++
         if (_state.value.searchQuery.isNotBlank()) clearSearch()
         if (item.isFolder) openFolder(item) else openDetail(item)
     }
@@ -1375,17 +1413,34 @@ class MainViewModel(
         container.logger.event("discovery", "A saved TV endpoint association was unlinked")
     }
 
-    fun play() = startPlayback(
-        requestedItem = _state.value.selectedItem,
-        downloadId = _state.value.selectedDownloadId,
-    )
+    fun play(): Job {
+        val entry = pendingQueueEntry?.takeIf { it.item.ref == _state.value.selectedItem?.ref }
+        if (entry != null && !entry.canPlayWith(activeJellyfinSession())) {
+            _state.update { it.copy(playbackStartingTargetId = null, errorMessage = "Sign in to the Jellyfin account that owns this queued video.") }
+            return viewModelScope.launch { }
+        }
+        return startPlayback(
+            requestedItem = _state.value.selectedItem,
+            downloadId = _state.value.selectedDownloadId,
+            queueEntry = entry,
+            onResult = { started ->
+                if (started && entry != null) {
+                    queueEntryStarted(entry)
+                    pendingQueueEntry = null
+                }
+            },
+        )
+    }
 
     /** Starts a gallery selection or queue entry without changing the item currently open for browsing. */
     private fun startPlayback(
         requestedItem: MediaItem?,
         downloadId: String?,
+        queueEntry: PlaylistEntry? = null,
         onResult: (Boolean) -> Unit = {},
     ): Job = viewModelScope.launch {
+        playingQueueEntryId = null
+        attemptQueueEntry = queueEntry
         if (!container.permissions.hasLocalNetworkAccess()) {
             onLocalNetworkPermissionDenied()
             _state.update { it.copy(playbackStartingTargetId = null) }
@@ -1461,6 +1516,9 @@ class MainViewModel(
         var started = false
         var onlineOwnerForAttempt: UserSession? = null
         runCatching {
+            check(queueEntry == null || queueEntry.canPlayWith(activeJellyfinSession())) {
+                "Sign in to the Jellyfin account that owns this queued video."
+            }
             if (downloadId != null) {
                 val owner = activeDownloadOwner() ?: error("The Jellyfin account for this download is unavailable.")
                 check(!hasPendingJellyfinWatchStateMutation(owner.serverId, owner.userId, downloadId)) {
@@ -1543,7 +1601,7 @@ class MainViewModel(
                     }
                     onlineOwnerForAttempt = owner
                     onlinePlaybackOwner = owner
-                    val autoAdvance = shouldAutoAdvance(item, s.playlist)
+                    val autoAdvance = shouldAutoAdvance(item, s.playlist, queuePlayback = queueEntry != null)
                     val resumeAt = PlaybackPositionPolicy.clamp(
                         requestedSmartResumePosition
                             ?: durableOnlineResumePosition(item, owner)
@@ -1689,9 +1747,8 @@ class MainViewModel(
         // singleton and may already be rebound by the time an old renderer emits its final event.
         val completedItem = completion.item?.takeIf { completion.isSourceSession } ?: snapshot.nowPlayingItem
         val completionOwner = onlinePlaybackOwner
-        if (completion.isSourceSession &&
-            (!container.playbackEngine.isCurrentPlaybackGeneration(completion.generation) ||
-                !isActiveOnlinePlaybackOwner(completionOwner))
+        if (!container.playbackEngine.isCurrentPlaybackGeneration(completion.generation) ||
+            (completion.isSourceSession && !isActiveOnlinePlaybackOwner(completionOwner))
         ) {
             container.logger.event("playback", "Ignoring a stale completed Jellyfin item")
             return
@@ -1710,6 +1767,12 @@ class MainViewModel(
             container.logger.event("playlist", "Ignoring duplicate end-of-media signal during a hand-off")
             return
         }
+        val completedQueueEntry = playingQueueEntryId
+        completedQueueEntry?.let { id ->
+            _state.update { it.copy(queues = it.queues.updateWorking(it.queues.working.finished(id))) }
+            playingQueueEntryId = null
+            attemptQueueEntry = null
+        }
         snapshot.playlist.next?.let { next ->
             autoAdvancing = true
             viewModelScope.launch {
@@ -1719,6 +1782,12 @@ class MainViewModel(
                     autoAdvancing = false
                 }
             }
+            return
+        }
+
+        // Finishing an explicit queue must not start an unqueued episode from the series.
+        if (completedQueueEntry != null) {
+            viewModelScope.launch { runCatching { container.playbackEngine.stop() } }
             return
         }
 
@@ -1804,6 +1873,11 @@ class MainViewModel(
     ) {
         val snapshot = _state.value
         if (snapshot.playlist.next?.entryId != entry.entryId) return
+        if (!entry.canPlayWith(activeJellyfinSession())) {
+            _state.update { it.copy(errorMessage = "Sign in to the Jellyfin account that owns ${entry.item.title} to play this queue.") }
+            if (currentEnded) runCatching { container.playbackEngine.stop() }
+            return
+        }
         val item = entry.item
         val availability = snapshot.availabilityFor(item)
         val pendingWatchState = isPlaybackBlockedByPendingJellyfinWatchState(item, activeJellyfinSession())
@@ -1834,6 +1908,9 @@ class MainViewModel(
             return
         }
 
+        container.playbackEngine.status.value?.let { checkpointQueue(it, force = true) }
+        playingQueueEntryId = null
+        attemptQueueEntry = entry
         val shouldUseOfflineCopy = availability == SourceItemAvailability.DOWNLOADED &&
             snapshot.sourceAvailability == com.adsamcik.streamferry.domain.SourceAvailability.UNAVAILABLE
         val remaining = snapshot.playlist.remove(entry.entryId)
@@ -1855,7 +1932,7 @@ class MainViewModel(
                     item,
                     streamPreferences(item),
                     onlineSmartResumeSeed(item, owner),
-                    autoAdvance = shouldAutoAdvance(item, remaining),
+                    autoAdvance = shouldAutoAdvance(item, remaining, queuePlayback = true),
                 )
             }.onFailure { error ->
                 if (isSessionExpired(error)) handleSessionExpired()
@@ -1865,12 +1942,13 @@ class MainViewModel(
                 _state.update { current ->
                     if (current.playlist.next?.entryId != entry.entryId) current else current.copy(
                         nowPlayingItem = item,
-                        playlist = current.playlist.remove(entry.entryId),
+                        queues = current.queues.updateWorking(current.queues.working.started(entry)),
                         selectedDownloadId = null,
                         errorMessage = null,
                     )
                 }
                 refreshAutoAdvancePolicy()
+                queueEntryStarted(entry)
                 container.logger.event("playlist", "$trigger seamlessly: ${item.title}")
                 return
             }
@@ -1887,16 +1965,18 @@ class MainViewModel(
         startPlayback(
             requestedItem = item,
             downloadId = if (shouldUseOfflineCopy) item.id else null,
+            queueEntry = entry,
             onResult = { started ->
                 if (started) {
                     _state.update { current ->
                         if (current.playlist.entries.none { it.entryId == entry.entryId }) current else current.copy(
-                            playlist = current.playlist.remove(entry.entryId),
+                            queues = current.queues.updateWorking(current.queues.working.started(entry)),
                             nowPlayingItem = item,
                             errorMessage = null,
                         )
                     }
                     refreshAutoAdvancePolicy()
+                    queueEntryStarted(entry)
                     container.logger.event("playlist", "$trigger: ${item.title}")
                 }
             },
@@ -1911,6 +1991,7 @@ class MainViewModel(
     )
 
     private fun resumePlaybackRecord(record: SmartResumeRecord?) = viewModelScope.launch {
+        pendingQueueEntry = null
         record ?: return@launch
         if (isSmartResumeBlockedByWatchMutation(record)) {
             _state.update { it.copy(errorMessage = "This item's watch-state change is waiting to sync. Reconnect to Jellyfin before resuming it.") }
@@ -2085,12 +2166,20 @@ class MainViewModel(
     }
 
     /** Begin casting a downloaded copy offline: remember it, then trigger device scan + picker. */
-    fun prepareCastDownload(itemId: String) = _state.update {
-        it.copy(selectedDownloadId = itemId)
+    fun prepareCastDownload(itemId: String) {
+        pendingQueueEntry = null
+        smartResumeOverrideSeconds = null
+        queueSelectionGeneration++
+        _state.update { it.copy(selectedDownloadId = itemId) }
     }
 
     /** Clear any pending offline-cast selection (used when starting a normal online cast). */
-    fun clearDownloadSelection() = _state.update { it.copy(selectedDownloadId = null) }
+    fun clearDownloadSelection() {
+        pendingQueueEntry = null
+        smartResumeOverrideSeconds = null
+        queueSelectionGeneration++
+        _state.update { it.copy(selectedDownloadId = null) }
+    }
 
     /** Queue a playable item without changing the gallery/detail selection or interrupting current playback. */
     fun enqueue(item: MediaItem) {
@@ -2098,17 +2187,21 @@ class MainViewModel(
         val snapshot = _state.value
         val reason = when {
             queuedItem.isFolder -> "Open this title and choose a specific episode or movie to add."
-            snapshot.availabilityFor(queuedItem) == SourceItemAvailability.UNAVAILABLE ->
-                "${queuedItem.title} is unavailable while Jellyfin is offline."
+            queuedItem.sourceId == MediaSourceIds.REMOTE && activeJellyfinSession() == null ->
+                "Sign in to Jellyfin before adding this video."
             else -> null
         }
         if (reason != null) {
             _state.update { it.copy(errorMessage = reason) }
             return
         }
+        includeCurrentPlaybackInQueue()
         val entryId = ++playlistEntrySequence
         _state.update { current ->
-            current.copy(playlist = current.playlist.enqueue(entryId, queuedItem), errorMessage = null)
+            current.copy(queues = current.queues.updateWorking(current.queues.working.copy(
+                upNext = current.playlist.enqueue(entryId, queuedItem,
+                    activeJellyfinSession().takeIf { queuedItem.sourceId == MediaSourceIds.REMOTE }),
+            )), errorMessage = null)
         }
         refreshAutoAdvancePolicy()
     }
@@ -2117,13 +2210,125 @@ class MainViewModel(
         _state.value.selectedItem?.let(::enqueue)
     }
 
+    fun saveQueue(name: String) {
+        includeCurrentPlaybackInQueue()
+        runCatching {
+            _state.update { it.copy(queues = it.queues.save(java.util.UUID.randomUUID().toString(), name)) }
+        }.onFailure { error -> _state.update { it.copy(errorMessage = error.message) } }
+    }
+
+    fun loadQueue(id: String) {
+        if (!canReplaceQueue()) return
+        pendingQueueEntry = null
+        smartResumeOverrideSeconds = null
+        queueSelectionGeneration++
+        _state.update { it.copy(queues = it.queues.load(id), errorMessage = null) }
+    }
+
+    fun newQueue() {
+        if (!canReplaceQueue()) return
+        pendingQueueEntry = null
+        smartResumeOverrideSeconds = null
+        queueSelectionGeneration++
+        _state.update { it.copy(queues = it.queues.newQueue()) }
+    }
+
+    fun deleteQueue(id: String) {
+        _state.update { it.copy(queues = it.queues.delete(id)) }
+    }
+
+    private fun canReplaceQueue(): Boolean {
+        if (_state.value.playback == null && _state.value.playbackStartingTargetId == null &&
+            !playbackStarting && !autoAdvancing && !playbackStopping) return true
+        _state.update { it.copy(errorMessage = "Stop playback before switching queues. Your progress will be kept.") }
+        return false
+    }
+
+    /** Resolve media afresh; persisted metadata never grants access to another account or a deleted file. */
+    fun resumeQueue() {
+        if (!canReplaceQueue()) return
+        val entry = _state.value.queues.working.resumeEntry ?: return
+        if (_state.value.isBusy) return
+        val selectionGeneration = ++queueSelectionGeneration
+        _state.update { it.copy(isBusy = true, errorMessage = null) }
+        viewModelScope.launch {
+            try {
+                check(entry.canPlayWith(activeJellyfinSession())) {
+                    "Sign in to the Jellyfin account that owns ${entry.item.title} to resume this queue."
+                }
+                val source = if (entry.item.sourceId == MediaSourceIds.LOCAL) container.localMediaSource else container.jellyfinMediaSource
+                val item = source.item(entry.item.id).getOrThrow()
+                if (queueSelectionGeneration != selectionGeneration ||
+                    _state.value.queues.working.resumeEntry?.entryId != entry.entryId ||
+                    !entry.canPlayWith(activeJellyfinSession())) return@launch
+                val restored = entry.copy(item = item.copy(
+                    resumePositionSeconds = entry.item.resumePositionSeconds ?: item.resumePositionSeconds,
+                ))
+                pendingQueueEntry = restored
+                smartResumeOverrideSeconds = restored.item.resumePositionSeconds
+                val offlineCopy = if (item.sourceId == MediaSourceIds.REMOTE &&
+                    _state.value.availabilityFor(item) == SourceItemAvailability.DOWNLOADED &&
+                    _state.value.sourceAvailability == SourceAvailability.UNAVAILABLE) item.id else null
+                _state.update { it.copy(selectedItem = restored.item, selectedDownloadId = offlineCopy, isBusy = false) }
+                scanTargets()
+            } catch (c: CancellationException) {
+                throw c
+            } catch (error: Exception) {
+                if (queueSelectionGeneration == selectionGeneration) _state.update {
+                    it.copy(errorMessage = LogRedactor.redact(error.message ?: "This queued video is unavailable. Try again or remove it from the queue.").take(180))
+                }
+            } finally {
+                _state.update { it.copy(isBusy = false) }
+            }
+        }
+    }
+
+    private fun queueEntryStarted(entry: PlaylistEntry) {
+        val working = _state.value.queues.working
+        if (working.current?.entryId != entry.entryId && working.upNext.entries.none { it.entryId == entry.entryId }) return
+        playingQueueEntryId = entry.entryId
+        attemptQueueEntry = entry
+        lastQueuePlaybackRevision = container.playbackEngine.status.value?.rendererPlaybackRevision ?: 0L
+        _state.update { it.copy(queues = it.queues.updateWorking(it.queues.working.started(entry))) }
+        refreshAutoAdvancePolicy()
+    }
+
+    /** The original Now Playing playlist flow includes the video already on the TV when saved. */
+    private fun includeCurrentPlaybackInQueue() {
+        val snapshot = _state.value
+        val playback = snapshot.playback ?: return
+        if (snapshot.queues.working.current != null || playbackStarting || autoAdvancing) return
+        val item = snapshot.nowPlayingItem ?: return
+        val owner = if (item.sourceId == MediaSourceIds.REMOTE) activeJellyfinSession() ?: return else null
+        val entry = PlaylistEntry(++playlistEntrySequence,
+            item.copy(resumePositionSeconds = playback.positionSeconds), owner)
+        playingQueueEntryId = entry.entryId
+        lastQueuePlaybackRevision = playback.rendererPlaybackRevision
+        _state.update { it.copy(queues = it.queues.updateWorking(it.queues.working.copy(current = entry))) }
+    }
+
+    private fun checkpointQueue(status: PlaybackStatus, force: Boolean = false) {
+        val id = playingQueueEntryId ?: return
+        if (!force && status.rendererPlaybackRevision <= lastQueuePlaybackRevision) return
+        lastQueuePlaybackRevision = status.rendererPlaybackRevision
+        val previous = _state.value.queues.working.current?.item?.resumePositionSeconds ?: 0L
+        val position = if (force) _state.value.playback?.positionSeconds ?: return else status.positionSeconds
+        if (!force && status.isPlaying && kotlin.math.abs(position - previous) < 5) return
+        _state.update { it.copy(queues = it.queues.updateWorking(it.queues.working.checkpoint(id, position))) }
+    }
+
     fun removePlaylistEntry(entryId: Long) {
-        _state.update { current -> current.copy(playlist = current.playlist.remove(entryId)) }
+        _state.update { current -> current.copy(queues = current.queues.updateWorking(current.queues.working.copy(
+            upNext = current.playlist.remove(entryId),
+            current = current.queues.working.current?.takeUnless { it.entryId == entryId && current.playback == null },
+        ))) }
         refreshAutoAdvancePolicy()
     }
 
     fun clearPlaylist() {
-        _state.update { current -> current.copy(playlist = current.playlist.clear()) }
+        _state.update { current -> current.copy(queues = current.queues.updateWorking(current.queues.working.copy(
+            upNext = current.playlist.clear(),
+        ))) }
         refreshAutoAdvancePolicy()
     }
 
@@ -2754,9 +2959,11 @@ class MainViewModel(
             items = update(st.items),
             searchResults = update(st.searchResults),
             libraries = update(st.libraries),
-            playlist = st.playlist.copy(
-                entries = st.playlist.entries.map { entry -> entry.copy(item = update(entry.item)) },
-            ),
+            queues = st.queues.updateWorking(st.queues.working.copy(upNext = st.playlist.copy(
+                entries = st.playlist.entries.map { entry ->
+                    if (entry.canPlayWith(activeJellyfinSession())) entry.copy(item = update(entry.item)) else entry
+                },
+            ))),
             continueWatching = if (shouldRemainInContinueWatching) {
                 update(st.continueWatching)
             } else {
@@ -2831,9 +3038,11 @@ class MainViewModel(
             items = update(st.items),
             searchResults = update(st.searchResults),
             libraries = update(st.libraries),
-            playlist = st.playlist.copy(
-                entries = st.playlist.entries.map { entry -> entry.copy(item = update(entry.item)) },
-            ),
+            queues = st.queues.updateWorking(st.queues.working.copy(upNext = st.playlist.copy(
+                entries = st.playlist.entries.map { entry ->
+                    if (entry.canPlayWith(activeJellyfinSession())) entry.copy(item = update(entry.item)) else entry
+                },
+            ))),
             continueWatching = if (clearsResume) {
                 st.continueWatching.filterNot { it.id == itemId }
             } else {
@@ -2965,6 +3174,9 @@ class MainViewModel(
     /** Explicit retry starts a fresh bounded recovery budget but keeps the same physical TV and checkpoint. */
     fun retryPlayback() {
         val ctx = reconnectContext ?: return
+        val queueEntry = attemptQueueEntry?.let { attempted ->
+            _state.value.queues.working.current?.takeIf { it.entryId == attempted.entryId } ?: attempted
+        }
         cancelReconnect()
         viewModelScope.launch {
             playbackStarting = true
@@ -2981,7 +3193,11 @@ class MainViewModel(
                 )
             }
             try {
+                check(queueEntry == null || queueEntry.canPlayWith(activeJellyfinSession())) {
+                    "Sign in to the Jellyfin account that owns this queued video."
+                }
                 playContext(ctx, ctx.endpoint, lastPlaybackPositionSeconds)
+                queueEntry?.let(::queueEntryStarted)
             } catch (c: CancellationException) {
                 throw c
             } catch (error: Exception) {
@@ -3006,6 +3222,11 @@ class MainViewModel(
     /** User-requested device change leaves recovery intentionally and returns to one physical-TV picker. */
     fun changeTv() = viewModelScope.launch {
         val ctx = reconnectContext
+        container.playbackEngine.status.value?.let { checkpointQueue(it, force = true) }
+        pendingQueueEntry = attemptQueueEntry?.let { attempted ->
+            _state.value.queues.working.current?.takeIf { it.entryId == attempted.entryId } ?: attempted
+        }
+        playingQueueEntryId = null
         val replayItem = (ctx as? ReconnectContext.Online)?.item ?: _state.value.nowPlayingItem
         cancelReconnect()
         smartResumeOverrideSeconds = lastPlaybackPositionSeconds
@@ -3182,6 +3403,10 @@ class MainViewModel(
 
     fun stopPlayback() {
         if (playbackStopping) return
+        container.playbackEngine.status.value?.let { checkpointQueue(it, force = true) }
+        playingQueueEntryId = null
+        attemptQueueEntry = null
+        pendingQueueEntry = null
         playbackStopping = true
         viewModelScope.launch {
             cancelReconnect()
@@ -3617,10 +3842,13 @@ class MainViewModel(
     fun setPreferredAudioLanguage(code: String) { container.playbackPreferences.preferredAudioLanguage = code }
 
     /** Keep an online renderer alive at end-of-media only when a real next item can reuse it. */
-    private fun shouldAutoAdvance(item: MediaItem?, playlist: PlaybackQueue): Boolean =
+    private fun shouldAutoAdvance(
+        item: MediaItem?, playlist: PlaybackQueue,
+        queuePlayback: Boolean = playingQueueEntryId != null || attemptQueueEntry != null,
+    ): Boolean =
         item?.sourceId == MediaSourceIds.REMOTE && (
             playlist.isNotEmpty ||
-                (container.playbackPreferences.autoPlayNextEpisode &&
+                (!queuePlayback && container.playbackPreferences.autoPlayNextEpisode &&
                     item.type.equals("Episode", ignoreCase = true) && item.seriesId != null)
             )
 
@@ -3860,7 +4088,13 @@ class MainViewModel(
                 // The journal/materialization code owns app-private cache and download metadata. Join it before
                 // deleting data so a late IO completion cannot recreate a supposedly erased watch-state intent.
                 cancelWatchStateMutationsForSessionTransition()
-                watchStateMaterializationMutex.withLock { container.deleteAllData() }
+                queuePersistenceMutex.withLock {
+                    watchStateMaterializationMutex.withLock { container.deleteAllData() }
+                }
+                pendingQueueEntry = null
+                playingQueueEntryId = null
+                attemptQueueEntry = null
+                queueSelectionGeneration++
                 _state.value = AppUiState() // reset to a clean welcome state
             } catch (c: CancellationException) {
                 throw c
