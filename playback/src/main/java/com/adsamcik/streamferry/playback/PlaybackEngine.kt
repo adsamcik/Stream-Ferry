@@ -148,6 +148,8 @@ data class PlaybackCompletion(
     val isSourceSession: Boolean,
     /** Exact renderer session; lets consumers reject a buffered event after a newer play begins. */
     val generation: Long,
+    /** Account and item captured when local playback began; never inferred from the current UI. */
+    val localSeed: SmartResumeSeed? = null,
 )
 
 /** Parameters of a LOCAL (offline / downloaded) playback, kept so the on-device stream can be reloaded. */
@@ -157,6 +159,7 @@ private data class LocalPlaybackParams(
     val title: String,
     val runtimeSeconds: Long?,
     val allowClientTranscode: Boolean,
+    val seed: SmartResumeSeed?,
 )
 
 /**
@@ -844,7 +847,7 @@ class PlaybackEngine(
         pendingRecoveryKind = recoveryContinuation?.reservedKind
         this@PlaybackEngine.target = target
         this@PlaybackEngine.selectedTarget = selectedTarget
-        localPlayback = LocalPlaybackParams(filePath, contentType, title, runtimeSeconds, allowClientTranscode)
+        localPlayback = LocalPlaybackParams(filePath, contentType, title, runtimeSeconds, allowClientTranscode, smartResumeSeed)
         forcedLocalCodec = null // a fresh file starts on automatic codec negotiation
         localCodecFallbacksTried.clear()
         var endpointConnected = false
@@ -2414,6 +2417,7 @@ class PlaybackEngine(
                             item = item,
                             isSourceSession = currentProviderSession != null,
                             generation = completedPlayGeneration,
+                            localSeed = localPlayback?.seed,
                         ),
                     )
                     val gen = completedPlayGeneration

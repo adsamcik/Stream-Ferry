@@ -4,6 +4,8 @@ import android.app.Application
 import androidx.lifecycle.viewModelScope
 import com.adsamcik.streamferry.app.AppContainer
 import com.adsamcik.streamferry.app.MainViewModel
+import com.adsamcik.streamferry.core.resume.SmartResumeSeed
+import com.adsamcik.streamferry.core.resume.SmartResumeSourceType
 import com.adsamcik.streamferry.core.stream.MediaProfile
 import com.adsamcik.streamferry.data.cache.CachingMediaLibraryRepository
 import com.adsamcik.streamferry.data.cache.JellyfinConnectionMonitor
@@ -233,12 +235,51 @@ class LiveWatchStateValidationTest {
     fun downloadedCompletionQueuesRemoteWatchedState() = runBlocking {
         withContext(main) {
             uiState().value = vm.state.value.copy(nowPlayingItem = item)
-            completions.emit(PlaybackCompletion(null, false, 7))
+            completions.emit(downloadedCompletion())
         }
-        withContext(main) { yield() }
-        assertTrue(client.itemDetails(item.id).played || journal.pendingFor(session.serverId, session.userId, item.id) != null,
-            "Finishing an account-owned download must sync or queue watched state")
+        eventually { client.itemDetails(item.id).played || journal.pendingFor(session.serverId, session.userId, item.id) != null }
+        awaitSynced(true)
+        assertTrue(client.itemDetails(item.id).played)
     }
+
+    @Test
+    fun offlineDownloadedCompletionSurvivesRestartAndReplaysForOwner() = runBlocking {
+        withContext(main) { users.value = null; yield(); completions.emit(downloadedCompletion()) }
+        eventually { journal.pendingFor(session.serverId, session.userId, item.id) != null &&
+            downloads.get(owner, item.id)?.mediaItem?.played == true }
+        assertFalse(client.itemDetails(item.id).played)
+        assertNotNull(JellyfinWatchMutationStore(RuntimeEnvironment.getApplication())
+            .pendingFor(session.serverId, session.userId, item.id))
+        withContext(main) { users.value = session }
+        eventually { client.itemDetails(item.id).played && journal.pendingFor(session.serverId, session.userId).isEmpty() }
+    }
+
+    @Test
+    fun downloadedCompletionAfterAccountSwitchWaitsForOriginalOwner() = runBlocking {
+        withContext(main) { users.value = UserSession("another-account", session.serverId); yield() }
+        withContext(main) { completions.emit(downloadedCompletion()) }
+        eventually { journal.pendingFor(session.serverId, session.userId, item.id) != null }
+        assertFalse(client.itemDetails(item.id).played)
+        assertTrue(journal.pendingFor(session.serverId, "another-account").isEmpty())
+        withContext(main) { users.value = session }
+        eventually { client.itemDetails(item.id).played && journal.pendingFor(session.serverId, session.userId).isEmpty() }
+    }
+
+    @Test
+    fun staleOrOwnerlessLocalCompletionDoesNotQueueRemoteState() = runBlocking {
+        withContext(main) {
+            completions.emit(downloadedCompletion().copy(generation = 6))
+            completions.emit(PlaybackCompletion(null, false, 7))
+            yield()
+        }
+        assertTrue(journal.pendingFor(session.serverId, session.userId).isEmpty())
+        assertFalse(client.itemDetails(item.id).played)
+    }
+
+    private fun downloadedCompletion() = PlaybackCompletion(null, false, 7, SmartResumeSeed(
+        SmartResumeSourceType.DOWNLOADED, item.id, item.title, durationSeconds = 1200,
+        serverId = session.serverId, userId = session.userId,
+    ))
 
     @Test
     fun failedRemoteWritePersistsAndReplaysOnRefresh() = runBlocking {

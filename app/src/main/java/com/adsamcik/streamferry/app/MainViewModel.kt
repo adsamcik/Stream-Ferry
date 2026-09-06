@@ -1689,9 +1689,8 @@ class MainViewModel(
         // singleton and may already be rebound by the time an old renderer emits its final event.
         val completedItem = completion.item?.takeIf { completion.isSourceSession } ?: snapshot.nowPlayingItem
         val completionOwner = onlinePlaybackOwner
-        if (completion.isSourceSession &&
-            (!container.playbackEngine.isCurrentPlaybackGeneration(completion.generation) ||
-                !isActiveOnlinePlaybackOwner(completionOwner))
+        if (!container.playbackEngine.isCurrentPlaybackGeneration(completion.generation) ||
+            (completion.isSourceSession && !isActiveOnlinePlaybackOwner(completionOwner))
         ) {
             container.logger.event("playback", "Ignoring a stale completed Jellyfin item")
             return
@@ -1704,7 +1703,25 @@ class MainViewModel(
                 rejectIfPlaying = false,
             )
         }
-        if (!completion.isSourceSession) clearCompletedLocalResume()
+        if (!completion.isSourceSession) {
+            completion.localSeed?.takeIf {
+                it.sourceType == SmartResumeSourceType.DOWNLOADED && it.isStructurallyValid()
+            }?.let { seed ->
+                mutateJellyfinWatchState(
+                    item = MediaItem(
+                        id = seed.mediaId, title = seed.displayTitle, year = null,
+                        runtimeSeconds = seed.durationSeconds, overview = null,
+                        resumePositionSeconds = null, isFolder = false, type = "Video",
+                        sourceId = MediaSourceIds.REMOTE,
+                    ),
+                    origin = "downloaded playback completion",
+                    mutationKind = JellyfinWatchMutationKind.MARK_PLAYED,
+                    rejectIfPlaying = false,
+                    ownerSession = UserSession(userId = seed.userId!!, serverId = seed.serverId!!),
+                )
+            }
+            clearCompletedLocalResume()
+        }
 
         if (autoAdvancing) {
             container.logger.event("playlist", "Ignoring duplicate end-of-media signal during a hand-off")
@@ -2021,7 +2038,7 @@ class MainViewModel(
         )
 
     private fun downloadedSmartResumeSeed(entry: DownloadEntry): SmartResumeSeed? =
-        (entry.owner ?: activeDownloadOwner())?.let { owner ->
+        entry.owner?.let { owner ->
             SmartResumeSeed(
                 SmartResumeSourceType.DOWNLOADED,
                 entry.itemId,
@@ -2470,6 +2487,7 @@ class MainViewModel(
         origin: String,
         mutationKind: JellyfinWatchMutationKind,
         rejectIfPlaying: Boolean = true,
+        ownerSession: UserSession? = container.authRepository.currentUser.value,
     ) {
         if (item.sourceId != MediaSourceIds.REMOTE || (rejectIfPlaying && item.isFolder)) return
         if (rejectIfPlaying && isPlaybackActiveFor(item.id)) {
@@ -2478,7 +2496,7 @@ class MainViewModel(
             }
             return
         }
-        val session = container.authRepository.currentUser.value ?: return
+        val session = ownerSession ?: return
         val mutation = JellyfinWatchMutation(
             operationId = UUID.randomUUID().toString(),
             serverId = session.serverId,
