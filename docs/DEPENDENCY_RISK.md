@@ -2,7 +2,8 @@
 
 Principles (§14): only low-risk, actively maintained, trusted dependencies; prefer official
 Google/AndroidX/Jellyfin libraries and platform APIs; every dependency justified. Repositories are
-restricted to `google()` and `mavenCentral()` with `RepositoriesMode.FAIL_ON_PROJECT_REPOS`. No
+restricted to `google()`, `mavenCentral()`, and Tracebox's official GitHub Packages endpoint
+(exclusively for `io.github.tracebox`) with `RepositoriesMode.FAIL_ON_PROJECT_REPOS`. No
 JitPack, jcenter, mavenLocal, dynamic versions (`+`, `latest.release`, ranges) or SNAPSHOTs. Gradle
 dependency verification metadata and Gradle Wrapper validation are required.
 
@@ -15,7 +16,7 @@ dependency verification metadata and Gradle Wrapper validation are required.
 
 | Dependency | Version | Source | License | Why needed | Risk notes |
 | --- | --- | --- | --- | --- | --- |
-| Tracebox managed runtime and Compose diagnostics UI | Git submodule pin (`vendor/tracebox`) | Reviewed source composite | Apache-2.0 | One offline diagnostics store and approved exports | Alpha; local history extension. No native artifact, networking or uploader. |
+| Tracebox managed runtime and Compose diagnostics UI | 0.1.0-alpha.8 | Official GitHub Packages release | Apache-2.0 | One offline diagnostics store and approved exports | Alpha; bounded local history. Authenticated package download. No native artifact, networking or uploader. |
 | desugar_jdk_libs_nio | 2.1.5 | google() | GPLv2 + Classpath Exception | Tracebox NIO compatibility | Android toolchain dependency; core library desugaring enabled. |
 | Android Gradle Plugin | 9.2.1 | google() | Apache-2.0 | Build Android app, compileSdk 37 | Official Google; requires Gradle ≥ 9.4.1. |
 | Kotlin plugin / stdlib | 2.4.0 | mavenCentral() | Apache-2.0 | Language | Official JetBrains; matches build host. |

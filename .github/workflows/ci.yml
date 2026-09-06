@@ -21,6 +21,7 @@ concurrency:
 
 permissions:
   contents: read
+  packages: read
 
 jobs:
   build:
@@ -28,6 +29,8 @@ jobs:
     timeout-minutes: 59
 
     env:
+      TRACEBOX_USER: ${{ vars.TRACEBOX_READ_USER || github.actor }}
+      TRACEBOX_TOKEN: ${{ secrets.TRACEBOX_READ_TOKEN || github.token }}
       # Reuse the GitHub-hosted runner's pre-installed Android SDK
       # (platform 37 + build-tools 37), matching copilot-setup-steps.yml.
       ANDROID_HOME: /usr/local/lib/android/sdk
@@ -36,8 +39,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
-        with:
-          submodules: recursive
 
       - name: Set up JDK 21
         uses: actions/setup-java@v5

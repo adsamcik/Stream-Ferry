@@ -15,6 +15,7 @@ on:
 
 permissions:
   contents: write
+  packages: read
 
 concurrency:
   group: public-release-${{ github.event.inputs.tag || github.ref_name }}
@@ -25,6 +26,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 59
     env:
+      TRACEBOX_USER: ${{ vars.TRACEBOX_READ_USER || github.actor }}
+      TRACEBOX_TOKEN: ${{ secrets.TRACEBOX_READ_TOKEN || github.token }}
       ANDROID_HOME: /usr/local/lib/android/sdk
       ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
 
@@ -32,7 +35,6 @@ jobs:
       - name: Checkout release tag
         uses: actions/checkout@v7
         with:
-          submodules: recursive
           ref: ${{ github.event.inputs.tag || github.ref }}
           fetch-depth: 0
 

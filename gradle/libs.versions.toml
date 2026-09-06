@@ -19,6 +19,7 @@ castFramework = "22.3.1"
 
 # Jellyfin official Kotlin SDK — VERIFIED on Maven Central: org.jellyfin.sdk:jellyfin-core:1.8.12, LGPL-3.0.
 jellyfinSdk = "1.8.12"
+tracebox = "0.1.0-alpha.8"
 
 # Networking / serialization (Maven Central).
 okhttp = "5.5.0"
@@ -57,6 +58,8 @@ compose-material-icons = { module = "androidx.compose.material:material-icons-ex
 play-services-cast-framework = { module = "com.google.android.gms:play-services-cast-framework", version.ref = "castFramework" }
 
 jellyfin-core = { module = "org.jellyfin.sdk:jellyfin-core", version.ref = "jellyfinSdk" }
+tracebox = { module = "io.github.tracebox:tracebox", version.ref = "tracebox" }
+tracebox-ui-compose = { module = "io.github.tracebox:tracebox-ui-compose", version.ref = "tracebox" }
 
 okhttp = { module = "com.squareup.okhttp3:okhttp", version.ref = "okhttp" }
 kotlinx-coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "coroutines" }

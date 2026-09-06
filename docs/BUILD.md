@@ -3,27 +3,28 @@
 ## Requirements
 
 - JDK 21 (Java 17 application bytecode).
-- Initialize the pinned Tracebox source with `git submodule update --init --recursive`.
 - Android SDK Platform 37 + build-tools 37.0.0 (installed on the build host).
 - Gradle wrapper and Android Gradle Plugin versions are pinned in the repository; use the wrapper.
 - **Network access to `google()` / `maven.google.com`**, or a complete warm dependency cache — see
   Android dependency availability below.
 
-Tracebox is built from the exact Git submodule revision at `vendor/tracebox`, using a Gradle composite
-build. It requires no GitHub Packages credentials or Maven Local artifacts. For coordinated local
-library work, pass `-PtraceboxSourceDir=/absolute/path/to/Tracebox/src`; normal builds and CI use the
-pin. Push the Tracebox commit before pushing a parent commit that references it.
+Tracebox uses the published `0.1.0-alpha.8` AARs from its official
+[GitHub Packages repository](https://github.com/adsamcik/Tracebox/releases/tag/v0.1.0-alpha.8).
+The version catalog pins all direct Tracebox dependencies. There is no source composite or
+submodule to initialize, and no Tracebox SDK configuration or native toolchain is needed.
 
-Android Studio writes the SDK path to the root `local.properties`. The settings script also seeds
-`vendor/tracebox/local.properties` with that `sdk.dir` when the vendored build has no SDK path of its
-own. Both files remain ignored by Git; no other root properties are copied. Existing Tracebox SDK
-paths are preserved, so update both files if you move the SDK. CI can continue using `ANDROID_HOME`.
-An external checkout selected with `-PtraceboxSourceDir=...` must provide its own `local.properties`
-or use `ANDROID_HOME`.
+GitHub Packages requires authentication even for public Maven packages. Put `gpr.user` (GitHub
+username) and `gpr.key` (a classic token with `read:packages`) in your user-level
+`~/.gradle/gradle.properties`, never in this repository. Existing `GITHUB_OWNER`/`GITHUB_TOKEN`
+Gradle properties and the `TRACEBOX_USER`/`TRACEBOX_TOKEN` or `GITHUB_ACTOR`/`GITHUB_TOKEN`
+environment variables are also supported.
+Only the `io.github.tracebox` group is resolved from this repository.
 
-If sync reports `D8BackportedMethodsGenerator` parameters with "no value available", run
-`./gradlew :app:assembleDebug --stacktrace` to expose the underlying error. A missing SDK in an
-included build can surface as this D8 error during Android Studio sync.
+CI uses `TRACEBOX_READ_TOKEN` when configured, otherwise the job's `GITHUB_TOKEN` with
+`packages: read`. The latter must have access to Tracebox's packages. If cross-repository access
+is unavailable, configure the `TRACEBOX_READ_TOKEN` repository secret with a classic
+`read:packages` token and the `TRACEBOX_READ_USER` repository variable with its owner's username.
+See [GitHub's Gradle authentication instructions](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-gradle-registry).
 
 ## Standard commands (run on a machine with Google Maven access)
 

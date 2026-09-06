@@ -134,8 +134,8 @@ android {
 }
 
 dependencies {
-    implementation("io.github.tracebox:tracebox:0.1.0-alpha.7")
-    implementation("io.github.tracebox:tracebox-ui-compose:0.1.0-alpha.7")
+    implementation(libs.tracebox)
+    implementation(libs.tracebox.ui.compose)
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs_nio:2.1.5")
     implementation(project(":core"))
     implementation(project(":source:api"))

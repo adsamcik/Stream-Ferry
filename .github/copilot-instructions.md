@@ -74,7 +74,8 @@ change to the core (currently ~128 tests).
 
 ## Conventions and constraints
 
-- **Supply chain:** only `google()` and `mavenCentral()` are allowed (see `settings.gradle.kts`,
+- **Supply chain:** `google()`, `mavenCentral()`, and the official Tracebox GitHub Packages
+  endpoint (exclusively for `io.github.tracebox`) are allowed (see `settings.gradle.kts`,
   which sets `FAIL_ON_PROJECT_REPOS`). Do **not** add JitPack, jcenter, `mavenLocal`, or any other
   repository, and do not add a dependency without a clear need. Prefer existing libraries.
 - **Versions:** edit `gradle/libs.versions.toml`; keep AGP/Gradle/Kotlin compatibility intact.

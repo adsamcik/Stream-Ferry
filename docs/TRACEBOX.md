@@ -33,23 +33,17 @@ the reviewed package retains historical context and should be used for investiga
 Legacy stores remain only as upgrade readers and deletion helpers. The app no longer runs their
 writer, uncaught handler, periodic flush loop, separate crash activity or text-export actions.
 
-## Coordinated source dependency
+## Published dependency
 
-`vendor/tracebox` pins a reviewed Tracebox Git commit. The Gradle composite substitutes the managed
-runtime and Compose UI coordinates, including transitive modules. The version in the dependency
-declarations is the baseline release coordinate; the submodule commit is the actual source identity.
-Initialize submodules before building. CI and release checkouts initialize them recursively.
+Stream Ferry consumes Tracebox `0.1.0-alpha.8` from the official GitHub Packages Maven registry.
+The [published release](https://github.com/adsamcik/Tracebox/releases/tag/v0.1.0-alpha.8) includes
+the bounded history API, crash-cause and historical exit evidence, and consumer rules needed for
+minified apps without native capture. The version catalog pins both the managed runtime and
+Compose UI; Gradle resolves their transitive released modules without source substitution.
+See [BUILD.md](BUILD.md) for local and CI package credentials.
 
-For local library development use `-PtraceboxSourceDir=/absolute/path/to/Tracebox/src`. Commit and
-push Tracebox first, update the submodule pin, then push Stream Ferry. A parent revision referring
-to an unpublished library commit cannot be cloned by CI until that library commit is pushed.
-
-To inspect an approved package locally with Tracebox's pinned Rust toolchain:
-
-```text
-cargo run --manifest-path vendor/tracebox/Cargo.toml -p tbdiag-cli -- validate report.tbdiag
-cargo run --manifest-path vendor/tracebox/Cargo.toml -p tbdiag-cli -- decode report.tbdiag
-```
+To inspect an approved package, use `tbdiag-cli` from a separate Tracebox checkout at the matching
+release tag. That tooling is optional and is not part of the Stream Ferry build.
 
 Tracebox's local history extension applies current-policy and deletion fences, limits reads to 2,000
 ordinary records, filters event types before bounded selection, and excludes raw crash artifacts
@@ -58,8 +52,8 @@ and private storage identities. Reads never approve an export.
 ## Verification
 
 Run `:app:assembleDebug :app:assembleRelease :app:testDebugUnitTest :ui:testDebugUnitTest :app:lintDebug :ui:lintDebug`
-and the root `checkSourceBoundaries` task. Tracebox's runtime, export and ANR/exit unit suites cover
-the library changes. App tests exercise tracing gates, redaction before Tracebox, long Unicode
+and the root `checkSourceBoundaries` task. Tracebox's own release pipeline validates its library
+suites. App tests exercise tracing gates, redaction before Tracebox, long Unicode
 messages, build filtering, history readback, and retention of legacy files on import failure.
 Device qualification should cover a deliberate debug crash, relaunch, trace toggle, reviewed
 save/share and deletion while legacy import is active.
