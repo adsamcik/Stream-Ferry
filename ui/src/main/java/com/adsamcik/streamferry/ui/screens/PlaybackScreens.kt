@@ -874,6 +874,9 @@ private fun PlaylistCard(state: AppUiState, viewModel: UiController) {
                     TextButton(onClick = viewModel::clearPlaylist) { Text("Clear") }
                 }
             }
+            TextButton(onClick = { viewModel.navigate(com.adsamcik.streamferry.ui.state.Route.QUEUES) }) {
+                Text("Save and manage queues")
+            }
             if (entries.isEmpty()) {
                 Text(
                     "Keep browsing, then use Add to playlist on a video, episode, or movie.",

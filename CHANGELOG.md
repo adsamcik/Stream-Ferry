@@ -12,6 +12,11 @@ there is **no telemetry** and nothing leaves the device unless you share a repor
 
 ## [Unreleased]
 
+### Added
+- Added named saved queues with automatic persistence of the working queue and its unfinished item's
+  playback position. Build queues before playback, reopen them from Library → Queues, and resume on a
+  TV across app sessions. Finished entries advance in order; unavailable entries remain retryable.
+
 ### Fixed
 - Kept Google Cast volume controls stable when the Android Sender SDK applies a volume request without
   immediately echoing the new device state; the app now reconciles eventual receiver reports and records

@@ -11,6 +11,7 @@ import com.adsamcik.streamferry.physical.PhysicalTv
 import com.adsamcik.streamferry.playback.PlaybackAttemptDescriptor
 import com.adsamcik.streamferry.playback.PlaybackPhase
 import com.adsamcik.streamferry.playback.PlaybackQueue
+import com.adsamcik.streamferry.playback.SavedQueueLibrary
 import com.adsamcik.streamferry.playback.RecoveryBudget
 import com.adsamcik.streamferry.playback.RecoveryBudgetStatus
 import com.adsamcik.streamferry.playback.RecoveryBudgetUsage
@@ -20,7 +21,7 @@ import com.adsamcik.streamferry.ui.theme.ThemeMode
 /** Navigation routes (§18 screens). */
 enum class Route {
     WELCOME, SERVER_SETUP, LOGIN, GALLERY, MEDIA_DETAIL,
-    TARGET_PICKER, PLAYBACK, DOWNLOADS, HISTORY, DIAGNOSTICS, SETTINGS, SERVERS, ABOUT,
+    TARGET_PICKER, PLAYBACK, QUEUES, DOWNLOADS, HISTORY, DIAGNOSTICS, SETTINGS, SERVERS, ABOUT,
 }
 
 /** State of the manual server-connection step. */
@@ -102,8 +103,8 @@ data class AppUiState(
      * opening another title while browsing cannot change the now-playing controls or autoplay target.
      */
     val nowPlayingItem: MediaItem? = null,
-    /** Session-scoped FIFO playlist. Entries retain their own ids so the same media can be queued twice. */
-    val playlist: PlaybackQueue = PlaybackQueue(),
+    /** Durable working queue and named queues, including their unfinished entry. */
+    val queues: SavedQueueLibrary = SavedQueueLibrary(),
 
     /** Latest app-wide renderer-confirmed checkpoint, displayed at either gallery root. */
     val smartResume: SmartResumeUiState? = null,
@@ -117,6 +118,8 @@ data class AppUiState(
 
     val diagnostics: DiagnosticsUiState = DiagnosticsUiState(),
 ) {
+    val playlist: PlaybackQueue get() = queues.working.upNext
+
     /** The folder currently being browsed, or null at the library root. */
     val currentFolder: MediaItem? get() = folderStack.lastOrNull()
 
