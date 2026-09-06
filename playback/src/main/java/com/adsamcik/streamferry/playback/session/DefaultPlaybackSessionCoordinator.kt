@@ -44,6 +44,7 @@ class DefaultPlaybackSessionCoordinator(
         val token: Long,
         val providerSession: ProviderPlaybackSession,
         val positionSeconds: Long,
+        val shouldReport: () -> Boolean,
         val startReported: CompletableDeferred<Unit> = CompletableDeferred(),
     )
 
@@ -72,6 +73,7 @@ class DefaultPlaybackSessionCoordinator(
     suspend fun reportProgress(isPaused: Boolean, expectedToken: Long? = null) = mutex.withLock {
         val active = reportingSnapshot(expectedToken) ?: return@withLock
         active.startReported.await()
+        if (!active.shouldReport()) return@withLock
         runBoundedRemoteCleanup("report progress") {
             active.providerSession.report(
                 PlaybackEvent.Progress(active.positionSeconds, isPaused),
@@ -79,11 +81,18 @@ class DefaultPlaybackSessionCoordinator(
         }
     }
 
+    /** Drain an already-started lifecycle report before a manual mutation writes server truth. */
+    suspend fun awaitPendingReports() = mutex.withLock {
+        reportingSnapshot(null)?.startReported?.await()
+        Unit
+    }
+
     /** @return the phone proxy URL the TV should load (host:port + /session/{id}/stream). */
     suspend fun startAndBuildUrl(
         providerSession: ProviderPlaybackSession,
         phoneLanIp: String,
         initialPositionSeconds: Long = 0L,
+        shouldReport: () -> Boolean = { true },
     ): Pair<ProxySession, String> = mutex.withLock {
         val hostPort = proxy.start(phoneLanIp)
         val stream = providerSession.descriptor.stream
@@ -93,14 +102,16 @@ class DefaultPlaybackSessionCoordinator(
             totalLength = stream.totalLength,
         )
         proxy.registerStreamLease(session.id, providerSession.upstream)
-        val reporting = beginReporting(providerSession, initialPositionSeconds)
+        val reporting = beginReporting(providerSession, initialPositionSeconds, shouldReport)
         _active.value = session
         // Server reporting must not delay the renderer load (a slow first request used to add
         // several seconds here). Preserve Started -> Progress -> Stopped ordering for this token.
         reportingScope.launch {
             try {
-                runBoundedRemoteCleanup("report started") {
-                    providerSession.report(PlaybackEvent.Started(reporting.positionSeconds))
+                if (reporting.shouldReport()) {
+                    runBoundedRemoteCleanup("report started") {
+                        providerSession.report(PlaybackEvent.Started(reporting.positionSeconds))
+                    }
                 }
             } finally {
                 reporting.startReported.complete(Unit)
@@ -162,8 +173,10 @@ class DefaultPlaybackSessionCoordinator(
 
         if (reporting != null && session != null) {
             reporting.startReported.await()
-            runBoundedRemoteCleanup("report stopped") {
-                reporting.providerSession.report(PlaybackEvent.Stopped(reporting.positionSeconds))
+            if (reporting.shouldReport()) {
+                runBoundedRemoteCleanup("report stopped") {
+                    reporting.providerSession.report(PlaybackEvent.Stopped(reporting.positionSeconds))
+                }
             }
             runBoundedRemoteCleanup("close source playback") {
                 reporting.providerSession.close(stopReason(reason))
@@ -175,12 +188,14 @@ class DefaultPlaybackSessionCoordinator(
     private fun beginReporting(
         providerSession: ProviderPlaybackSession,
         initialPositionSeconds: Long,
+        shouldReport: () -> Boolean,
     ): ReportingSession =
         synchronized(reportStateLock) {
             ReportingSession(
                 token = ++nextReportToken,
                 providerSession = providerSession,
                 positionSeconds = initialPositionSeconds.coerceAtLeast(0L),
+                shouldReport = shouldReport,
             ).also { reportingSession = it }
         }
 

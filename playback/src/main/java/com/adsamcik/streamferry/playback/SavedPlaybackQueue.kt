@@ -1,5 +1,9 @@
 package com.adsamcik.streamferry.playback
 
+import com.adsamcik.streamferry.domain.MediaItem
+import com.adsamcik.streamferry.domain.MediaSourceIds
+import com.adsamcik.streamferry.domain.UserSession
+
 /** The current entry survives Stop and process death, until it finishes or is explicitly skipped. */
 data class QueueContents(
     val upNext: PlaybackQueue = PlaybackQueue(),
@@ -52,4 +56,20 @@ data class SavedQueueLibrary(
     )
 
     fun newQueue(): SavedQueueLibrary = copy(working = QueueContents(), activeId = null)
+}
+
+/** A title's watch metadata is shared by its entries, but only within the owning account. */
+fun SavedQueueLibrary.updateWatchState(
+    owner: UserSession,
+    itemId: String,
+    transform: (MediaItem) -> MediaItem,
+): SavedQueueLibrary {
+    fun update(entry: PlaylistEntry): PlaylistEntry = if (entry.owner == owner &&
+        entry.item.sourceId == MediaSourceIds.REMOTE && entry.item.id == itemId
+    ) entry.copy(item = transform(entry.item)) else entry
+    fun update(contents: QueueContents) = contents.copy(
+        current = contents.current?.let(::update),
+        upNext = contents.upNext.copy(entries = contents.upNext.entries.map(::update)),
+    )
+    return copy(working = update(working), saved = saved.map { it.copy(contents = update(it.contents)) })
 }

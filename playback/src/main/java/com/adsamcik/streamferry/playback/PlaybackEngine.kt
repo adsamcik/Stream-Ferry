@@ -150,6 +150,7 @@ data class PlaybackCompletion(
     val generation: Long,
     /** Account and item captured when local playback began; never inferred from the current UI. */
     val localSeed: SmartResumeSeed? = null,
+    val automaticWatchStateEnabled: () -> Boolean = { true },
 )
 
 /** Parameters of a LOCAL (offline / downloaded) playback, kept so the on-device stream can be reloaded. */
@@ -213,6 +214,7 @@ class PlaybackEngine(
 
     @Volatile private var target: PlaybackTargetController? = null
     @Volatile private var selectedTarget: DiscoveredTarget? = null
+    private val watchStatePolicy = PlaybackWatchStatePolicy()
     @Volatile private var item: MediaItem? = null
     /** Coordinator token for this online item; makes asynchronous progress reports session-safe. */
     @Volatile private var reportingSessionToken: Long? = null
@@ -353,6 +355,15 @@ class PlaybackEngine(
     fun checkpointSmartResumeLifecycle() = smartResume.checkpoint(SmartResumeCheckpointKind.LIFECYCLE)
 
     /** Whether an asynchronous completion still belongs to the currently active renderer session. */
+    /** Immediate session-scoped override; queued titles and another account cannot disable reporting. */
+    fun suppressAutomaticWatchState(serverId: String, userId: String, itemId: String): Boolean =
+        watchStatePolicy.suppress(serverId, userId, itemId) { smartResume.detach() }
+
+    suspend fun awaitPendingAutomaticReports() = coordinator.awaitPendingReports()
+
+    fun hasManualWatchStateOverride(generation: Long = playGeneration): Boolean =
+        playGeneration == generation && watchStatePolicy.current?.automatic == false
+
     fun isCurrentPlaybackGeneration(generation: Long): Boolean = playGeneration == generation
     /** Redacted snapshot for UI diagnostics and for coordinator-owned recovery decisions. */
     fun recoverySnapshot(): PlaybackRecoverySession = recoverySession
@@ -516,7 +527,9 @@ class PlaybackEngine(
             startedAt = Instant.ofEpochMilli(clock()),
         )
         this@PlaybackEngine.smartResumeDeviceContext = smartResumeDeviceContext
-        smartResume.prepare(smartResumeSeed, smartResumeDeviceContext)
+        watchStatePolicy.begin(smartResumeSeed, continuation = recoveryContinuation != null) { automatic ->
+            if (automatic) smartResume.prepare(smartResumeSeed, smartResumeDeviceContext) else smartResume.detach()
+        }
         playGeneration++
         completedGeneration = null
         recoverySession = recoveryContinuation?.let { recoverySession.continueFrom(it) } ?: recoverySession.startSession()
@@ -628,7 +641,9 @@ class PlaybackEngine(
             playGeneration++
             completedGeneration = null // supersede the ended session (its pending end-of-media stop/timeout is now stale)
             recoverySession = recoverySession.startSession()
-            smartResume.prepare(smartResumeSeed, smartResumeDeviceContext)
+            watchStatePolicy.begin(smartResumeSeed, continuation = false) { automatic ->
+                if (automatic) smartResume.prepare(smartResumeSeed, smartResumeDeviceContext) else smartResume.detach()
+            }
             connectionLost = false
             // Fresh per-item + recovery state. We do NOT tear the session down (that's the whole point), so
             // reset the flags stopInternalLocked would otherwise clear.
@@ -840,7 +855,9 @@ class PlaybackEngine(
             startedAt = Instant.ofEpochMilli(clock()),
         )
         this@PlaybackEngine.smartResumeDeviceContext = smartResumeDeviceContext
-        smartResume.prepare(smartResumeSeed, smartResumeDeviceContext)
+        watchStatePolicy.begin(smartResumeSeed, continuation = recoveryContinuation != null) { automatic ->
+            if (automatic) smartResume.prepare(smartResumeSeed, smartResumeDeviceContext) else smartResume.detach()
+        }
         playGeneration++
         completedGeneration = null
         recoverySession = recoveryContinuation?.let { recoverySession.continueFrom(it) } ?: recoverySession.startSession()
@@ -1647,7 +1664,9 @@ class PlaybackEngine(
         seekSettleTargetSeconds = null // fresh stream: don't let a prior seek's hold suppress its statuses
 
         val (_, url) = preparePlaybackSource("Couldn't establish the phone-hosted media gateway.") {
-            coordinator.startAndBuildUrl(providerSession, phoneIp, initialPositionSeconds = positionSeconds)
+            coordinator.startAndBuildUrl(providerSession, phoneIp, initialPositionSeconds = positionSeconds,
+                shouldReport = watchStatePolicy.current.let { session -> { session?.automatic != false } },
+            )
         }
         reportingSessionToken = coordinator.activeReportToken()
         noteSourcePosition(positionSeconds)
@@ -2418,6 +2437,7 @@ class PlaybackEngine(
                             isSourceSession = currentProviderSession != null,
                             generation = completedPlayGeneration,
                             localSeed = localPlayback?.seed,
+                            automaticWatchStateEnabled = watchStatePolicy.current.let { session -> { session?.automatic != false } },
                         ),
                     )
                     val gen = completedPlayGeneration
@@ -2677,6 +2697,7 @@ class PlaybackEngine(
         rendererVolume = RendererVolumeState()
         _status.value = null
         smartResume.detach()
+        watchStatePolicy.end()
         smartResumeDeviceContext = null
     }
 

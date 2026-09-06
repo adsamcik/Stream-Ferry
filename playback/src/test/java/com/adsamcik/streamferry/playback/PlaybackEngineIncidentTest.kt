@@ -47,7 +47,7 @@ class PlaybackEngineIncidentTest {
                 coEvery { source.mediaSegments() } returns emptyList()
                 Result.success(source)
             }
-            coEvery { coordinator.startAndBuildUrl(any(), any(), any()) } returns
+            coEvery { coordinator.startAndBuildUrl(any(), any(), any(), any()) } returns
                 (SessionRegistry().create("video/mp4", false, 100_000) to "http://127.0.0.1/session/test/stream")
             every { service.isForegroundActive() } returns true
             coEvery { service.startAndAwaitForegrounded(any()) } returns
@@ -61,8 +61,29 @@ class PlaybackEngineIncidentTest {
                 dispatcher = StandardTestDispatcher(scope.testScheduler),
             )
         }
-        suspend fun start() = engine.play(movie, target, selected, StreamPreferences())
+        suspend fun start(seed: com.adsamcik.streamferry.core.resume.SmartResumeSeed? = null) =
+            engine.play(movie, target, selected, StreamPreferences(), smartResumeSeed = seed)
         fun emit(event: PlaybackTargetEvent) { check(events.tryEmit(event)) }
+    }
+
+    @Test fun `manual override reaches completion events and next playback starts automatic`() = runTest {
+        val f = Fixture(this)
+        val seed = com.adsamcik.streamferry.core.resume.SmartResumeSeed(
+            com.adsamcik.streamferry.core.resume.SmartResumeSourceType.REMOTE, "movie", "Movie", serverId = "server", userId = "user")
+        val completions = mutableListOf<PlaybackCompletion>()
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { f.engine.endOfMedia.collect { completions += it } }
+        try {
+            f.start(seed); runCurrent()
+            assertFalse(f.engine.suppressAutomaticWatchState("server", "user", "queued"))
+            assertTrue(f.engine.suppressAutomaticWatchState("server", "user", "movie"))
+            f.emit(PlaybackTargetEvent.StatusChanged(1150, true)); runCurrent()
+            f.emit(PlaybackTargetEvent.Ended); runCurrent()
+            assertEquals(1, completions.size)
+            assertFalse(completions.single().automaticWatchStateEnabled())
+            f.start(seed); runCurrent()
+            assertFalse(f.engine.hasManualWatchStateOverride())
+            assertFalse(completions.single().automaticWatchStateEnabled())
+        } finally { f.engine.stop(); runCurrent() }
     }
 
     @Test fun `successful fallback still accepts real end of media`() = runTest {
