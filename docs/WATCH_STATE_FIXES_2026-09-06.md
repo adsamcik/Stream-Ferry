@@ -31,4 +31,4 @@ The disposable Jellyfin 10.11.11 fixture contains one synthetic 20-minute video.
 
 The live suite remains opt-in through `STREAM_FERRY_WATCH_VALIDATION_URL=http://127.0.0.1:18096`; use `--rerun` when toggling that environment variable. It now includes offline downloaded completion, completion across an account switch, stale/ownerless local events, and Downloaded-shelf refresh through watched and partial-progress changes.
 
-This work does not change the separate restriction on manually editing the currently playing item's watch state.
+The subsequent [manual watched-state precedence change](MANUAL_WATCH_STATE_2026-09-06.md) removes the restriction on editing the currently playing item and defines how current and queued edits interact with automatic reporting.
