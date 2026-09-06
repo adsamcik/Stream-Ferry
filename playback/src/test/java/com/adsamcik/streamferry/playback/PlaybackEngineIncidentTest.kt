@@ -61,8 +61,8 @@ class PlaybackEngineIncidentTest {
                 dispatcher = StandardTestDispatcher(scope.testScheduler),
             )
         }
-        suspend fun start(seed: com.adsamcik.streamferry.core.resume.SmartResumeSeed? = null) =
-            engine.play(movie, target, selected, StreamPreferences(), smartResumeSeed = seed)
+        suspend fun start(seed: com.adsamcik.streamferry.core.resume.SmartResumeSeed? = null, preserveOverride: Boolean = false) =
+            engine.play(movie, target, selected, StreamPreferences(), smartResumeSeed = seed, preserveManualWatchOverride = preserveOverride)
         fun emit(event: PlaybackTargetEvent) { check(events.tryEmit(event)) }
     }
 
@@ -76,6 +76,8 @@ class PlaybackEngineIncidentTest {
             f.start(seed); runCurrent()
             assertFalse(f.engine.suppressAutomaticWatchState("server", "user", "queued"))
             assertTrue(f.engine.suppressAutomaticWatchState("server", "user", "movie"))
+            f.start(seed, preserveOverride = true); runCurrent()
+            assertTrue(f.engine.hasManualWatchStateOverride())
             f.emit(PlaybackTargetEvent.StatusChanged(1150, true)); runCurrent()
             f.emit(PlaybackTargetEvent.Ended); runCurrent()
             assertEquals(1, completions.size)

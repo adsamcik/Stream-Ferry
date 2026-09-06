@@ -82,6 +82,8 @@ class MainViewModelUiController(
     override fun skipBy(deltaSeconds: Long) = viewModel.skipBy(deltaSeconds)
     override fun selectPreferredCodec(codec: String?) { viewModel.selectPreferredCodec(codec) }
     override fun skipSegment() { viewModel.skipSegment() }
+    override fun markQueueItemWatched(entryId: Long, played: Boolean) = viewModel.markQueueItemWatched(entryId, played)
+    override fun resetQueueItemProgress(entryId: Long) = viewModel.resetQueueItemProgress(entryId)
     override fun markWatched(item: MediaItem, played: Boolean) = viewModel.markWatched(item, played)
     override fun resetEpisodeProgress(item: MediaItem) = viewModel.resetEpisodeProgress(item)
     override fun retryPlayback() = viewModel.retryPlayback()

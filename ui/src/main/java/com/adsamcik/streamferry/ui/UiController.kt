@@ -79,6 +79,8 @@ interface UiController {
     fun skipBy(deltaSeconds: Long)
     fun selectPreferredCodec(codec: String?)
     fun skipSegment()
+    fun markQueueItemWatched(entryId: Long, played: Boolean)
+    fun resetQueueItemProgress(entryId: Long)
     fun markWatched(item: MediaItem, played: Boolean)
     fun resetEpisodeProgress(item: MediaItem)
     fun retryPlayback()

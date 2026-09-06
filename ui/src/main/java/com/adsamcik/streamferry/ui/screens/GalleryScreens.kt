@@ -1594,15 +1594,9 @@ fun MediaDetailScreen(
     val availability = state.availabilityFor(media)
     val serverUnavailable = media.sourceId == MediaSourceIds.REMOTE &&
         state.sourceAvailability == SourceAvailability.UNAVAILABLE
-    val activePlaybackForMedia = state.playback != null && state.nowPlayingItem?.id == media.id
-    val watchStateActionEnabled = state.loggedIn && !serverUnavailable && !activePlaybackForMedia
+    val watchStateActionEnabled = state.canBrowseRemote
     val watchStateUpdating = media.id in state.watchStateMutationItemIds
-    val watchStateUnavailableReason = when {
-        !state.loggedIn -> "Reconnect to Jellyfin to change watch state."
-        serverUnavailable -> "Jellyfin is unavailable. Reconnect to change watch state."
-        activePlaybackForMedia -> "Stop playback before changing its watch state."
-        else -> null
-    }
+    val watchStateUnavailableReason = if (!state.canBrowseRemote) "Reconnect to Jellyfin to change watch state." else null
 
     Column(
         modifier = Modifier.fillMaxSize(),

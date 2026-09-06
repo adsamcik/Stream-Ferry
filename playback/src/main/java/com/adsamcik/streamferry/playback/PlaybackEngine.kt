@@ -514,6 +514,7 @@ class PlaybackEngine(
         smartResumeDeviceContext: SmartResumeDeviceContext? = null,
         onForegrounded: () -> Unit = {},
         recoveryContinuation: PlaybackRecoveryContinuation? = null,
+        preserveManualWatchOverride: Boolean = recoveryContinuation != null,
     ) = withContext(dispatcher) {
         // Run playback startup OFF the main thread. The Cast/DLNA controllers switch to Main internally
         // for each SDK call, so the main thread stays free BETWEEN them for the foreground service to
@@ -527,7 +528,7 @@ class PlaybackEngine(
             startedAt = Instant.ofEpochMilli(clock()),
         )
         this@PlaybackEngine.smartResumeDeviceContext = smartResumeDeviceContext
-        watchStatePolicy.begin(smartResumeSeed, continuation = recoveryContinuation != null) { automatic ->
+        watchStatePolicy.begin(smartResumeSeed, continuation = preserveManualWatchOverride) { automatic ->
             if (automatic) smartResume.prepare(smartResumeSeed, smartResumeDeviceContext) else smartResume.detach()
         }
         playGeneration++
@@ -845,6 +846,7 @@ class PlaybackEngine(
         selectedTarget: DiscoveredTarget,
         onForegrounded: () -> Unit = {},
         recoveryContinuation: PlaybackRecoveryContinuation? = null,
+        preserveManualWatchOverride: Boolean = recoveryContinuation != null,
     ) = withContext(dispatcher) {
         // Off the main thread so the foreground service can foreground within its deadline (see play()).
         mutex.withLock {
@@ -855,7 +857,7 @@ class PlaybackEngine(
             startedAt = Instant.ofEpochMilli(clock()),
         )
         this@PlaybackEngine.smartResumeDeviceContext = smartResumeDeviceContext
-        watchStatePolicy.begin(smartResumeSeed, continuation = recoveryContinuation != null) { automatic ->
+        watchStatePolicy.begin(smartResumeSeed, continuation = preserveManualWatchOverride) { automatic ->
             if (automatic) smartResume.prepare(smartResumeSeed, smartResumeDeviceContext) else smartResume.detach()
         }
         playGeneration++

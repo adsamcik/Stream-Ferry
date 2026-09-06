@@ -56,6 +56,7 @@ import com.adsamcik.streamferry.playback.PlaybackQueue
 import com.adsamcik.streamferry.playback.PlaylistEntry
 import com.adsamcik.streamferry.playback.PlaybackFailureCause
 import com.adsamcik.streamferry.playback.PlaybackFailureStage
+import com.adsamcik.streamferry.playback.updateWatchState
 import com.adsamcik.streamferry.playback.PlaybackCompletion
 import com.adsamcik.streamferry.playback.PlaybackPhase
 import com.adsamcik.streamferry.playback.PlaybackPreparationException
@@ -162,7 +163,7 @@ class MainViewModel(
     )
 
     // Prevent conflicting watched/reset requests for one account-scoped item from racing on the server or cache.
-    private val activeWatchStateMutations = mutableSetOf<JellyfinWatchMutationKey>()
+    private val watchStateMutationLocks = mutableMapOf<JellyfinWatchMutationKey, Mutex>()
     // Invalidates an older detail response after a successful server-side watch-state mutation.
     private val jellyfinWatchStateRevisions = mutableMapOf<JellyfinWatchMutationKey, Long>()
     // Applies the latest confirmed action to a result that was already in flight when the action completed.
@@ -351,7 +352,6 @@ class MainViewModel(
                 observedJellyfinSession = user
                 // A prior account's overlays and revisions are never valid for a newly materialized scope.
                 if (sessionChanged) {
-                    activeWatchStateMutations.clear()
                     jellyfinWatchStateRevisions.clear()
                     jellyfinWatchStateOverrides.clear()
                     jellyfinWatchStateCachePatches.clear()
@@ -854,7 +854,6 @@ class MainViewModel(
         watchStateMutationSupervisor = newWatchStateMutationSupervisor()
         watchStateMutationScope = newWatchStateMutationScope(watchStateMutationSupervisor)
         previous.cancelAndJoin()
-        activeWatchStateMutations.clear()
         jellyfinWatchStateCachePatches.clear()
         pendingWatchStateReconciliations.clear()
         activeWatchStateReconciliations.clear()
@@ -1753,17 +1752,20 @@ class MainViewModel(
             container.logger.event("playback", "Ignoring a stale completed Jellyfin item")
             return
         }
-        if (completion.isSourceSession && completedItem?.sourceId == MediaSourceIds.REMOTE) {
+        val automaticWatchState = completion.automaticWatchStateEnabled() &&
+            !container.playbackEngine.hasManualWatchStateOverride(completion.generation)
+        if (automaticWatchState && completion.isSourceSession && completedItem?.sourceId == MediaSourceIds.REMOTE) {
             mutateJellyfinWatchState(
                 item = completedItem,
                 origin = "playback completion",
                 mutationKind = JellyfinWatchMutationKind.MARK_PLAYED,
-                rejectIfPlaying = false,
+                manualEdit = false,
+                automaticWatchStateAllowed = completion.automaticWatchStateEnabled,
             )
         }
         if (!completion.isSourceSession) {
             completion.localSeed?.takeIf {
-                it.sourceType == SmartResumeSourceType.DOWNLOADED && it.isStructurallyValid()
+                automaticWatchState && it.sourceType == SmartResumeSourceType.DOWNLOADED && it.isStructurallyValid()
             }?.let { seed ->
                 mutateJellyfinWatchState(
                     item = MediaItem(
@@ -1774,7 +1776,8 @@ class MainViewModel(
                     ),
                     origin = "downloaded playback completion",
                     mutationKind = JellyfinWatchMutationKind.MARK_PLAYED,
-                    rejectIfPlaying = false,
+                    manualEdit = false,
+                    automaticWatchStateAllowed = completion.automaticWatchStateEnabled,
                     ownerSession = UserSession(userId = seed.userId!!, serverId = seed.serverId!!),
                 )
             }
@@ -2326,6 +2329,7 @@ class MainViewModel(
     }
 
     private fun checkpointQueue(status: PlaybackStatus, force: Boolean = false) {
+        if (container.playbackEngine.hasManualWatchStateOverride()) return
         val id = playingQueueEntryId ?: return
         if (!force && status.rendererPlaybackRevision <= lastQueuePlaybackRevision) return
         lastQueuePlaybackRevision = status.rendererPlaybackRevision
@@ -2673,6 +2677,34 @@ class MainViewModel(
         )
     }
 
+    /** Queue actions target an entry; an upcoming duplicate must not override the current playback. */
+    fun markQueueItemWatched(entryId: Long, played: Boolean) {
+        val entry = queueEntryForWatchEdit(entryId) ?: return
+        mutateJellyfinWatchState(entry.item, "manual queue watch edit",
+            if (played) JellyfinWatchMutationKind.MARK_PLAYED else JellyfinWatchMutationKind.MARK_UNPLAYED,
+            overrideCurrentPlayback = entry.entryId == playingQueueEntryId,
+        )
+    }
+
+    fun resetQueueItemProgress(entryId: Long) {
+        val entry = queueEntryForWatchEdit(entryId) ?: return
+        if (!entry.item.isEpisode()) return
+        mutateJellyfinWatchState(entry.item, "manual queue progress reset", JellyfinWatchMutationKind.RESET_PROGRESS,
+            overrideCurrentPlayback = entry.entryId == playingQueueEntryId,
+        )
+    }
+
+    private fun queueEntryForWatchEdit(entryId: Long): PlaylistEntry? {
+        val contents = _state.value.queues.working
+        val entry = (listOfNotNull(contents.current) + contents.upNext.entries)
+            .firstOrNull { it.entryId == entryId } ?: return null
+        if (entry.owner != activeJellyfinSession() || entry.owner == null) {
+            _state.update { it.copy(errorMessage = "Sign into this video's account to change its watch state.") }
+            return null
+        }
+        return entry
+    }
+
     /** Reset a Jellyfin episode to unwatched at 0:00, including every durable local resume representation. */
     fun resetEpisodeProgress(item: MediaItem) {
         if (!item.isEpisode()) return
@@ -2692,17 +2724,20 @@ class MainViewModel(
         item: MediaItem,
         origin: String,
         mutationKind: JellyfinWatchMutationKind,
-        rejectIfPlaying: Boolean = true,
-        ownerSession: UserSession? = container.authRepository.currentUser.value,
+        manualEdit: Boolean = true,
+        overrideCurrentPlayback: Boolean = true,
+        automaticWatchStateAllowed: () -> Boolean = { true },
+        ownerSession: UserSession? = activeJellyfinSession(),
     ) {
-        if (item.sourceId != MediaSourceIds.REMOTE || (rejectIfPlaying && item.isFolder)) return
-        if (rejectIfPlaying && isPlaybackActiveFor(item.id)) {
-            _state.update { current ->
-                current.copy(errorMessage = "Stop this item before changing its watch state.")
-            }
-            return
-        }
+        if (item.sourceId != MediaSourceIds.REMOTE || (manualEdit && item.isFolder)) return
         val session = ownerSession ?: return
+        if (manualEdit && overrideCurrentPlayback) {
+            // Suppress immediately, before a queued Ended/status callback can race the user's action.
+            val suppressed = container.playbackEngine.suppressAutomaticWatchState(session.serverId, session.userId, item.id)
+            if (suppressed && currentResumeKey == DownloadIdentity(DownloadOwner(session.serverId, session.userId), item.id).resumeKey) {
+                currentResumeKey = null
+            }
+        }
         val mutation = JellyfinWatchMutation(
             operationId = UUID.randomUUID().toString(),
             serverId = session.serverId,
@@ -2712,18 +2747,22 @@ class MainViewModel(
             createdAtMillis = System.currentTimeMillis(),
         )
         val mutationKey = mutation.key()
+        val mutationLock = watchStateMutationLocks.getOrPut(mutationKey) { Mutex() }
         watchStateMutationScope.launch {
-            if (!activeWatchStateMutations.add(mutationKey)) return@launch
-            setWatchStateMutationUpdating(mutation, updating = true)
-            try {
-                withContext(Dispatchers.IO) { container.jellyfinWatchMutationStore.put(mutation) }
-                synchronizeJellyfinWatchStateMutation(mutation, session, origin)
-            } catch (error: Throwable) {
-                if (error is CancellationException) throw error
-                handleJellyfinWatchStateMutationFailure(session, origin, error)
-            } finally {
-                activeWatchStateMutations.remove(mutationKey)
-                setWatchStateMutationUpdating(mutation, updating = false)
+            mutationLock.withLock {
+                if (!manualEdit && !automaticWatchStateAllowed()) return@withLock
+                setWatchStateMutationUpdating(mutation, updating = true)
+                try {
+                    withContext(Dispatchers.IO) { container.jellyfinWatchMutationStore.put(mutation) }
+                    // An in-flight Started/Progress/Stopped request must finish before the absolute manual write.
+                    if (manualEdit) container.playbackEngine.awaitPendingAutomaticReports()
+                    synchronizeJellyfinWatchStateMutation(mutation, session, origin)
+                } catch (error: Throwable) {
+                    if (error is CancellationException) throw error
+                    handleJellyfinWatchStateMutationFailure(session, origin, error)
+                } finally {
+                    setWatchStateMutationUpdating(mutation, updating = false)
+                }
             }
         }
     }
@@ -2737,9 +2776,12 @@ class MainViewModel(
             pending.forEach { mutation ->
                 if (container.authRepository.currentUser.value != session) return@launch
                 val mutationKey = mutation.key()
-                if (!activeWatchStateMutations.add(mutationKey)) return@forEach
+                val mutationLock = watchStateMutationLocks.getOrPut(mutationKey) { Mutex() }
+                if (!mutationLock.tryLock()) return@forEach
                 setWatchStateMutationUpdating(mutation, updating = true)
                 try {
+                    if (container.jellyfinWatchMutationStore.pendingFor(mutation.serverId, mutation.userId, mutation.itemId)
+                            ?.operationId != mutation.operationId) return@forEach
                     synchronizeJellyfinWatchStateMutation(mutation, session, "queued watch-state change")
                 } catch (error: Throwable) {
                     if (error is CancellationException) throw error
@@ -2748,8 +2790,8 @@ class MainViewModel(
                     // session down and a later verified sign-in will resume the durable journal.
                     if (isSessionExpired(error)) return@launch
                 } finally {
-                    activeWatchStateMutations.remove(mutationKey)
                     setWatchStateMutationUpdating(mutation, updating = false)
+                    mutationLock.unlock()
                 }
             }
         }
@@ -2978,11 +3020,9 @@ class MainViewModel(
             items = update(st.items),
             searchResults = update(st.searchResults),
             libraries = update(st.libraries),
-            queues = st.queues.updateWorking(st.queues.working.copy(upNext = st.playlist.copy(
-                entries = st.playlist.entries.map { entry ->
-                    if (entry.canPlayWith(activeJellyfinSession())) entry.copy(item = update(entry.item)) else entry
-                },
-            ))),
+            queues = activeJellyfinSession()?.let { owner ->
+                st.queues.updateWatchState(owner, authoritative.id) { authoritative }
+            } ?: st.queues,
             continueWatching = if (shouldRemainInContinueWatching) {
                 update(st.continueWatching)
             } else {
@@ -3005,7 +3045,7 @@ class MainViewModel(
     }
 
     private fun setWatchStateMutationUpdating(mutation: JellyfinWatchMutation, updating: Boolean) {
-        if (container.authRepository.currentUser.value != mutation.session()) return
+        if (activeJellyfinSession() != mutation.session()) return
         _state.update { current ->
             current.copy(
                 watchStateMutationItemIds = if (updating) {
@@ -3040,9 +3080,6 @@ class MainViewModel(
         .mapNotNull { it.toPlaybackHistoryUiState(currentUser) }
         .toList()
 
-    private fun isPlaybackActiveFor(itemId: String): Boolean =
-        _state.value.playback != null && _state.value.nowPlayingItem?.id == itemId
-
     /** Immediately reflect a confirmed or queued mutation across each materialized UI list and playback queue. */
     private fun applyJellyfinItemMutation(
         itemId: String,
@@ -3057,11 +3094,9 @@ class MainViewModel(
             items = update(st.items),
             searchResults = update(st.searchResults),
             libraries = update(st.libraries),
-            queues = st.queues.updateWorking(st.queues.working.copy(upNext = st.playlist.copy(
-                entries = st.playlist.entries.map { entry ->
-                    if (entry.canPlayWith(activeJellyfinSession())) entry.copy(item = update(entry.item)) else entry
-                },
-            ))),
+            queues = activeJellyfinSession()?.let { owner ->
+                st.queues.updateWatchState(owner, itemId, transform)
+            } ?: st.queues,
             continueWatching = if (clearsResume) {
                 st.continueWatching.filterNot { it.id == itemId }
             } else {
@@ -3402,6 +3437,7 @@ class MainViewModel(
                     smartResumeSeed = onlineSmartResumeSeed(context.item, context.owner),
                     smartResumeDeviceContext = deviceContext,
                     recoveryContinuation = recoveryContinuation,
+                    preserveManualWatchOverride = true,
                 )
             }
             is ReconnectContext.Local -> container.playbackEngine.playLocal(
@@ -3416,6 +3452,7 @@ class MainViewModel(
                 target = controllerFor(endpoint),
                 selectedTarget = endpoint,
                 recoveryContinuation = recoveryContinuation,
+                preserveManualWatchOverride = true,
             )
         }
     }
@@ -3808,6 +3845,7 @@ class MainViewModel(
 
     /** Throttled persist of the current local-file playback position ("where you left off"). */
     private fun saveResumeThrottled(positionSeconds: Long) {
+        if (container.playbackEngine.hasManualWatchStateOverride()) return
         val key = currentResumeKey ?: return
         val now = System.currentTimeMillis()
         if (now - lastResumeSaveMs < RESUME_SAVE_INTERVAL_MS) return
@@ -3817,7 +3855,9 @@ class MainViewModel(
 
     /** Persist the latest position immediately (on stop), then clear the session resume key. */
     private fun saveResumeNow() {
-        currentResumeKey?.let { container.resumeStore.save(it, lastPlaybackPositionSeconds, currentDurationSeconds) }
+        if (!container.playbackEngine.hasManualWatchStateOverride()) {
+            currentResumeKey?.let { container.resumeStore.save(it, lastPlaybackPositionSeconds, currentDurationSeconds) }
+        }
         currentResumeKey = null
         currentDurationSeconds = null
         lastResumeSaveMs = 0L

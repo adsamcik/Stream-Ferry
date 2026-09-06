@@ -20,6 +20,14 @@ import com.adsamcik.streamferry.data.resume.ResumeStore
 import com.adsamcik.streamferry.data.resume.SmartResumeStore
 import com.adsamcik.streamferry.domain.*
 import com.adsamcik.streamferry.logging.DiagnosticsLogger
+import com.adsamcik.streamferry.core.session.SessionRegistry
+import com.adsamcik.streamferry.data.proxy.LocalProxyServer
+import com.adsamcik.streamferry.playback.PlaylistEntry
+import com.adsamcik.streamferry.playback.PlaybackQueue
+import com.adsamcik.streamferry.playback.QueueContents
+import com.adsamcik.streamferry.playback.SavedQueueLibrary
+import com.adsamcik.streamferry.playback.session.DefaultPlaybackSessionCoordinator
+import com.adsamcik.streamferry.ui.state.PlaybackUiState
 import com.adsamcik.streamferry.playback.PlaybackCompletion
 import com.adsamcik.streamferry.playback.PlaybackStatus
 import com.adsamcik.streamferry.source.api.*
@@ -78,9 +86,13 @@ class LiveWatchStateValidationTest {
     private val http = OkHttpClient()
     private val logger = mockk<DiagnosticsLogger>(relaxed = true)
     private val users = MutableStateFlow<UserSession?>(null)
+    private val cachedUsers = MutableStateFlow<UserSession?>(null)
     private val completions = MutableSharedFlow<PlaybackCompletion>()
     private val monitor = JellyfinConnectionMonitor()
     @Volatile private var rejectMutation = false
+    @Volatile private var activePlaybackItemId: String? = null
+    @Volatile private var automaticReports = true
+    private var reportingCoordinator: DefaultPlaybackSessionCoordinator? = null
     private val scopeKey get() = AccountLibraryScope(session.serverId, session.userId).cacheKey
 
     @Before
@@ -141,11 +153,12 @@ class LiveWatchStateValidationTest {
                 else provider.update(media, state)
         }
         container = mockk(relaxed = true)
+        every { container.savedQueueStore.read() } returns SavedQueueLibrary()
         every { container.appearancePreferences.themeMode } returns ThemeMode.SYSTEM
         every { container.permissions.hasLocalNetworkAccess() } returns true
         every { container.permissions.localNetworkAccess } returns MutableStateFlow(true)
         every { container.authRepository.currentUser } returns users
-        every { container.authRepository.cachedSession } returns MutableStateFlow(null)
+        every { container.authRepository.cachedSession } returns cachedUsers
         coEvery { container.authRepository.restoreCachedSession() } returns null
         coEvery { container.authRepository.ensureOnlineSession() } returns Result.success(session)
         coEvery { container.authRepository.runWithActiveSession(any(), any()) } coAnswers {
@@ -168,6 +181,14 @@ class LiveWatchStateValidationTest {
         every { container.playbackEngine.status } returns MutableStateFlow<PlaybackStatus?>(null)
         every { container.playbackEngine.endOfMedia } returns completions
         every { container.playbackEngine.isCurrentPlaybackGeneration(any()) } answers { firstArg<Long>() == 7L }
+        every { container.playbackEngine.suppressAutomaticWatchState(any(), any(), any()) } answers {
+            val matches = firstArg<String>() == session.serverId && secondArg<String>() == session.userId &&
+                thirdArg<String>() == activePlaybackItemId
+            if (matches) automaticReports = false
+            matches
+        }
+        every { container.playbackEngine.hasManualWatchStateOverride(any()) } answers { firstArg<Long>() == 7L && !automaticReports }
+        coEvery { container.playbackEngine.awaitPendingAutomaticReports() } coAnswers { reportingCoordinator?.awaitPendingReports() ?: Unit }
         every { container.playbackPreferences.autoPlayNextEpisode } returns false
         main = newSingleThreadContext("watch-validation-main")
         Dispatchers.setMain(main)
@@ -183,6 +204,126 @@ class LiveWatchStateValidationTest {
         if (::journal.isInitialized) journal.clear()
         http.dispatcher.executorService.shutdown()
         http.connectionPool.evictAll()
+    }
+
+    @Test
+    fun currentManualUnwatchedOverridesProgressStopAndCompletion() = runBlocking {
+        verifyCurrentManualOverride(played = false)
+    }
+
+    @Test
+    fun currentManualWatchedOverridesLaterProgress() = runBlocking {
+        verifyCurrentManualOverride(played = true)
+    }
+
+    private suspend fun verifyCurrentManualOverride(played: Boolean) {
+        activatePlayback(item.id)
+        val coordinator = startRealReporting()
+        withContext(main) { vm.markWatched(item, played) }
+        eventually { !automaticReports && journal.pendingFor(session.serverId, session.userId).isEmpty() &&
+            vm.state.value.watchStateMutationItemIds.isEmpty() && client.itemDetails(item.id).resumePositionSeconds == null }
+        coordinator.notePosition(1150)
+        coordinator.reportProgress(false)
+        coordinator.stop("completed")
+        withContext(main) { completions.emit(PlaybackCompletion(item, true, 7, automaticWatchStateEnabled = { automaticReports })); yield() }
+        assertEquals(played, client.itemDetails(item.id).played)
+        assertNull(client.itemDetails(item.id).resumePositionSeconds)
+        assertTrue(journal.pendingFor(session.serverId, session.userId).isEmpty())
+    }
+
+    @Test
+    fun editingQueuedCopyDoesNotSuppressCurrentOrItsFuturePlayback() = runBlocking {
+        activatePlayback(item.id)
+        val current = PlaylistEntry(101, item, session)
+        val next = PlaylistEntry(102, item, session)
+        withContext(main) {
+            setPrivate("playingQueueEntryId", 101L)
+            uiState().value = vm.state.value.copy(queues = SavedQueueLibrary(QueueContents(PlaybackQueue(listOf(next)), current)))
+            vm.markQueueItemWatched(102, true)
+        }
+        awaitSynced(true)
+        assertTrue(automaticReports, "Editing an upcoming duplicate must not disable the current playback")
+        assertTrue(vm.state.value.queues.working.upNext.next!!.item.played)
+        withContext(main) { vm.markQueueItemWatched(102, false) }
+        eventually { vm.state.value.watchStateMutationItemIds.isEmpty() && client.itemDetails(item.id).resumePositionSeconds == null &&
+            !client.itemDetails(item.id).played && journal.pendingFor(session.serverId, session.userId).isEmpty() }
+        // When the queued entry starts, it still reports progress and can become watched automatically.
+        val coordinator = startRealReporting()
+        coordinator.notePosition(1150)
+        coordinator.reportProgress(false)
+        coordinator.stop("completed next entry")
+        assertTrue(client.itemDetails(item.id).played)
+    }
+
+    @Test
+    fun editingCurrentQueueEntrySuppressesAutomationAndUpdatesItsSnapshot() = runBlocking {
+        activatePlayback(item.id)
+        withContext(main) {
+            setPrivate("playingQueueEntryId", 101L)
+            uiState().value = vm.state.value.copy(queues = SavedQueueLibrary(QueueContents(current = PlaylistEntry(101, item, session))))
+            vm.markQueueItemWatched(101, true)
+        }
+        awaitSynced(true)
+        assertFalse(automaticReports)
+        assertTrue(vm.state.value.queues.working.current!!.item.played)
+        assertNull(vm.state.value.queues.working.current!!.item.resumePositionSeconds)
+    }
+
+    @Test
+    fun offlineManualEditOverridesDownloadedCompletionAndReplaysForCachedOwner() = runBlocking {
+        activatePlayback(item.id)
+        withContext(main) { cachedUsers.value = session; users.value = null }
+        eventually { vm.state.value.hasCachedRemoteSession && !vm.state.value.loggedIn }
+        withContext(main) { vm.markWatched(item, false) }
+        eventually { journal.pendingFor(session.serverId, session.userId, item.id) != null &&
+            vm.state.value.watchStateMutationItemIds.isEmpty() && downloads.get(owner, item.id)?.mediaItem?.resumePositionSeconds == null }
+        assertFalse(automaticReports)
+        assertEquals(300L, client.itemDetails(item.id).resumePositionSeconds)
+        withContext(main) { completions.emit(downloadedCompletion()); yield() }
+        assertEquals(JellyfinWatchMutationKind.MARK_UNPLAYED, journal.pendingFor(session.serverId, session.userId, item.id)?.kind)
+        withContext(main) { users.value = session }
+        eventually { journal.pendingFor(session.serverId, session.userId).isEmpty() && client.itemDetails(item.id).resumePositionSeconds == null }
+        assertFalse(client.itemDetails(item.id).played)
+    }
+
+    @Test
+    fun latestManualEditWinsWhenRequestsOverlap() = runBlocking {
+        activatePlayback(item.id)
+        withContext(main) { vm.markWatched(item, true); vm.markWatched(item, false) }
+        eventually { journal.pendingFor(session.serverId, session.userId).isEmpty() &&
+            vm.state.value.watchStateMutationItemIds.isEmpty() &&
+            vm.state.value.selectedItem?.played == false && client.itemDetails(item.id).resumePositionSeconds == null }
+        assertFalse(client.itemDetails(item.id).played)
+        assertFalse(automaticReports)
+    }
+
+    private suspend fun activatePlayback(itemId: String) = withContext(main) {
+        activePlaybackItemId = itemId
+        automaticReports = true
+        setPrivate("onlinePlaybackOwner", session)
+        uiState().value = vm.state.value.copy(nowPlayingItem = item, playback = PlaybackUiState("Test TV", "CAST", isPlaying = true))
+    }
+
+    private suspend fun startRealReporting(): DefaultPlaybackSessionCoordinator {
+        val reporter = DefaultJellyfinPlaybackReporter(client, "watch-validation", logger, monitor)
+        val info = JellyfinPlaybackInfo(mediaSourceId = item.id, playSessionId = null,
+            profile = MediaProfile(container = "mp4", videoCodec = "h264", audioCodec = "aac"), runtimeSeconds = 1200, itemId = item.id)
+        val source = mockk<ProviderPlaybackSession>(relaxed = true)
+        every { source.descriptor.stream } returns StreamDescriptor("video/mp4", "mp4", isTranscoding = false, isByteSeekable = true, totalLength = 1)
+        coEvery { source.report(any()) } coAnswers {
+            when (val event = firstArg<PlaybackEvent>()) {
+                is PlaybackEvent.Started -> reporter.reportStart(info, event.positionSeconds)
+                is PlaybackEvent.Progress -> reporter.reportProgress(info, event.positionSeconds, event.isPaused)
+                is PlaybackEvent.Stopped -> reporter.reportStopped(info, event.positionSeconds)
+            }
+        }
+        val proxy = mockk<LocalProxyServer>(relaxed = true)
+        every { proxy.start(any()) } returns "127.0.0.1:19000"
+        return DefaultPlaybackSessionCoordinator(SessionRegistry(), proxy, logger).also {
+            reportingCoordinator = it
+            it.startAndBuildUrl(source, "127.0.0.1", 300, shouldReport = { automaticReports })
+            it.awaitPendingReports()
+        }
     }
 
     @Test

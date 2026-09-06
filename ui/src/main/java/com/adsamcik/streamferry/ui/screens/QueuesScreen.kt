@@ -5,6 +5,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.PlaylistPlay
+import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material3.*
@@ -15,6 +16,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.adsamcik.streamferry.domain.MediaSourceIds
+import com.adsamcik.streamferry.domain.isEpisode
+import com.adsamcik.streamferry.playback.PlaylistEntry
 import com.adsamcik.streamferry.playback.SavedPlaybackQueue
 import com.adsamcik.streamferry.ui.UiController
 import com.adsamcik.streamferry.ui.state.AppUiState
@@ -55,14 +59,14 @@ fun QueuesScreen(state: AppUiState, viewModel: UiController) {
         contents.current?.let { entry ->
             item(key = "current-${entry.entryId}") {
                 QueueEntryRow(
-                    title = entry.item.title,
+                    entry = entry, state = state, viewModel = viewModel,
                     subtitle = if (state.playback != null) "Current item" else "Resume from ${queuePosition(entry.item.resumePositionSeconds ?: 0)}",
                     onRemove = if (canSwitch) ({ viewModel.removePlaylistEntry(entry.entryId) }) else null,
                 )
             }
         }
         items(contents.upNext.entries, key = { it.entryId }) { entry ->
-            QueueEntryRow(entry.item.title, entry.item.subtitle ?: "Up next", { viewModel.removePlaylistEntry(entry.entryId) })
+            QueueEntryRow(entry, state, viewModel, entry.item.subtitle ?: "Up next", { viewModel.removePlaylistEntry(entry.entryId) })
         }
         item {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -130,12 +134,30 @@ fun QueuesScreen(state: AppUiState, viewModel: UiController) {
 }
 
 @Composable
-private fun QueueEntryRow(title: String, subtitle: String, onRemove: (() -> Unit)?) {
+private fun QueueEntryRow(entry: PlaylistEntry, state: AppUiState, viewModel: UiController, subtitle: String, onRemove: (() -> Unit)?) {
+    val title = entry.item.title
+    var showWatchActions by remember(entry.entryId) { mutableStateOf(false) }
     Surface(shape = MaterialTheme.shapes.large, color = MaterialTheme.colorScheme.surfaceContainerHigh) {
         Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 Text(title, maxLines = 2, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.SemiBold)
                 Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            if (entry.item.sourceId == MediaSourceIds.REMOTE && !entry.item.isFolder) Box {
+                IconButton(onClick = { showWatchActions = true },
+                    enabled = state.canBrowseRemote && entry.item.id !in state.watchStateMutationItemIds) {
+                    Icon(Icons.Rounded.MoreVert, contentDescription = "Watch state for $title")
+                }
+                DropdownMenu(expanded = showWatchActions, onDismissRequest = { showWatchActions = false }) {
+                    DropdownMenuItem(text = { Text(if (entry.item.played) "Mark unwatched" else "Mark watched") }, onClick = {
+                        viewModel.markQueueItemWatched(entry.entryId, !entry.item.played)
+                        showWatchActions = false
+                    })
+                    if (entry.item.isEpisode()) DropdownMenuItem(text = { Text("Reset progress") }, onClick = {
+                        viewModel.resetQueueItemProgress(entry.entryId)
+                        showWatchActions = false
+                    })
+                }
             }
             if (onRemove != null) IconButton(onClick = onRemove) {
                 Icon(Icons.Rounded.Close, contentDescription = "Remove $title from queue")
