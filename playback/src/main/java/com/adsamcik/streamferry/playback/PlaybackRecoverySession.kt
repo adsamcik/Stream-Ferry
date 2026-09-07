@@ -202,10 +202,10 @@ fun isAlternateProtocolEligible(input: ProtocolSwitchInput): Boolean =
         input.failureCause != PlaybackFailureCause.UPSTREAM_OR_SERVER_UNAVAILABLE &&
         input.budget.canSchedule(input.usage, RecoveryAttemptKind.ALTERNATE_PROTOCOL)
 
-/** A reserved, redacted hand-off for exactly one coordinator-owned protocol switch. */
+/** A redacted hand-off that preserves one playback session across an engine stop/start boundary. */
 class PlaybackRecoveryContinuation internal constructor(
     internal val session: PlaybackRecoverySession,
-    internal val reservedKind: RecoveryAttemptKind,
+    internal val reservedKind: RecoveryAttemptKind?,
 )
 /**
  * Immutable, pure session ledger. The engine owns side effects; this type owns generations, concise
@@ -287,6 +287,21 @@ data class PlaybackRecoverySession(
         return PlaybackRecoveryContinuation(
             reserved.copy(alternateProtocolReserved = true),
             RecoveryAttemptKind.ALTERNATE_PROTOCOL,
+        )
+    }
+
+    /**
+     * Continue the same media session after an explicit user protocol switch. Unlike automatic
+     * recovery, this does not consume the finite recovery budget or claim the one automatic alternate
+     * protocol attempt. The UI admits this only while playback is active on a confidently paired TV.
+     */
+    fun manualProtocolSwitchContinuation(): PlaybackRecoveryContinuation? {
+        if (phase !in setOf(PlaybackPhase.PLAYING, PlaybackPhase.PAUSED, PlaybackPhase.BUFFERING)) {
+            return null
+        }
+        return PlaybackRecoveryContinuation(
+            copy(phase = PlaybackPhase.CHANGING_PROTOCOL),
+            reservedKind = null,
         )
     }
 

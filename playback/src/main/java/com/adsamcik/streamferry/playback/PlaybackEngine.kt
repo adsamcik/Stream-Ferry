@@ -416,6 +416,18 @@ class PlaybackEngine(
         }
 
     /**
+     * Preserve track choices, watch-state policy, recovery history, and night-volume state while the
+     * user explicitly moves the current video to the other protocol endpoint on the same physical TV.
+     * Manual choices do not spend or disable the bounded automatic-recovery allowance.
+     */
+    fun beginManualProtocolSwitch(): PlaybackRecoveryContinuation? = synchronized(recoveryLock) {
+        val continuation = recoverySession.manualProtocolSwitchContinuation()
+            ?: return@synchronized null
+        recoverySession = continuation.session
+        continuation
+    }
+
+    /**
      * Reconnect the current endpoint once without creating a fresh playback session or resetting its
      * finite recovery budget. [refreshedEndpoint] is the same physical endpoint rebound by stable identity
      * after rediscovery, so a TV reboot can replace an ephemeral Cast route or DLNA control address. The

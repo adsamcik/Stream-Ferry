@@ -206,6 +206,26 @@ class PlaybackRecoverySessionTest {
         ))
     }
 
+    @Test fun manualProtocolSwitchPreservesSessionWithoutConsumingAutomaticRecovery() {
+        var original = session().transition(PlaybackPhase.PLAYING)
+        original = assertNotNull(original.reserveRecovery(
+            RecoveryAttemptKind.SAME_STREAM_NETWORK,
+            PlaybackPhase.RECONNECTING,
+        )).transition(PlaybackPhase.PLAYING)
+
+        val firstSwitch = assertNotNull(original.manualProtocolSwitchContinuation())
+        assertNull(firstSwitch.reservedKind)
+        val continued = original.stop().continueFrom(firstSwitch)
+
+        assertEquals(original.usage, continued.usage)
+        assertEquals(original.attempts, continued.attempts)
+        assertEquals(original.alternateProtocolReserved, continued.alternateProtocolReserved)
+        assertTrue(continued.generation > original.generation)
+        assertNotNull(continued.transition(PlaybackPhase.PLAYING).manualProtocolSwitchContinuation())
+        assertNull(continued.stop().manualProtocolSwitchContinuation())
+        assertNull(continued.fail().manualProtocolSwitchContinuation())
+    }
+
     private fun protocolSwitchInput(state: PlaybackRecoverySession) = ProtocolSwitchInput(
         isLocalSession = false,
         isOnlineSession = true,
