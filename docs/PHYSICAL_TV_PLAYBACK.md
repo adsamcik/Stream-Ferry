@@ -7,11 +7,13 @@ backend, compatibility database, background workflow engine, or claim of univers
 ## User flow
 
 1. Choosing a playable movie or episode opens one physical-TV picker.
-2. Tapping a TV starts playback. Cast versus DLNA is an internal endpoint choice.
+2. Tapping a TV starts playback. Cast versus DLNA is initially an internal endpoint choice.
 3. The app enters one Now Playing route after the phone proxy service is foregrounded.
 4. Connection, preparation, buffering, stream changes, reconnect, and protocol fallback update that
    same screen. They do not navigate back through the library or picker.
-5. Exhaustion releases renderer/proxy resources but retains a stable error screen with **Retry**,
+5. When that exact TV has a confidently paired Cast and DLNA endpoint, **Playback options** offers
+   **Switch to Google Cast** or **Switch to DLNA** without returning to the picker.
+6. Exhaustion releases renderer/proxy resources but retains a stable error screen with **Retry**,
    **Change TV**, **Stop**, and expandable redacted attempt details.
 
 The phone remains the only media gateway. Every renderer attempt receives a new ephemeral
@@ -101,6 +103,13 @@ Typed Jellyfin/source/phone-gateway preparation failures do not trigger a transc
 changing the renderer cannot repair an unavailable source. Attempt failure stages and causes remain
 coarse and redacted because receiver error taxonomies vary substantially.
 
+A manual protocol switch uses the same guarded handoff path and is available only for a confidently
+merged dual-protocol TV. It preserves the current video's manual watch-state policy, track choices,
+night-volume session, attempt history, and renderer-confirmed position. Because it is an explicit user
+choice, it does not consume or disable the finite automatic-recovery allowance and can be used again to
+switch back after playback is established. A failed connection still receives the normal bounded
+same-endpoint connection retries before Now Playing surfaces an actionable failure.
+
 ## Smart Resume v2 and playback history
 
 The app-private store keeps media identities from the rolling last 90 days, with a generous defensive
@@ -149,6 +158,7 @@ they are therefore not claimed as a detectable manual override.
 | --- | --- |
 | Matching outcomes, false-merge guards, persisted link/unlink and selection | Unit-tested |
 | Attempt deduplication, finite budgets, stale generations, Stop, one protocol reservation | Unit-tested |
+| Manual Cast↔DLNA switch visibility, session continuity, and confirmed-position handoff | Unit-tested |
 | Network/format/lower-resolution policy | Unit-tested |
 | Playback-history migration/bounds, reconciliation, device identity, completion protection | Unit-tested |
 | Gradual/hard/sparse/reduction-only/manual/DST volume decisions | Unit-tested |
@@ -165,7 +175,9 @@ whether first frame, controls, confirmed resume, cleanup, and diagnostics behave
 - [ ] Samsung DLNA: discovery, load/first frame, polling, seek, pause, volume when RenderingControl exists.
 - [ ] LG DLNA: the same, including reload/Stop ordering.
 - [ ] One TV exposing Cast and DLNA: one row only when evidence is confident; force a failure and verify
-      alternate protocol resumes at confirmed progress.
+      alternate protocol resumes at confirmed progress. While playing, switch Cast → DLNA → Cast from
+      **Playback options** and confirm that tracks, watched-state policy, queue progress, and controls remain
+      scoped to the same current video.
 - [ ] Initial Cast and DLNA connection failures: starting with either protocol, verify two bounded retries,
       then automatic handoff on a confidently paired TV. If the alternate also fails, verify its two retries
       end terminally without switching back; source/load failures must not be mislabeled as connection retries.
