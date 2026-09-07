@@ -650,6 +650,7 @@ fun PlaybackScreen(state: AppUiState, viewModel: UiController) {
         if (showOptions && !p.isTerminal) {
             PlaybackOptionsSheet(
                 p = p,
+                alternateProtocol = state.alternatePlaybackProtocol,
                 viewModel = viewModel,
                 sheetState = sheetState,
                 onDismiss = { showOptions = false },
@@ -1009,6 +1010,7 @@ private fun QuickControlButton(
 @Composable
 private fun PlaybackOptionsSheet(
     p: PlaybackUiState,
+    alternateProtocol: Protocol?,
     viewModel: UiController,
     sheetState: androidx.compose.material3.SheetState,
     onDismiss: () -> Unit,
@@ -1031,9 +1033,26 @@ private fun PlaybackOptionsSheet(
                         fontWeight = FontWeight.ExtraBold,
                     )
                     Text(
-                        "Use these overrides when compatibility or network quality causes trouble. Auto is best most of the time.",
+                        "Change how this TV is connected or tune compatibility and network-quality overrides.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            if (alternateProtocol != null) {
+                item(key = "playback-options-protocol") {
+                    ProtocolSwitchCard(
+                        currentProtocol = p.protocol,
+                        alternateProtocol = alternateProtocol,
+                        enabled = p.phase in setOf(
+                            PlaybackPhase.PLAYING,
+                            PlaybackPhase.PAUSED,
+                            PlaybackPhase.BUFFERING,
+                        ),
+                        onSwitch = {
+                            onDismiss()
+                            viewModel.switchPlaybackProtocol()
+                        },
                     )
                 }
             }
@@ -1050,6 +1069,70 @@ private fun PlaybackOptionsSheet(
                     PlaybackAttemptHistory(p.attemptHistory)
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun ProtocolSwitchCard(
+    currentProtocol: String,
+    alternateProtocol: Protocol,
+    enabled: Boolean,
+    onSwitch: () -> Unit,
+) {
+    val currentLabel = if (currentProtocol.equals(Protocol.CAST.name, ignoreCase = true)) {
+        "Google Cast"
+    } else {
+        "DLNA"
+    }
+    val alternateLabel = when (alternateProtocol) {
+        Protocol.CAST -> "Google Cast"
+        Protocol.DLNA -> "DLNA"
+    }
+    ElevatedCard(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Icon(
+                    if (alternateProtocol == Protocol.CAST) Icons.Rounded.Cast else Icons.Rounded.Tv,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                )
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(
+                        "TV connection",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Text(
+                        "Using $currentLabel. The same TV is also available through $alternateLabel.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.78f),
+                    )
+                }
+            }
+            OutlinedButton(
+                onClick = onSwitch,
+                enabled = enabled,
+                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                shape = RoundedCornerShape(16.dp),
+            ) {
+                Text("Switch to $alternateLabel")
+            }
+            Text(
+                "Playback reconnects at the TV's last confirmed position.",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.7f),
+            )
         }
     }
 }

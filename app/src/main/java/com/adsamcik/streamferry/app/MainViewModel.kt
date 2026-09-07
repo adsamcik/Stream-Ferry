@@ -3225,6 +3225,84 @@ class MainViewModel(
                     UpstreamRetry.isRetryableStatus(cause.statusCode))
         }
 
+    /**
+     * Explicitly hand the current video to the other endpoint on the same confidently paired TV.
+     * The engine continuation preserves playback-session policy and uses only renderer-confirmed progress.
+     */
+    fun switchPlaybackProtocol() {
+        if (!container.permissions.hasLocalNetworkAccess()) {
+            onLocalNetworkPermissionDenied()
+            return
+        }
+        if (reconnectJob?.isActive == true || playbackStarting || playbackStopping || autoAdvancing) return
+        val originalContext = reconnectContext ?: return
+        val currentState = _state.value
+        val currentPlayback = currentState.playback ?: return
+        if (currentPlayback.isTerminal ||
+            currentState.selectedPhysicalTv?.id != originalContext.physicalTv.id ||
+            currentState.selectedTarget?.protocol != originalContext.endpoint.protocol
+        ) return
+        val alternate = originalContext.physicalTv.alternateEndpoint(originalContext.endpoint.protocol) ?: return
+        val continuation = container.playbackEngine.beginManualProtocolSwitch() ?: return
+        val generation = ++reconnectGeneration
+        val alternateContext = originalContext.withEndpoint(alternate)
+        reconnecting = true
+        reconnectContext = alternateContext
+        container.playbackEngine.status.value?.let { checkpointQueue(it, force = true) }
+        _state.update { current ->
+            current.copy(
+                selectedTarget = alternate,
+                playback = current.playback?.copy(
+                    protocol = alternate.protocol.name,
+                    phase = PlaybackPhase.CHANGING_PROTOCOL,
+                    adaptiveNote = "Switching to ${alternate.protocol.connectionLabel()}…",
+                    reconnecting = true,
+                    errorMessage = null,
+                ),
+                errorMessage = null,
+            )
+        }
+        reconnectJob = viewModelScope.launch {
+            try {
+                val switched = try {
+                    playContext(alternateContext, alternate, lastPlaybackPositionSeconds, continuation)
+                    true
+                } catch (c: CancellationException) {
+                    throw c
+                } catch (error: Exception) {
+                    container.logger.w("playback", "User-requested TV protocol switch failed", error)
+                    retryEndpointConnection(alternateContext, error, currentPlayback).isSuccess
+                }
+                if (generation != reconnectGeneration) return@launch
+                if (switched) {
+                    _state.update { current ->
+                        current.copy(
+                            selectedPhysicalTv = alternateContext.physicalTv,
+                            selectedTarget = alternate,
+                        )
+                    }
+                    container.logger.event(
+                        "playback",
+                        "User switched playback to ${alternate.protocol.connectionLabel()} on the same TV",
+                    )
+                } else {
+                    surfaceTerminalPlaybackFailure(
+                        alternateContext,
+                        "Couldn't switch this TV to ${alternate.protocol.connectionLabel()}.",
+                    )
+                }
+            } finally {
+                if (generation == reconnectGeneration) {
+                    reconnecting = false
+                    reconnectJob = null
+                    _state.update { current ->
+                        current.copy(playback = current.playback?.copy(reconnecting = false))
+                    }
+                }
+            }
+        }
+    }
+
     /** Explicit retry starts a fresh bounded recovery budget but keeps the same physical TV and checkpoint. */
     fun retryPlayback() {
         val ctx = reconnectContext ?: return

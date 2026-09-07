@@ -140,4 +140,60 @@ class MainViewModelQueueTest {
         assertEquals(0, vm.state.value.queues.saved.single().contents.size)
         coVerify { container.playbackEngine.stop() }
     }
+
+    @Test fun `manual protocol switch uses paired endpoint and confirmed position`() {
+        val statuses = MutableStateFlow<PlaybackStatus?>(null)
+        val playbackEngine = container.playbackEngine
+        every { playbackEngine.status } returns statuses
+        every { container.permissions.hasLocalNetworkAccess() } returns true
+        every { container.localMediaSource.mimeTypeFor(local.id) } returns "video/mp4"
+        val continuation = mockk<PlaybackRecoveryContinuation>(relaxed = true)
+        every { playbackEngine.beginManualProtocolSwitch() } returns continuation
+        val cast = DiscoveredTarget(
+            "cast-tv", "Living Room TV", Protocol.CAST, TargetCapabilities(Protocol.CAST), null,
+        )
+        val dlna = DiscoveredTarget(
+            "dlna-tv", "Living Room TV", Protocol.DLNA, TargetCapabilities(Protocol.DLNA), null,
+        )
+        val tv = PhysicalTv("living-room", "Living Room TV", castEndpoint = cast, dlnaEndpoint = dlna)
+        val vm = create()
+
+        vm.onItemClicked(local)
+        vm.selectPhysicalTv(tv)
+        statuses.value = PlaybackStatus(
+            targetName = tv.displayName,
+            protocolName = Protocol.CAST.name,
+            rendererPlaybackRevision = 1,
+            isPlaying = true,
+            isBuffering = false,
+            positionSeconds = 125,
+            durationSeconds = local.runtimeSeconds,
+            streamMode = "Direct",
+            currentBitrateBps = 0,
+            measuredThroughputBps = 0,
+            adaptiveNote = "",
+            phase = PlaybackPhase.PLAYING,
+        )
+
+        vm.switchPlaybackProtocol()
+
+        assertEquals(Protocol.DLNA, vm.state.value.selectedTarget?.protocol)
+        coVerify(exactly = 1) {
+            playbackEngine.playLocal(
+                filePath = local.id,
+                contentType = "video/mp4",
+                title = local.title,
+                runtimeSeconds = local.runtimeSeconds,
+                allowClientTranscode = any(),
+                resumePositionSeconds = 125,
+                smartResumeSeed = any(),
+                smartResumeDeviceContext = match { it.lastSuccessfulProtocol == Protocol.DLNA },
+                target = any(),
+                selectedTarget = dlna,
+                onForegrounded = any(),
+                recoveryContinuation = continuation,
+                preserveManualWatchOverride = true,
+            )
+        }
+    }
 }

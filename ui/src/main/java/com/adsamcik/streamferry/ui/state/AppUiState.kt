@@ -1,6 +1,7 @@
 package com.adsamcik.streamferry.ui.state
 
 import com.adsamcik.streamferry.domain.DiscoveredTarget
+import com.adsamcik.streamferry.core.stream.Protocol
 import com.adsamcik.streamferry.domain.SourceAvailability
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.domain.MediaSourceIds
@@ -135,6 +136,17 @@ data class AppUiState(
         downloadFor(item.id)?.completed == true -> SourceItemAvailability.DOWNLOADED
         sourceAvailability == SourceAvailability.UNAVAILABLE -> SourceItemAvailability.UNAVAILABLE
         else -> SourceItemAvailability.AVAILABLE
+    }
+
+    /** The other endpoint on this exact, confidently paired physical TV, if both are available. */
+    val alternatePlaybackProtocol: Protocol? get() {
+        val tv = selectedPhysicalTv ?: return null
+        if (tv.castEndpoint == null || tv.dlnaEndpoint == null) return null
+        return when (selectedTarget?.protocol) {
+            Protocol.CAST -> Protocol.DLNA
+            Protocol.DLNA -> Protocol.CAST
+            null -> null
+        }
     }
 }
 

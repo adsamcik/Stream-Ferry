@@ -83,6 +83,7 @@ interface UiController {
     fun resetQueueItemProgress(entryId: Long)
     fun markWatched(item: MediaItem, played: Boolean)
     fun resetEpisodeProgress(item: MediaItem)
+    fun switchPlaybackProtocol()
     fun retryPlayback()
     fun changeTv()
     fun stopPlayback()
