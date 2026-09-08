@@ -1,14 +1,5 @@
 # Changelog
 
-## Unreleased
-
-- Move all app-owned diagnostic capture, durable events, crashes, ANRs and process-exit evidence to
-  offline Tracebox. Preserve opt-in TV tracing and local event browsing.
-- Review `.tbdiag` packages before save/share; remove the custom text export and crash handler.
-- Import recent legacy evidence with readback verification. Deletion stops import, clears both
-  stores and cached exports, and leaves recording disabled.
-
-
 All notable changes to **Stream Ferry** are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
@@ -21,10 +12,27 @@ there is **no telemetry** and nothing leaves the device unless you share a repor
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-08
+
 ### Added
 - Added named saved queues with automatic persistence of the working queue and its unfinished item's
   playback position. Build queues before playback, reopen them from Library → Queues, and resume on a
   TV across app sessions. Finished entries advance in order; unavailable entries remain retryable.
+- Added in-playback Cast ↔ DLNA switching for confidently paired TV endpoints. From Playback Options,
+  switching keeps the current video and queue, then resumes from the renderer-confirmed position instead
+  of returning to the TV picker.
+- Added per-session watched and unwatched controls for the current and queued Jellyfin videos. Manual
+  choices take precedence only for that playback session, while the app preserves the server's latest
+  watch state for future browsing.
+- Moved app-owned diagnostic events, crashes, ANRs, and Android process-exit evidence into the bounded,
+  offline Tracebox store. Reviewed `.tbdiag` packages remain opt-in, and recent legacy evidence is
+  imported with readback verification.
+
+### Changed
+- Refreshed the library, queue, settings, and Now Playing surfaces with a clearer Material 3 hierarchy
+  while preserving accessible source controls and durable playback navigation.
+- Made playback-progress recovery use conservative delivered-media evidence where available, so saved
+  positions and recovery actions avoid treating bytes merely received by the phone as confirmed viewing.
 
 ### Fixed
 - Kept Google Cast volume controls stable when the Android Sender SDK applies a volume request without
@@ -35,6 +43,10 @@ there is **no telemetry** and nothing leaves the device unless you share a repor
   reservation prevent cycling when both TV services remain broken until the TV is restarted.
 - Synchronized natural Cast completion back to the phone as an authoritative final playback update,
   preventing a finished video from retaining a stale partial progress position.
+- Preserved the newest Jellyfin watched metadata across cached lists, downloaded media, and queued
+  mutations, including completion updates made while offline.
+- Made screen-off recovery safer by retaining foreground-service ownership across rapid replacement,
+  cancelling revoked relay retries, and resynchronizing Cast progress after suspension.
 
 ## [0.6.0] - 2026-08-17
 
@@ -483,7 +495,8 @@ there is **no telemetry** and nothing leaves the device unless you share a repor
   policy, redaction), the Android app skeleton and Compose UI, CI + release pipelines, and
   documentation.
 
-[Unreleased]: https://github.com/adamnova/video-bridge/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/adamnova/video-bridge/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/adamnova/video-bridge/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/adamnova/video-bridge/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/adamnova/video-bridge/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/adamnova/video-bridge/compare/v0.4.1...v0.4.2
