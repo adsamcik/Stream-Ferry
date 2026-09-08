@@ -5,6 +5,7 @@ import com.google.android.gms.cast.CastMediaControlIntent
 import com.google.android.gms.cast.framework.CastOptions
 import com.google.android.gms.cast.framework.OptionsProvider
 import com.google.android.gms.cast.framework.SessionProvider
+import com.google.android.gms.cast.framework.media.CastMediaOptions
 
 /**
  * Cast configuration (§10).
@@ -19,8 +20,17 @@ import com.google.android.gms.cast.framework.SessionProvider
 class CastOptionsProvider : OptionsProvider {
 
     override fun getCastOptions(context: Context): CastOptions {
+        val mediaOptions = CastMediaOptions.Builder()
+            // The Cast SDK-managed session owns Cast route volume while the activity is stopped,
+            // including lock-screen hardware volume keys. Stream Ferry's playback foreground
+            // service already provides the persistent media notification, so do not post a second
+            // Cast SDK notification for the same playback.
+            .setMediaSessionEnabled(true)
+            .setNotificationOptions(null)
+            .build()
         return CastOptions.Builder()
             .setReceiverApplicationId(CastMediaControlIntent.DEFAULT_MEDIA_RECEIVER_APPLICATION_ID)
+            .setCastMediaOptions(mediaOptions)
             // We never resume a Cast session that points at a stale proxy URL after process death;
             // resumption is handled explicitly by PlaybackSessionCoordinator instead.
             .setResumeSavedSession(false)
