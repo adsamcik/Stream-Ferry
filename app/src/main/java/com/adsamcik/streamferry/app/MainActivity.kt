@@ -86,6 +86,8 @@ class MainActivity : FragmentActivity() {
         container.initializeCastContext()
         // Covers settings-driven revocation without treating a denial as an empty device list.
         viewModel.onLocalNetworkPermissionResult(container.permissions.hasLocalNetworkAccess())
+        // Screen-off suspension can leave the Cast timeline stale even while the TV keeps playing.
+        if (container.permissions.hasLocalNetworkAccess()) container.castController.refreshPlaybackStatus()
         // The battery-optimization request is handled by a system activity. Re-read its result when
         // control returns so the Settings toggle immediately reflects the user's choice.
         viewModel.refreshBackgroundPlaybackStatus()
