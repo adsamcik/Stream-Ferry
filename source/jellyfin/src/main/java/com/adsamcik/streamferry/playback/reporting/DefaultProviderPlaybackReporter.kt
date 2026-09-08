@@ -8,9 +8,8 @@ import java.io.IOException
 import kotlinx.coroutines.CancellationException
 
 /**
- * Reports playback lifecycle to Jellyfin and performs transcode/HLS cleanup (§8). Never invents
- * progress: callers pass real positions derived from target status; on unknown positions we report
- * the last known value rather than fabricating one.
+ * Lifecycle/scrobble events use confirmed positions. Bounded delivery estimates are saved separately
+ * as position-only user data, which does not infer watched state or increment play counts.
  */
 class DefaultJellyfinPlaybackReporter(
     private val api: JellyfinApi,
@@ -48,6 +47,15 @@ class DefaultJellyfinPlaybackReporter(
             mediaSourceId = info.mediaSourceId,
             positionTicks = ticks(positionSeconds),
         )
+    }
+
+    override suspend fun reportEstimate(info: JellyfinPlaybackInfo, estimate: com.adsamcik.streamferry.core.resume.ProgressEstimate) {
+        if (!estimate.isValid() || estimate.confidence != com.adsamcik.streamferry.core.resume.ProgressConfidence.DELIVERY ||
+            estimate.anchorAgeMillis > 120_000 || estimate.uncertaintySeconds > 15) return
+        val position = estimate.recoveryPositionSeconds()
+        if (position <= estimate.anchorPositionSeconds || position > Long.MAX_VALUE / TICKS_PER_SECOND ||
+            com.adsamcik.streamferry.core.resume.ResumePolicy.resumePosition(position, info.runtimeSeconds) == null) return
+        reportLifecycle("save estimated resume") { api.saveEstimatedPosition(info.itemId, ticks(position)) }
     }
 
     override suspend fun stopTranscode(info: JellyfinPlaybackInfo) = reportLifecycle("stopTranscode") {

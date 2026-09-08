@@ -95,6 +95,32 @@ class LocalProxyServer(
     @Volatile
     var byteListener: ((Long) -> Unit)? = null
 
+    /** Completed playable media only; scoped to the exact proxy session and seek epoch. */
+    @Volatile var mediaDeliveryListener: ((MediaDelivery) -> Unit)? = null
+    private val deliveryTrackers = ConcurrentHashMap<String, ProxyDeliveryTracker>()
+
+    fun renewDeliveryEpoch(sessionId: String): Long =
+        deliveryTrackers.computeIfAbsent(sessionId) { ProxyDeliveryTracker() }.renew()
+
+    private fun deliveryEpoch(session: ProxySession) = deliveryTrackers.computeIfAbsent(session.id) { ProxyDeliveryTracker() }.epoch()
+
+    private fun noteFileBytes(session: ProxySession, epoch: Long, offset: Long, bytes: ByteArray, length: Int, out: OutputStream) {
+        if (session.isHls || session.contentType.substringBefore(';').lowercase() !in
+            setOf("video/mp4", "audio/mp4", "video/quicktime", "application/octet-stream")) return
+        // Small final writes may still be in BufferedOutputStream. Failed flushes cannot count.
+        out.flush()
+        deliveryTrackers[session.id]?.written(offset, bytes, length, epoch)?.forEach {
+            mediaDeliveryListener?.invoke(MediaDelivery(session.id, epoch, it.startMs, it.endMs))
+        }
+    }
+
+    private fun noteMediaDelivered(session: ProxySession, resourceId: String, range: ByteRange?, epoch: Long) {
+        val tracker = deliveryTrackers[session.id] ?: return
+        tracker.completed(resourceId, range, epoch).forEach {
+            mediaDeliveryListener?.invoke(MediaDelivery(session.id, epoch, it.startMs, it.endMs))
+        }
+    }
+
     /**
      * Invoked when a downstream (TV) media connection closes, with the bytes delivered, how long it
      * lived, and whether the response completed normally (vs. the TV aborting mid-stream). Lets the engine
@@ -126,6 +152,7 @@ class LocalProxyServer(
     }
 
     fun unregisterStreamLease(sessionId: String) {
+        deliveryTrackers.remove(sessionId)
         remoteLeases.remove(sessionId)
         activeResponses.remove(sessionId)?.forEach { response -> runCatching { response.close() } }
         hlsRegistries.remove(sessionId)
@@ -186,6 +213,7 @@ class LocalProxyServer(
         oldScope?.cancel()
         hlsRegistries.clear()
         hlsResources.clear()
+        deliveryTrackers.clear()
         clientTranscoders.values.forEach { runCatching { it.release() } }
         clientTranscoders.clear()
         boundAddress = null
@@ -306,6 +334,7 @@ class LocalProxyServer(
 
     private suspend fun serve(session: ProxySession, req: RequestLine, out: OutputStream) {
         val head = req.method == "HEAD"
+        val epoch = deliveryEpoch(session)
         // On-device transcode: serve the phone-hosted HLS/CMAF playlist + on-demand segments.
         clientTranscoders[session.id]?.let {
             serveClientTranscode(session, it, req, out, head)
@@ -313,7 +342,7 @@ class LocalProxyServer(
         }
         // Offline download: serve the app-private local file (the TV still only gets the proxy URL).
         if (session.localFilePath != null) {
-            serveLocalFile(session, req, out, head)
+            serveLocalFile(session, req, out, head, epoch)
             return
         }
         // HLS sessions are served as a rewritten playlist + proxied resources so the TV never sees a
@@ -332,7 +361,7 @@ class LocalProxyServer(
         }
         val totalLength = lease.descriptor.totalLength ?: session.totalLength ?: req.knownTotalLength ?: -1L
         if (totalLength < 0) {
-            serveUnknownLengthUpstream(session, out, head)
+            serveUnknownLengthUpstream(session, out, head, epoch)
             return
         }
 
@@ -373,10 +402,10 @@ class LocalProxyServer(
             closeUpstream(session.id, first)
             return
         }
-        streamResilient(session, lease, first, rangeStart, rangeEndInclusive, totalLength, out, canResume = true)
+        streamResilient(session, lease, first, rangeStart, rangeEndInclusive, totalLength, out, canResume = true, epoch = epoch)
     }
 
-    private suspend fun serveUnknownLengthUpstream(session: ProxySession, out: OutputStream, head: Boolean) {
+    private suspend fun serveUnknownLengthUpstream(session: ProxySession, out: OutputStream, head: Boolean, epoch: Long) {
         val lease = remoteLeases[session.id]
         val first = lease?.let { catchingNonCancel { openFullUpstream(session, it) }.getOrNull() }
         if (first == null) {
@@ -396,7 +425,7 @@ class LocalProxyServer(
             closeUpstream(session.id, first)
             return
         }
-        streamResilient(session, lease, first, rangeStart = 0, rangeEndInclusive = contentLength?.minus(1), expectedTotalLength = -1, out = out, canResume = false)
+        streamResilient(session, lease, first, rangeStart = 0, rangeEndInclusive = contentLength?.minus(1), expectedTotalLength = -1, out = out, canResume = false, epoch = epoch)
     }
 
     /** Serve source-owned HLS resources without learning their URLs, credentials, or server type. */
@@ -407,6 +436,8 @@ class LocalProxyServer(
         out: OutputStream,
         head: Boolean,
     ) {
+        val delivery = deliveryTrackers.computeIfAbsent(session.id) { ProxyDeliveryTracker() }
+        val deliveryEpoch = delivery.epoch()
         val lease = remoteLeases[session.id]
         if (lease == null) {
             writeStatus(out, 404, "Not Found")
@@ -493,6 +524,7 @@ class LocalProxyServer(
                         resourceMap[nested.opaqueId] = nested
                     }
                     val encodedById = registry.encodeBatch(resolvedByRaw.values.map { it.opaqueId })
+                    delivery.playlist(resource?.opaqueId, body, resolvedByRaw.mapValues { it.value.opaqueId })
                     rewriter.rewrite(body) { uri ->
                         encodedById.getValue(resolvedByRaw.getValue(uri).opaqueId)
                     }
@@ -522,7 +554,10 @@ class LocalProxyServer(
                     acceptRanges = true,
                     extra = response.header("Content-Range")?.let { "Content-Range" to it },
                 )
-                if (!head) copyTo(session, response.body, out, length)
+                if (!head && copyTo(session, response.body, out, length)) {
+                    ensureSessionActive(session)
+                    noteMediaDelivered(session, resource.opaqueId, range, deliveryEpoch)
+                }
             }
         } finally {
             closeUpstream(session.id, response)
@@ -676,7 +711,7 @@ class LocalProxyServer(
     }
 
     /** Copy a (segment/key/subtitle) body downstream through the bounded buffer; abort if the TV leaves. */
-    private suspend fun copyTo(session: ProxySession, input: InputStream, out: OutputStream, expectedLength: Long? = null) {
+    private suspend fun copyTo(session: ProxySession, input: InputStream, out: OutputStream, expectedLength: Long? = null): Boolean =
         input.use { ins ->
             val buf = ByteArray(MemoryBufferPolicy.COPY_CHUNK_BYTES)
             var copied = 0L
@@ -694,22 +729,21 @@ class LocalProxyServer(
                     copied += n
                     byteListener?.invoke(n.toLong())
                 } catch (e: Exception) {
-                    return // downstream (TV) disconnected
+                    return false // downstream (TV) disconnected
                 }
             }
-            runCatching { out.flush() }
+            copied > 0 && runCatching { out.flush() }.isSuccess
         }
-    }
 
     /**
      * Serve an app-private downloaded file (offline playback). The file length is known, so full HTTP
      * byte-range / seek support is provided via [HttpResponsePlan] + a [RandomAccessFile]. The file path
      * is fixed on the session (never taken from the request), so there is no path-traversal surface.
      */
-    private suspend fun serveLocalFile(session: ProxySession, req: RequestLine, out: OutputStream, head: Boolean) {
+    private suspend fun serveLocalFile(session: ProxySession, req: RequestLine, out: OutputStream, head: Boolean, epoch: Long) {
         val path = session.localFilePath!!
         if (path.startsWith("content://")) {
-            serveContentUri(session, path, req, out, head)
+            serveContentUri(session, path, req, out, head, epoch)
             return
         }
         val file = File(path)
@@ -746,6 +780,7 @@ class LocalProxyServer(
                 if (n < 0) throw IOException("Local file ended before declared length")
                 try {
                     out.write(buf, 0, n)
+                    noteFileBytes(session, epoch, endInclusive - remaining + 1, buf, n, out)
                     byteListener?.invoke(n.toLong())
                 } catch (e: Exception) {
                     return // downstream (TV) disconnected
@@ -761,7 +796,7 @@ class LocalProxyServer(
      * support, by opening it as a seekable file descriptor. The URI is fixed on the session (never taken
      * from the request) and is opened on the phone only — the TV receives just the proxy URL.
      */
-    private suspend fun serveContentUri(session: ProxySession, uriString: String, req: RequestLine, out: OutputStream, head: Boolean) {
+    private suspend fun serveContentUri(session: ProxySession, uriString: String, req: RequestLine, out: OutputStream, head: Boolean, epoch: Long) {
         val resolver = contentResolver
         if (resolver == null) {
             writeStatus(out, 500, "Internal Server Error")
@@ -811,6 +846,7 @@ class LocalProxyServer(
                     if (n < 0) throw IOException("Local content ended before declared length")
                     try {
                         out.write(buf, 0, n)
+                        noteFileBytes(session, epoch, endInclusive - remaining + 1, buf, n, out)
                         byteListener?.invoke(n.toLong())
                     } catch (e: Exception) {
                         return // downstream (TV) disconnected
@@ -828,6 +864,8 @@ class LocalProxyServer(
      * only ever fetches these phone proxy URLs — never the source.
      */
     private fun serveClientTranscode(session: ProxySession, source: ClientTranscodeSource, req: RequestLine, out: OutputStream, head: Boolean) {
+        val delivery = deliveryTrackers.computeIfAbsent(session.id) { ProxyDeliveryTracker() }
+        val deliveryEpoch = delivery.epoch()
         when (val seg = queryParam(req.path, "seg")) {
             null -> {
                 val base = "http://$boundAddress:$boundPort/session/${session.id}"
@@ -841,6 +879,10 @@ class LocalProxyServer(
             "media" -> {
                 val base = "http://$boundAddress:$boundPort/session/${session.id}"
                 val body = source.mediaPlaylist(base).toByteArray(Charsets.UTF_8)
+                val playlist = body.toString(Charsets.UTF_8)
+                delivery.playlist(null, playlist, playlist.lineSequence().map { it.trim() }
+                    .filter { it.isNotEmpty() && !it.startsWith('#') }
+                    .associateWith { queryParam(it, "seg") ?: it })
                 logger.trace(TAG, "TV fetched on-device transcode media playlist (${body.size} B)")
                 writeSimpleHeaders(out, 200, "OK", "application/vnd.apple.mpegurl", body.size.toLong(), acceptRanges = false, extra = null)
                 if (!head) { out.write(body); runCatching { out.flush() } }
@@ -853,7 +895,9 @@ class LocalProxyServer(
                 val index = seg.toIntOrNull()
                 if (index == null) { writeStatus(out, 404, "Not Found"); return }
                 logger.trace(TAG, "TV fetched on-device transcode segment #$index")
-                serveSegmentResource(source.mediaSegment(index, allowExport = !head), out, head)
+                if (serveSegmentResource(source.mediaSegment(index, allowExport = !head), out, head)) {
+                    noteMediaDelivered(session, seg, null, deliveryEpoch)
+                }
             }
         }
     }
@@ -862,20 +906,21 @@ class LocalProxyServer(
     private fun playlistHead(body: ByteArray): String =
         String(body, Charsets.UTF_8).replace("\n", " | ").take(300)
 
-    private fun serveSegmentResource(resource: ClientTranscodeSource.Resource, out: OutputStream, head: Boolean) {
+    private fun serveSegmentResource(resource: ClientTranscodeSource.Resource, out: OutputStream, head: Boolean): Boolean =
         when (resource) {
             is ClientTranscodeSource.Resource.Ready -> serveSegmentBytes(resource.bytes, out, head)
-            ClientTranscodeSource.Resource.NotFound -> writeStatus(out, 404, "Not Found")
+            ClientTranscodeSource.Resource.NotFound -> { writeStatus(out, 404, "Not Found"); false }
             // An export failure/cancellation is retryable by the receiver, but must not masquerade as a
             // successful zero-byte fMP4 response. HEAD follows the same state mapping without exporting.
-            ClientTranscodeSource.Resource.Unavailable -> writeStatus(out, 503, "Service Unavailable")
-            ClientTranscodeSource.Resource.TimedOut -> writeStatus(out, 504, "Gateway Timeout")
+            ClientTranscodeSource.Resource.Unavailable -> { writeStatus(out, 503, "Service Unavailable"); false }
+            ClientTranscodeSource.Resource.TimedOut -> { writeStatus(out, 504, "Gateway Timeout"); false }
         }
-    }
 
-    private fun serveSegmentBytes(bytes: ByteArray, out: OutputStream, head: Boolean) {
+    private fun serveSegmentBytes(bytes: ByteArray, out: OutputStream, head: Boolean): Boolean {
         writeSimpleHeaders(out, 200, "OK", "video/mp4", bytes.size.toLong(), acceptRanges = false, extra = null)
-        if (!head) { out.write(bytes); runCatching { out.flush() } }
+        if (head || bytes.isEmpty()) return false
+        out.write(bytes)
+        return runCatching { out.flush() }.isSuccess
     }
 
     private fun looksLikePlaylist(contentType: String?): Boolean =
@@ -936,6 +981,7 @@ class LocalProxyServer(
         expectedTotalLength: Long,
         out: OutputStream,
         canResume: Boolean,
+        epoch: Long,
     ) {
         val policy = ResilientStreamPolicy(rangeStart, rangeEndInclusive)
         val watchdog = ThroughputWatchdog()
@@ -966,7 +1012,7 @@ class LocalProxyServer(
                 val resp = response
                 response = null
                 val result = try {
-                    copyStream(session, resp.body, out, buf, policy, watchdog)
+                    copyStream(session, resp.body, out, buf, policy, watchdog, epoch)
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (_: Exception) {
@@ -1021,6 +1067,7 @@ class LocalProxyServer(
         buf: ByteArray,
         policy: ResilientStreamPolicy,
         watchdog: ThroughputWatchdog,
+        epoch: Long,
     ): StreamResult {
         input.use { ins ->
             var sinceFlush = 0L
@@ -1041,6 +1088,7 @@ class LocalProxyServer(
                 val writable = minOf(n.toLong(), remaining).toInt()
                 try {
                     out.write(buf, 0, writable)
+                    noteFileBytes(session, epoch, policy.nextOffset, buf, writable, out)
                     policy.recordProgress(writable.toLong())
                     byteListener?.invoke(writable.toLong())
                     if (watchdog.record(writable.toLong(), System.currentTimeMillis())) {

@@ -1,6 +1,7 @@
 package com.adsamcik.streamferry.source.api
 
 import com.adsamcik.streamferry.core.http.ByteRange
+import com.adsamcik.streamferry.core.resume.ProgressEstimate
 import com.adsamcik.streamferry.core.segments.MediaSegment
 import com.adsamcik.streamferry.core.stream.MediaProfile
 import com.adsamcik.streamferry.core.stream.TargetCapabilities
@@ -222,8 +223,12 @@ interface ProviderPlaybackSession {
 
 sealed interface PlaybackEvent {
     data class Started(val positionSeconds: Long) : PlaybackEvent
-    data class Progress(val positionSeconds: Long, val isPaused: Boolean) : PlaybackEvent
-    data class Stopped(val positionSeconds: Long) : PlaybackEvent
+    data class Progress(
+        val positionSeconds: Long,
+        val isPaused: Boolean,
+        val estimate: ProgressEstimate? = null,
+    ) : PlaybackEvent
+    data class Stopped(val positionSeconds: Long, val estimate: ProgressEstimate? = null) : PlaybackEvent
 }
 
 data class PlaybackChange(

@@ -24,6 +24,9 @@ object Mp4DeliveryIndex {
 
     private data class Box(val type: String, val body: Int, val end: Int)
     private class Reader(val data: ByteArray) {
+        // Budgets apply to the whole file, not once per track (constant-size sample tables can be tiny).
+        private var remainingSamples = MAX_ENTRIES.toLong()
+        private var remainingChunks = MAX_CHUNKS
         fun u32(p: Int): Long {
             require(p >= 0 && p <= data.size - 4)
             return (0..3).fold(0L) { value, i -> (value shl 8) or (data[p + i].toLong() and 255) }
@@ -108,7 +111,8 @@ object Mp4DeliveryIndex {
             require(stsz.end - stsz.body >= 12)
             val fixed = u32(stsz.body + 4)
             val samples = u32(stsz.body + 8)
-            require(samples in 1..MAX_ENTRIES.toLong())
+            require(samples in 1..remainingSamples)
+            remainingSamples -= samples
             require(fixed != 0L || samples * 4 <= stsz.end.toLong() - stsz.body - 12)
             val stts = tables.one("stts")
             val (times, timeCount) = stts.table(8)
@@ -143,7 +147,8 @@ object Mp4DeliveryIndex {
             val offsets = tables.single { it.type == "stco" || it.type == "co64" }
             val width = if (offsets.type == "co64") 8 else 4
             val (chunks, chunkCount) = offsets.table(width)
-            require(chunkCount <= MAX_CHUNKS && u32(mapping) == 1L)
+            require(chunkCount <= remainingChunks && u32(mapping) == 1L)
+            remainingChunks -= chunkCount
             var previousFirst = 0L
             repeat(mappingCount) { i ->
                 val first = u32(mapping + i * 12)

@@ -365,8 +365,16 @@ class JellyfinPlaybackProvider(
         override suspend fun report(event: PlaybackEvent) {
             when (event) {
                 is PlaybackEvent.Started -> reporter.reportStart(info, event.positionSeconds)
-                is PlaybackEvent.Progress -> reporter.reportProgress(info, event.positionSeconds, event.isPaused)
-                is PlaybackEvent.Stopped -> reporter.reportStopped(info, event.positionSeconds)
+                is PlaybackEvent.Progress -> {
+                    reporter.reportProgress(info, event.positionSeconds, event.isPaused)
+                    event.estimate?.takeIf { it.anchorPositionSeconds == event.positionSeconds }
+                        ?.let { reporter.reportEstimate(info, it) }
+                }
+                is PlaybackEvent.Stopped -> {
+                    reporter.reportStopped(info, event.positionSeconds)
+                    event.estimate?.takeIf { it.anchorPositionSeconds == event.positionSeconds }
+                        ?.let { reporter.reportEstimate(info, it) }
+                }
             }
         }
 

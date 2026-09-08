@@ -607,6 +607,13 @@ class JellyfinClient(
         },
     )
 
+    override suspend fun saveEstimatedPosition(itemId: String, positionTicks: Long): Unit = withContext(Dispatchers.IO) {
+        val uid = userId ?: error("Not authenticated")
+        // The partial UserData API stores resume ticks without the watched-threshold calculation used
+        // by Sessions/Playing/Progress. Never send Played/PlayCount or use a legacy full-object update.
+        exec(post(path("UserItems", itemId, "UserData"), estimatedPositionUserDataPayload(positionTicks), "userId" to uid))
+    }
+
     override suspend fun reportProgress(playSessionId: String?, itemId: String, positionTicks: Long, isPaused: Boolean) =
         reportProgress(playSessionId, itemId, mediaSourceId = null, positionTicks, isPaused)
 
@@ -1083,9 +1090,12 @@ internal class JellyfinHttpException(
 ) : SourceHttpException(code, serverReason)
 
 /**
- * The UserData patch used by Reset progress. Explicitly mark it unplayed as well as clearing ticks;
- * Jellyfin otherwise may retain a completed state for an episode that should start from the beginning.
+ * A partial resume update. Omitting all watched/count/favorite fields preserves them on the server.
  */
+internal fun estimatedPositionUserDataPayload(positionTicks: Long): JsonObject = buildJsonObject {
+    put("PlaybackPositionTicks", positionTicks.coerceAtLeast(0))
+}
+
 internal fun resetProgressUserDataPayload(): JsonObject = buildJsonObject {
     put("PlaybackPositionTicks", 0L)
     put("Played", false)

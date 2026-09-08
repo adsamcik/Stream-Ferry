@@ -96,4 +96,22 @@ class Mp4DeliveryTrackerTest {
         assertTrue(tracker.written(0, excessive, excessive.size).isEmpty())
         assertTrue(tracker.written(8, ByteArray(1000), 1000).isEmpty())
     }
+
+    @Test fun `tiny constant size tables cannot multiply sample budgets across tracks`() {
+        fun hugeTrack(): ByteArray = box("trak", box("mdia",
+            box("mdhd", words(0, 0, 0, 1000, 1_000_000, 0)),
+            box("hdlr", words(0, 0), "vide".toByteArray()),
+            box("minf", box("dinf", box("dref", words(0, 1), box("url ", words(1)))),
+                box("stbl",
+                    box("stsd", words(0, 1), box("avc1", words(0, 1))),
+                    box("stts", words(0, 1, 600_000, 1)),
+                    box("stsc", words(0, 1, 1, 600_000, 1)),
+                    box("stsz", words(0, 1, 600_000)),
+                    box("stco", words(0, 1, 1000)),
+                ),
+            ),
+        ))
+        assertNotNull(Mp4DeliveryIndex.parse(box("moov", hugeTrack())))
+        assertNull(Mp4DeliveryIndex.parse(box("moov", hugeTrack(), hugeTrack())))
+    }
 }

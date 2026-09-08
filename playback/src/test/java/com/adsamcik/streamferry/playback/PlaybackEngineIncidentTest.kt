@@ -2,6 +2,9 @@ package com.adsamcik.streamferry.playback
 
 import com.adsamcik.streamferry.core.stream.*
 import com.adsamcik.streamferry.core.session.SessionRegistry
+import com.adsamcik.streamferry.core.resume.*
+import com.adsamcik.streamferry.data.proxy.LocalProxyServer
+import com.adsamcik.streamferry.data.proxy.MediaDelivery
 import com.adsamcik.streamferry.domain.*
 import com.adsamcik.streamferry.source.api.PlaybackProvider
 import com.adsamcik.streamferry.source.api.PlaybackRequest
@@ -14,11 +17,17 @@ import com.adsamcik.streamferry.playback.proxy.ProxyForegroundStartPath
 import io.mockk.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.test.*
 import kotlin.test.*
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class PlaybackEngineIncidentTest {
+    private class ResumeStore : SmartResumeRecordStore {
+        override var current: SmartResumeRecord? = null
+        override fun apply(update: SmartResumeCheckpoint) = SmartResumeReducer.reduce(current, update).also { current = it }
+        override fun clear() { current = null }
+    }
     private class Fixture(scope: TestScope) {
         val events = MutableSharedFlow<PlaybackTargetEvent>(extraBufferCapacity = 16)
         val target = mockk<PlaybackTargetController>(relaxed = true)
@@ -26,6 +35,12 @@ class PlaybackEngineIncidentTest {
         val logger = mockk<DiagnosticSink>(relaxed = true)
         val coordinator = mockk<DefaultPlaybackSessionCoordinator>(relaxed = true)
         val service = mockk<PlaybackServiceController>(relaxed = true)
+        val proxy = mockk<LocalProxyServer>(relaxed = true)
+        val resumeStore = ResumeStore()
+        val proxySession = SessionRegistry().create("video/mp4", false, 100_000)
+        var deliveryListener: ((MediaDelivery) -> Unit)? = null
+        var deliveryEpoch = 0L
+        var sleepMillis = 0L
         val movie = MediaItem("movie", "Movie", null, 3600, null, null, false)
         val selected = DiscoveredTarget("tv", "TV", Protocol.CAST, TargetCapabilities(Protocol.CAST), null)
         val engine: PlaybackEngine
@@ -47,23 +62,57 @@ class PlaybackEngineIncidentTest {
                 coEvery { source.mediaSegments() } returns emptyList()
                 Result.success(source)
             }
+            every { proxy.mediaDeliveryListener = any() } answers { deliveryListener = firstArg() }
+            every { proxy.renewDeliveryEpoch(any()) } answers { ++deliveryEpoch }
+            every { coordinator.active } returns MutableStateFlow(proxySession)
             coEvery { coordinator.startAndBuildUrl(any(), any(), any(), any()) } returns
-                (SessionRegistry().create("video/mp4", false, 100_000) to "http://127.0.0.1/session/test/stream")
+                (proxySession to "http://127.0.0.1/session/test/stream")
             every { service.isForegroundActive() } returns true
             coEvery { service.startAndAwaitForegrounded(any()) } returns
                 ForegroundServiceStartResult.Foregrounded(ProxyForegroundStartPath.START_SERVICE)
             val network = mockk<com.adsamcik.streamferry.diagnostics.NetworkInfoProvider>()
             every { network.lanIpv4() } returns "127.0.0.1"
             engine = PlaybackEngine(
-                provider, coordinator, mockk(relaxed = true), network, service, logger,
+                provider, coordinator, proxy, network, service, logger,
                 mockk(relaxed = true), mockk(relaxed = true), { mockk(relaxed = true) },
-                mockk(relaxed = true), clock = { scope.testScheduler.currentTime },
+                mockk(relaxed = true),
+                smartResume = SmartResumeSessionTracker(resumeStore, { scope.testScheduler.currentTime }),
+                clock = { scope.testScheduler.currentTime },
                 dispatcher = StandardTestDispatcher(scope.testScheduler),
+                elapsedRealtime = { scope.testScheduler.currentTime + sleepMillis },
             )
         }
         suspend fun start(seed: com.adsamcik.streamferry.core.resume.SmartResumeSeed? = null, preserveOverride: Boolean = false) =
             engine.play(movie, target, selected, StreamPreferences(), smartResumeSeed = seed, preserveManualWatchOverride = preserveOverride)
         fun emit(event: PlaybackTargetEvent) { check(events.tryEmit(event)) }
+    }
+
+    @Test fun `screen off delivery saves recovery without promoting SDK heartbeat and fresh TV corrects it`() = runTest {
+        val f = Fixture(this)
+        val seed = SmartResumeSeed(SmartResumeSourceType.REMOTE, "movie", "Movie", durationSeconds = 3600, serverId = "server", userId = "user")
+        try {
+            f.start(seed); runCurrent()
+            f.emit(PlaybackTargetEvent.StatusChanged(100, true)); runCurrent()
+            f.sleepMillis = 60_000
+            advanceTimeBy(5000); runCurrent()
+            f.deliveryListener!!.invoke(MediaDelivery(f.proxySession.id, f.deliveryEpoch, 100_000, 200_000))
+            assertEquals(100, f.resumeStore.current!!.confirmedPositionSeconds)
+            assertEquals(165, f.resumeStore.current!!.estimatedProgress!!.progress.positionSeconds)
+            f.emit(PlaybackTargetEvent.StatusChanged(101, true, isPositionConfirmed = false)); runCurrent()
+            f.engine.checkpointSmartResumeLifecycle()
+            assertEquals(100, f.resumeStore.current!!.confirmedPositionSeconds)
+            assertTrue(f.resumeStore.current!!.resumePositionSeconds()!! > 150)
+            assertTrue(f.engine.status.value!!.recoveryPositionSeconds > 150)
+            f.emit(PlaybackTargetEvent.StatusChanged(130, true)); runCurrent()
+            assertEquals(130, f.resumeStore.current!!.confirmedPositionSeconds)
+            assertEquals(130, f.engine.status.value!!.recoveryPositionSeconds)
+            assertNull(f.resumeStore.current!!.estimatedProgress)
+            val oldEpoch = f.deliveryEpoch
+            f.engine.seekTo(500)
+            f.deliveryListener!!.invoke(MediaDelivery(f.proxySession.id, oldEpoch, 0, 1_000_000))
+            f.engine.checkpointSmartResumeLifecycle()
+            assertNull(f.resumeStore.current!!.estimatedProgress)
+        } finally { f.engine.stop(); runCurrent() }
     }
 
     @Test fun `manual override reaches completion events and next playback starts automatic`() = runTest {

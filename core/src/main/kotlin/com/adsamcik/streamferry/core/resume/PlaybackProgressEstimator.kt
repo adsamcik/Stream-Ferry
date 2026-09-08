@@ -14,7 +14,7 @@ data class ProgressEstimate(
     val confidence: ProgressConfidence,
 ) {
     fun isValid() = anchorPositionSeconds >= 0 && positionSeconds >= anchorPositionSeconds &&
-        anchorAgeMillis in 0..PlaybackProgressEstimator.MAX_DELIVERY_AGE_MS &&
+        anchorAgeMillis in 0..(if (confidence == ProgressConfidence.CLOCK) PlaybackProgressEstimator.MAX_CLOCK_AGE_MS else PlaybackProgressEstimator.MAX_DELIVERY_AGE_MS) &&
         uncertaintySeconds in 0..120 && positionSeconds - anchorPositionSeconds <= 1_200
 
     /** Prefer replaying a little material to skipping material that may not have been watched. */

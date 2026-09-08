@@ -130,11 +130,17 @@ class MainViewModelQueueTest {
         statuses.value = playing
         vm.saveQueue("Playing tonight")
         assertEquals(100L, vm.state.value.queues.working.current?.item?.resumePositionSeconds)
-        statuses.value = playing.copy(rendererPlaybackRevision = 2, positionSeconds = 125)
+        statuses.value = playing.copy(rendererPlaybackRevision = 2, positionSeconds = 125, recoveryPositionSeconds = 125)
         assertEquals(125L, vm.state.value.queues.saved.single().contents.current?.item?.resumePositionSeconds)
         // An optimistic/stale status with no new renderer observation must not overwrite the checkpoint.
-        statuses.value = playing.copy(rendererPlaybackRevision = 2, positionSeconds = 500)
+        statuses.value = playing.copy(rendererPlaybackRevision = 2, positionSeconds = 500, recoveryPositionSeconds = 125)
         assertEquals(125L, vm.state.value.queues.working.current?.item?.resumePositionSeconds)
+        // Delivery can save a rewound estimate without claiming a new TV observation.
+        statuses.value = playing.copy(rendererPlaybackRevision = 2, positionSeconds = 125, recoveryPositionSeconds = 159)
+        assertEquals(159L, vm.state.value.queues.saved.single().contents.current?.item?.resumePositionSeconds)
+        // A lower fresh TV report supersedes the estimate.
+        statuses.value = playing.copy(rendererPlaybackRevision = 3, positionSeconds = 90, recoveryPositionSeconds = 90)
+        assertEquals(90L, vm.state.value.queues.working.current?.item?.resumePositionSeconds)
         assertTrue(completions.tryEmit(PlaybackCompletion(local, false, 1)))
         assertEquals(0, vm.state.value.queues.working.size)
         assertEquals(0, vm.state.value.queues.saved.single().contents.size)

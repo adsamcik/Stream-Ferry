@@ -136,6 +136,8 @@ data class PlaybackStatus(
     val currentSubtitleIndex: Int? = null,
     /** A skippable segment (intro/outro/recap) covering the current position, for the "Skip" button. */
     val skipSegment: SkipSegment? = null,
+    /** Durable recovery position, potentially rewound from a bounded estimate; independent of UI ticks. */
+    val recoveryPositionSeconds: Long = positionSeconds,
 )
 
 /** A skippable segment surfaced to the UI: a button [label] and the position to seek to on skip. */
@@ -196,11 +198,17 @@ class PlaybackEngine(
     /** Fresh local-network permission check for UI, notification, autoplay, and reconnect paths. */
     private val requireLocalNetworkAccess: () -> Unit = {},
     private val dispatcher: CoroutineDispatcher = Dispatchers.Default,
+    private val elapsedRealtime: () -> Long = android.os.SystemClock::elapsedRealtime,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + dispatcher)
     // Evaluated lazily (thread-safe) on first on-device-transcode use, always from an off-main path.
     private val deviceEncodeCaps: DeviceEncodeCapabilities by lazy { deviceEncodeCapsProvider() }
     private val mutex = Mutex()
+    private val progressLock = Any()
+    private val progressEstimator = com.adsamcik.streamferry.core.resume.PlaybackProgressEstimator()
+    private var progressSessionId: String? = null
+    private var progressEpoch = 0L
+    private var progressOffsetSeconds = 0L
     private val streamSelection = StreamSelectionService()
     private val playbackRouter = PlaybackRouter()
     private val transcodeNegotiator = TranscodeNegotiator()
@@ -352,7 +360,40 @@ class PlaybackEngine(
     private val absolutePositionSeconds: Long get() = streamStartSeconds + reportedPositionSeconds
 
     /** Persist the latest renderer-confirmed position when the app leaves the foreground. */
-    fun checkpointSmartResumeLifecycle() = smartResume.checkpoint(SmartResumeCheckpointKind.LIFECYCLE)
+    fun checkpointSmartResumeLifecycle() {
+        updateProgressEstimate()
+        smartResume.checkpoint(SmartResumeCheckpointKind.LIFECYCLE)
+    }
+
+    private fun beginProgressTracking() = synchronized(progressLock) {
+        progressEstimator.reset()
+        progressSessionId = coordinator.active.value?.id
+        progressEpoch = progressSessionId?.let(proxy::renewDeliveryEpoch) ?: 0L
+        progressOffsetSeconds = streamStartSeconds
+        proxy.mediaDeliveryListener = { delivery ->
+            synchronized(progressLock) {
+                if (delivery.sessionId == progressSessionId && delivery.epoch == progressEpoch) {
+                    val offset = progressOffsetSeconds * 1000
+                    progressEstimator.delivered(delivery.startMs + offset, delivery.endMs + offset, elapsedRealtime())
+                    updateProgressEstimate()
+                }
+            }
+        }
+    }
+
+    private fun holdProgressEstimate(resetDelivery: Boolean = false) = synchronized(progressLock) {
+        if (resetDelivery) {
+            progressEstimator.reset()
+            progressEpoch = progressSessionId?.let(proxy::renewDeliveryEpoch) ?: 0L
+        } else progressEstimator.hold()
+        if (resetDelivery) reportingSessionToken?.let { coordinator.clearEstimate(it) }
+    }
+
+    private fun updateProgressEstimate() = synchronized(progressLock) {
+        val estimate = progressEstimator.estimate(elapsedRealtime(), item?.runtimeSeconds ?: localPlayback?.runtimeSeconds)
+        if (estimate != null) smartResume.noteEstimate(estimate)
+        reportingSessionToken?.let { coordinator.noteEstimate(estimate, it) }
+    }
 
     /** Whether an asynchronous completion still belongs to the currently active renderer session. */
     /** Immediate session-scoped override; queued titles and another account cannot disable reporting. */
@@ -762,6 +803,7 @@ class PlaybackEngine(
         val t = target ?: return
         t.pause()
         isPlaying = false
+        holdProgressEstimate()
         controlErrorMessage = null
         smartResume.checkpoint(SmartResumeCheckpointKind.PAUSED)
         reportSourceProgressSoon()
@@ -1007,6 +1049,7 @@ class PlaybackEngine(
         // silently never plays (local has no server transcode, so recovery surfaces the failure).
         proxy.byteListener = { n -> startupBytesServed += n }
         proxy.onDownstreamClosed = { bytes, durationMs, completed -> onDownstreamClosedEarly(bytes, durationMs, completed) }
+        beginProgressTracking()
         logger.event(
             "playback",
             "Loading ${if (transcodeTarget != null) "on-device HLS transcode" else "direct-play (${streamForTv.mimeType})"} " +
@@ -1086,6 +1129,7 @@ class PlaybackEngine(
         val duration = currentProviderSession?.descriptor?.runtimeSeconds ?: item?.runtimeSeconds ?: localPlayback?.runtimeSeconds
         val pos = PlaybackPositionPolicy.clamp(absoluteSeconds, duration)
         smartResume.noteSeekRequested(pos)
+        holdProgressEstimate(resetDelivery = true)
         // Only a progressive (non-HLS) transcode is a non-seekable live stream that must be re-resolved at
         // the new position server-side. A direct-play file AND a full-timeline HLS transcode are seekable,
         // so the renderer seeks within the existing stream (matching what the TV's own controls do) — a
@@ -1683,6 +1727,7 @@ class PlaybackEngine(
             )
         }
         reportingSessionToken = coordinator.activeReportToken()
+        beginProgressTracking()
         noteSourcePosition(positionSeconds)
         // Hand the start position to load() so the renderer begins AT it (Cast sets it in the load request;
         // DLNA seeks once playing) for a direct-play file or a full-timeline HLS transcode — no separate,
@@ -1799,6 +1844,7 @@ class PlaybackEngine(
         armWatchdog: Boolean = false,
         playWhenReady: Boolean = true,
     ) {
+        holdProgressEstimate(resetDelivery = true)
         // The coordinator reports a terminal position while replacing the source session. Record the
         // requested resume point first so a seek, bitrate switch, or recovery cannot save stale progress.
         noteSourcePosition(positionSeconds)
@@ -2164,14 +2210,15 @@ class PlaybackEngine(
                 logger.w(TAG, "Night-volume scheduler tick failed; leaving volume unchanged", e)
             }
             val a = adaptive
+            updateProgressEstimate()
+            reportingSessionToken?.let { token ->
+                runCatching { coordinator.reportProgress(isPaused = !isPlaying, expectedToken = token) }
+            }
             if (a == null) {
                 publishStatus()
                 continue
             }
             val now = clock()
-            reportingSessionToken?.let { token ->
-                runCatching { coordinator.reportProgress(isPaused = !isPlaying, expectedToken = token) }
-            }
             // A transient failure here must never silently kill adaptation for the rest of the session.
             runCatching {
                 lastThroughputBps = a.averageThroughputBps(now)
@@ -2346,7 +2393,7 @@ class PlaybackEngine(
                 publishStatus()
             }
             is PlaybackTargetEvent.StatusChanged -> {
-                verifyRendererResumePosition(source, event)
+                if (event.isPositionConfirmed) verifyRendererResumePosition(source, event)
                 val incomingAbsolute = streamStartSeconds + event.positionSeconds
                 if (SeekSettle.shouldHold(
                         seekSettleTargetSeconds, incomingAbsolute, clock(), seekSettleUntilMs, SEEK_SETTLE_TOLERANCE_SECONDS,
@@ -2364,14 +2411,21 @@ class PlaybackEngine(
                 recoverySession = recoverySession.transition(if (event.isPlaying) PlaybackPhase.PLAYING else PlaybackPhase.PAUSED)
                 // Evidence the stream actually started playing on the TV — cancels the startup watchdog.
                 if (event.isPlaying || event.positionSeconds > 0) markPlaybackStarted()
-                noteSourcePosition(absolutePositionSeconds)
-                smartResume.onRendererStatus(
-                    absolutePositionSeconds,
-                    item?.runtimeSeconds ?: localPlayback?.runtimeSeconds,
-                    event.isPlaying,
-                    smartResumeDeviceContext,
-                )
-                maybeAutoSkip()
+                if (event.isPositionConfirmed) {
+                    synchronized(progressLock) {
+                        progressEstimator.confirm(absolutePositionSeconds, event.isPlaying && !isBuffering,
+                            elapsedRealtime(), event.playbackRate)
+                        noteSourcePosition(absolutePositionSeconds)
+                        smartResume.onRendererStatus(
+                            absolutePositionSeconds,
+                            item?.runtimeSeconds ?: localPlayback?.runtimeSeconds,
+                            event.isPlaying,
+                            smartResumeDeviceContext,
+                            allowRegression = true,
+                        )
+                    }
+                    maybeAutoSkip()
+                } else updateProgressEstimate()
                 publishStatus()
             }
             is PlaybackTargetEvent.VolumeChanged -> {
@@ -2386,6 +2440,7 @@ class PlaybackEngine(
             }
             is PlaybackTargetEvent.BufferingChanged -> {
                 isBuffering = event.isBuffering
+                if (event.isBuffering) holdProgressEstimate()
                 recoverySession = recoverySession.transition(if (event.isBuffering) PlaybackPhase.BUFFERING else if (isPlaying) PlaybackPhase.PLAYING else PlaybackPhase.PAUSED)
                 if (event.isBuffering) adaptive?.recordRebuffer(clock())
                 logger.trace(TAG, "Buffering ${if (event.isBuffering) "started" else "ended"} at ${absolutePositionSeconds}s")
@@ -2414,6 +2469,7 @@ class PlaybackEngine(
                     // mistake this completion for a newer stream that has reused the same TV connection.
                     val completedPlayGeneration = playGeneration
                     completedGeneration = completedPlayGeneration
+                    holdProgressEstimate(resetDelivery = true)
                     val lastRendererPosition = absolutePositionSeconds
                     val duration = currentProviderSession?.descriptor?.runtimeSeconds
                         ?: item?.runtimeSeconds
@@ -2479,6 +2535,8 @@ class PlaybackEngine(
                 scope.launch { stopIfCurrent(gen, "renderer stopped") }
             }
             is PlaybackTargetEvent.Disconnected -> {
+                updateProgressEstimate()
+                holdProgressEstimate()
                 isPlaying = false
                 pendingRendererResumePosition = null
                 smartResume.checkpoint(SmartResumeCheckpointKind.DISCONNECTED)
@@ -2641,6 +2699,12 @@ class PlaybackEngine(
     }
 
     private suspend fun stopInternalLocked(reason: String) {
+        updateProgressEstimate()
+        synchronized(progressLock) {
+            progressEstimator.reset()
+            progressSessionId = null
+            proxy.mediaDeliveryListener = null
+        }
         recoverySession = recoverySession.stop().let { stopped ->
             if (reason.endsWith("failed")) stopped.fail() else stopped
         }
@@ -2758,6 +2822,7 @@ class PlaybackEngine(
             isPlaying = isPlaying,
             isBuffering = isBuffering,
             positionSeconds = absolutePositionSeconds,
+            recoveryPositionSeconds = smartResume.recoveryPositionSeconds() ?: absolutePositionSeconds,
             // For an online session the duration comes from the source descriptor; a local session
             // falls back to the item runtime (probed for on-device files).
             durationSeconds = descriptor?.runtimeSeconds ?: item?.runtimeSeconds,

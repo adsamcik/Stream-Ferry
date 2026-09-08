@@ -73,6 +73,7 @@ interface JellyfinPlaybackReporter {
     suspend fun reportStart(info: JellyfinPlaybackInfo)
     suspend fun reportStart(info: JellyfinPlaybackInfo, initialPositionSeconds: Long) = reportStart(info)
     suspend fun reportProgress(info: JellyfinPlaybackInfo, positionSeconds: Long, isPaused: Boolean)
+    suspend fun reportEstimate(info: JellyfinPlaybackInfo, estimate: com.adsamcik.streamferry.core.resume.ProgressEstimate) {}
     suspend fun reportStopped(info: JellyfinPlaybackInfo, positionSeconds: Long)
     suspend fun stopTranscode(info: JellyfinPlaybackInfo)
 }

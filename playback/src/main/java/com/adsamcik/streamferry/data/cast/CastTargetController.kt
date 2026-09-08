@@ -731,6 +731,10 @@ class CastTargetController(
         val status = client.mediaStatus
         val positionSeconds = client.approximateStreamPosition / 1000L
         val state = status?.playerState
+        fun positionEvent(playing: Boolean) = PlaybackTargetEvent.StatusChanged(
+            positionSeconds, playing, isPositionConfirmed = !isHeartbeat,
+            playbackRate = status?.playbackRate ?: 1.0,
+        )
         // High-signal, always-on transition event (mirrors DLNA's) so a shared report shows the receiver's
         // state machine — e.g. a stall reads as "... -> LOADING" that never reaches PLAYING, a decode
         // rejection as "LOADING -> IDLE (ERROR)". The per-callback line below stays on the trace channel.
@@ -754,15 +758,15 @@ class CastTargetController(
         when (status?.playerState) {
             MediaStatus.PLAYER_STATE_BUFFERING -> {
                 if (!lastBuffering) { lastBuffering = true; _events.tryEmit(PlaybackTargetEvent.BufferingChanged(true)) }
-                _events.tryEmit(PlaybackTargetEvent.StatusChanged(positionSeconds, isPlaying = false))
+                _events.tryEmit(positionEvent(false))
             }
             MediaStatus.PLAYER_STATE_PLAYING -> {
                 if (lastBuffering) { lastBuffering = false; _events.tryEmit(PlaybackTargetEvent.BufferingChanged(false)) }
-                _events.tryEmit(PlaybackTargetEvent.StatusChanged(positionSeconds, isPlaying = true))
+                _events.tryEmit(positionEvent(true))
             }
             MediaStatus.PLAYER_STATE_PAUSED -> {
                 if (lastBuffering) { lastBuffering = false; _events.tryEmit(PlaybackTargetEvent.BufferingChanged(false)) }
-                _events.tryEmit(PlaybackTargetEvent.StatusChanged(positionSeconds, isPlaying = false))
+                _events.tryEmit(positionEvent(false))
             }
             MediaStatus.PLAYER_STATE_IDLE ->
                 when (status.idleReason) {

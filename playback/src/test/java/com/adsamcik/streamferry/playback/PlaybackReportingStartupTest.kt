@@ -1,6 +1,8 @@
 package com.adsamcik.streamferry.playback
 
 import com.adsamcik.streamferry.core.session.SessionRegistry
+import com.adsamcik.streamferry.core.resume.ProgressEstimate
+import com.adsamcik.streamferry.core.resume.ProgressConfidence
 import com.adsamcik.streamferry.data.proxy.LocalProxyServer
 import com.adsamcik.streamferry.playback.session.DefaultPlaybackSessionCoordinator
 import com.adsamcik.streamferry.source.api.*
@@ -11,6 +13,38 @@ import kotlin.test.*
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class PlaybackReportingStartupTest {
+    @Test fun `estimated checkpoint freezes on expiry and is replaced by fresh TV truth or seek`() = runTest {
+        val proxy = mockk<LocalProxyServer>(relaxed = true)
+        every { proxy.start(any()) } returns "127.0.0.1:1234"
+        val source = mockk<ProviderPlaybackSession>(relaxed = true)
+        every { source.descriptor.stream } returns StreamDescriptor("video/mp4", "mp4", isTranscoding = false, isByteSeekable = true, totalLength = 8)
+        val coordinator = DefaultPlaybackSessionCoordinator(SessionRegistry(), proxy, mockk(relaxed = true), StandardTestDispatcher(testScheduler))
+        coordinator.startAndBuildUrl(source, "127.0.0.1", 100)
+        runCurrent()
+        val token = coordinator.activeReportToken()!!
+        val estimate = ProgressEstimate(160, 100, 60_000, 6, ProgressConfidence.DELIVERY)
+        coordinator.noteEstimate(estimate, token + 1)
+        coordinator.reportProgress(false)
+        coVerify { source.report(PlaybackEvent.Progress(100, false)) }
+        coordinator.noteEstimate(estimate, token)
+        coordinator.noteEstimate(null, token)
+        coordinator.noteEstimate(estimate.copy(anchorAgeMillis = 180_000), token)
+        coordinator.reportProgress(true)
+        coVerify { source.report(PlaybackEvent.Progress(100, true, estimate)) }
+        coordinator.notePosition(90, token)
+        coordinator.noteEstimate(estimate, token)
+        coordinator.reportProgress(false)
+        coVerify { source.report(PlaybackEvent.Progress(90, false)) }
+        coordinator.noteEstimate(estimate.copy(anchorPositionSeconds = 90), token)
+        coordinator.clearEstimate(token)
+        coordinator.reportProgress(false)
+        coVerify(exactly = 2) { source.report(PlaybackEvent.Progress(90, false)) }
+        coordinator.notePosition(100, token)
+        coordinator.noteEstimate(estimate, token)
+        coordinator.stop("connection lost")
+        coVerify { source.report(PlaybackEvent.Stopped(100, estimate)) }
+    }
+
     @Test fun `manual edit drains in flight reports and suppresses later progress and stop but keeps cleanup`() = runTest {
         val proxy = mockk<LocalProxyServer>(relaxed = true)
         every { proxy.start(any()) } returns "127.0.0.1:1234"

@@ -2,6 +2,8 @@ package com.adsamcik.streamferry.playback.session
 
 import com.adsamcik.streamferry.core.session.ProxySession
 import com.adsamcik.streamferry.core.session.SessionRegistry
+import com.adsamcik.streamferry.core.resume.ProgressEstimate
+import com.adsamcik.streamferry.core.resume.ProgressConfidence
 import com.adsamcik.streamferry.data.proxy.ClientTranscodeSource
 import com.adsamcik.streamferry.data.proxy.LocalProxyServer
 import com.adsamcik.streamferry.source.api.DiagnosticSink
@@ -46,6 +48,7 @@ class DefaultPlaybackSessionCoordinator(
         val positionSeconds: Long,
         val shouldReport: () -> Boolean,
         val startReported: CompletableDeferred<Unit> = CompletableDeferred(),
+        val estimate: ProgressEstimate? = null,
     )
 
     private val reportStateLock = Any()
@@ -65,18 +68,38 @@ class DefaultPlaybackSessionCoordinator(
         synchronized(reportStateLock) {
             val active = reportingSession ?: return
             if (expectedToken != null && active.token != expectedToken) return
-            reportingSession = active.copy(positionSeconds = seconds)
+            reportingSession = active.copy(positionSeconds = seconds, estimate = null)
         }
+    }
+
+    fun noteEstimate(estimate: ProgressEstimate?, expectedToken: Long) = synchronized(reportStateLock) {
+        val active = reportingSession ?: return@synchronized
+        if (active.token != expectedToken) return@synchronized
+        // Expiry freezes the previously saved checkpoint; it must not rewind user data to a stale
+        // confirmation on the next lifecycle heartbeat. Only new TV truth or a seek clears it.
+        val eligible = estimate?.takeIf {
+            it.isValid() && it.anchorPositionSeconds == active.positionSeconds &&
+                it.confidence == ProgressConfidence.DELIVERY && it.anchorAgeMillis <= 120_000 &&
+                it.uncertaintySeconds <= 15 && it.recoveryPositionSeconds() > active.positionSeconds
+        } ?: return@synchronized
+        if (eligible.recoveryPositionSeconds() >= (active.estimate?.recoveryPositionSeconds() ?: 0L)) {
+            reportingSession = active.copy(estimate = eligible)
+        }
+    }
+
+    fun clearEstimate(expectedToken: Long) = synchronized(reportStateLock) {
+        reportingSession?.takeIf { it.token == expectedToken }?.let { reportingSession = it.copy(estimate = null) }
     }
 
     /** Report progress for the exact active session; queued work from a prior item is rejected by token. */
     suspend fun reportProgress(isPaused: Boolean, expectedToken: Long? = null) = mutex.withLock {
-        val active = reportingSnapshot(expectedToken) ?: return@withLock
-        active.startReported.await()
+        val initial = reportingSnapshot(expectedToken) ?: return@withLock
+        initial.startReported.await()
+        val active = reportingSnapshot(initial.token) ?: return@withLock
         if (!active.shouldReport()) return@withLock
         runBoundedRemoteCleanup("report progress") {
             active.providerSession.report(
-                PlaybackEvent.Progress(active.positionSeconds, isPaused),
+                PlaybackEvent.Progress(active.positionSeconds, isPaused, active.estimate),
             )
         }
     }
@@ -175,7 +198,7 @@ class DefaultPlaybackSessionCoordinator(
             reporting.startReported.await()
             if (reporting.shouldReport()) {
                 runBoundedRemoteCleanup("report stopped") {
-                    reporting.providerSession.report(PlaybackEvent.Stopped(reporting.positionSeconds))
+                    reporting.providerSession.report(PlaybackEvent.Stopped(reporting.positionSeconds, reporting.estimate))
                 }
             }
             runBoundedRemoteCleanup("close source playback") {

@@ -60,6 +60,8 @@ interface JellyfinApi {
     suspend fun reportPlaying(playSessionId: String?, itemId: String)
     suspend fun reportProgress(playSessionId: String?, itemId: String, positionTicks: Long, isPaused: Boolean)
     suspend fun reportStopped(playSessionId: String?, itemId: String, positionTicks: Long)
+    /** Position-only user-data update; must not infer completion or alter played state. */
+    suspend fun saveEstimatedPosition(itemId: String, positionTicks: Long) {}
 
     /** Full start payload: Jellyfin distinguishes the library item from the selected media source/version. */
     suspend fun reportPlaying(

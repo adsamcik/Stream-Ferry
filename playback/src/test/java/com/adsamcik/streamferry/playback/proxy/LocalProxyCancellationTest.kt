@@ -2,6 +2,7 @@ package com.adsamcik.streamferry.playback.proxy
 
 import com.adsamcik.streamferry.core.session.SessionRegistry
 import com.adsamcik.streamferry.data.proxy.LocalProxyServer
+import com.adsamcik.streamferry.data.proxy.MediaDelivery
 import com.adsamcik.streamferry.source.api.*
 import io.mockk.*
 import java.io.ByteArrayInputStream
@@ -41,9 +42,9 @@ class LocalProxyCancellationTest {
         coEvery { lease.open(range = any()) } returns Result.success(StreamResponse(200, mapOf("Content-Length" to "8"), body))
     }
 
-    private fun request(address: String, id: String, query: String = ""): Socket = Socket("127.0.0.1", address.substringAfter(':').toInt()).apply {
+    private fun request(address: String, id: String, query: String = "", method: String = "GET"): Socket = Socket("127.0.0.1", address.substringAfter(':').toInt()).apply {
         soTimeout = 3000
-        getOutputStream().write("GET /session/$id/stream$query HTTP/1.1\r\nHost: localhost\r\n\r\n".toByteArray())
+        getOutputStream().write("$method /session/$id/stream$query HTTP/1.1\r\nHost: localhost\r\n\r\n".toByteArray())
         getOutputStream().flush()
     }
 
@@ -130,6 +131,8 @@ class LocalProxyCancellationTest {
         val sessions = SessionRegistry()
         val log = Log()
         val proxy = LocalProxyServer(sessions, log)
+        val deliveries = CopyOnWriteArrayList<MediaDelivery>()
+        proxy.mediaDeliveryListener = { deliveries += it }
         val session = sessions.create("application/vnd.apple.mpegurl", isHls = true)
         val source = mockk<StreamLease>()
         val segment = StreamResourceRef("segment", StreamResourceKind.MEDIA)
@@ -148,6 +151,39 @@ class LocalProxyCancellationTest {
             val opaque = assertNotNull(Regex("seg=([A-Za-z0-9_-]+)").find(root)).groupValues[1]
             request(address, session.id, "?seg=$opaque").use { it.getInputStream().readBytes() }
             assertTrue(log.outcomes.last().contains("clean=false outcome=upstream_failed"))
+            assertTrue(deliveries.isEmpty())
+        } finally { proxy.stop() }
+    }
+
+    @Test fun `HLS timeline reaches delivery callback only after a complete GET body`() {
+        val sessions = SessionRegistry()
+        val proxy = LocalProxyServer(sessions, Log())
+        val session = sessions.create("application/vnd.apple.mpegurl", isHls = true)
+        val source = mockk<StreamLease>()
+        val segment = StreamResourceRef("segment", StreamResourceKind.MEDIA)
+        val playlist = "#EXTM3U\n#EXTINF:10,\nsegment.ts\n#EXT-X-ENDLIST\n"
+        coEvery { source.open(range = any()) } answers { Result.success(StreamResponse(
+            200, mapOf("Content-Type" to "application/vnd.apple.mpegurl"), ByteArrayInputStream(playlist.toByteArray()),
+        )) }
+        coEvery { source.resolve(any(), any()) } returns Result.success(segment)
+        coEvery { source.open(segment, any()) } answers { Result.success(StreamResponse(
+            200, mapOf("Content-Type" to "video/mp2t", "Content-Length" to "8"), ByteArrayInputStream("allmedia".toByteArray()),
+        )) }
+        proxy.registerStreamLease(session.id, source)
+        val epoch = proxy.renewDeliveryEpoch(session.id)
+        val deliveries = CopyOnWriteArrayList<MediaDelivery>()
+        proxy.mediaDeliveryListener = { deliveries += it }
+        try {
+            val address = proxy.start("127.0.0.1")
+            val root = request(address, session.id).use { it.getInputStream().readBytes().decodeToString() }
+            assertTrue(deliveries.isEmpty())
+            val opaque = assertNotNull(Regex("seg=([A-Za-z0-9_-]+)").find(root)).groupValues[1]
+            request(address, session.id, "?seg=$opaque", "HEAD").use { it.getInputStream().readBytes() }
+            assertTrue(deliveries.isEmpty())
+            request(address, session.id, "?seg=$opaque").use {
+                assertTrue(it.getInputStream().readBytes().decodeToString().endsWith("allmedia"))
+            }
+            assertEquals(listOf(MediaDelivery(session.id, epoch, 0, 10_000)), deliveries)
         } finally { proxy.stop() }
     }
 }

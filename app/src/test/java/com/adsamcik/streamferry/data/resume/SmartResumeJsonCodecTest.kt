@@ -23,6 +23,22 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class SmartResumeRecordVersioningTest {
+    @Test fun estimateSurvivesAtomicStoreReloadWithoutPromotingItToConfirmed() {
+        val record = SmartResumeRecordVersioning.migrate(2, v1Fields())!!.record
+        val estimate = com.adsamcik.streamferry.core.resume.SavedProgressEstimate(
+            com.adsamcik.streamferry.core.resume.ProgressEstimate(180,120,60_000,6,
+                com.adsamcik.streamferry.core.resume.ProgressConfidence.DELIVERY), 99)
+        val json = SmartResumeJsonCodec.encode(record.copy(estimatedProgress = estimate))
+        historyFile.writeText(json.toString())
+        val restored = SmartResumeStore(RuntimeEnvironment.getApplication(), { 100_000 }).current!!
+        assertEquals(120, restored.confirmedPositionSeconds)
+        assertEquals(174, restored.resumePositionSeconds())
+        assertEquals(estimate, restored.estimatedProgress)
+        json.getJSONObject("estimatedProgress").put("confidence", "corrupt")
+        val recovered = SmartResumeJsonCodec.decode(json)!!.record
+        assertEquals(120, recovered.resumePositionSeconds())
+        assertNull(recovered.estimatedProgress)
+    }
     private val historyFile: File
         get() = File(RuntimeEnvironment.getApplication().noBackupFilesDir, "smart_resume_v1.json")
 

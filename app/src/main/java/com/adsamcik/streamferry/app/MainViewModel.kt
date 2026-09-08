@@ -297,14 +297,14 @@ class MainViewModel(
             container.playbackEngine.status.collect { status ->
                 if (playbackStopping) return@collect
                 if (status != null) {
-                    lastPlaybackPositionSeconds = status.positionSeconds
+                    lastPlaybackPositionSeconds = status.recoveryPositionSeconds
                     checkpointQueue(status)
                     // The engine may have probed a missing SAF/MediaStore duration. Retain that authoritative
                     // timeline so near-end local checkpoints are removed instead of resurfacing as resume.
                     if (currentResumeKey != null && status.durationSeconds?.let { it > 0L } == true) {
                         currentDurationSeconds = status.durationSeconds
                     }
-                    saveResumeThrottled(status.positionSeconds)
+                    saveResumeThrottled(status.recoveryPositionSeconds)
                     recordSuccessfulPhysicalEndpoint(status)
                 }
                 // An unexpected renderer drop -> kick off auto-reconnect + resume (idempotent).
@@ -2030,7 +2030,7 @@ class MainViewModel(
                     val uri = record.localContentUri ?: error("This local video is no longer available.")
                     val item = container.localMediaSource.item(uri).getOrThrow()
                     val position = record.playbackStartPosition(
-                        rendererConfirmedSeconds = container.resumeStore.resumePosition(uri),
+                        sourceResumeSeconds = container.resumeStore.resumePosition(uri),
                     )
                     beginSmartResumeTargetSelection(item, null, position, record.deviceContext())
                 }
@@ -2041,7 +2041,7 @@ class MainViewModel(
                     val file = container.downloadStore.fileFor(entry)
                     check(file.isFile && file.canRead() && file.length() > 0L) { "The downloaded copy is unavailable." }
                     val position = record.playbackStartPosition(
-                        rendererConfirmedSeconds = container.resumeStore.resumePosition(
+                        sourceResumeSeconds = container.resumeStore.resumePosition(
                             DownloadIdentity(owner, entry.itemId).resumeKey,
                         ),
                     )
@@ -2064,12 +2064,11 @@ class MainViewModel(
     fun clearPlaybackHistory() = container.smartResumeStore.clear()
 
     private fun SmartResumeRecord.playbackStartPosition(
-        rendererConfirmedSeconds: Long? = null,
         sourceResumeSeconds: Long? = null,
     ): Long = if (state == SmartResumeRecordState.FINISHED) {
         0L
     } else {
-        SmartResumePositionReconciler.reconcile(this, rendererConfirmedSeconds, sourceResumeSeconds) ?: 0L
+        SmartResumePositionReconciler.reconcile(this, rendererConfirmedSeconds = null, sourceResumeSeconds) ?: 0L
     }
 
     private fun beginSmartResumeTargetSelection(
@@ -2322,7 +2321,7 @@ class MainViewModel(
         val item = snapshot.nowPlayingItem ?: return
         val owner = if (item.sourceId == MediaSourceIds.REMOTE) activeJellyfinSession() ?: return else null
         val entry = PlaylistEntry(++playlistEntrySequence,
-            item.copy(resumePositionSeconds = playback.positionSeconds), owner)
+            item.copy(resumePositionSeconds = container.playbackEngine.status.value?.recoveryPositionSeconds ?: playback.positionSeconds), owner)
         playingQueueEntryId = entry.entryId
         lastQueuePlaybackRevision = playback.rendererPlaybackRevision
         _state.update { it.copy(queues = it.queues.updateWorking(it.queues.working.copy(current = entry))) }
@@ -2331,10 +2330,10 @@ class MainViewModel(
     private fun checkpointQueue(status: PlaybackStatus, force: Boolean = false) {
         if (container.playbackEngine.hasManualWatchStateOverride()) return
         val id = playingQueueEntryId ?: return
-        if (!force && status.rendererPlaybackRevision <= lastQueuePlaybackRevision) return
         lastQueuePlaybackRevision = status.rendererPlaybackRevision
         val previous = _state.value.queues.working.current?.item?.resumePositionSeconds ?: 0L
-        val position = if (force) _state.value.playback?.positionSeconds ?: return else status.positionSeconds
+        val position = status.recoveryPositionSeconds
+        if (!force && position == previous) return
         if (!force && status.isPlaying && kotlin.math.abs(position - previous) < 5) return
         _state.update { it.copy(queues = it.queues.updateWorking(it.queues.working.checkpoint(id, position))) }
     }

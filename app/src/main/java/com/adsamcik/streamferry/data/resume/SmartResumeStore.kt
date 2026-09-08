@@ -8,6 +8,9 @@ import com.adsamcik.streamferry.core.resume.SmartResumeRecordState
 import com.adsamcik.streamferry.core.resume.SmartResumeRecordStore
 import com.adsamcik.streamferry.core.resume.SmartResumeHistoryReducer
 import com.adsamcik.streamferry.core.resume.SmartResumeSourceType
+import com.adsamcik.streamferry.core.resume.SavedProgressEstimate
+import com.adsamcik.streamferry.core.resume.ProgressEstimate
+import com.adsamcik.streamferry.core.resume.ProgressConfidence
 import com.adsamcik.streamferry.core.stream.Protocol
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -158,6 +161,7 @@ internal object SmartResumeRecordVersioning {
         val physicalDeviceReference: String? = null,
         val lastSuccessfulProtocol: String? = null,
         val stableEndpointIdentity: String? = null,
+        val estimatedProgress: SavedProgressEstimate? = null,
     )
 
     internal data class Decoded(val record: SmartResumeRecord, val migratedFromV1: Boolean)
@@ -175,6 +179,10 @@ internal object SmartResumeRecordVersioning {
                 sessionId = fields.sessionId, generation = fields.generation, sequence = fields.sequence, state = fields.state,
                 physicalDeviceStableId = fields.physicalDeviceStableId, physicalDeviceReference = fields.physicalDeviceReference,
                 lastSuccessfulProtocol = protocol, stableEndpointIdentity = fields.stableEndpointIdentity,
+                estimatedProgress = fields.estimatedProgress?.takeIf {
+                    version >= 3 && it.isValid() && it.progress.anchorPositionSeconds == fields.confirmedPositionSeconds &&
+                        it.capturedAtMillis <= fields.updatedAtMillis
+                },
             ),
             migratedFromV1 = version == 1,
         )
@@ -193,6 +201,14 @@ internal object SmartResumeJsonCodec {
         putNullable("physicalDeviceReference", r.physicalDeviceReference)
         putNullable("lastSuccessfulProtocol", r.lastSuccessfulProtocol?.name)
         putNullable("stableEndpointIdentity", r.stableEndpointIdentity)
+        putNullable("estimatedProgress", r.estimatedProgress?.let { saved -> JSONObject().apply {
+            put("positionSeconds", saved.progress.positionSeconds)
+            put("anchorPositionSeconds", saved.progress.anchorPositionSeconds)
+            put("anchorAgeMillis", saved.progress.anchorAgeMillis)
+            put("uncertaintySeconds", saved.progress.uncertaintySeconds)
+            put("confidence", saved.progress.confidence.name)
+            put("capturedAtMillis", saved.capturedAtMillis)
+        } })
     }
 
     fun decode(o: JSONObject): SmartResumeRecordVersioning.Decoded? = SmartResumeRecordVersioning.migrate(
@@ -212,6 +228,12 @@ internal object SmartResumeJsonCodec {
             physicalDeviceReference = o.stringOrNull("physicalDeviceReference"),
             lastSuccessfulProtocol = o.stringOrNull("lastSuccessfulProtocol"),
             stableEndpointIdentity = o.stringOrNull("stableEndpointIdentity"),
+            estimatedProgress = runCatching {
+                val e = o.getJSONObject("estimatedProgress")
+                SavedProgressEstimate(ProgressEstimate(e.getLong("positionSeconds"), e.getLong("anchorPositionSeconds"),
+                    e.getLong("anchorAgeMillis"), e.getLong("uncertaintySeconds"),
+                    ProgressConfidence.valueOf(e.getString("confidence"))), e.getLong("capturedAtMillis"))
+            }.getOrNull(),
         ),
     )
 

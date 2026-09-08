@@ -19,6 +19,7 @@ data class SmartResumeUiState(
     val actionLabel: String,
     val updatedAtMillis: Long,
     val isFinished: Boolean,
+    val isEstimated: Boolean = false,
 )
 
 /** A record is intentionally hidden while a different Jellyfin account is active. */
@@ -27,7 +28,7 @@ fun SmartResumeRecord.toUiState(currentUser: UserSession?): SmartResumeUiState? 
     return toPlaybackHistoryUiState(currentUser)?.copy(
         positionSeconds = position,
         progressFraction = ResumePolicy.progressFraction(position, durationSeconds),
-        actionLabel = "Resume at ${formatSmartResumeTime(position)}",
+        actionLabel = "Resume ${if (position > confirmedPositionSeconds) "around" else "at"} ${formatSmartResumeTime(position)}",
     )
 }
 
@@ -38,6 +39,8 @@ fun SmartResumeRecord.toPlaybackHistoryUiState(currentUser: UserSession?): Smart
     ) return null
     val finished = state == SmartResumeRecordState.FINISHED
     val resumablePosition = resumePositionSeconds()
+    val estimated = !finished && resumablePosition != null && resumablePosition > confirmedPositionSeconds
+    val shownPosition = if (estimated) resumablePosition else confirmedPositionSeconds
     return SmartResumeUiState(
         historyKey = identityKey(),
         mediaId = mediaId,
@@ -49,16 +52,17 @@ fun SmartResumeRecord.toPlaybackHistoryUiState(currentUser: UserSession?): Smart
             SmartResumeSourceType.DOWNLOADED -> "Downloaded"
             SmartResumeSourceType.LOCAL -> "On this device"
         },
-        positionSeconds = confirmedPositionSeconds,
+        positionSeconds = shownPosition,
         durationSeconds = durationSeconds,
-        progressFraction = if (finished) 1f else ResumePolicy.progressFraction(confirmedPositionSeconds, durationSeconds),
+        progressFraction = if (finished) 1f else ResumePolicy.progressFraction(shownPosition, durationSeconds),
         actionLabel = when {
             finished -> "Watch again"
-            resumablePosition != null -> "Resume at ${formatSmartResumeTime(resumablePosition)}"
+            resumablePosition != null -> "Resume ${if (estimated) "around" else "at"} ${formatSmartResumeTime(resumablePosition)}"
             else -> "Play from start"
         },
         updatedAtMillis = updatedAtMillis,
         isFinished = finished,
+        isEstimated = estimated,
     )
 }
 

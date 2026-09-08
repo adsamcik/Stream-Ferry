@@ -206,7 +206,12 @@ data class TargetDiscoveryMetadata(
 
 sealed interface PlaybackTargetEvent {
     data object Connected : PlaybackTargetEvent
-    data class StatusChanged(val positionSeconds: Long, val isPlaying: Boolean) : PlaybackTargetEvent
+    data class StatusChanged(
+        val positionSeconds: Long,
+        val isPlaying: Boolean,
+        val isPositionConfirmed: Boolean = true,
+        val playbackRate: Double = 1.0,
+    ) : PlaybackTargetEvent
     /** Authoritative normalized master-volume report from the active renderer session. */
     data class VolumeChanged(val level: Float) : PlaybackTargetEvent
     /** The renderer started/stopped rebuffering (a stall). Feeds the adaptive-bitrate controller. */

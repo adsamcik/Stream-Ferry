@@ -1,6 +1,8 @@
 package com.adsamcik.streamferry.playback.reporting
 
 import com.adsamcik.streamferry.core.stream.MediaProfile
+import com.adsamcik.streamferry.core.resume.ProgressEstimate
+import com.adsamcik.streamferry.core.resume.ProgressConfidence
 import com.adsamcik.streamferry.data.cache.JellyfinConnectionMonitor
 import com.adsamcik.streamferry.data.jellyfin.HttpJellyfinRepository.Companion.TICKS_PER_SECOND
 import com.adsamcik.streamferry.data.jellyfin.DefaultJellyfinPlaybackReporter
@@ -15,6 +17,20 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 
 class DefaultJellyfinPlaybackReporterTest {
+
+    @Test fun estimatesUseOnlyPositionUserDataWithARewindAndBoundedConfidence() = runTest {
+        val api = RecordingApi()
+        val reporter = DefaultJellyfinPlaybackReporter(api, "device", NoOpLogger)
+        val estimate = ProgressEstimate(160, 100, 60_000, 6, ProgressConfidence.DELIVERY)
+        reporter.reportEstimate(playbackInfo(), estimate)
+        assertEquals(listOf(Call("estimate", "library-item", null, 154L * TICKS_PER_SECOND, null)), api.calls)
+        reporter.reportEstimate(playbackInfo(), estimate.copy(confidence = ProgressConfidence.CLOCK, anchorAgeMillis = 30_000))
+        reporter.reportEstimate(playbackInfo(), estimate.copy(anchorAgeMillis = 121_000))
+        reporter.reportEstimate(playbackInfo(), estimate.copy(uncertaintySeconds = 16))
+        reporter.reportEstimate(playbackInfo(), estimate.copy(positionSeconds = 700))
+        reporter.reportEstimate(playbackInfo(), estimate.copy(positionSeconds = 598))
+        assertEquals(1, api.calls.size)
+    }
 
     @Test
     fun reportsKeepTheLibraryItemAndSelectedMediaSourceDistinct() = runTest {
@@ -67,6 +83,11 @@ class DefaultJellyfinPlaybackReporterTest {
 
     private class RecordingApi(private val failure: Throwable? = null) : JellyfinApi {
         val calls = mutableListOf<Call>()
+
+        override suspend fun saveEstimatedPosition(itemId: String, positionTicks: Long) {
+            failIfNeeded()
+            calls += Call("estimate", itemId, null, positionTicks, null)
+        }
 
         override suspend fun systemInfoPublic(): String? = null
         override suspend fun authenticateByName(username: String, password: String): JellyfinApi.AuthResult = error("unused")

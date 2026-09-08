@@ -17,6 +17,22 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 
 class JellyfinUserDataRequestTest {
+    @Test fun estimatesPatchOnlyPositionWithoutWatchedOrCountFields() = runBlocking {
+        val responder = RecordingResponder(listOf(200))
+        client(responder).saveEstimatedPosition(ITEM_ID, 1_230_000_000)
+        val request = responder.requests.single()
+        assertEquals("/UserItems/$ITEM_ID/UserData", request.url.encodedPath)
+        assertEquals(USER_ID, request.url.queryParameter("userId"))
+        val payload = Json.parseToJsonElement(request.bodyText()).jsonObject
+        assertEquals(setOf("PlaybackPositionTicks"), payload.keys)
+        assertEquals("1230000000", payload["PlaybackPositionTicks"]?.jsonPrimitive?.content)
+    }
+
+    @Test fun unsupportedEstimateEndpointNeverFallsBackToAPlaybackOrFullUserDataMutation() = runBlocking {
+        val responder = RecordingResponder(listOf(404))
+        kotlin.test.assertFailsWith<JellyfinHttpException> { client(responder).saveEstimatedPosition(ITEM_ID, 1_230_000_000) }
+        assertEquals(1, responder.requests.size)
+    }
 
     @Test
     fun resetProgressPostsExplicitUnwatchedStateToCurrentUserDataEndpoint() = runBlocking {
