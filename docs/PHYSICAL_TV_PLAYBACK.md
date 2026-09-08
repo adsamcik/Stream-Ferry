@@ -128,7 +128,9 @@ Playback history**, where it can be searched by title, subtitle/episode text, or
 entries restart from the beginning.
 
 For Jellyfin media, resume uses the newer of the local renderer-confirmed checkpoint and the newly
-resolved server resume point. Local/downloaded resume similarly reconciles the legacy local position.
+resolved server resume point, with a separate bounded delivery estimate when available. A fresh TV
+confirmation always wins, including backwards corrections. Local/downloaded resume similarly reconciles
+the legacy local position. Estimate policy and format coverage are in [DELIVERY_PROGRESS.md](DELIVERY_PROGRESS.md).
 After restart, the app performs one bounded Cast/DLNA scan. It automatically reuses the previous TV only
 on an exact stable physical or endpoint identity; names are display hints only. If the TV is unavailable,
 the picker stays open with the previous name and the resume record remains intact. A new proxy and
@@ -161,6 +163,7 @@ they are therefore not claimed as a detectable manual override.
 | Manual Cast↔DLNA switch visibility, session continuity, and confirmed-position handoff | Unit-tested |
 | Network/format/lower-resolution policy | Unit-tested |
 | Playback-history migration/bounds, reconciliation, device identity, completion protection | Unit-tested |
+| Delivery estimation, HLS/audio/ranges, MP4 indexing, crash checkpoint reload and Jellyfin request shape | Automated tests; physical and live-server checks pending |
 | Gradual/hard/sparse/reduction-only/manual/DST volume decisions | Unit-tested |
 | Android integration and Compose code | Compiled by `assembleDebug`; see the verification report for the exact run |
 | Cast, Google TV, Samsung, LG, and dual-protocol behavior | Hardware-dependent; not verified by unit tests |
@@ -177,6 +180,16 @@ whether first frame, controls, confirmed resume, cleanup, and diagnostics behave
       interruption that the Cast SDK recovers, and with TV-remote pause/seek while the phone is locked.
       Confirm paused/buffering playback does not keep advancing on the phone and Stop prevents late
       refreshes from restoring the session. Record the observed offset before and after unlocking.
+- [ ] Delivery recovery: repeat with full-timeline HLS and indexed direct MP4. While status updates are
+      delayed, compare TV time with the saved **Resume around** point and Jellyfin resume position.
+      Terminate the phone process, reopen, and confirm recovery uses the saved estimate with a rewind,
+      without adding time spent crashed. Repeat after TV-remote pause/seek and a download gap. Estimates
+      must freeze at their age/delivery bounds; a lower fresh TV report must replace them.
+- [ ] Jellyfin estimate semantics: on a disposable test item/account, record played flag, play count,
+      favorites and last-played date before an estimated position-only update. Confirm these fields do
+      not change from that update; near-end inference cannot mark watched. Normal confirmed lifecycle
+      events retain their usual semantics. Repeat with manual watched/unwatched override and a server
+      rejecting the partial user-data endpoint; local recovery must still remain usable.
 - [ ] Google TV: same checks; confirm an integrated TV and separate dongle are not falsely merged.
 - [ ] Samsung DLNA: discovery, load/first frame, polling, seek, pause, volume when RenderingControl exists.
 - [ ] LG DLNA: the same, including reload/Stop ordering.

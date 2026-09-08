@@ -87,6 +87,10 @@ The eight Cast progress regressions passed. No ADB device was connected for the 
 API references: [RemoteMediaClient status and position](https://developers.google.com/android/reference/com/google/android/gms/cast/framework/media/RemoteMediaClient)
 and [Android elapsed time and deep sleep](https://developer.android.com/reference/android/os/SystemClock).
 
+Delivery-backed crash recovery and Jellyfin position estimates are described in
+[DELIVERY_PROGRESS.md](DELIVERY_PROGRESS.md). They combine confirmed TV status with elapsed time and
+indexed media delivery, retaining a separate, bounded recovery estimate when receiver status is delayed.
+
 ## Volume control and reconciliation
 
 Android's `CastSession.setVolume()` is an asynchronous `void` request, not a result-bearing media command.
