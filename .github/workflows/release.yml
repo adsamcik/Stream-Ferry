@@ -60,6 +60,17 @@ jobs:
             echo "::error::CHANGELOG.md has no dated [$version] release section."
             exit 1
           fi
+          notes=release-notes.md
+          awk -v hdr="## [$version]" '
+            index($0, hdr) == 1 { capture = 1; next }
+            capture && index($0, "## [") == 1 { exit }
+            capture { print }
+          ' CHANGELOG.md > "$notes"
+          sed -i '/./,$!d' "$notes"
+          if [[ ! -s "$notes" ]]; then
+            echo "::error::CHANGELOG.md must include non-empty release notes for [$version]."
+            exit 1
+          fi
           if [[ "$(git cat-file -t "$tag")" != "tag" ]]; then
             echo "::error::Release tag $tag must be annotated, not lightweight."
             exit 1
@@ -154,17 +165,9 @@ jobs:
           CERTIFICATE: ${{ steps.assets.outputs.certificate }}
         run: |
           notes=release-notes.md
-          version="${TAG#v}"
-          if [[ -f CHANGELOG.md ]]; then
-            awk -v hdr="## [$version]" '
-              index($0, hdr) == 1 { capture = 1; next }
-              capture && index($0, "## [") == 1 { exit }
-              capture { print }
-            ' CHANGELOG.md > "$notes"
-          fi
-          sed -i '/./,$!d' "$notes" 2>/dev/null || true
           if [[ ! -s "$notes" ]]; then
-            echo "Stream Ferry $TAG" > "$notes"
+            echo "::error::Validated release notes are unavailable."
+            exit 1
           fi
           cat >> "$notes" <<EOF
 

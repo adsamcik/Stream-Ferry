@@ -44,7 +44,8 @@ Add the following **repository Actions secrets**, exactly as written in
 
 ## Cut a release
 
-1. Update the checked-in `versionName` and `CHANGELOG.md`.
+1. Update the checked-in `versionName` and add a non-empty, dated `## [X.Y.Z] - YYYY-MM-DD`
+   section to `CHANGELOG.md`. Its content becomes the public GitHub Release notes.
 2. Commit and push the release commit to `main`.
 3. Create and push a strict semantic-version tag, for example:
 
@@ -55,9 +56,10 @@ Add the following **repository Actions secrets**, exactly as written in
 
 The release workflow verifies the tag has the form `vMAJOR.MINOR.PATCH` and passes its version name to
 Gradle, which is the sole source of the monotonic Android version-code calculation
-(`MAJOR * 1,000,000 + MINOR * 1,000 + PATCH`). The workflow requires the stable signing secrets, then
-builds the APK. It creates or updates the public GitHub Release with the APK, checksum, and signer
-report. A manual dispatch can rebuild an already-published tag.
+(`MAJOR * 1,000,000 + MINOR * 1,000 + PATCH`). It also rejects a tag whose matching changelog section
+is missing or empty, so every published release has meaningful notes. The workflow requires the stable
+signing secrets, then builds the APK. It creates or updates the public GitHub Release with the APK,
+checksum, signer report, and those notes. A manual dispatch can rebuild an already-published tag.
 
 ### Verify a GitHub APK
 
