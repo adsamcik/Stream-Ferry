@@ -74,7 +74,7 @@ class MediaSessionController(
     private data class MetadataKey(val title: String, val target: String, val duration: Long?)
     private data class NotificationKey(
         val title: String, val target: String, val phase: PlaybackNotificationFactory.Phase,
-        val playPause: Boolean, val skip: Boolean,
+        val playPause: Boolean, val skip: Boolean, val mediaSessionAttached: Boolean,
     )
     private var lastMetadataKey: MetadataKey? = null
     private var lastNotificationKey: NotificationKey? = null
@@ -102,11 +102,12 @@ class MediaSessionController(
 
     /** Reflect the latest engine status into the session + notification. */
     fun update(status: PlaybackStatus?) {
+        val castOwnsMediaSession = status?.protocolName == CAST_PROTOCOL
         val controls = status?.let { PlaybackControlPolicy.evaluate(it.phase, it.durationSeconds) }
         playPauseEnabled = controls?.canPlayPause == true
         skipEnabled = controls?.canSkip == true
         timelineSeekEnabled = controls?.canSeekTimeline == true
-        remoteVolumeEnabled = status?.volumeSupported == true
+        remoteVolumeEnabled = status?.volumeSupported == true && !castOwnsMediaSession
         if (remoteVolumeEnabled) {
             val volume = (status!!.volume * MAX_VOLUME).roundToInt().coerceIn(0, MAX_VOLUME)
             if (remoteVolumeProvider.currentVolume != volume) remoteVolumeProvider.setCurrentVolume(volume)
@@ -118,12 +119,32 @@ class MediaSessionController(
             lastMetadataKey = null
             return
         }
-        if (!session.isActive) session.isActive = true
+        if (castOwnsMediaSession && session.isActive) {
+            // CastMediaOptions gives Google Cast its own route-aware MediaSession. Keeping this
+            // cross-protocol session active as well leaves Android with two competing remote volume
+            // owners and can strand hardware keys on the wrong one after the screen turns off.
+            session.setPlaybackState(
+                stateOf(
+                    PlaybackState.STATE_STOPPED,
+                    status.positionSeconds * 1000,
+                    false,
+                    canPlayPause = false,
+                    canSkip = false,
+                    canSeek = false,
+                ),
+            )
+            session.isActive = false
+        }
+        if (castOwnsMediaSession) {
+            lastMetadataKey = null
+        } else if (!session.isActive) {
+            session.isActive = true
+        }
         val title = MetadataSanitizer.receiverTitle(status.title)
         val targetName = MetadataSanitizer.normalize(status.targetName, MAX_DEVICE_NAME_UTF8_BYTES)
             .ifBlank { appContext.getString(R.string.notif_your_tv) }
         val metadataKey = MetadataKey(title, targetName, status.durationSeconds)
-        if (metadataKey != lastMetadataKey) {
+        if (!castOwnsMediaSession && metadataKey != lastMetadataKey) {
             val metadata = MediaMetadata.Builder()
                 .putString(MediaMetadata.METADATA_KEY_TITLE, title)
                 .putString(MediaMetadata.METADATA_KEY_DISPLAY_TITLE, title)
@@ -144,25 +165,34 @@ class MediaSessionController(
             status.isPlaying -> PlaybackState.STATE_PLAYING
             else -> PlaybackState.STATE_PAUSED
         }
-        session.setPlaybackState(
-            stateOf(
-                playerState,
-                status.positionSeconds * 1000,
-                status.isPlaying,
-                canPlayPause = playPauseEnabled,
-                canSkip = skipEnabled,
-                canSeek = timelineSeekEnabled,
-            ),
-        )
+        if (!castOwnsMediaSession) {
+            session.setPlaybackState(
+                stateOf(
+                    playerState,
+                    status.positionSeconds * 1000,
+                    status.isPlaying,
+                    canPlayPause = playPauseEnabled,
+                    canSkip = skipEnabled,
+                    canSeek = timelineSeekEnabled,
+                ),
+            )
+        }
         val phase = when {
             controls?.isTransitioning == true -> PlaybackNotificationFactory.Phase.PREPARING
             status.isBuffering -> PlaybackNotificationFactory.Phase.BUFFERING
             status.isPlaying -> PlaybackNotificationFactory.Phase.PLAYING
             else -> PlaybackNotificationFactory.Phase.PAUSED
         }
-        // Position/throughput reports still update PlaybackState for the lock-screen timeline.
-        // They do not change the notification content and must not rebuild/repost it every second.
-        val notificationKey = NotificationKey(title, targetName, phase, playPauseEnabled, skipEnabled)
+        // DLNA position reports still update this session's lock-screen timeline; Cast reports are
+        // represented by the SDK-owned session. Neither changes notification content every second.
+        val notificationKey = NotificationKey(
+            title,
+            targetName,
+            phase,
+            playPauseEnabled,
+            skipEnabled,
+            mediaSessionAttached = !castOwnsMediaSession,
+        )
         if (notificationKey == lastNotificationKey) return
         lastNotification = notificationFactory.build(
             title = title,
@@ -170,6 +200,7 @@ class MediaSessionController(
             phase = phase,
             canPlayPause = playPauseEnabled,
             canSkip = skipEnabled,
+            attachMediaSession = !castOwnsMediaSession,
         )
         runCatching { notificationManager.notify(PlaybackNotificationFactory.NOTIFICATION_ID, lastNotification) }
             .onSuccess { lastNotificationKey = notificationKey }
@@ -231,5 +262,6 @@ class MediaSessionController(
         private const val MAX_VOLUME = 20
         private const val SKIP_SECONDS = 30L
         private const val MAX_DEVICE_NAME_UTF8_BYTES = 160
+        private const val CAST_PROTOCOL = "CAST"
     }
 }

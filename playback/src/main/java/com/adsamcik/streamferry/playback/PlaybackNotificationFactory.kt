@@ -43,6 +43,7 @@ internal class PlaybackNotificationFactory(
         phase: Phase,
         canPlayPause: Boolean = phase != Phase.PREPARING,
         canSkip: Boolean = phase != Phase.PREPARING,
+        attachMediaSession: Boolean = true,
     ): Notification {
         val playing = phase == Phase.PLAYING
         val playPause = if (playing) {
@@ -50,9 +51,11 @@ internal class PlaybackNotificationFactory(
         } else {
             action(R.drawable.ic_notification_play, R.string.play, ACTION_PLAY, REQUEST_PLAY)
         }
-        val style = Notification.MediaStyle().setMediaSession(sessionToken)
-        if (canPlayPause && canSkip) style.setShowActionsInCompactView(0, 1, 2)
-        else style.setShowActionsInCompactView(0)
+        val style = Notification.MediaStyle().apply {
+            if (attachMediaSession) setMediaSession(sessionToken)
+            if (canPlayPause && canSkip) setShowActionsInCompactView(0, 1, 2)
+            else setShowActionsInCompactView(0)
+        }
 
         return baseBuilder(appContext)
             .setContentTitle(title)

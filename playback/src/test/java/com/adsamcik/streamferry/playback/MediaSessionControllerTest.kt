@@ -1,5 +1,7 @@
 package com.adsamcik.streamferry.playback
 
+import android.app.Notification
+import android.media.session.MediaSession
 import io.mockk.mockk
 import kotlin.test.*
 import org.junit.runner.RunWith
@@ -13,11 +15,7 @@ class MediaSessionControllerTest {
     @Test fun `position updates reuse notification while pause and restart refresh controls`() {
         val context = RuntimeEnvironment.getApplication()
         val controller = MediaSessionController(context, mockk(relaxed = true), null)
-        val status = PlaybackStatus(
-            "TV", "CAST", isPlaying = true, isBuffering = false, positionSeconds = 1,
-            durationSeconds = 3600, streamMode = "Direct", currentBitrateBps = 1000,
-            measuredThroughputBps = 2000, adaptiveNote = "", title = "Movie", phase = PlaybackPhase.PLAYING,
-        )
+        val status = status(protocol = "DLNA")
         try {
             controller.update(status)
             val first = controller.currentNotification()
@@ -31,4 +29,33 @@ class MediaSessionControllerTest {
             assertNotSame(paused, controller.currentNotification(), "Restart must republish even when content matches")
         } finally { controller.release() }
     }
+
+    @Test fun `cast playback delegates active session and notification token to cast sdk`() {
+        val context = RuntimeEnvironment.getApplication()
+        val controller = MediaSessionController(context, mockk(relaxed = true), null)
+        val frameworkSession = controller.frameworkSession()
+        try {
+            controller.update(status(protocol = "DLNA"))
+            assertTrue(frameworkSession.isActive)
+            assertNotNull(controller.currentNotification().mediaSessionToken())
+
+            controller.update(status(protocol = "CAST"))
+            assertFalse(frameworkSession.isActive)
+            assertNull(controller.currentNotification().mediaSessionToken())
+        } finally { controller.release() }
+    }
+
+    private fun status(protocol: String) = PlaybackStatus(
+        "TV", protocol, isPlaying = true, isBuffering = false, positionSeconds = 1,
+        durationSeconds = 3600, streamMode = "Direct", currentBitrateBps = 1000,
+        measuredThroughputBps = 2000, adaptiveNote = "", title = "Movie", phase = PlaybackPhase.PLAYING,
+    )
+
+    private fun Notification.mediaSessionToken(): MediaSession.Token? =
+        extras.getParcelable(Notification.EXTRA_MEDIA_SESSION, MediaSession.Token::class.java)
+
+    private fun MediaSessionController.frameworkSession(): MediaSession =
+        MediaSessionController::class.java.getDeclaredField("session")
+            .apply { isAccessible = true }
+            .get(this) as MediaSession
 }
