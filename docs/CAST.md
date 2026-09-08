@@ -56,6 +56,37 @@ route, then atomically installs its session/client callback binding before repor
 suspension, the Cast SDK owns recovery; the app only receives a terminal disconnect after resume failure
 or session end, so it cannot race the SDK with a second full reload.
 
+## Progress after screen-off suspension
+
+The controller checkpoints the SDK's approximate position every five seconds while Android schedules
+the app and the receiver is playing. Approximate progress is cached sender state; it must not be the
+only source indefinitely. After 30 seconds without a fresh status, the heartbeat requests media status
+from the receiver. The refresh deadline uses `SystemClock.elapsedRealtime()`, including deep sleep, so
+the first scheduled heartbeat after a long sleep can refresh immediately.
+
+Returning to the activity and resuming a suspended Cast session both request fresh receiver status and
+restart progress tracking. A successful request publishes the current position even when the SDK does
+not issue another status callback. This updates the engine, UI, media session, and resume checkpoints
+through the existing status event path. Paused and buffering states stop the recurring heartbeat.
+
+Only one refresh runs at a time, with the existing 20-second Cast command timeout. Failed periodic
+requests retry no sooner than the next 30-second deadline and do not turn a progress refresh failure
+into a playback failure. Suspension/disconnect cancels pending refreshes; session generation checks
+reject old callbacks. These checks do not acquire a wake lock or promise network access during Doze.
+
+`CastProgressTest` covers a ten-minute sleep gap, periodic reconciliation, stale paused state on
+foregrounding, silent session recovery, paused/buffering state, single in-flight requests, timeout/failure
+retries, and late callbacks after disconnect. These are tests with a simulated receiver; physical
+screen-off playback remains a separate acceptance check in [PHYSICAL_TV_PLAYBACK.md](PHYSICAL_TV_PLAYBACK.md).
+
+Validation on 2026-09-08: `testDebugUnitTest assembleDebug lintDebug checkSourceBoundaries` and
+`:core:test :source:api:test` succeeded with the existing Gradle cache (including up-to-date tasks).
+Combined JUnit reports account for 674 passing tests, 25 skipped opt-in tests, and zero failures.
+The eight Cast progress regressions passed. No ADB device was connected for the physical TV check.
+
+API references: [RemoteMediaClient status and position](https://developers.google.com/android/reference/com/google/android/gms/cast/framework/media/RemoteMediaClient)
+and [Android elapsed time and deep sleep](https://developer.android.com/reference/android/os/SystemClock).
+
 ## Volume control and reconciliation
 
 Android's `CastSession.setVolume()` is an asynchronous `void` request, not a result-bearing media command.

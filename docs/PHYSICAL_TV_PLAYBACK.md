@@ -171,6 +171,12 @@ Record phone model/Android version, app commit, TV model/firmware, network topol
 whether first frame, controls, confirmed resume, cleanup, and diagnostics behaved as expected.
 
 - [ ] Chromecast / Google Cast: direct play, server fallback, seek, pause, volume, Stop.
+- [ ] Cast screen-off progress: play for 10–15 minutes with the phone locked and the TV running.
+      Unlock and return to playback; after the status round-trip, the phone timeline, notification, and
+      saved resume position should match the TV within a few seconds. Repeat with a brief phone Wi-Fi
+      interruption that the Cast SDK recovers, and with TV-remote pause/seek while the phone is locked.
+      Confirm paused/buffering playback does not keep advancing on the phone and Stop prevents late
+      refreshes from restoring the session. Record the observed offset before and after unlocking.
 - [ ] Google TV: same checks; confirm an integrated TV and separate dongle are not falsely merged.
 - [ ] Samsung DLNA: discovery, load/first frame, polling, seek, pause, volume when RenderingControl exists.
 - [ ] LG DLNA: the same, including reload/Stop ordering.
