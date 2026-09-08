@@ -12,6 +12,13 @@ there is **no telemetry** and nothing leaves the device unless you share a repor
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-09-08
+
+### Fixed
+- Delegated Cast playback's Android media session and route-volume handling to the Google Cast SDK.
+  This prevents Stream Ferry's foreground notification from competing for hardware volume keys after
+  the app backgrounds, while retaining one persistent playback notification.
+
 ## [0.7.0] - 2026-09-08
 
 ### Added
@@ -495,7 +502,8 @@ there is **no telemetry** and nothing leaves the device unless you share a repor
   policy, redaction), the Android app skeleton and Compose UI, CI + release pipelines, and
   documentation.
 
-[Unreleased]: https://github.com/adamnova/video-bridge/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/adamnova/video-bridge/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/adamnova/video-bridge/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/adamnova/video-bridge/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/adamnova/video-bridge/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/adamnova/video-bridge/compare/v0.4.2...v0.5.0
