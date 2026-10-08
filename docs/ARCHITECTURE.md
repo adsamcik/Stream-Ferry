@@ -79,6 +79,10 @@ The Compose shell separates durable destinations from contextual media work:
   from Now Playing returns to Library while the TV session continues; Stop is an explicit playback
   control. A persistent mini-player keeps the active target, state, progress, and play/pause action
   available while browsing.
+- The TV volume slider sends changes during dragging. `MainViewModel` sends one volume command at a
+  time and retains only the newest waiting value, so slow renderer responses do not build a backlog.
+  The thumb follows the finger immediately; queued values are discarded after playback stops or the
+  renderer session changes.
 - `MainViewModel` persists only stable route, source, search, and Downloads-origin values in
   `SavedStateHandle`. Contextual routes are validated against their required selection/session state and
   collapse to Library after process recreation instead of restoring a blank or looping screen.

@@ -1699,9 +1699,7 @@ private fun TransportControls(
 
 @Composable
 private fun VolumeControl(p: PlaybackUiState, viewModel: UiController, compact: Boolean = false) {
-    // Drive the device volume only when the user releases the slider — onValueChange fires ~60x/s during
-    // a drag, which would flood a DLNA renderer (one blocking SOAP call each) and delay other commands.
-    // Local drag state keeps the thumb responsive while dragging.
+    // Keep the thumb responsive to the finger while the controller coalesces live volume requests.
     var dragging by remember { mutableStateOf(false) }
     var dragValue by remember { mutableFloatStateOf(p.volume) }
     val shown = (if (dragging) dragValue else p.displayedVolume).coerceIn(0f, 1f)
@@ -1728,8 +1726,12 @@ private fun VolumeControl(p: PlaybackUiState, viewModel: UiController, compact: 
             }
             Slider(
                 value = shown,
-                onValueChange = { dragging = true; dragValue = it },
-                onValueChangeFinished = { dragging = false; viewModel.setVolume(dragValue) },
+                onValueChange = {
+                    dragging = true
+                    dragValue = it
+                    viewModel.setVolume(it)
+                },
+                onValueChangeFinished = { dragging = false },
                 modifier = Modifier.weight(1f),
             )
         }

@@ -217,6 +217,14 @@ class MainViewModel(
     private var queueSelectionGeneration = 0L
     /** Rejects late completions/timeouts after a newer control intent supersedes an older one. */
     private var playbackControlCommandSequence = 0L
+    private data class VolumeCommand(
+        val id: Long,
+        val level: Float,
+        val playbackGeneration: Long,
+        val targetId: String?,
+    )
+    private var pendingVolumeCommand: VolumeCommand? = null
+    private var volumeCommandJob: Job? = null
     private var lastPlaybackPositionSeconds: Long = 0L
     // What to re-play on reconnect (Jellyfin online OR an on-device / downloaded local file). Set after a
     // successful play()/playLocal(), cleared on stop / a new play.
@@ -2432,24 +2440,47 @@ class MainViewModel(
     }
 
     fun setVolume(level: Float) {
+        if (playbackStopping) return
         val playback = _state.value.playback ?: return
         val target = level.coerceIn(0f, 1f)
-        val commandId = beginPlaybackControl(PlaybackControlKind.VOLUME) { current, id ->
+        val commandId = beginPlaybackControl(PlaybackControlKind.VOLUME, startConfirmationTimeout = false) { current, id ->
             PlaybackControlStatePolicy.requestVolume(current, id, target, playback.rendererVolumeRevision)
         }
-        viewModelScope.launch {
-            try {
-                container.playbackEngine.setVolume(target)
-            } catch (c: CancellationException) {
-                throw c
-            } catch (e: Exception) {
-                handlePlaybackControlFailure(PlaybackControlKind.VOLUME, commandId, "change volume", e)
+        // A slow DLNA command must not accumulate every intermediate slider position. Keep the
+        // latest intent visible immediately, then send it as soon as the in-flight command finishes.
+        pendingVolumeCommand = VolumeCommand(commandId, target, playback.attemptGeneration, _state.value.selectedTarget?.id)
+        if (volumeCommandJob?.isActive == true) return
+        volumeCommandJob = viewModelScope.launch {
+            while (true) {
+                val command = pendingVolumeCommand ?: break
+                pendingVolumeCommand = null
+                val current = _state.value
+                if (playbackStopping || current.playback?.attemptGeneration != command.playbackGeneration ||
+                    current.selectedTarget?.id != command.targetId
+                ) {
+                    _state.update { state ->
+                        state.copy(playback = state.playback?.let { playback ->
+                            if (playback.controls.volume?.commandId != command.id) playback
+                            else playback.copy(controls = playback.controls.copy(volume = null))
+                        })
+                    }
+                    continue
+                }
+                try {
+                    container.playbackEngine.setVolume(command.level)
+                    schedulePlaybackControlConfirmation(PlaybackControlKind.VOLUME, command.id)
+                } catch (c: CancellationException) {
+                    throw c
+                } catch (e: Exception) {
+                    handlePlaybackControlFailure(PlaybackControlKind.VOLUME, command.id, "change volume", e)
+                }
             }
         }
     }
 
     private fun beginPlaybackControl(
         kind: PlaybackControlKind,
+        startConfirmationTimeout: Boolean = true,
         transition: (PlaybackControlUiState, Long) -> PlaybackControlUiState,
     ): Long {
         val commandId = ++playbackControlCommandSequence
@@ -2458,6 +2489,11 @@ class MainViewModel(
                 playback.copy(controls = transition(playback.controls, commandId))
             })
         }
+        if (startConfirmationTimeout) schedulePlaybackControlConfirmation(kind, commandId)
+        return commandId
+    }
+
+    private fun schedulePlaybackControlConfirmation(kind: PlaybackControlKind, commandId: Long) {
         viewModelScope.launch {
             delay(
                 if (kind == PlaybackControlKind.VOLUME) VOLUME_RECONCILIATION_TIMEOUT_MS
@@ -2504,7 +2540,6 @@ class MainViewModel(
                 })
             }
         }
-        return commandId
     }
 
     /** Surface sender-command failures instead of leaving an optimistic TV control state on screen. */
