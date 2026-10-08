@@ -476,7 +476,9 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
     val mediaSessionController: MediaSessionController by lazy {
         val content = PendingIntent.getActivity(
             appContext, 0,
-            Intent(appContext, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            Intent(appContext, MainActivity::class.java)
+                .setAction(ACTION_OPEN_PLAYBACK)
+                .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         MediaSessionController(

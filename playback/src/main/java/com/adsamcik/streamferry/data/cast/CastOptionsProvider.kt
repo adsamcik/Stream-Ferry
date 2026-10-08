@@ -21,11 +21,10 @@ class CastOptionsProvider : OptionsProvider {
 
     override fun getCastOptions(context: Context): CastOptions {
         val mediaOptions = CastMediaOptions.Builder()
-            // The Cast SDK-managed session owns Cast route volume while the activity is stopped,
-            // including lock-screen hardware volume keys. Stream Ferry's playback foreground
-            // service already provides the persistent media notification, so do not post a second
-            // Cast SDK notification for the same playback.
-            .setMediaSessionEnabled(true)
+            // Stream Ferry owns one media session + foreground notification for both Cast and DLNA.
+            // Its transport and remote-volume callbacks route through PlaybackEngine to the selected
+            // renderer, including while the activity is stopped. Avoid competing SDK controls.
+            .setMediaSessionEnabled(false)
             .setNotificationOptions(null)
             .build()
         return CastOptions.Builder()

@@ -118,6 +118,23 @@ through the proxy, and HLS only if rewritten through the proxy. No credentials i
 Server-provided title metadata is control-character normalized and capped by UTF-8 byte length before it
 is sent to the receiver or shown in the notification.
 
+## System playback controls
+
+`MediaSessionController` owns the active media session for both Cast and DLNA. Its callbacks route
+play/pause, relative skips, timeline seeking, stop, and remote volume through `PlaybackEngine` to the
+selected renderer. The proxy service uses that session's notification, so there is one playback card
+with the media title, TV name, and current state. Paused playback keeps the session active; stopping
+deactivates it. Notification taps open Now Playing. Android controls the final system layout.
+
+The Cast SDK's notification and media session are both explicitly disabled. Disabling only its
+notification does not leave a working SDK media session: the SDK also requires notification options
+before attaching that session. Previously the app deactivated its own session for Cast on the
+assumption that the SDK was handling it, leaving no active session for system media controls.
+
+Framework tests cover session ownership, metadata, transport commands, remote-volume callbacks, and
+capability gating. Lock-screen appearance and screen-off volume routing still need physical phone
+and TV verification.
+
 ## CORS
 
 The Cast receiver's player fetches HLS playlists/segments (and any subtitle tracks) via cross-origin

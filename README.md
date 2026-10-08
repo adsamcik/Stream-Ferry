@@ -57,9 +57,9 @@ Implemented end-to-end:
   storage and cast it to a TV later **without the server** (the proxy serves the local file); the
   library listing is cached so browsing works offline. Both are opt-in, app-private, and removed by
   "Delete all app data". See [docs/DOWNLOADS.md](docs/DOWNLOADS.md).
-- **System playback controls** — a media-style notification, lock-screen controls, hardware
-  media-button support, and phone volume keys all control the TV via a `MediaSession` (plus in-app
-  play/pause/seek/volume on the Now Playing screen).
+- **System playback controls** — one app-owned media notification and session control both Cast and
+  DLNA: play/pause, rewind/forward 30 seconds, stop, a seekable timeline when duration is known, and
+  phone volume keys. Controls remain available while paused; tapping the card opens Now Playing.
 - **Durable Now Playing + bounded recovery** — connection, preparation, buffering, same-stream retry,
   compatible server fallback, and an eligible alternate endpoint of the same physical TV stay on one
   Now Playing screen. Attempt generations reject stale callbacks, Stop cancels recovery, and exhaustion

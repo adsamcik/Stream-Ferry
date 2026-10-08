@@ -18,6 +18,7 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import androidx.fragment.app.FragmentActivity
 import com.adsamcik.streamferry.permissions.AndroidNetworkPermissionManager
 import com.adsamcik.streamferry.ui.AppRoot
+import com.adsamcik.streamferry.ui.state.Route
 import com.adsamcik.streamferry.ui.theme.StreamFerryTheme
 
 /**
@@ -100,10 +101,14 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun handleLaunchIntent(launchIntent: Intent?) {
-        if (launchIntent?.action != ACTION_OPEN_DOWNLOADS) return
-        // Consume the action so activity recreation does not unexpectedly navigate back to Downloads.
+        val action = launchIntent?.action ?: return
+        if (action != ACTION_OPEN_DOWNLOADS && action != ACTION_OPEN_PLAYBACK) return
+        // Consume notification actions so recreation preserves subsequent in-app navigation.
         launchIntent.action = null
-        viewModel.openDownloads()
+        when (action) {
+            ACTION_OPEN_DOWNLOADS -> viewModel.openDownloads()
+            ACTION_OPEN_PLAYBACK -> viewModel.navigate(Route.PLAYBACK)
+        }
     }
 
     override fun onStop() {
