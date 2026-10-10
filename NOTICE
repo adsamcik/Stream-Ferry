@@ -8,6 +8,11 @@ PolyForm Noncommercial License 1.0.0 in LICENSE unless stated otherwise.
 Third-party components and materials are not covered by the Stream Ferry
 license. They remain governed by their respective terms; see docs/LICENSES.md.
 
+The replay_30 and forward_30 notification icons are derived from Google Material
+Icons, Copyright Google LLC, licensed under the Apache License, Version 2.0.
+The license and attribution are bundled in the APK at
+assets/licenses/material-icons-Apache-2.0.txt (source: playback/src/main/assets).
+
 The public PolyForm license does not grant commercial-use rights. For a
 separate license permitting commercial use, modification, integration, or
 distribution of Stream Ferry, contact the copyright holder through the

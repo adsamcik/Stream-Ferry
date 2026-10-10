@@ -135,6 +135,22 @@ Framework tests cover session ownership, metadata, transport commands, remote-vo
 capability gating. Lock-screen appearance and screen-off volume routing still need physical phone
 and TV verification.
 
+The native card uses numbered 30-second rewind/forward icons, play/pause, and Stop. Android 13+
+places play/pause and the two skip actions in its three compact slots; Stop is available when
+expanded. A known positive duration and `ACTION_SEEK_TO` enable the system's draggable timeline.
+Unknown-duration playback retains relative skips without advertising timeline seeking. The card
+publishes the sanitized media title and selected TV name; the notification also reports preparing,
+buffering, playing, or paused status. Position updates refresh the session without reposting the card.
+
+The Edge Play browser preview is a design study, not the system notification layout. Traditional
+custom RemoteViews do not support SeekBar. Android 15+ DrawInstructions can render richer content,
+but the framework's action bridge dispatches prebound intents without forwarding dynamic action
+metadata, so it does not establish a working custom drag-to-seek control across the app's Android
+14+ range. The approved fallback retains Android's native seeking and layout. See the
+[RemoteViews API](https://developer.android.com/reference/android/widget/RemoteViews),
+[framework action bridge](https://android.googlesource.com/platform/frameworks/base/+/refs/heads/main/core/java/android/widget/RemoteViews.java),
+and [system media controls](https://developer.android.com/media/implement/surfaces/mobile).
+
 ## CORS
 
 The Cast receiver's player fetches HLS playlists/segments (and any subtitle tracks) via cross-origin

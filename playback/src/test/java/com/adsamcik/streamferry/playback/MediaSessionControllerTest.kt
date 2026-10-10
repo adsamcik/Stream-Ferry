@@ -110,6 +110,51 @@ class MediaSessionControllerTest {
         }
     }
 
+    @Test fun `native timeline remains seekable while paused and clears when duration becomes unknown`() {
+        val context = RuntimeEnvironment.getApplication()
+        for (protocol in listOf("CAST", "DLNA")) {
+            val transport = mockk<MediaSessionController.Transport>(relaxed = true)
+            val controller = MediaSessionController(context, transport, null)
+            try {
+                val paused = status(protocol).copy(
+                    isPlaying = false,
+                    positionSeconds = 120,
+                    phase = PlaybackPhase.PAUSED,
+                )
+                controller.update(paused)
+                val timeline = stateUpdates.last()
+                assertEquals(PlaybackState.STATE_PAUSED, timeline.state)
+                assertEquals(120_000L, timeline.position)
+                assertEquals(0f, timeline.playbackSpeed, "Paused progress must not advance")
+                assertTrue(timeline.actions and PlaybackState.ACTION_SEEK_TO != 0L)
+                val metadata = metadataUpdates.last()
+                assertEquals("Movie", metadata.getString(MediaMetadata.METADATA_KEY_DISPLAY_TITLE))
+                assertEquals("TV", metadata.getString(MediaMetadata.METADATA_KEY_DISPLAY_SUBTITLE))
+                assertEquals("TV", metadata.getString(MediaMetadata.METADATA_KEY_ARTIST))
+                assertEquals(3_600_000L, metadata.getLong(MediaMetadata.METADATA_KEY_DURATION))
+
+                callbacks.last().onSeekTo(240_000)
+                verify(exactly = 1) { transport.onSeekTo(240) }
+
+                controller.update(paused.copy(durationSeconds = null))
+                assertEquals(0L, stateUpdates.last().actions and PlaybackState.ACTION_SEEK_TO)
+                assertFalse(metadataUpdates.last().containsKey(MediaMetadata.METADATA_KEY_DURATION))
+                callbacks.last().onSeekTo(360_000)
+                verify(exactly = 0) { transport.onSeekTo(360) }
+                callbacks.last().onCustomAction(PlaybackNotificationFactory.ACTION_RWND, null)
+                verify(exactly = 1) { transport.onSkip(-30) }
+
+                controller.update(paused.copy(isBuffering = true))
+                assertEquals(PlaybackState.STATE_BUFFERING, stateUpdates.last().state)
+                assertEquals(0f, stateUpdates.last().playbackSpeed)
+                assertEquals(
+                    "Buffering on TV",
+                    controller.currentNotification().extras.getString(Notification.EXTRA_TEXT),
+                )
+            } finally { controller.release() }
+        }
+    }
+
     @Test fun `unknown duration and preparation gate unsupported system commands`() {
         val context = RuntimeEnvironment.getApplication()
         val transport = mockk<MediaSessionController.Transport>(relaxed = true)

@@ -15,6 +15,7 @@ below is the curated summary.
 | Tracebox | Apache-2.0 | Managed runtime and Compose UI from [release 0.1.0-alpha.8, including notices](https://github.com/adsamcik/Tracebox/releases/tag/v0.1.0-alpha.8). Native Crashpad binaries are not packaged. |
 | desugar_jdk_libs_nio | GPLv2 with Classpath Exception | Android core library desugaring. |
 | Android Gradle Plugin, AndroidX, Compose | Apache-2.0 | Permissive. |
+| Material Icons | Apache-2.0 | Google's [replay_30 and forward_30 icons](https://github.com/google/material-design-icons/tree/master/src/av), converted to notification vectors. [License and attribution](../playback/src/main/assets/licenses/material-icons-Apache-2.0.txt) are bundled in the APK. |
 | Kotlin, kotlinx-coroutines, kotlinx-serialization | Apache-2.0 | Permissive. |
 | OkHttp | Apache-2.0 | Permissive. |
 | JUnit | EPL-1.0 | Test-only. |
