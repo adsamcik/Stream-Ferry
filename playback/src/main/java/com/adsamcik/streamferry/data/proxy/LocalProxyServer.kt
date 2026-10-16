@@ -871,6 +871,32 @@ class LocalProxyServer(
      * only ever fetches these phone proxy URLs — never the source.
      */
     private fun serveClientTranscode(session: ProxySession, source: ClientTranscodeSource, req: RequestLine, out: OutputStream, head: Boolean) {
+        if (source.isProgressive) {
+            // A live TS entity has no final byte length and cannot honour byte ranges. Close-delimited
+            // HTTP lets a renderer start on the first packets while the encoder continues producing.
+            if (head) {
+                writeSimpleHeaders(out, 200, "OK", "video/mp2t", null, false, "Accept-Ranges" to "none")
+                return
+            }
+            val input = source.openProgressive()
+            if (input == null) { writeStatus(out, 503, "Service Unavailable"); return }
+            input.use {
+                // Wait for actual output before promising a successful media response.
+                val bytes = ByteArray(188 * 32)
+                var count = it.read(bytes)
+                if (count < 0) { writeStatus(out, 503, "Service Unavailable"); return }
+                writeSimpleHeaders(out, 200, "OK", "video/mp2t", null, false, "Accept-Ranges" to "none")
+                while (count >= 0 && sessions.isActive(session.id) && !stopping) {
+                    if (count > 0) {
+                        out.write(bytes, 0, count)
+                        out.flush()
+                        byteListener?.invoke(count.toLong())
+                    }
+                    count = it.read(bytes)
+                }
+            }
+            return
+        }
         val delivery = deliveryTrackers.computeIfAbsent(session.id) { ProxyDeliveryTracker() }
         val deliveryEpoch = delivery.epoch()
         when (val seg = queryParam(req.path, "seg")) {
@@ -896,20 +922,20 @@ class LocalProxyServer(
             }
             "init" -> {
                 logger.trace(TAG, "TV fetched on-device transcode init segment")
-                serveSegmentResource(source.initSegment(allowExport = !head), out, head)
+                serveSegmentResource(source.initSegment(allowExport = !head), out, head, source.segmentContentType)
             }
             else -> {
                 if (seg.startsWith("init_")) {
                     val rawIndex = seg.removePrefix("init_")
                     val index = rawIndex.takeIf { it.isNotEmpty() && it.all(Char::isDigit) }?.toIntOrNull()
                     if (index == null || index < 0) { writeStatus(out, 404, "Not Found"); return }
-                    serveSegmentResource(source.initSegment(index, allowExport = !head), out, head)
+                    serveSegmentResource(source.initSegment(index, allowExport = !head), out, head, source.segmentContentType)
                     return
                 }
                 val index = seg.toIntOrNull()
                 if (index == null) { writeStatus(out, 404, "Not Found"); return }
                 logger.trace(TAG, "TV fetched on-device transcode segment #$index")
-                if (serveSegmentResource(source.mediaSegment(index, allowExport = !head), out, head)) {
+                if (serveSegmentResource(source.mediaSegment(index, allowExport = !head), out, head, source.segmentContentType)) {
                     noteMediaDelivered(session, seg, null, deliveryEpoch)
                 }
             }
@@ -920,9 +946,9 @@ class LocalProxyServer(
     private fun playlistHead(body: ByteArray): String =
         String(body, Charsets.UTF_8).replace("\n", " | ").take(300)
 
-    private fun serveSegmentResource(resource: ClientTranscodeSource.Resource, out: OutputStream, head: Boolean): Boolean =
+    private fun serveSegmentResource(resource: ClientTranscodeSource.Resource, out: OutputStream, head: Boolean, mimeType: String = "video/mp4"): Boolean =
         when (resource) {
-            is ClientTranscodeSource.Resource.Ready -> serveSegmentBytes(resource.bytes, out, head)
+            is ClientTranscodeSource.Resource.Ready -> serveSegmentBytes(resource.bytes, out, head, mimeType)
             ClientTranscodeSource.Resource.NotFound -> { writeStatus(out, 404, "Not Found"); false }
             // An export failure/cancellation is retryable by the receiver, but must not masquerade as a
             // successful zero-byte fMP4 response. HEAD follows the same state mapping without exporting.
@@ -930,8 +956,8 @@ class LocalProxyServer(
             ClientTranscodeSource.Resource.TimedOut -> { writeStatus(out, 504, "Gateway Timeout"); false }
         }
 
-    private fun serveSegmentBytes(bytes: ByteArray, out: OutputStream, head: Boolean): Boolean {
-        writeSimpleHeaders(out, 200, "OK", "video/mp4", bytes.size.toLong(), acceptRanges = false, extra = null)
+    private fun serveSegmentBytes(bytes: ByteArray, out: OutputStream, head: Boolean, mimeType: String = "video/mp4"): Boolean {
+        writeSimpleHeaders(out, 200, "OK", mimeType, bytes.size.toLong(), acceptRanges = false, extra = null)
         if (head || bytes.isEmpty()) return false
         out.write(bytes)
         return runCatching { out.flush() }.isSuccess

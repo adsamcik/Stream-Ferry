@@ -5,7 +5,7 @@ import android.media.MediaExtractor
 import android.media.MediaFormat
 import androidx.media3.transformer.EditedMediaItem
 import androidx.media3.transformer.Composition
-import androidx.media3.transformer.InAppMp4Muxer
+import androidx.media3.muxer.Muxer
 import androidx.media3.transformer.Transformer
 import androidx.media3.effect.Presentation
 import com.adsamcik.streamferry.core.stream.MediaProfile
@@ -128,19 +128,19 @@ class OnDeviceTranscoderTest {
     @Test
     fun `unsupported URI scheme is rejected before any export`() = runBlocking {
         assertFailsWith<IllegalArgumentException> {
-            transcoder.transcodeSegment("ftp://example.test/video.mp4", 0, 2_000, target, outputFile())
+            transcoder.transcodeStream("ftp://example.test/video.mp4", target, streamMuxer)
         }
         assertTrue(startedItems.isEmpty())
     }
 
     @Test
-    fun `remote HLS reaches the shared export with its MIME and SDR tone mapping`() = runBlocking {
+    fun `remote HLS reaches continuous export with its MIME custom muxer and SDR tone mapping`() = runBlocking {
         val owner = Any()
         val failure = CompletableDeferred<Throwable?>()
         val export = launch(Dispatchers.Default) {
             failure.complete(runCatching {
-                transcoder.transcodeFile(
-                    "http://127.0.0.1:1234/stream", target, outputFile(),
+                transcoder.transcodeStream(
+                    "http://127.0.0.1:1234/stream", target, streamMuxer,
                     sourceMimeType = "application/x-mpegURL", owner = owner,
                 )
             }.exceptionOrNull())
@@ -151,7 +151,7 @@ class OnDeviceTranscoderTest {
             val item = composition.sequences.single().editedMediaItems.single().mediaItem
             assertEquals("http://127.0.0.1:1234/stream", item.localConfiguration?.uri.toString())
             assertEquals("application/x-mpegURL", item.localConfiguration?.mimeType)
-            verify { anyConstructed<Transformer.Builder>().setMuxerFactory(ofType<InAppMp4Muxer.Factory>()) }
+            verify { anyConstructed<Transformer.Builder>().setMuxerFactory(streamMuxer) }
             assertTrue(transcoder.cancelOwnedInFlightAndAwait(owner))
             assertIs<CancellationException>(withTimeout(5_000) { failure.await() })
             export.join()
@@ -168,7 +168,7 @@ class OnDeviceTranscoderTest {
         val owner = Any()
         val export = launch(Dispatchers.Default) {
             runCatching {
-                transcoder.transcodeSegment("content://media/video/10", 0, 2_000, target, outputFile(), owner)
+                transcoder.transcodeStream("content://media/video/10", target, streamMuxer, owner = owner)
             }
         }
         try {
@@ -206,7 +206,7 @@ class OnDeviceTranscoderTest {
         val failure = CompletableDeferred<Throwable?>()
         val export = launch(Dispatchers.Default) {
             failure.complete(runCatching {
-                transcoder.transcodeSegment(uri, 0, 2_000, target, outputFile(), owner = owner)
+                transcoder.transcodeStream(uri, target, streamMuxer, owner = owner)
             }.exceptionOrNull())
         }
         try {
@@ -220,5 +220,5 @@ class OnDeviceTranscoderTest {
         }
     }
 
-    private fun outputFile() = File(RuntimeEnvironment.getApplication().cacheDir, "transcode-test.mp4")
+    private val streamMuxer = mockk<Muxer.Factory>(relaxed = true)
 }

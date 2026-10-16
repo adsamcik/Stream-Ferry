@@ -5,7 +5,7 @@ package com.adsamcik.streamferry.core.transcode
  *
  * Pure value types plus receiver packaging rules. The Android MediaCodec / muxer layer maps these
  * to concrete encoder configs; this stays framework-free and unit-tested. The phone hosts the resulting
- * HLS/CMAF stream or completed MP4 — the TV never sees a source/Jellyfin URL.
+ * HLS/CMAF or continuous MPEG-TS stream — the TV never sees a source/Jellyfin URL.
  */
 
 /** Video codecs the on-device encoder / server can target, roughly ordered by efficiency (best first). */
@@ -16,11 +16,11 @@ enum class AudioCodec { AAC }
 
 /** Streaming container/packaging for the phone-hosted live origin the TV fetches. */
 enum class StreamContainer {
-    /** Completed seekable MP4 for renderers that do not consume HLS, including DLNA. */
-    MP4,
+    /** Continuous H.264/HEVC with AAC, consumed progressively by DLNA receivers. */
+    PROGRESSIVE_TS,
     /**
-     * Classic HLS with MPEG-2 transport-stream segments. H.264 only: HEVC/VP9/AV1 must NOT be packaged in
-     * MPEG-TS (and Android has no built-in TS muxer).
+     * Classic HLS with MPEG-2 transport-stream segments. The Cast HLS planner admits H.264 here;
+     * HEVC uses fragmented MP4 for Cast compatibility.
      */
     HLS_TS,
 
@@ -59,14 +59,15 @@ data class TranscodeTarget(
     init {
         require(maxFps >= 1) { "maxFps must be >= 1" }
         require(isPackagingValid(videoCodec, container)) {
-            "Only H.264 may be packaged in MPEG-TS; use fMP4/CMAF or DASH for HEVC/VP9/AV1."
+            "The requested codec is unsupported by this stream packaging."
         }
         require(!tenBit || videoCodec != VideoCodec.H264) { "10-bit is not used for the H.264 fallback." }
     }
 }
 
-/** Packaging rule: only H.264 may go in MPEG-TS; HEVC/VP9/AV1 use fMP4/CMAF (or DASH). */
+/** The phone TS muxer supports H.264/HEVC; Cast HEVC is carried in fragmented MP4. */
 fun isPackagingValid(codec: VideoCodec, container: StreamContainer): Boolean = when (codec) {
     VideoCodec.H264 -> true
-    VideoCodec.HEVC, VideoCodec.VP9, VideoCodec.AV1 -> container != StreamContainer.HLS_TS
+    VideoCodec.HEVC -> container != StreamContainer.HLS_TS
+    VideoCodec.VP9, VideoCodec.AV1 -> container != StreamContainer.HLS_TS && container != StreamContainer.PROGRESSIVE_TS
 }

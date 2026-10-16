@@ -23,6 +23,13 @@ class TranscodeFormatsTest {
         assertTrue(isPackagingValid(VideoCodec.HEVC, StreamContainer.DASH_FMP4))
     }
 
+    @Test fun progressiveTransportAdmitsTheImplementedH264AndHevcMuxer() {
+        assertTrue(isPackagingValid(VideoCodec.H264, StreamContainer.PROGRESSIVE_TS))
+        assertTrue(isPackagingValid(VideoCodec.HEVC, StreamContainer.PROGRESSIVE_TS))
+        assertFalse(isPackagingValid(VideoCodec.VP9, StreamContainer.PROGRESSIVE_TS))
+        assertFalse(isPackagingValid(VideoCodec.AV1, StreamContainer.PROGRESSIVE_TS))
+    }
+
     @Test fun h264AnyContainerIsValid() {
         assertTrue(isPackagingValid(VideoCodec.H264, StreamContainer.HLS_TS))
         assertTrue(isPackagingValid(VideoCodec.H264, StreamContainer.HLS_FMP4))

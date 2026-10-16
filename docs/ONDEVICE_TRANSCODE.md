@@ -1,50 +1,54 @@
 # On-device transcoding
 
-All supported video sources and receiver protocols share the phone's Media3 hardware encoder.
-Playback options → **TV output → Transcoding → On device** selects phone conversion for gallery/SAF
-files, downloaded files, and online provider media, on both Google Cast and DLNA. Format and resolution
-controls then negotiate the phone encoder and receiver together. **Original** requests direct playback;
-**Auto** retains the normal direct/server selection for online media and the saved phone-conversion
-preference for local media.
+All supported sources use one continuous phone encoder on both Google Cast and DLNA.
+Playback options → **TV output → Transcoding → On device** enables conversion during playback.
+Format and resolution choices negotiate the phone encoder and receiver together; changes preserve
+position and play/pause intent. **Original** requests original media, and **Auto** keeps the usual
+source selection with a bounded phone fallback if server conversion fails.
 
-## Shared pipeline
+## Streaming pipeline
 
-1. Obtain readable media: local file/content URI, or an opaque input URL from the phone proxy. Online
-   input uses the provider's existing stream lease, including authentication, refresh, verified ranges,
-   and HLS reference rewriting. The encoder never receives provider credentials or private URLs.
-2. Select H.264 or HEVC with AAC and a resolution admitted by both endpoints. Apply the output height
-   as a ceiling, preserving aspect ratio and avoiding upscaling when source dimensions are known.
-3. Use the same `OnDeviceTranscoder` reservation, hardware encoder, cancellation, and error handling.
-   HDR input is tone-mapped to SDR through Media3's OpenGL path; the phone does not promise Main10 output.
-4. Publish receiver-compatible bytes through an opaque phone proxy URL:
-   - Cast with HLS support can request SDR clips on demand from a seekable local progressive source with an
-     exact duration. Each independent fragmented MP4 export has its own initialization and discontinuity.
-   - Online provider media, DLNA, non-HLS receivers, HDR, nonseekable input, or input without an exact duration use a completed
-     MP4. Conversion finishes before playback starts; progress is shown while preparing. The completed
-     file supports normal byte ranges and renderer seeking.
+1. Open a local file/content URI or an opaque provider input URL. The existing provider lease retains
+   authentication, refresh, range verification, and HLS reference rewriting. Credentials and private
+   source URLs stay on the phone.
+2. Start one Media3 Transformer decode/encode lifecycle at the requested source position, producing
+   H.264 or HEVC video with AAC. The output height is capped without upscaling known source dimensions.
+   HDR input uses the shared OpenGL HDR-to-SDR path. B frames are disabled, and keyframes are requested
+   every two seconds.
+3. Publish encoded media as it is produced:
+   - **Cast:** short fragmented-MP4 HLS segments, with one initialization segment and a growing/sliding
+     media playlist. Playback starts after the first media fragment is ready; ENDLIST appears only
+     when encoding reaches source EOF.
+   - **DLNA:** continuous MPEG-TS packets over an unknown-length HTTP response. PAT/PMT, PCR, PES
+     timestamps, Annex B H.264/HEVC and ADTS AAC are emitted while encoding. No Content-Length or byte
+     seeking is advertised. HEAD probes do not open or consume the stream.
 
-The MP4 fallback uses private cache space and can take substantial time for a long video. Stop cancels
-preparation before waiting for the playback command lock. Failed or stopped exports remove their owned
-cache only after the encoder has stopped; a still-owned native output is retained rather than deleted.
+No source waits for whole-video conversion, and no completed output file is required. Unknown-duration,
+HLS, nonseekable and HDR inputs use the same pipeline. The current source catalog exposes finite local
+videos and provider movies/episodes; the continuous lifecycle itself does not require a known runtime.
 
-## Source lifecycle and controls
+## Buffering, seeking, and lifecycle
 
-Online input and renderer output have separate proxy sessions. Source Started/Progress/Stopped reports
-and provider cleanup survive phone conversion. Encoder reads do not count as receiver throughput,
-delivery progress, or evidence that the receiver rejected a format. Stop revokes both sessions.
+Bounded queues apply receiver backpressure to the encoder. HLS retains up to eight segments within a
+24 MiB budget, using the receiver cursor and a small retry window; skipped startup segments cannot
+permanently block production. DLNA has a 2 MiB producer queue and a bounded startup replay buffer for
+receivers that probe bytes then reopen the URL. A later unsupported reconnect fails explicitly rather
+than serving an arbitrary midstream byte as the beginning.
 
-Output changes preserve playback position and play/pause intent. A prepared MP4 uses renderer seeking,
-not server re-resolution. Automatic server bitrate adaptation is disabled while phone output is active.
-Existing source-selected audio/subtitle processing remains with the provider before phone encoding.
+All phone output is rebased to renderer time zero at the requested source position. App seeking and
+format/resolution changes restart the streaming encoder there, rather than waiting for prior content
+to be encoded or claiming byte access to future output. Source watch progress remains absolute.
+Stop wakes blocked readers/writers before cancelling and draining only that session's encoder.
 
-There is no source-type or Cast-only admission gate. Actual unsupported decoders, hardware encoders,
-tone mapping, insufficient storage, or unreadable input surface a conversion failure. The current source
-catalog provides finite movies/episodes and local videos; an endless live stream cannot finish a
-whole-file MP4 preparation. AV1/VP9 encoding, CPU encoding, DASH, and MPEG-TS output are not implemented.
+Online input and output use separate opaque proxy sessions. Provider Started/Progress/Stopped reporting
+survives phone conversion, and Stop revokes both sessions. Encoder reads never count as receiver
+throughput, playback progress, or evidence of a receiver format failure. Server bitrate adaptation is
+disabled while phone output is active. Existing provider audio/subtitle selection remains source-owned.
 
 ## Verification limits
 
-Unit tests exercise routing, negotiation, authenticated input, provider lifecycle, cancellation, proxy
-ranges, and output choices. Build/lint and compiled instrumentation tests do not establish physical
-MediaCodec, thermal, Cast, DLNA, HDR colour, or sustained streaming behavior. Receiver and real-phone
-validation remain separate.
+Unit tests cover first media before export completion, bounded output/retry behavior, authenticated
+input, source reporting, playback controls, timestamp rebasing, and TS packet structure. Independent
+FFmpeg decoding can validate packaging but does not exercise Android hardware. Builds, lint and compiled
+instrumentation tests do not establish physical MediaCodec speed, colour, thermal behavior, Cast/DLNA
+interoperability or rendered UI. Those require real-phone and receiver validation.

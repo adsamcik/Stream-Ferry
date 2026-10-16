@@ -1,11 +1,20 @@
 package com.adsamcik.streamferry.data.proxy
 
+import java.io.InputStream
+
 /**
  * A phone-hosted, on-device-transcoded HLS/CMAF origin for one local-file playback session. The proxy
  * serves the playlist + segments produced here; the TV only ever sees the proxy URL. Methods are blocking
  * (called from the proxy's connection threads) and may transcode a segment on demand.
  */
 interface ClientTranscodeSource {
+    /** DLNA consumes a single continuous transport stream; Cast consumes the HLS resources below. */
+    val isProgressive: Boolean get() = false
+    val segmentContentType: String get() = "video/mp4"
+
+    /** Open one continuous receiver read. HEAD must never call this method. */
+    fun openProgressive(): InputStream? = null
+
     /**
      * The MASTER (multivariant) HLS playlist: declares the stream's `CODECS` (so a Cast/CMAF receiver
      * starts the fMP4 stream) and points at the media playlist.

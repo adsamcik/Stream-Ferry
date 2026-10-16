@@ -6,6 +6,7 @@ import android.net.Uri
 import android.os.Handler
 import android.os.HandlerThread
 import androidx.media3.common.MediaItem
+import androidx.media3.common.C
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.util.Clock
 import androidx.media3.effect.Presentation
@@ -19,10 +20,9 @@ import androidx.media3.transformer.EditedMediaItemSequence
 import androidx.media3.transformer.Effects
 import androidx.media3.transformer.ExportException
 import androidx.media3.transformer.ExportResult
-import androidx.media3.transformer.InAppFragmentedMp4Muxer
-import androidx.media3.transformer.InAppMp4Muxer
-import androidx.media3.transformer.ProgressHolder
 import androidx.media3.transformer.Transformer
+import androidx.media3.transformer.VideoEncoderSettings
+import androidx.media3.muxer.Muxer
 import com.adsamcik.streamferry.core.transcode.TranscodeTarget
 import com.adsamcik.streamferry.core.stream.MediaProfile
 import com.adsamcik.streamferry.core.transcode.VideoCodec
@@ -30,22 +30,17 @@ import com.adsamcik.streamferry.source.api.DiagnosticSink
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.io.IOException
 
 /**
  * Hardware-accelerated on-device transcoder built on AndroidX Media3 Transformer (Surface-to-Surface
- * decode→encode internally). Exports either a source clip as fragmented MP4 (CMAF) or a complete
- * source as seekable MP4 using the same hardware encoder and [TranscodeTarget].
+ * decode→encode internally). A receiver-specific streaming muxer consumes encoded samples directly.
  *
  * Transformer must be created and started on a thread with a Looper, so a dedicated [HandlerThread] is
- * used; the Transformer is configured with that Looper. The public surface exposes no Media3 types, so
- * the `@UnstableApi` opt-in stays confined here.
+ * used; the Transformer is configured with that Looper.
  */
 @SuppressLint("UnsafeOptInUsageError")
 class OnDeviceTranscoder(
@@ -72,59 +67,19 @@ class OnDeviceTranscoder(
         @Volatile var cancelled: Boolean = false,
     )
 
-    /** Raised when an export did not complete inside its duration-derived deadline. */
-    class ExportDeadlineExceededException(
-        message: String,
-        /** True only when the cancelled Media3 lifecycle had finished before this exception was raised. */
-        val stopped: Boolean,
-    ) : Exception(message)
-
-    /** Transcode `[startMs, endMs)` of a local [sourceUri] into [outFile] as a fragmented MP4. */
-    suspend fun transcodeSegment(
-        sourceUri: String,
-        startMs: Long,
-        endMs: Long,
-        target: TranscodeTarget,
-        outFile: File,
-        /** Opaque session identity used to cancel only this caller's export during teardown. */
-        owner: Any? = null,
-        /** Checked on the Transformer looper before start so release/reservation races do not start work. */
-        abortIf: (() -> Boolean)? = null,
-        sourceMimeType: String? = null,
-    ) = export(sourceUri, startMs, endMs, target, outFile, owner, abortIf, sourceMimeType, fragmented = true)
-
-    /** Export a complete, seekable MP4 for receivers that cannot consume the phone's HLS origin. */
-    suspend fun transcodeFile(
+    /** One continuous decode/encode lifecycle. The muxer publishes bytes while encoding, never a file. */
+    suspend fun transcodeStream(
         sourceUri: String,
         target: TranscodeTarget,
-        outFile: File,
+        muxerFactory: Muxer.Factory,
+        startMs: Long = 0,
         sourceMimeType: String? = null,
-        runtimeSeconds: Double? = null,
-        owner: Any? = null,
-        abortIf: (() -> Boolean)? = null,
-        onProgress: (Int?) -> Unit = {},
         sourceProfile: MediaProfile? = null,
-    ) = export(
-        sourceUri, 0, null, target, outFile, owner, abortIf, sourceMimeType,
-        fragmented = false, runtimeSeconds = runtimeSeconds, onProgress = onProgress, knownSourceProfile = sourceProfile,
-    )
-
-    private suspend fun export(
-        sourceUri: String,
-        startMs: Long,
-        endMs: Long?,
-        target: TranscodeTarget,
-        outFile: File,
-        owner: Any?,
-        abortIf: (() -> Boolean)?,
-        sourceMimeType: String?,
-        fragmented: Boolean,
-        runtimeSeconds: Double? = null,
-        onProgress: (Int?) -> Unit = {},
-        knownSourceProfile: MediaProfile? = null,
+        owner: Any? = null,
+        abortIf: (() -> Boolean)? = null,
     ) {
         check(!released) { "on-device transcoder is released" }
-        require(endMs == null || endMs > startMs) { "transcode segment must have a positive duration" }
+        require(startMs >= 0) { "transcode start must not be negative" }
         require(target.videoCodec in setOf(VideoCodec.H264, VideoCodec.HEVC) && !target.tenBit) {
             "on-device output requires an 8-bit H.264 or HEVC target"
         }
@@ -136,7 +91,7 @@ class OnDeviceTranscoder(
         }
 
         // Probe before reserving: failures must not strand the process-wide encoder reservation.
-        val sourceProfile = knownSourceProfile ?: if (localSourceUri.scheme in setOf("content", "file")) {
+        val profile = sourceProfile ?: if (localSourceUri.scheme in setOf("content", "file")) {
             LocalMediaProbe.probe(appContext, sourceUri, "mp4")
         } else null
 
@@ -151,23 +106,17 @@ class OnDeviceTranscoder(
         }
 
         val codec = codecLabel(target.videoCodec)
-        val sourceHeight = if (sourceProfile?.rotationDegrees?.mod(180) == 90) {
-            sourceProfile.widthPx
+        val sourceHeight = if (profile?.rotationDegrees?.mod(180) == 90) {
+            profile.widthPx
         } else {
-            sourceProfile?.heightPx
+            profile?.heightPx
         }
         val maxHeight = sourceHeight?.takeIf { it > 0 }
             ?.coerceAtMost(target.maxResolution.maxHeightPx) ?: target.maxResolution.maxHeightPx
         val startedAt = System.currentTimeMillis()
-        val deadlineMs = if (endMs != null) exportDeadlineMs(startMs, endMs) else {
-            // Full-length preparation is intentionally allowed to take longer than a short HLS clip.
-            val durationMs = runtimeSeconds?.takeIf { it.isFinite() && it > 0 }?.times(1_000)
-            ((durationMs ?: UNKNOWN_FILE_DURATION_MS.toDouble()) * EXPORT_TIME_MULTIPLIER + EXPORT_STARTUP_GRACE_MS)
-                .toLong().coerceIn(MAX_EXPORT_DEADLINE_MS, MAX_FILE_EXPORT_DEADLINE_MS)
-        }
         logger.trace(
             TAG,
-            "HW transcode start: $codec ${maxHeight}p seg [${startMs}-${endMs}ms], deadline=${deadlineMs}ms",
+            "HW stream transcode start: $codec ${maxHeight}p from ${startMs}ms",
         )
         val posted = runCatching {
             handler.post {
@@ -179,11 +128,9 @@ class OnDeviceTranscoder(
                     val mediaItemBuilder = MediaItem.Builder()
                         .setUri(localSourceUri)
                     sourceMimeType?.let { mediaItemBuilder.setMimeType(it) }
-                    if (endMs != null) {
-                        mediaItemBuilder.setClippingConfiguration(
-                            MediaItem.ClippingConfiguration.Builder()
-                                .setStartPositionMs(startMs).setEndPositionMs(endMs).build(),
-                        )
+                    if (startMs > 0) {
+                        val clipping = MediaItem.ClippingConfiguration.Builder().setStartPositionMs(startMs)
+                        mediaItemBuilder.setClippingConfiguration(clipping.build())
                     }
                     val mediaItem = mediaItemBuilder.build()
                     // Cap the OUTPUT height to the negotiated tier (preserving aspect ratio). Without this
@@ -195,18 +142,20 @@ class OnDeviceTranscoder(
                     val builder = Transformer.Builder(appContext)
                         .setVideoMimeType(videoMimeFor(target.videoCodec))
                         .setAudioMimeType(MimeTypes.AUDIO_AAC)
+                        // Waiting for the receiver is intentional after the bounded output buffer fills.
+                        .setMaxDelayBetweenMuxerSamplesMs(C.TIME_UNSET)
                         // Negotiation already admitted this output. Fail rather than silently change
                         // a user's codec/resolution choice when a device cannot actually encode it.
                         .setEncoderFactory(
                             DefaultEncoderFactory.Builder(appContext)
                                 .setEnableFallback(false)
                                 .setEnableFormatFallback(false)
+                                .setRequestedVideoEncoderSettings(
+                                    VideoEncoderSettings.Builder().setMaxBFrames(0).setiFrameIntervalSeconds(2f).build(),
+                                )
                                 .build(),
                         )
-                        .setMuxerFactory(
-                            if (fragmented) InAppFragmentedMp4Muxer.Factory()
-                            else InAppMp4Muxer.Factory().setAttemptStreamableOutputEnabled(true),
-                        )
+                        .setMuxerFactory(muxerFactory)
                         .setLooper(thread.looper)
                     if (localSourceUri.scheme in setOf("http", "https")) {
                         builder.setAssetLoaderFactory(
@@ -221,8 +170,7 @@ class OnDeviceTranscoder(
                             override fun onCompleted(composition: Composition, result: ExportResult) {
                                 logger.trace(
                                     TAG,
-                                    "HW transcode done: $codec seg [${startMs}-${endMs}ms] " +
-                                        "in ${System.currentTimeMillis() - startedAt}ms (${outFile.length() / 1024} KiB)",
+                                    "HW stream transcode done: $codec in ${System.currentTimeMillis() - startedAt}ms",
                                 )
                                 completeSuccess(flight)
                             }
@@ -230,7 +178,7 @@ class OnDeviceTranscoder(
                             override fun onError(composition: Composition, result: ExportResult, exception: ExportException) {
                                 logger.w(
                                     TAG,
-                                    "HW transcode failed: $codec seg [${startMs}-${endMs}ms] errorCode=${exception.errorCode}",
+                                    "HW stream transcode failed: $codec errorCode=${exception.errorCode}",
                                     exception,
                                 )
                                 completeFailure(flight, exception)
@@ -244,18 +192,20 @@ class OnDeviceTranscoder(
                     } else {
                         // A shared SDR output contract works for HDR sources too. For an unknown
                         // remote profile Media3 discovers the transfer characteristics during decode.
-                        if (sourceProfile == null || sourceProfile.isHdr) {
+                        // Media3's start API requires an output path, but the custom muxer ignores it.
+                        // Neither streaming muxer creates or writes a file at this path.
+                        val unusedOutputPath = File(appContext.cacheDir, "unused-stream-output").absolutePath
+                        if (profile == null || profile.isHdr) {
                             val composition = Composition.Builder(EditedMediaItemSequence.Builder(edited).build())
                                 .setHdrMode(Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL)
                                 .build()
-                            transformer.start(composition, outFile.absolutePath)
+                            transformer.start(composition, unusedOutputPath)
                         } else {
-                            transformer.start(edited, outFile.absolutePath)
+                            transformer.start(edited, unusedOutputPath)
                         }
-                        if (!fragmented) reportProgress(flight, outFile, onProgress)
                     }
                 } catch (t: Throwable) {
-                    logger.w(TAG, "HW transcode setup failed: $codec seg [${startMs}-${endMs}ms]", t)
+                    logger.w(TAG, "HW stream transcode setup failed: $codec", t)
                     completeFailure(flight, t)
                 }
             }
@@ -265,41 +215,12 @@ class OnDeviceTranscoder(
         }
 
         try {
-            withTimeout(deadlineMs) { done.await() }
-        } catch (e: TimeoutCancellationException) {
-            cancel(flight, "transcode deadline exceeded")
-            val stopped = awaitStopped(flight, CANCEL_DRAIN_WAIT_MS)
-            if (!stopped) {
-                // Keep the reservation: a late Media3 callback must never overlap a new hardware export.
-                logger.w(TAG, "Timed out waiting for cancelled $codec export to terminate; encoder remains reserved")
-            }
-            throw ExportDeadlineExceededException(
-                "on-device $codec export exceeded its ${deadlineMs}ms deadline for [${startMs}-${endMs}ms]",
-                stopped = stopped,
-            )
+            done.await()
         } catch (e: CancellationException) {
             if (!done.isCompleted) cancel(flight, "transcode caller cancelled")
-            // The owning session may remove its cache immediately after this suspend call unwinds.
             withContext(NonCancellable) { awaitStopped(flight, CANCEL_DRAIN_WAIT_MS) }
             throw e
         }
-    }
-
-    /** Runs on Media3's looper; never leaves recurring callbacks after this export terminates. */
-    private fun reportProgress(flight: InFlight, output: File, onProgress: (Int?) -> Unit) {
-        if (flight.done.isCompleted || flight.cancelled) return
-        if (output.parentFile?.usableSpace?.let { it in 1 until MIN_FREE_EXPORT_BYTES } == true) {
-            runCatching { flight.transformer?.cancel() }
-                .onSuccess { completeFailure(flight, IOException("Not enough free space to prepare the converted video")) }
-                .onFailure { cancel(flight, "insufficient private cache space for on-device conversion") }
-            return
-        }
-        val holder = ProgressHolder()
-        val progress = runCatching {
-            if (flight.transformer?.getProgress(holder) == Transformer.PROGRESS_STATE_AVAILABLE) holder.progress else null
-        }.getOrNull()
-        runCatching { onProgress(progress) }
-        handler.postDelayed({ reportProgress(flight, output, onProgress) }, PROGRESS_INTERVAL_MS)
     }
 
     /** Abort the active export (including a queued-but-not-yet-started one). */
@@ -307,11 +228,7 @@ class OnDeviceTranscoder(
         inFlight?.let { cancel(it, "transcode cancelled on stop") }
     }
 
-    /**
-     * Abort the active export and wait only a finite amount of time for its callback/unwind. This is used
-     * before a session removes its temporary directory, preventing the muxer from writing into deleted
-     * storage indefinitely.
-     */
+    /** Abort the active export and wait a finite amount of time for its lifecycle to unwind. */
     fun cancelInFlightAndAwait(timeoutMs: Long = RELEASE_WAIT_MS): Boolean {
         val flight = inFlight ?: return true
         cancel(flight, "transcode cancelled on stop")
@@ -399,12 +316,6 @@ class OnDeviceTranscoder(
         }
     }
 
-    private fun exportDeadlineMs(startMs: Long, endMs: Long): Long {
-        val durationMs = (endMs - startMs).coerceAtLeast(MIN_SEGMENT_DURATION_MS)
-        return (EXPORT_STARTUP_GRACE_MS + durationMs * EXPORT_TIME_MULTIPLIER)
-            .coerceAtMost(MAX_EXPORT_DEADLINE_MS)
-    }
-
     private fun codecLabel(codec: VideoCodec): String = when (codec) {
         VideoCodec.H264 -> "h264"
         VideoCodec.HEVC -> "hevc"
@@ -419,14 +330,6 @@ class OnDeviceTranscoder(
 
     companion object {
         private const val TAG = "OnDeviceTranscoder"
-        private const val MIN_SEGMENT_DURATION_MS = 1_000L
-        private const val EXPORT_STARTUP_GRACE_MS = 10_000L
-        private const val EXPORT_TIME_MULTIPLIER = 10L
-        private const val MAX_EXPORT_DEADLINE_MS = 90_000L
-        private const val MAX_FILE_EXPORT_DEADLINE_MS = 24 * 60 * 60 * 1_000L
-        private const val UNKNOWN_FILE_DURATION_MS = 6 * 60 * 60 * 1_000L
-        private const val MIN_FREE_EXPORT_BYTES = 16 * 1024 * 1024L
-        private const val PROGRESS_INTERVAL_MS = 500L
         private const val CANCEL_DRAIN_WAIT_MS = 5_000L
         private const val RELEASE_WAIT_MS = 5_000L
     }

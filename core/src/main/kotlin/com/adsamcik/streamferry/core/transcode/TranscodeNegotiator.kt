@@ -3,15 +3,15 @@ package com.adsamcik.streamferry.core.transcode
 /**
  * Chooses the on-device transcode [TranscodeTarget] by gating BOTH the phone's hardware encoders AND
  * the receiver, following the ladder HEVC-4K -> H.264-4K -> (HEVC/H.264)-1080p -> H.264-720p (all with
- * AAC audio). 4K is negotiated, never assumed; the safe default is 1080p H.264/AAC. HEVC is only ever
- * packaged as fMP4/CMAF or DASH (never MPEG-TS). Pure + unit-testable.
+ * AAC audio). 4K is negotiated, never assumed; the safe default is 1080p H.264/AAC. Cast uses
+ * fragmented MP4, while DLNA uses a continuous transport stream. Pure + unit-testable.
  */
 class TranscodeNegotiator {
 
     /**
-     * The phone publishes HLS/fMP4 to capable receivers and a completed MP4 to the others. It limits
+     * The phone publishes HLS/fMP4 to Cast and progressive MPEG-TS to DLNA. It limits
      * output to the Media3 Transformer codecs it can request consistently (H.264 and HEVC); AV1/VP9, DASH,
-     * MPEG-TS, Main10, explicit bitrate, and fixed-frame-rate contracts remain feature-gated.
+     * Main10, explicit bitrate, and fixed-frame-rate contracts remain feature-gated.
      */
     fun negotiate(
         device: DeviceEncodeCapabilities,
@@ -41,7 +41,7 @@ class TranscodeNegotiator {
             return TranscodeTarget(
                 videoCodec = codec,
                 audioCodec = AudioCodec.AAC,
-                container = if (receiver.supportsFmp4) StreamContainer.HLS_FMP4 else StreamContainer.MP4,
+                container = if (receiver.supportsFmp4) StreamContainer.HLS_FMP4 else StreamContainer.PROGRESSIVE_TS,
                 maxResolution = tier,
                 maxFps = fpsAdmissionBound,
                 tenBit = false,

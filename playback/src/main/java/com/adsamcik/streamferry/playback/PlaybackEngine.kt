@@ -46,12 +46,10 @@ import com.adsamcik.streamferry.core.volume.NightVolumeSession
 import com.adsamcik.streamferry.core.volume.RendererVolumeState
 import com.adsamcik.streamferry.core.segments.MediaSegment
 import com.adsamcik.streamferry.core.segments.MediaSegmentTracker
-import com.adsamcik.streamferry.data.transcode.ClientTranscodeSession
 import com.adsamcik.streamferry.data.transcode.LocalMediaProbe
 import com.adsamcik.streamferry.data.transcode.OnDeviceTranscoder
-import com.adsamcik.streamferry.data.transcode.PreparedTranscodeFileSession
+import com.adsamcik.streamferry.data.transcode.StreamingTranscodeSession
 import android.content.Context
-import java.io.File
 import java.time.Instant
 import java.time.ZoneId
 import kotlinx.coroutines.CancellationException
@@ -262,7 +260,7 @@ class PlaybackEngine(
     // The on-device transcode target (codec/resolution) currently being produced on the phone, or null
     // when not transcoding on-device — surfaced so the UI can show exactly what's being sent to the TV.
     @Volatile private var onDeviceTranscodeTarget: TranscodeTarget? = null
-    private var preparedTranscodeFile: PreparedTranscodeFileSession? = null
+    @Volatile private var streamingTranscode: StreamingTranscodeSession? = null
     @Volatile private var transcodePreparationJob: Job? = null
     // The probed source format of a LOCAL file (online sources use the provider descriptor), for the same UI.
     @Volatile private var localSourceProfile: MediaProfile? = null
@@ -1018,23 +1016,19 @@ class PlaybackEngine(
         currentProviderSession = null
         mediaAudioTrackRefs = emptyMap()
         mediaSubtitleTrackRefs = emptyMap()
-        // An on-device transcode is a full-timeline HLS stream (seekable): reflect that so the seek
-        // path (renderer-seek, not server re-resolve) and status/telemetry are correct. A direct-play
-        // local file is a plain progressive stream.
+        // Phone output is a continuous stream beginning at the requested source position.
         currentIsHls = false
         currentIsTranscoding = transcodeTarget != null
         onDeviceTranscodeTarget = transcodeTarget // null for direct play; set for on-device transcode
-        streamStartSeconds = 0
-        reportedPositionSeconds = boundedStartPos
+        streamStartSeconds = if (transcodeTarget != null) boundedStartPos else 0
+        reportedPositionSeconds = if (transcodeTarget != null) 0 else boundedStartPos
         seekSettleTargetSeconds = null
-        noteSourcePosition(reportedPositionSeconds)
+        noteSourcePosition(boundedStartPos)
         val streamForTv: RendererStream
         val url: String
         if (transcodeTarget != null) {
             val output = prepareOnDeviceOutput(
-                params.filePath, params.contentType, localSourceProfile, exactRuntimeSeconds,
-                transcodeTarget, phoneIp,
-                segmentable = LocalMediaProbe.isByteSeekable(appContext, params.filePath),
+                params.filePath, params.contentType, localSourceProfile, transcodeTarget, phoneIp, boundedStartPos,
             )
             url = output.first
             streamForTv = output.second
@@ -1086,7 +1080,7 @@ class PlaybackEngine(
             url,
             streamForTv,
             params.title,
-            effectiveRuntimeSeconds,
+            effectiveRuntimeSeconds?.let { if (transcodeTarget != null) (it - boundedStartPos).coerceAtLeast(0) else it },
             startPositionSeconds = reportedPositionSeconds,
             playWhenReady = playWhenReady,
         )
@@ -1101,49 +1095,53 @@ class PlaybackEngine(
         uri: String,
         mimeType: String,
         profile: MediaProfile?,
-        exactDuration: Double?,
         output: TranscodeTarget,
         phoneIp: String,
-        segmentable: Boolean,
+        startPositionSeconds: Long,
     ): Pair<String, RendererStream> {
-        val cacheDir = File(File(appContext.cacheDir, "transcode"), "ct_$playGeneration")
-        if (selectedTarget?.protocol == Protocol.CAST && selectedTarget?.capabilities?.supportsHls == true &&
-            segmentable && exactDuration != null && profile != null && !profile.isHdr && profile.bitDepth <= 8
-        ) {
-            val session = ClientTranscodeSession(onDeviceTranscoder, uri, exactDuration, output, cacheDir, logger)
-            return coordinator.startClientTranscodeAndBuildUrl(session, phoneIp).second to RendererStream(
-                mimeType = "application/vnd.apple.mpegurl", hlsSegmentFormat = HlsSegmentFormat.FMP4,
-            )
-        }
+        val hls = selectedTarget?.protocol == Protocol.CAST
         val preparation = currentCoroutineContext()[Job]
         transcodePreparationJob = preparation
-        lastNote = "Preparing on-device video before playback…"
+        val generation = playGeneration
+        lastNote = "Starting on-device stream…"
+        recoverySession = recoverySession.transition(PlaybackPhase.CHANGING_STREAM)
         publishStatus()
         try {
-            val session = PreparedTranscodeFileSession(
-                onDeviceTranscoder, uri, output, cacheDir, logger,
-                sourceMimeType = mimeType,
-                runtimeSeconds = exactDuration ?: item?.runtimeSeconds?.toDouble(),
-                sourceProfile = profile,
-            )
-            preparedTranscodeFile = session
-            session.prepare(onProgress = { percent ->
-                    if (transcodePreparationJob === preparation) {
-                        lastNote = percent?.let { "Preparing on-device video: $it%" }
-                            ?: "Preparing on-device video before playback…"
-                        publishStatus()
+            lateinit var session: StreamingTranscodeSession
+            session = StreamingTranscodeSession(
+                onDeviceTranscoder, uri, output, logger, hls, startPositionSeconds,
+                sourceMimeType = mimeType, sourceProfile = profile,
+                onFailure = { error ->
+                    if (generation == playGeneration && streamingTranscode === session) {
+                        scope.launch {
+                            mutex.withLock {
+                                if (generation == playGeneration && streamingTranscode === session) {
+                                    logger.w(TAG, "On-device streaming encoder failed", error)
+                                    handlePlaybackFailure(PlaybackFailureKind.UNKNOWN, "On-device encoding failed. Try another format or resolution.")
+                                }
+                            }
+                        }
                     }
-                })
-            return coordinator.startPreparedTranscodeAndBuildUrl(session.file.absolutePath, phoneIp).second to
-                RendererStream(mimeType = "video/mp4", isByteSeekable = true)
+                },
+            )
+            streamingTranscode = session
+            // Readiness means the first short fragment/packets, never completion of the source.
+            session.awaitReady()
+            return coordinator.startClientTranscodeAndBuildUrl(session, phoneIp).second to
+                if (hls) RendererStream("application/vnd.apple.mpegurl", HlsSegmentFormat.FMP4)
+                else RendererStream("video/mp2t", isByteSeekable = false)
+        } catch (error: Throwable) {
+            releaseStreamingTranscode()
+            throw error
         } finally {
             if (transcodePreparationJob === preparation) transcodePreparationJob = null
         }
     }
 
-    private fun releasePreparedTranscode() {
-        preparedTranscodeFile?.release()
-        preparedTranscodeFile = null
+    private fun releaseStreamingTranscode() {
+        val session = streamingTranscode
+        streamingTranscode = null
+        session?.release()
     }
 
     /**
@@ -1163,7 +1161,7 @@ class PlaybackEngine(
         terminalFailureSurfaced = false
         try {
             proxy.stop()
-            releasePreparedTranscode()
+            releaseStreamingTranscode()
             // Tell a polled controller (DLNA) we're tearing down first, then Stop before the new URI (many
             // renderers need it), then reload in place from the current position.
             runCatching { target?.prepareReload() }
@@ -1188,11 +1186,14 @@ class PlaybackEngine(
         val pos = PlaybackPositionPolicy.clamp(absoluteSeconds, duration)
         smartResume.noteSeekRequested(pos)
         holdProgressEstimate(resetDelivery = true)
-        // Only a progressive (non-HLS) transcode is a non-seekable live stream that must be re-resolved at
-        // the new position server-side. A direct-play file AND a full-timeline HLS transcode are seekable,
-        // so the renderer seeks within the existing stream (matching what the TV's own controls do) — a
-        // server-side re-resolve of a full-timeline stream would reload it and play from 0 ("restart").
-        val serverSideSeek = onDeviceTranscodeTarget == null &&
+        // Phone streams restart their encoder at the requested source position. Server output uses
+        // its existing seek policy; direct files and full-timeline HLS can seek in the renderer.
+        if (onDeviceTranscodeTarget != null) {
+            reloadOutput(pos, "seek phone stream", localPlayWhenReady)
+            controlErrorMessage = null
+            return
+        }
+        val serverSideSeek =
             PlaybackPositionPolicy.requiresServerReload(currentIsTranscoding, currentIsHls)
         logger.event("playback", "Seek -> ${pos}s (${if (serverSideSeek) "server-side re-resolve" else "renderer seek"})")
         if (serverSideSeek) {
@@ -1237,9 +1238,10 @@ class PlaybackEngine(
         }
     }
 
-    suspend fun stop() {
-        // A complete MP4 export can outlast a command. Cancel it before waiting for the command lock.
+    suspend fun stop() = withContext(dispatcher) {
+        // Wake a producer blocked by receiver backpressure before waiting for the command lock.
         transcodePreparationJob?.cancel(CancellationException("Playback stopped"))
+        releaseStreamingTranscode()
         mutex.withLock { stopInternalLocked("user stopped") }
     }
 
@@ -1252,6 +1254,7 @@ class PlaybackEngine(
         if (!hadActivePlayback) return
         transcodePreparationJob?.cancel(CancellationException("Local network permission revoked"))
         proxy.stop()
+        releaseStreamingTranscode()
         runCatching { serviceController.stop() }
         mutex.withLock {
             if (target != null || hadActivePlayback) {
@@ -1840,11 +1843,9 @@ class PlaybackEngine(
         currentIsHls = stream.isHls
         currentIsTranscoding = stream.isTranscoding || phoneTarget != null
         onDeviceTranscodeTarget = phoneTarget
-        // Only a PROGRESSIVE (non-HLS) transcode is a genuine live stream that begins server-side at the
-        // requested position (its own t=0 == media position). A direct-play file AND a full-timeline HLS
-        // transcode whose VOD HLS lists the full timeline is seekable, so the
-        // renderer positions itself within them and the stream's t=0 is media 0.
-        val serverSideStart = phoneTarget == null && PlaybackPositionPolicy.requiresServerReload(stream.isTranscoding, stream.isHls)
+        // Phone output and progressive server transcodes begin at the requested source position.
+        // Direct files and full-timeline server HLS retain their original renderer timeline.
+        val serverSideStart = phoneTarget != null || PlaybackPositionPolicy.requiresServerReload(stream.isTranscoding, stream.isHls)
         streamStartSeconds = if (serverSideStart) positionSeconds else 0L
         reportedPositionSeconds = if (serverSideStart) 0L else positionSeconds
         seekSettleTargetSeconds = null // fresh stream: don't let a prior seek's hold suppress its statuses
@@ -1863,12 +1864,11 @@ class PlaybackEngine(
                 val input = coordinator.prepareTranscodeInput(providerSession, phoneIp, positionSeconds,
                     shouldReport = watchStatePolicy.current.let { session -> { session?.automatic != false } })
                 val output = prepareOnDeviceOutput(
-                    input, stream.contentType, descriptor.profile, null, phoneTarget, phoneIp,
-                    segmentable = false,
+                    input, stream.contentType, descriptor.profile, phoneTarget, phoneIp, positionSeconds,
                 )
                 rendererStream = output.second
                 currentIsHls = rendererStream.hlsSegmentFormat != null
-                adaptive = null // A prepared phone output is not a server bitrate ladder.
+                adaptive = null // Receiver-paced phone output is not a server bitrate ladder.
                 lastNote = "Transcoding on device"
                 output.first
             } else coordinator.startAndBuildUrl(providerSession, phoneIp, initialPositionSeconds = positionSeconds,
@@ -1915,7 +1915,7 @@ class PlaybackEngine(
             url,
             rendererStream,
             item.title,
-            descriptor.runtimeSeconds,
+            descriptor.runtimeSeconds?.let { if (phoneTarget != null) (it - positionSeconds).coerceAtLeast(0) else it },
             startPositionSeconds = loadStart,
             playWhenReady = playWhenReady,
         )
@@ -1994,7 +1994,7 @@ class PlaybackEngine(
 
     private suspend fun retireStartupAttempt(reason: String) {
         proxy.stop()
-        releasePreparedTranscode()
+        releaseStreamingTranscode()
         runCatching { target?.prepareReload() }
         runCatching { coordinator.stop(reason) }
     }
@@ -2022,7 +2022,7 @@ class PlaybackEngine(
             // Revoke the old phone-hosted stream before any renderer control call can block. The
             // coordinator then clears its session bookkeeping and performs bounded remote cleanup.
             proxy.stop()
-            releasePreparedTranscode()
+            releaseStreamingTranscode()
             // Tell the target we're about to tear down the current stream so a polled controller (DLNA)
             // stops its poll BEFORE the renderer is forced to STOP — otherwise the old poll can emit a
             // stale end-of-media that survives the reload window and stops the new stream.
@@ -2875,7 +2875,7 @@ class PlaybackEngine(
         // Close the local relay before any renderer/source RPC can block. coordinator.stop() repeats
         // this idempotently while it clears its bookkeeping and performs bounded remote cleanup.
         proxy.stop()
-        releasePreparedTranscode()
+        releaseStreamingTranscode()
         target?.let {
             if (PlaybackTeardownPolicy.shouldSendRendererStop(connectionLost)) {
                 runCatching { it.stop() }

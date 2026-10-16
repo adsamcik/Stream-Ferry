@@ -16,7 +16,7 @@ import androidx.compose.ui.test.performClick
 import androidx.test.platform.app.InstrumentationRegistry
 import com.adsamcik.streamferry.core.transcode.*
 import com.adsamcik.streamferry.data.proxy.ClientTranscodeSource
-import com.adsamcik.streamferry.data.transcode.ClientTranscodeSession
+import com.adsamcik.streamferry.data.transcode.StreamingTranscodeSession
 import com.adsamcik.streamferry.data.transcode.OnDeviceTranscoder
 import com.adsamcik.streamferry.data.transcode.LocalMediaProbe
 import com.adsamcik.streamferry.source.api.DiagnosticSink
@@ -71,7 +71,7 @@ class LocalTranscodeOutputTest {
         }
     }
 
-    @Test fun realHardwareExportPublishesSeekableSegmentsFromDownloadedPath() = runBlocking {
+    @Test fun realHardwareStreamingPublishesPlayableFirstFragmentFromDownloadedPath() = runBlocking {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val context = instrumentation.targetContext
         val directory = File(context.cacheDir, "local-transcode-device-test").apply { mkdirs() }
@@ -87,28 +87,20 @@ class LocalTranscodeOutputTest {
         val target = TranscodeTarget(VideoCodec.H264, AudioCodec.AAC, StreamContainer.HLS_FMP4, ResolutionTier.SD_480P, 30)
         val runtime = requireNotNull(LocalMediaProbe.probeDurationSecondsExact(context, input.absolutePath))
         assertEquals(6.0, runtime, 0.001)
-        val session = ClientTranscodeSession(transcoder, input.absolutePath, runtime, target, File(directory, "session"), logger)
+        val session = StreamingTranscodeSession(transcoder, input.absolutePath, target, logger, hls = true)
         try {
-            val exported = File(context.filesDir, "synthetic-transcode.mp4")
-            transcoder.transcodeSegment(input.absolutePath, 0, 2000, target, exported)
-            val encoded = exported.readBytes()
-            val info = Fmp4Splitter.codecInfo(Fmp4Splitter.initSegment(encoded))
+            // Readiness is the first short fragment; the export continues in the session coroutine.
+            session.awaitReady()
+            val first = session.mediaSegment(0, allowExport = true)
+            assertTrue("First real encoded HLS fragment must be publishable: $first", first is ClientTranscodeSource.Resource.Ready)
+            val init = session.initSegment(allowExport = true) as ClientTranscodeSource.Resource.Ready
+            val info = Fmp4Splitter.codecInfo(init.bytes)
             assertTrue("Hardware output must use requested H.264: $info", info?.videoCodec?.startsWith("avc") == true)
             assertEquals("720p input must actually be encoded to 480p", 480, info?.height)
-            val first = session.mediaSegment(0, allowExport = true)
-            assertTrue("First real encoded HLS segment must be publishable: $first", first is ClientTranscodeSource.Resource.Ready)
-            assertTrue(session.initSegment(allowExport = true) is ClientTranscodeSource.Resource.Ready)
-            assertTrue("Seeking to the last segment must encode it", session.mediaSegment(2, allowExport = true) is ClientTranscodeSource.Resource.Ready)
-            assertTrue("Out-of-order segment must also work", session.mediaSegment(1, allowExport = true) is ClientTranscodeSource.Resource.Ready)
-            val published = File(context.filesDir, "synthetic-hls").apply { mkdirs() }
-            for (index in 0..2) {
-                File(published, "init_$index.mp4").writeBytes((session.initSegment(index, true) as ClientTranscodeSource.Resource.Ready).bytes)
-                File(published, "seg_$index.m4s").writeBytes((session.mediaSegment(index, true) as ClientTranscodeSource.Resource.Ready).bytes)
-            }
-            val base = "http://synthetic/stream"
-            File(published, "media.m3u8").writeText(session.mediaPlaylist("http://synthetic")
-                .replace(Regex("${Regex.escape(base)}\\?seg=init_(\\d+)"), "init_$1.mp4")
-                .replace(Regex("${Regex.escape(base)}\\?seg=(\\d+)"), "seg_$1.m4s"))
+            val fragment = (first as ClientTranscodeSource.Resource.Ready).bytes
+            assertTrue(Fmp4Splitter.isValidMediaSegment(fragment))
+            File(context.filesDir, "synthetic-stream-first-fragment.mp4").writeBytes(init.bytes + fragment)
+            assertTrue(session.mediaPlaylist("http://synthetic").contains("#EXTINF:"))
         } finally {
             session.release()
             transcoder.release()

@@ -11,7 +11,7 @@ import com.adsamcik.streamferry.core.transcode.LocalTranscodeMode
 import com.adsamcik.streamferry.core.transcode.ResolutionTier
 import com.adsamcik.streamferry.data.proxy.LocalProxyServer
 import com.adsamcik.streamferry.data.transcode.LocalMediaProbe
-import com.adsamcik.streamferry.data.transcode.PreparedTranscodeFileSession
+import com.adsamcik.streamferry.data.transcode.StreamingTranscodeSession
 import com.adsamcik.streamferry.diagnostics.NetworkInfoProvider
 import com.adsamcik.streamferry.domain.DiscoveredTarget
 import com.adsamcik.streamferry.domain.MediaItem
@@ -46,10 +46,10 @@ class PlaybackEngineLocalTranscodeTest {
         every { LocalMediaProbe.probe(any(), any(), any()) } returns compatibleProfile
         every { LocalMediaProbe.isByteSeekable(any(), any()) } returns true
         every { LocalMediaProbe.probeDurationSecondsExact(any(), any()) } returns 3600.0
-        mockkConstructor(PreparedTranscodeFileSession::class)
-        every { anyConstructed<PreparedTranscodeFileSession>().file } returns PREPARED_FILE
-        coEvery { anyConstructed<PreparedTranscodeFileSession>().prepare(any()) } returns PREPARED_FILE
-        every { anyConstructed<PreparedTranscodeFileSession>().release() } just Runs
+        mockkConstructor(StreamingTranscodeSession::class)
+        // Only first-media readiness is signalled. No source-EOF or export-completion event is sent.
+        coEvery { anyConstructed<StreamingTranscodeSession>().awaitReady() } returns Unit
+        every { anyConstructed<StreamingTranscodeSession>().release() } just Runs
     }
 
     @AfterTest fun releaseLocalProbe() = unmockkAll()
@@ -75,8 +75,6 @@ class PlaybackEngineLocalTranscodeTest {
                 (session to ORIGINAL_URL)
             coEvery { coordinator.startClientTranscodeAndBuildUrl(any(), any()) } returns
                 (session to TRANSCODE_URL)
-            coEvery { coordinator.startPreparedTranscodeAndBuildUrl(any(), any()) } returns
-                (session to PREPARED_URL)
             coEvery { coordinator.prepareTranscodeInput(any(), any(), any(), any()) } returns INPUT_URL
             coEvery { coordinator.startAndBuildUrl(any(), any(), any(), any()) } returns
                 (session to ORIGINAL_URL)
@@ -142,7 +140,7 @@ class PlaybackEngineLocalTranscodeTest {
             assertEquals(LocalTranscodeMode.ON_DEVICE, transcoded.localTranscodeMode)
             assertEquals(123L, transcoded.positionSeconds)
             coVerify(exactly = 1) { f.coordinator.startClientTranscodeAndBuildUrl(any(), "127.0.0.1") }
-            coVerify { f.target.load(TRANSCODE_URL, match { it.mimeType == "application/vnd.apple.mpegurl" }, "Movie", 3600, 123, true) }
+            coVerify { f.target.load(TRANSCODE_URL, match { it.mimeType == "application/vnd.apple.mpegurl" }, "Movie", 3477, 0, true) }
 
             f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ORIGINAL); runCurrent()
             assertEquals("Direct play", f.engine.status.value?.streamMode)
@@ -171,7 +169,7 @@ class PlaybackEngineLocalTranscodeTest {
             f.engine.selectPreferredCodec("h264"); runCurrent()
             assertEquals("H.264 · 480p · on device", f.engine.status.value?.outputFormat)
             assertEquals(123L, f.engine.status.value?.positionSeconds)
-            coVerify(exactly = 3) { f.target.load(TRANSCODE_URL, any(), "Movie", 3600, 123, true) }
+            coVerify(exactly = 3) { f.target.load(TRANSCODE_URL, any(), "Movie", 3477, 0, true) }
         } finally { f.engine.stop(); runCurrent() }
     }
 
@@ -205,11 +203,12 @@ class PlaybackEngineLocalTranscodeTest {
             assertEquals(false, f.engine.status.value?.isPlaying)
             assertEquals(200L, f.engine.status.value?.positionSeconds)
 
+            f.events.emit(PlaybackTargetEvent.StatusChanged(0, false)); runCurrent()
             f.engine.selectMaxVideoHeight(480); runCurrent()
             assertEquals(false, f.engine.status.value?.isPlaying)
             assertEquals(200L, f.engine.status.value?.positionSeconds)
             coVerify(exactly = 2) {
-                f.target.load(TRANSCODE_URL, any(), "Movie", 3600, 200, false)
+                f.target.load(TRANSCODE_URL, any(), "Movie", 3400, 0, false)
             }
 
             f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ORIGINAL); runCurrent()
@@ -229,10 +228,10 @@ class PlaybackEngineLocalTranscodeTest {
             f.events.emit(PlaybackTargetEvent.BufferingChanged(true)); runCurrent()
             f.events.emit(PlaybackTargetEvent.StatusChanged(123, false)); runCurrent()
             f.engine.selectPreferredCodec("h264"); runCurrent()
-            coVerify { f.target.load(TRANSCODE_URL, any(), "Movie", 3600, 123, true) }
+            coVerify { f.target.load(TRANSCODE_URL, any(), "Movie", 3477, 0, true) }
             f.engine.pause()
             f.engine.selectMaxVideoHeight(480); runCurrent()
-            coVerify { f.target.load(TRANSCODE_URL, any(), "Movie", 3600, 123, false) }
+            coVerify { f.target.load(TRANSCODE_URL, any(), "Movie", 3477, 0, false) }
         } finally { f.engine.stop(); runCurrent() }
     }
 
@@ -258,70 +257,81 @@ class PlaybackEngineLocalTranscodeTest {
                 f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE); runCurrent()
                 assertEquals("On-device transcode", f.engine.status.value?.streamMode)
                 assertEquals(LocalTranscodeMode.ON_DEVICE, f.engine.status.value?.localTranscodeMode)
-                coVerify(exactly = 0) { f.coordinator.startClientTranscodeAndBuildUrl(any(), any()) }
-                coVerify(exactly = 1) { f.coordinator.startPreparedTranscodeAndBuildUrl(PREPARED_FILE.absolutePath, "127.0.0.1") }
-                coVerify { f.target.load(PREPARED_URL, match { it.mimeType == "video/mp4" && it.isByteSeekable }, "Movie", 3600, 123, true) }
+                coVerifyOrder {
+                    anyConstructed<StreamingTranscodeSession>().awaitReady()
+                    f.coordinator.startClientTranscodeAndBuildUrl(any(), "127.0.0.1")
+                    f.target.load(TRANSCODE_URL, any(), "Movie", 3477, 0, true)
+                }
+                coVerify(exactly = 1) { f.coordinator.startClientTranscodeAndBuildUrl(any(), "127.0.0.1") }
+                coVerify { f.target.load(TRANSCODE_URL, match { it.mimeType == (if (protocol == Protocol.CAST) "application/vnd.apple.mpegurl" else "video/mp2t") && !it.isByteSeekable }, "Movie", 3477, 0, true) }
             } finally { f.engine.stop(); runCurrent() }
         }
     }
 
     @Test fun `online HLS and nonseekable providers use the same phone output controls for Cast and DLNA`() = runTest {
         for (protocol in listOf(Protocol.CAST, Protocol.DLNA)) {
-            val f = Fixture(this, protocol)
-            f.providerStream = StreamDescriptor(
-                contentType = if (protocol == Protocol.CAST) "application/vnd.apple.mpegurl" else "video/mp4",
-                outputContainer = if (protocol == Protocol.CAST) "hls" else "mp4",
-                hlsSegmentFormat = if (protocol == Protocol.CAST) com.adsamcik.streamferry.source.api.HlsSegmentFormat.FMP4 else null,
-                isTranscoding = true, isByteSeekable = false, totalLength = null,
-            )
-            try {
-                f.startOnline(); runCurrent()
-                assertNull(f.engine.status.value?.localTranscodeUnavailableReason)
-                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE); runCurrent()
-                f.engine.selectPreferredCodec("h264"); runCurrent()
-                f.engine.selectMaxVideoHeight(480); runCurrent()
-                val status = assertNotNull(f.engine.status.value)
-                assertEquals(LocalTranscodeMode.ON_DEVICE, status.localTranscodeMode)
-                assertEquals("H.264 · 480p · on device", status.outputFormat)
-                assertEquals(123L, status.positionSeconds)
-                val request = f.requests.last()
-                assertFalse(request.forceTranscode)
-                assertEquals(0L, request.startPositionSeconds)
-                assertNull(request.maxBitrateBps)
-                assertNull(request.preferredVideoCodec)
-                assertEquals(Int.MAX_VALUE, request.maxVideoHeight)
-                coVerify(exactly = 3) { f.coordinator.prepareTranscodeInput(f.providerSession, "127.0.0.1", 123, any()) }
-                coVerify(exactly = 3) { f.coordinator.startPreparedTranscodeAndBuildUrl(PREPARED_FILE.absolutePath, "127.0.0.1") }
-                coVerify(exactly = 3) { f.target.load(PREPARED_URL, match { it.mimeType == "video/mp4" && it.isByteSeekable }, "Movie", 3600, 123, true) }
-            } finally { f.engine.stop(); runCurrent() }
+            for (hls in listOf(false, true)) {
+                val f = Fixture(this, protocol)
+                f.providerStream = StreamDescriptor(
+                    contentType = if (hls) "application/vnd.apple.mpegurl" else "video/mp4",
+                    outputContainer = if (hls) "hls" else "mp4",
+                    hlsSegmentFormat = if (hls) com.adsamcik.streamferry.source.api.HlsSegmentFormat.FMP4 else null,
+                    isTranscoding = true, isByteSeekable = false, totalLength = null,
+                )
+                try {
+                    f.startOnline(); runCurrent()
+                    assertNull(f.engine.status.value?.localTranscodeUnavailableReason)
+                    f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE); runCurrent()
+                    f.engine.selectPreferredCodec("h264"); runCurrent()
+                    f.engine.selectMaxVideoHeight(480); runCurrent()
+                    val status = assertNotNull(f.engine.status.value)
+                    assertEquals(LocalTranscodeMode.ON_DEVICE, status.localTranscodeMode)
+                    assertEquals("H.264 · 480p · on device", status.outputFormat)
+                    assertEquals(123L, status.positionSeconds)
+                    val request = f.requests.last()
+                    assertFalse(request.forceTranscode)
+                    assertEquals(0L, request.startPositionSeconds)
+                    assertNull(request.maxBitrateBps)
+                    assertNull(request.preferredVideoCodec)
+                    assertEquals(Int.MAX_VALUE, request.maxVideoHeight)
+                    coVerify(exactly = 3) { f.coordinator.prepareTranscodeInput(f.providerSession, "127.0.0.1", 123, any()) }
+                    coVerify(exactly = 3) { f.coordinator.startClientTranscodeAndBuildUrl(any(), "127.0.0.1") }
+                    coVerify(exactly = 3) { f.target.load(TRANSCODE_URL, match { it.mimeType == (if (protocol == Protocol.CAST) "application/vnd.apple.mpegurl" else "video/mp2t") && !it.isByteSeekable }, "Movie", 3477, 0, true) }
+                } finally { f.engine.stop(); runCurrent() }
+            }
         }
     }
 
-    @Test fun `online phone output preserves pause and position seeks without encoding again and restores original provider`() = runTest {
-        val f = Fixture(this, Protocol.DLNA)
-        try {
-            f.startOnline(); runCurrent()
-            f.events.emit(PlaybackTargetEvent.StatusChanged(123, true)); runCurrent()
-            f.events.emit(PlaybackTargetEvent.StatusChanged(200, true)); runCurrent()
-            f.events.emit(PlaybackTargetEvent.StatusChanged(200, false)); runCurrent()
-            f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE); runCurrent()
-            assertEquals(false, f.engine.status.value?.isPlaying)
-            assertEquals(200L, f.engine.status.value?.positionSeconds)
-            coVerify { f.target.load(PREPARED_URL, any(), "Movie", 3600, 200, false) }
-            val requestsBeforeSeek = f.requests.size
-            f.engine.seekTo(300); runCurrent()
-            coVerify(exactly = 1) { f.target.seekTo(300) }
-            assertEquals(requestsBeforeSeek, f.requests.size)
-            coVerify(exactly = 1) { f.coordinator.startPreparedTranscodeAndBuildUrl(any(), any()) }
-            f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ORIGINAL); runCurrent()
-            assertEquals(LocalTranscodeMode.ORIGINAL, f.engine.status.value?.localTranscodeMode)
-            assertEquals(300L, f.engine.status.value?.positionSeconds)
-            assertEquals(false, f.engine.status.value?.isPlaying)
-            coVerify { f.target.load(ORIGINAL_URL, any(), "Movie", 3600, 300, false) }
-            assertFalse(f.requests.last().forceTranscode)
-            assertEquals(300L, f.requests.last().startPositionSeconds)
-            verify(atLeast = 1) { anyConstructed<PreparedTranscodeFileSession>().release() }
-        } finally { f.engine.stop(); runCurrent() }
+    @Test fun `online phone output preserves pause and position by restarting streaming at seek and restores original provider`() = runTest {
+        for (protocol in listOf(Protocol.CAST, Protocol.DLNA)) {
+            val f = Fixture(this, protocol)
+            try {
+                f.startOnline(); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(123, true)); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(200, true)); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(200, false)); runCurrent()
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE); runCurrent()
+                assertEquals(false, f.engine.status.value?.isPlaying)
+                assertEquals(200L, f.engine.status.value?.positionSeconds)
+                coVerify { f.target.load(TRANSCODE_URL, any(), "Movie", 3400, 0, false) }
+                f.events.emit(PlaybackTargetEvent.StatusChanged(5, false)); runCurrent()
+                assertEquals(205L, f.engine.status.value?.positionSeconds)
+                val requestsBeforeSeek = f.requests.size
+                f.engine.seekTo(300); runCurrent()
+                coVerify(exactly = 0) { f.target.seekTo(any()) }
+                assertEquals(requestsBeforeSeek + 1, f.requests.size)
+                coVerify(exactly = 2) { f.coordinator.startClientTranscodeAndBuildUrl(any(), any()) }
+                coVerify { f.target.load(TRANSCODE_URL, any(), "Movie", 3300, 0, false) }
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ORIGINAL); runCurrent()
+                assertEquals(LocalTranscodeMode.ORIGINAL, f.engine.status.value?.localTranscodeMode)
+                assertEquals(300L, f.engine.status.value?.positionSeconds)
+                assertEquals(false, f.engine.status.value?.isPlaying)
+                coVerify { f.target.load(ORIGINAL_URL, any(), "Movie", 3600, 300, false) }
+                assertFalse(f.requests.last().forceTranscode)
+                assertEquals(300L, f.requests.last().startPositionSeconds)
+                verify(atLeast = 1) { anyConstructed<StreamingTranscodeSession>().release() }
+            } finally { f.engine.stop(); runCurrent() }
+        }
     }
 
     @Test fun `automatic startup uses phone output when initial unforced provider negotiation fails`() = runTest {
@@ -341,8 +351,8 @@ class PlaybackEngineLocalTranscodeTest {
             assertEquals(Int.MAX_VALUE, f.requests.last().maxVideoHeight)
             coVerify(exactly = 0) { f.target.load(ORIGINAL_URL, any(), any(), any(), any(), any()) }
             coVerify(exactly = 1) { f.coordinator.prepareTranscodeInput(f.providerSession, "127.0.0.1", 123, any()) }
-            coVerify(exactly = 1) { f.coordinator.startPreparedTranscodeAndBuildUrl(any(), any()) }
-            coVerify(exactly = 1) { f.target.load(PREPARED_URL, any(), "Movie", 3600, 123, true) }
+            coVerify(exactly = 1) { f.coordinator.startClientTranscodeAndBuildUrl(any(), any()) }
+            coVerify(exactly = 1) { f.target.load(TRANSCODE_URL, any(), "Movie", 3477, 0, true) }
         } finally { f.engine.stop(); runCurrent() }
     }
 
@@ -366,8 +376,8 @@ class PlaybackEngineLocalTranscodeTest {
             assertEquals(Int.MAX_VALUE, f.requests.last().maxVideoHeight)
             coVerify(exactly = 1) { f.target.load(ORIGINAL_URL, any(), any(), any(), any(), any()) }
             coVerify(exactly = 1) { f.coordinator.prepareTranscodeInput(f.providerSession, "127.0.0.1", 123, any()) }
-            coVerify(exactly = 1) { f.coordinator.startPreparedTranscodeAndBuildUrl(any(), any()) }
-            coVerify(exactly = 1) { f.target.load(PREPARED_URL, any(), "Movie", 3600, 123, true) }
+            coVerify(exactly = 1) { f.coordinator.startClientTranscodeAndBuildUrl(any(), any()) }
+            coVerify(exactly = 1) { f.target.load(TRANSCODE_URL, any(), "Movie", 3477, 0, true) }
         } finally { f.engine.stop(); runCurrent() }
     }
 
@@ -392,15 +402,15 @@ class PlaybackEngineLocalTranscodeTest {
             assertEquals(listOf(false, true, false), f.requests.map { it.forceTranscode })
             coVerify(exactly = 2) { f.target.load(ORIGINAL_URL, any(), any(), any(), any(), any()) }
             coVerify(exactly = 1) { f.coordinator.prepareTranscodeInput(f.providerSession, "127.0.0.1", 123, any()) }
-            coVerify(exactly = 1) { f.coordinator.startPreparedTranscodeAndBuildUrl(any(), any()) }
-            coVerify(exactly = 1) { f.target.load(PREPARED_URL, any(), "Movie", 3600, 123, true) }
+            coVerify(exactly = 1) { f.coordinator.startClientTranscodeAndBuildUrl(any(), any()) }
+            coVerify(exactly = 1) { f.target.load(TRANSCODE_URL, any(), "Movie", 3477, 0, true) }
         } finally { f.engine.stop(); runCurrent() }
     }
 
-    @Test fun `stop cancels an online phone preparation before the renderer can load its output`() = runTest {
+    @Test fun `stop cancels a streaming startup before the renderer can load its output`() = runTest {
         val f = Fixture(this, Protocol.DLNA)
         val preparing = CompletableDeferred<Unit>()
-        coEvery { anyConstructed<PreparedTranscodeFileSession>().prepare(any()) } coAnswers {
+        coEvery { anyConstructed<StreamingTranscodeSession>().awaitReady() } coAnswers {
             preparing.complete(Unit)
             awaitCancellation()
         }
@@ -412,9 +422,9 @@ class PlaybackEngineLocalTranscodeTest {
             f.engine.stop(); runCurrent()
             assertTrue(conversion.isCancelled)
             assertNull(f.engine.status.value)
-            coVerify(exactly = 0) { f.coordinator.startPreparedTranscodeAndBuildUrl(any(), any()) }
-            coVerify(exactly = 0) { f.target.load(PREPARED_URL, any(), any(), any(), any(), any()) }
-            verify(atLeast = 1) { anyConstructed<PreparedTranscodeFileSession>().release() }
+            coVerify(exactly = 0) { f.coordinator.startClientTranscodeAndBuildUrl(any(), any()) }
+            coVerify(exactly = 0) { f.target.load(TRANSCODE_URL, any(), any(), any(), any(), any()) }
+            verify(atLeast = 1) { anyConstructed<StreamingTranscodeSession>().release() }
             coVerify(atLeast = 1) { f.coordinator.stop(any()) }
         } finally { f.engine.stop(); runCurrent() }
     }
@@ -422,9 +432,7 @@ class PlaybackEngineLocalTranscodeTest {
     private companion object {
         const val ORIGINAL_URL = "http://127.0.0.1/session/test/stream"
         const val TRANSCODE_URL = "http://127.0.0.1/session/test/transcode.m3u8"
-        const val PREPARED_URL = "http://127.0.0.1/session/test/prepared.mp4"
         const val INPUT_URL = "http://127.0.0.1/session/input/stream"
-        val PREPARED_FILE = File(System.getProperty("java.io.tmpdir"), "prepared-transcode-test.mp4")
         val compatibleProfile = MediaProfile(
             "mp4", "h264", widthPx = 1920, heightPx = 1080, audioCodec = "aac",
         )

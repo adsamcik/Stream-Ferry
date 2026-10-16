@@ -167,17 +167,6 @@ class DefaultPlaybackSessionCoordinator(
         }
     }
 
-    /** Publish a prepared phone MP4 without losing the authenticated input or provider lifecycle. */
-    suspend fun startPreparedTranscodeAndBuildUrl(
-        filePath: String,
-        phoneLanIp: String,
-    ): Pair<ProxySession, String> = mutex.withLock {
-        val hostPort = proxy.start(phoneLanIp)
-        val session = sessions.create(contentType = "video/mp4", isHls = false, localFilePath = filePath)
-        _active.value = session
-        session to "http://$hostPort/session/${session.id}/stream"
-    }
-
     private fun reportStarted(reporting: ReportingSession) {
         reportingScope.launch {
             try {
@@ -211,14 +200,14 @@ class DefaultPlaybackSessionCoordinator(
         session to url
     }
 
-    /** Start a proxy session that serves an on-device-transcoded HLS/CMAF origin (the TV gets only the playlist URL). */
+    /** Publish continuous phone output, retaining source authentication and reporting for either protocol. */
     suspend fun startClientTranscodeAndBuildUrl(
         source: ClientTranscodeSource,
         phoneLanIp: String,
     ): Pair<ProxySession, String> = mutex.withLock {
         val hostPort = proxy.start(phoneLanIp)
         val session = sessions.create(
-            contentType = "application/vnd.apple.mpegurl",
+            contentType = if (source.isProgressive) "video/mp2t" else "application/vnd.apple.mpegurl",
             isHls = false,
         )
         proxy.registerClientTranscode(session.id, source)

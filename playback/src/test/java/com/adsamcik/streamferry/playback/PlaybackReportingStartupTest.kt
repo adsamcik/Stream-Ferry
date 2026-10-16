@@ -14,7 +14,7 @@ import kotlin.test.*
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class PlaybackReportingStartupTest {
-    @Test fun `remote transcode keeps source reports and revokes both input and prepared output`() = runTest {
+    @Test fun `remote transcode keeps source reports and revokes both input and progressive output`() = runTest {
         val sessions = SessionRegistry()
         val proxy = mockk<LocalProxyServer>(relaxed = true)
         every { proxy.start(any()) } returns "127.0.0.1:1234"
@@ -26,7 +26,11 @@ class PlaybackReportingStartupTest {
         val token = coordinator.activeReportToken()
         assertTrue(inputUrl.contains(input.id))
         verify { proxy.registerStreamLease(input.id, source.upstream, rendererOutput = false) }
-        val (output, outputUrl) = coordinator.startPreparedTranscodeAndBuildUrl("/private/prepared.mp4", "127.0.0.1")
+        val progressive = mockk<ClientTranscodeSource>()
+        every { progressive.isProgressive } returns true
+        val (output, outputUrl) = coordinator.startClientTranscodeAndBuildUrl(progressive, "127.0.0.1")
+        assertTrue(outputUrl.endsWith("/stream"))
+        verify { proxy.registerClientTranscode(output.id, progressive) }
         assertNotEquals(input.id, output.id)
         assertTrue(outputUrl.contains(output.id))
         assertTrue(sessions.isActive(input.id))
@@ -72,7 +76,7 @@ class PlaybackReportingStartupTest {
         assertTrue(coordinator.prepareTranscodeInput(source, "127.0.0.1").endsWith("/playlist.m3u8"))
         val input = coordinator.active.value!!
         val token = coordinator.activeReportToken()
-        coordinator.startClientTranscodeAndBuildUrl(mockk<ClientTranscodeSource>(), "127.0.0.1")
+        coordinator.startClientTranscodeAndBuildUrl(mockk<ClientTranscodeSource>(relaxed = true), "127.0.0.1")
         assertEquals(token, coordinator.activeReportToken())
         runCurrent()
         coordinator.reportProgress(false, token)
