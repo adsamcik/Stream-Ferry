@@ -4,6 +4,7 @@ import com.adsamcik.streamferry.core.session.SessionRegistry
 import com.adsamcik.streamferry.core.resume.ProgressEstimate
 import com.adsamcik.streamferry.core.resume.ProgressConfidence
 import com.adsamcik.streamferry.data.proxy.LocalProxyServer
+import com.adsamcik.streamferry.data.proxy.ClientTranscodeSource
 import com.adsamcik.streamferry.playback.session.DefaultPlaybackSessionCoordinator
 import com.adsamcik.streamferry.source.api.*
 import io.mockk.*
@@ -13,6 +14,76 @@ import kotlin.test.*
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class PlaybackReportingStartupTest {
+    @Test fun `remote transcode keeps source reports and revokes both input and prepared output`() = runTest {
+        val sessions = SessionRegistry()
+        val proxy = mockk<LocalProxyServer>(relaxed = true)
+        every { proxy.start(any()) } returns "127.0.0.1:1234"
+        val source = mockk<ProviderPlaybackSession>(relaxed = true)
+        every { source.descriptor.stream } returns StreamDescriptor("video/mp4", "mp4", isTranscoding = false, isByteSeekable = true, totalLength = 8)
+        val coordinator = DefaultPlaybackSessionCoordinator(sessions, proxy, mockk(relaxed = true), StandardTestDispatcher(testScheduler))
+        val inputUrl = coordinator.prepareTranscodeInput(source, "127.0.0.1", 30)
+        val input = coordinator.active.value!!
+        val token = coordinator.activeReportToken()
+        assertTrue(inputUrl.contains(input.id))
+        verify { proxy.registerStreamLease(input.id, source.upstream, rendererOutput = false) }
+        val (output, outputUrl) = coordinator.startPreparedTranscodeAndBuildUrl("/private/prepared.mp4", "127.0.0.1")
+        assertNotEquals(input.id, output.id)
+        assertTrue(outputUrl.contains(output.id))
+        assertTrue(sessions.isActive(input.id))
+        assertEquals(token, coordinator.activeReportToken())
+        coordinator.notePosition(35, token)
+        runCurrent()
+        coordinator.reportProgress(false, token)
+        coVerify { source.report(PlaybackEvent.Started(30)) }
+        coVerify { source.report(PlaybackEvent.Progress(35, false)) }
+        coordinator.stop("user stopped")
+        assertFalse(sessions.isActive(input.id))
+        assertFalse(sessions.isActive(output.id))
+        coVerifyOrder {
+            source.report(PlaybackEvent.Started(30))
+            source.report(PlaybackEvent.Progress(35, false))
+            source.report(PlaybackEvent.Stopped(35))
+            source.close(PlaybackStopReason.USER)
+        }
+        verify { proxy.unregisterStreamLease(input.id); proxy.unregisterStreamLease(output.id); proxy.stop() }
+    }
+
+    @Test fun `failed remote transcode setup still closes owned provider without output`() = runTest {
+        val proxy = mockk<LocalProxyServer>(relaxed = true)
+        every { proxy.start(any()) } throws IllegalStateException("Network unavailable")
+        val source = mockk<ProviderPlaybackSession>(relaxed = true)
+        val coordinator = DefaultPlaybackSessionCoordinator(SessionRegistry(), proxy, mockk(relaxed = true), StandardTestDispatcher(testScheduler))
+        assertFailsWith<IllegalStateException> { coordinator.prepareTranscodeInput(source, "127.0.0.1") }
+        coordinator.stop("transcode failed")
+        coVerify(exactly = 1) { source.close(PlaybackStopReason.ERROR) }
+        assertNull(coordinator.active.value)
+    }
+
+    @Test fun `remote HLS input has media type suffix and segmented output preserves source reports`() = runTest {
+        val sessions = SessionRegistry()
+        val proxy = mockk<LocalProxyServer>(relaxed = true)
+        every { proxy.start(any()) } returns "127.0.0.1:1234"
+        val source = mockk<ProviderPlaybackSession>(relaxed = true)
+        every { source.descriptor.stream } returns StreamDescriptor(
+            "application/vnd.apple.mpegurl", "hls", HlsSegmentFormat.FMP4,
+            isTranscoding = false, isByteSeekable = false, totalLength = null,
+        )
+        val coordinator = DefaultPlaybackSessionCoordinator(sessions, proxy, mockk(relaxed = true), StandardTestDispatcher(testScheduler))
+        assertTrue(coordinator.prepareTranscodeInput(source, "127.0.0.1").endsWith("/playlist.m3u8"))
+        val input = coordinator.active.value!!
+        val token = coordinator.activeReportToken()
+        coordinator.startClientTranscodeAndBuildUrl(mockk<ClientTranscodeSource>(), "127.0.0.1")
+        assertEquals(token, coordinator.activeReportToken())
+        runCurrent()
+        coordinator.reportProgress(false, token)
+        coordinator.stop("done")
+        assertFalse(sessions.isActive(input.id))
+        coVerify(exactly = 1) { source.report(any<PlaybackEvent.Started>()) }
+        coVerify(exactly = 1) { source.report(any<PlaybackEvent.Progress>()) }
+        coVerify(exactly = 1) { source.report(any<PlaybackEvent.Stopped>()) }
+        coVerify(exactly = 1) { source.close(any()) }
+    }
+
     @Test fun `estimated checkpoint freezes on expiry and is replaced by fresh TV truth or seek`() = runTest {
         val proxy = mockk<LocalProxyServer>(relaxed = true)
         every { proxy.start(any()) } returns "127.0.0.1:1234"

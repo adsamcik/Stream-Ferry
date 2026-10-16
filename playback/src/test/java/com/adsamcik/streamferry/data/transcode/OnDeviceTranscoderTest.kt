@@ -4,6 +4,8 @@ import android.os.Looper
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import androidx.media3.transformer.EditedMediaItem
+import androidx.media3.transformer.Composition
+import androidx.media3.transformer.InAppMp4Muxer
 import androidx.media3.transformer.Transformer
 import androidx.media3.effect.Presentation
 import com.adsamcik.streamferry.core.stream.MediaProfile
@@ -19,6 +21,7 @@ import io.mockk.mockkConstructor
 import io.mockk.mockkObject
 import io.mockk.unmockkAll
 import io.mockk.unmockkObject
+import io.mockk.verify
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -48,6 +51,7 @@ import kotlin.test.assertTrue
 @LooperMode(LooperMode.Mode.PAUSED)
 class OnDeviceTranscoderTest {
     private val startedItems = LinkedBlockingQueue<EditedMediaItem>()
+    private val startedCompositions = LinkedBlockingQueue<Composition>()
     private val transformer = mockk<Transformer>(relaxed = true)
     private lateinit var transcoder: OnDeviceTranscoder
     private val target = TranscodeTarget(
@@ -58,16 +62,22 @@ class OnDeviceTranscoderTest {
     fun setUp() {
         mockkConstructor(Transformer.Builder::class)
         mockkObject(LocalMediaProbe)
-        every { LocalMediaProbe.probe(any(), any(), any()) } returns null
+        every { LocalMediaProbe.probe(any(), any(), any()) } returns MediaProfile(
+            container = "mp4", videoCodec = "h264", audioCodec = "aac", widthPx = 1280, heightPx = 720,
+        )
         every { anyConstructed<Transformer.Builder>().setVideoMimeType(any()) } answers { self as Transformer.Builder }
         every { anyConstructed<Transformer.Builder>().setAudioMimeType(any()) } answers { self as Transformer.Builder }
         every { anyConstructed<Transformer.Builder>().setEncoderFactory(any()) } answers { self as Transformer.Builder }
         every { anyConstructed<Transformer.Builder>().setMuxerFactory(any()) } answers { self as Transformer.Builder }
         every { anyConstructed<Transformer.Builder>().setLooper(any<Looper>()) } answers { self as Transformer.Builder }
+        every { anyConstructed<Transformer.Builder>().setAssetLoaderFactory(any()) } answers { self as Transformer.Builder }
         every { anyConstructed<Transformer.Builder>().addListener(any()) } answers { self as Transformer.Builder }
         every { anyConstructed<Transformer.Builder>().build() } returns transformer
         every { transformer.start(any<EditedMediaItem>(), any()) } answers {
             startedItems.put(firstArg())
+        }
+        every { transformer.start(any<Composition>(), any()) } answers {
+            startedCompositions.put(firstArg())
         }
         transcoder = OnDeviceTranscoder(RuntimeEnvironment.getApplication(), mockk<DiagnosticSink>(relaxed = true))
     }
@@ -116,11 +126,59 @@ class OnDeviceTranscoderTest {
     }
 
     @Test
-    fun `remote source is rejected before any export`() = runBlocking {
+    fun `unsupported URI scheme is rejected before any export`() = runBlocking {
         assertFailsWith<IllegalArgumentException> {
-            transcoder.transcodeSegment("https://example.test/video.mp4", 0, 2_000, target, outputFile())
+            transcoder.transcodeSegment("ftp://example.test/video.mp4", 0, 2_000, target, outputFile())
         }
         assertTrue(startedItems.isEmpty())
+    }
+
+    @Test
+    fun `remote HLS reaches the shared export with its MIME and SDR tone mapping`() = runBlocking {
+        val owner = Any()
+        val failure = CompletableDeferred<Throwable?>()
+        val export = launch(Dispatchers.Default) {
+            failure.complete(runCatching {
+                transcoder.transcodeFile(
+                    "http://127.0.0.1:1234/stream", target, outputFile(),
+                    sourceMimeType = "application/x-mpegURL", owner = owner,
+                )
+            }.exceptionOrNull())
+        }
+        try {
+            val composition = assertNotNull(startedCompositions.poll(5, TimeUnit.SECONDS))
+            assertEquals(Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL, composition.hdrMode)
+            val item = composition.sequences.single().editedMediaItems.single().mediaItem
+            assertEquals("http://127.0.0.1:1234/stream", item.localConfiguration?.uri.toString())
+            assertEquals("application/x-mpegURL", item.localConfiguration?.mimeType)
+            verify { anyConstructed<Transformer.Builder>().setMuxerFactory(ofType<InAppMp4Muxer.Factory>()) }
+            assertTrue(transcoder.cancelOwnedInFlightAndAwait(owner))
+            assertIs<CancellationException>(withTimeout(5_000) { failure.await() })
+            export.join()
+        } finally {
+            export.cancel()
+        }
+    }
+
+    @Test
+    fun `HDR local source uses the same SDR conversion composition`() = runBlocking {
+        every { LocalMediaProbe.probe(any(), any(), any()) } returns MediaProfile(
+            container = "mp4", videoCodec = "hevc", audioCodec = "aac", isHdr = true, bitDepth = 10,
+        )
+        val owner = Any()
+        val export = launch(Dispatchers.Default) {
+            runCatching {
+                transcoder.transcodeSegment("content://media/video/10", 0, 2_000, target, outputFile(), owner)
+            }
+        }
+        try {
+            val composition = assertNotNull(startedCompositions.poll(5, TimeUnit.SECONDS))
+            assertEquals(Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL, composition.hdrMode)
+            assertTrue(transcoder.cancelOwnedInFlightAndAwait(owner))
+            export.join()
+        } finally {
+            export.cancel()
+        }
     }
 
     @Test

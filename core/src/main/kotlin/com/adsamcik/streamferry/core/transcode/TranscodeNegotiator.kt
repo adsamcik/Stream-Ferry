@@ -9,8 +9,8 @@ package com.adsamcik.streamferry.core.transcode
 class TranscodeNegotiator {
 
     /**
-     * The active phone pipeline always publishes HLS/fMP4. It deliberately limits output to the Media3
-     * Transformer codecs it can request and package consistently here (H.264 and HEVC); AV1/VP9, DASH,
+     * The phone publishes HLS/fMP4 to capable receivers and a completed MP4 to the others. It limits
+     * output to the Media3 Transformer codecs it can request consistently (H.264 and HEVC); AV1/VP9, DASH,
      * MPEG-TS, Main10, explicit bitrate, and fixed-frame-rate contracts remain feature-gated.
      */
     fun negotiate(
@@ -21,9 +21,6 @@ class TranscodeNegotiator {
         /** Optional user-selected codec; its tier is still negotiated against both endpoints. */
         preferredCodec: VideoCodec? = null,
     ): TranscodeTarget {
-        require(receiver.supportsFmp4) {
-            "on-device transcoding requires an HLS fragmented-MP4 capable receiver"
-        }
         val fpsAdmissionBound = device.maxFps.coerceAtLeast(1)
         val ladder = buildList {
             for (tier in ResolutionTier.entries.reversed()) {
@@ -44,7 +41,7 @@ class TranscodeNegotiator {
             return TranscodeTarget(
                 videoCodec = codec,
                 audioCodec = AudioCodec.AAC,
-                container = StreamContainer.HLS_FMP4,
+                container = if (receiver.supportsFmp4) StreamContainer.HLS_FMP4 else StreamContainer.MP4,
                 maxResolution = tier,
                 maxFps = fpsAdmissionBound,
                 tenBit = false,
@@ -55,7 +52,7 @@ class TranscodeNegotiator {
         // PlaybackEngine catches this and leaves the local file on the direct-play path instead of
         // starting a Transformer job that cannot possibly be fulfilled.
         throw IllegalStateException(
-            "No compatible hardware H.264/HEVC fMP4 target is available" +
+            "No compatible hardware H.264/HEVC target is available" +
                 preferredCodec?.let { " for the selected $it codec" }.orEmpty() + ".",
         )
     }

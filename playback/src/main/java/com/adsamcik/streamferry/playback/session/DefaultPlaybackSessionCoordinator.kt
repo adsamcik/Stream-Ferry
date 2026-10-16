@@ -54,6 +54,8 @@ class DefaultPlaybackSessionCoordinator(
     private val reportStateLock = Any()
     private var nextReportToken = 0L
     private var reportingSession: ReportingSession? = null
+    /** Dedicated authenticated source endpoint retained while transformed output replaces it. */
+    private var transcodeInputSession: ProxySession? = null
     private val mutex = Mutex()
 
     /** Opaque identity for the active remote playback report; null for local/offline streams. */
@@ -129,20 +131,65 @@ class DefaultPlaybackSessionCoordinator(
         _active.value = session
         // Server reporting must not delay the renderer load (a slow first request used to add
         // several seconds here). Preserve Started -> Progress -> Stopped ordering for this token.
+        reportStarted(reporting)
+        val url = "http://$hostPort/session/${session.id}/stream"
+        logger.event("session", "Session started (online); proxy URL issued to TV (redacted)")
+        session to url
+    }
+
+    /**
+     * Give the phone encoder an opaque source URL using the same provider lease as direct playback.
+     * Progressive ranges, authenticated resource resolution and HLS rewriting stay source-owned.
+     * The input remains alive until [stop], including while a prepared output is being produced.
+     */
+    suspend fun prepareTranscodeInput(
+        providerSession: ProviderPlaybackSession,
+        phoneLanIp: String,
+        initialPositionSeconds: Long = 0L,
+        shouldReport: () -> Boolean = { true },
+    ): String = mutex.withLock {
+        val reporting = beginReporting(providerSession, initialPositionSeconds, shouldReport)
+        try {
+            val hostPort = proxy.start(phoneLanIp)
+            val stream = providerSession.descriptor.stream
+            val session = sessions.create(stream.contentType, stream.isHls, totalLength = stream.totalLength)
+            transcodeInputSession = session
+            _active.value = session
+            proxy.registerStreamLease(session.id, providerSession.upstream, rendererOutput = false)
+            reportStarted(reporting)
+            val endpoint = if (stream.isHls) "playlist.m3u8" else "stream"
+            "http://$hostPort/session/${session.id}/$endpoint"
+        } catch (error: Throwable) {
+            // Allow the caller's normal stop/error path to close the owned provider even when
+            // binding or registration failed before an output session could be installed.
+            reporting.startReported.complete(Unit)
+            throw error
+        }
+    }
+
+    /** Publish a prepared phone MP4 without losing the authenticated input or provider lifecycle. */
+    suspend fun startPreparedTranscodeAndBuildUrl(
+        filePath: String,
+        phoneLanIp: String,
+    ): Pair<ProxySession, String> = mutex.withLock {
+        val hostPort = proxy.start(phoneLanIp)
+        val session = sessions.create(contentType = "video/mp4", isHls = false, localFilePath = filePath)
+        _active.value = session
+        session to "http://$hostPort/session/${session.id}/stream"
+    }
+
+    private fun reportStarted(reporting: ReportingSession) {
         reportingScope.launch {
             try {
                 if (reporting.shouldReport()) {
                     runBoundedRemoteCleanup("report started") {
-                        providerSession.report(PlaybackEvent.Started(reporting.positionSeconds))
+                        reporting.providerSession.report(PlaybackEvent.Started(reporting.positionSeconds))
                     }
                 }
             } finally {
                 reporting.startReported.complete(Unit)
             }
         }
-        val url = "http://$hostPort/session/${session.id}/stream"
-        logger.event("session", "Session started (online); proxy URL issued to TV (redacted)")
-        session to url
     }
 
     /** Start a proxy session that serves an app-private downloaded file (offline playback). */
@@ -175,7 +222,7 @@ class DefaultPlaybackSessionCoordinator(
             isHls = false,
         )
         proxy.registerClientTranscode(session.id, source)
-        clearReportingSession()
+        if (transcodeInputSession == null) clearReportingSession()
         _active.value = session
         val url = "http://$hostPort/session/${session.id}/stream"
         logger.event("session", "Session started (on-device transcode); playlist URL issued to TV")
@@ -187,14 +234,15 @@ class DefaultPlaybackSessionCoordinator(
         val session = _active.value
         // End renderer access first. A remote source report can wait or fail, but it must never keep
         // an opaque proxy URL, accepted renderer socket, or upstream relay alive.
-        session?.let {
+        listOfNotNull(session, transcodeInputSession).distinctBy { it.id }.forEach {
             sessions.revoke(it.id)
             proxy.unregisterStreamLease(it.id)
         }
+        transcodeInputSession = null
         proxy.stop()
         _active.value = null
 
-        if (reporting != null && session != null) {
+        if (reporting != null) {
             reporting.startReported.await()
             if (reporting.shouldReport()) {
                 runBoundedRemoteCleanup("report stopped") {

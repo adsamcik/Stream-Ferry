@@ -89,7 +89,7 @@ class TranscodeNegotiatorTest {
         assertEquals(ResolutionTier.FHD_1080P, target.maxResolution)
     }
 
-    @Test fun receiverWithoutFmp4IsRejectedRatherThanAdvertisingTransportStream() {
+    @Test fun receiverWithoutFmp4UsesCompletedMp4RatherThanTransportStream() {
         val receiver = ReceiverPlaybackCapabilities(
             h264MaxResolution = ResolutionTier.UHD_4K,
             hevcMaxResolution = ResolutionTier.UHD_4K,
@@ -97,7 +97,9 @@ class TranscodeNegotiatorTest {
             supportsTs = true,
             supportsDash = false,
         )
-        assertFailsWith<IllegalArgumentException> { negotiator.negotiate(capableDevice, receiver) }
+        val target = negotiator.negotiate(capableDevice, receiver)
+        assertEquals(StreamContainer.MP4, target.container)
+        assertEquals(VideoCodec.HEVC, target.videoCodec)
     }
 
     @Test fun deviceWithoutH264OrHevcHardwareIsRejected() {

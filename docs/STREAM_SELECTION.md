@@ -1,9 +1,10 @@
 # Stream Selection
 
-The phone does not transcode **online Jellyfin streams**. It asks Jellyfin for a stream the **target
-TV** can play, encoding the TV's capabilities (not the phone's) into the Jellyfin `DeviceProfile` /
-PlaybackInfo request and choosing among Jellyfin-provided media sources. A separate experimental,
-hardware-only path may transcode incompatible local files for Cast.
+Automatic online playback asks Jellyfin for a stream the **target TV** can play, encoding the TV's
+capabilities into the Jellyfin `DeviceProfile` / PlaybackInfo request and choosing among its media
+sources. During playback, **TV output → Transcoding → On device** instead uses the shared phone
+encoder for any source on Cast or DLNA. Automatic startup can also use the phone if server conversion
+fails. See [ONDEVICE_TRANSCODE.md](ONDEVICE_TRANSCODE.md) for delivery and preparation behavior.
 
 ## How transcoding is actually requested (implemented)
 

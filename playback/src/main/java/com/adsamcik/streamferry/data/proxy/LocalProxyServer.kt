@@ -84,6 +84,8 @@ class LocalProxyServer(
     private val activeClients = ConcurrentHashMap.newKeySet<Socket>()
     /** Source-owned byte access. Provider URLs, headers, and tokens never enter this module. */
     private val remoteLeases = ConcurrentHashMap<String, StreamLease>()
+    /** Encoder input is source traffic, never renderer delivery or adaptive-bitrate evidence. */
+    private val transcodeInputs = ConcurrentHashMap.newKeySet<String>()
     /** Open bodies are tracked so local teardown can cut renderer access before remote cleanup. */
     private val activeResponses = ConcurrentHashMap<String, MutableSet<StreamResponse>>()
 
@@ -105,6 +107,7 @@ class LocalProxyServer(
     private fun deliveryEpoch(session: ProxySession) = deliveryTrackers.computeIfAbsent(session.id) { ProxyDeliveryTracker() }.epoch()
 
     private fun noteFileBytes(session: ProxySession, epoch: Long, offset: Long, bytes: ByteArray, length: Int, out: OutputStream) {
+        if (session.id in transcodeInputs) return
         if (session.isHls || session.contentType.substringBefore(';').lowercase() !in
             setOf("video/mp4", "audio/mp4", "video/quicktime", "application/octet-stream")) return
         // Small final writes may still be in BufferedOutputStream. Failed flushes cannot count.
@@ -115,6 +118,7 @@ class LocalProxyServer(
     }
 
     private fun noteMediaDelivered(session: ProxySession, resourceId: String, range: ByteRange?, epoch: Long) {
+        if (session.id in transcodeInputs) return
         val tracker = deliveryTrackers[session.id] ?: return
         tracker.completed(resourceId, range, epoch).forEach {
             mediaDeliveryListener?.invoke(MediaDelivery(session.id, epoch, it.startMs, it.endMs))
@@ -146,12 +150,14 @@ class LocalProxyServer(
         clientTranscoders.remove(sessionId)?.let { runCatching { it.release() } }
     }
 
-    fun registerStreamLease(sessionId: String, lease: StreamLease) {
+    fun registerStreamLease(sessionId: String, lease: StreamLease, rendererOutput: Boolean = true) {
         require(sessions.isActive(sessionId)) { "Proxy session is not active" }
+        if (!rendererOutput) transcodeInputs.add(sessionId)
         remoteLeases[sessionId] = lease
     }
 
     fun unregisterStreamLease(sessionId: String) {
+        transcodeInputs.remove(sessionId)
         deliveryTrackers.remove(sessionId)
         remoteLeases.remove(sessionId)
         activeResponses.remove(sessionId)?.forEach { response -> runCatching { response.close() } }
@@ -201,6 +207,7 @@ class LocalProxyServer(
             clients = activeClients.toList()
             activeResponses.clear()
             remoteLeases.clear()
+            transcodeInputs.clear()
             activeClients.clear()
             listener = serverSocket
             serverSocket = null
@@ -292,7 +299,7 @@ class LocalProxyServer(
                     is SessionLookup.Forbidden -> writeStatus(out, 403, "Forbidden")
                     is SessionLookup.Ok -> {
                         sessionId = lookup.session.id
-                        servedMedia = req.method == "GET" // a real playback fetch, not a HEAD probe
+                        servedMedia = req.method == "GET" && lookup.session.id !in transcodeInputs
                         serve(lookup.session, req, out)
                         out.flush()
                         completed = true
@@ -727,7 +734,7 @@ class LocalProxyServer(
                 try {
                     out.write(buf, 0, n)
                     copied += n
-                    byteListener?.invoke(n.toLong())
+                    if (session.id !in transcodeInputs) byteListener?.invoke(n.toLong())
                 } catch (e: Exception) {
                     return false // downstream (TV) disconnected
                 }
@@ -781,7 +788,7 @@ class LocalProxyServer(
                 try {
                     out.write(buf, 0, n)
                     noteFileBytes(session, epoch, endInclusive - remaining + 1, buf, n, out)
-                    byteListener?.invoke(n.toLong())
+                    if (session.id !in transcodeInputs) byteListener?.invoke(n.toLong())
                 } catch (e: Exception) {
                     return // downstream (TV) disconnected
                 }
@@ -847,7 +854,7 @@ class LocalProxyServer(
                     try {
                         out.write(buf, 0, n)
                         noteFileBytes(session, epoch, endInclusive - remaining + 1, buf, n, out)
-                        byteListener?.invoke(n.toLong())
+                        if (session.id !in transcodeInputs) byteListener?.invoke(n.toLong())
                     } catch (e: Exception) {
                         return // downstream (TV) disconnected
                     }
@@ -1097,7 +1104,7 @@ class LocalProxyServer(
                     out.write(buf, 0, writable)
                     noteFileBytes(session, epoch, policy.nextOffset, buf, writable, out)
                     policy.recordProgress(writable.toLong())
-                    byteListener?.invoke(writable.toLong())
+                    if (session.id !in transcodeInputs) byteListener?.invoke(writable.toLong())
                     if (watchdog.record(writable.toLong(), System.currentTimeMillis())) {
                         return StreamResult.UPSTREAM_STALLED
                     }

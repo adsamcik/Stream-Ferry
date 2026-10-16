@@ -3,9 +3,9 @@ package com.adsamcik.streamferry.core.transcode
 /**
  * Target formats for on-device (client-side) transcoding.
  *
- * Pure value types plus the Cast/HLS packaging rules. The Android MediaCodec / muxer layer maps these
+ * Pure value types plus receiver packaging rules. The Android MediaCodec / muxer layer maps these
  * to concrete encoder configs; this stays framework-free and unit-tested. The phone hosts the resulting
- * stream as a LAN-IP HLS/CMAF origin the TV fetches — the TV never sees a source/Jellyfin URL.
+ * HLS/CMAF stream or completed MP4 — the TV never sees a source/Jellyfin URL.
  */
 
 /** Video codecs the on-device encoder / server can target, roughly ordered by efficiency (best first). */
@@ -16,6 +16,8 @@ enum class AudioCodec { AAC }
 
 /** Streaming container/packaging for the phone-hosted live origin the TV fetches. */
 enum class StreamContainer {
+    /** Completed seekable MP4 for renderers that do not consume HLS, including DLNA. */
+    MP4,
     /**
      * Classic HLS with MPEG-2 transport-stream segments. H.264 only: HEVC/VP9/AV1 must NOT be packaged in
      * MPEG-TS (and Android has no built-in TS muxer).
