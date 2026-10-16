@@ -18,8 +18,12 @@ interface ClientTranscodeSource {
     /** The VOD HLS MEDIA playlist (advertises the whole runtime so the TV can seek anywhere). */
     fun mediaPlaylist(proxyBase: String): String
 
-    /** The shared CMAF init segment (`EXT-X-MAP`). [allowExport] is false for HTTP `HEAD` probes. */
+    /** Compatibility alias for the first CMAF init segment. */
     fun initSegment(allowExport: Boolean): Resource
+
+    /** Each independent clip has its own `EXT-X-MAP`. HTTP `HEAD` never starts an export. */
+    fun initSegment(index: Int, allowExport: Boolean): Resource =
+        if (index == 0) initSegment(allowExport) else Resource.NotFound
 
     /** The bare CMAF media segment for [index], transcoded on demand (full seek). */
     fun mediaSegment(index: Int, allowExport: Boolean): Resource

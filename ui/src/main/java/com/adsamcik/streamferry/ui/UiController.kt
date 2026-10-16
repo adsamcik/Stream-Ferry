@@ -76,6 +76,7 @@ interface UiController {
     fun selectSubtitleTrack(index: Int?)
     fun selectQuality(bitrateBps: Long?)
     fun selectMaxVideoHeight(height: Int?)
+    fun selectLocalTranscodeMode(mode: com.adsamcik.streamferry.core.transcode.LocalTranscodeMode)
     fun skipBy(deltaSeconds: Long)
     fun selectPreferredCodec(codec: String?)
     fun skipSegment()

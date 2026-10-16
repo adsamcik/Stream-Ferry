@@ -44,7 +44,7 @@ class PlaybackRouter {
         source: SourceCapabilities,
         preferClientTranscode: Boolean = false,
     ): PlaybackRoute {
-        if (decision.playMethod == PlayMethod.DIRECT_PLAY) {
+        if (decision.playMethod == PlayMethod.DIRECT_PLAY && !preferClientTranscode) {
             return PlaybackRoute(
                 RouteKind.DIRECT_PLAY,
                 "Original is target-compatible; direct play (range proxy).",

@@ -41,6 +41,7 @@ import com.adsamcik.streamferry.core.transcode.TranscodeNegotiator
 import com.adsamcik.streamferry.core.stream.MediaProfile
 import com.adsamcik.streamferry.core.transcode.TranscodeTarget
 import com.adsamcik.streamferry.core.transcode.VideoCodec
+import com.adsamcik.streamferry.core.transcode.LocalTranscodeMode
 import com.adsamcik.streamferry.core.volume.NightVolumeInput
 import com.adsamcik.streamferry.core.volume.NightVolumePolicy
 import com.adsamcik.streamferry.core.volume.NightVolumeScheduler
@@ -99,9 +100,11 @@ data class PlaybackStatus(
     val availableVideoCodecs: List<String> = emptyList(),
     /** Manually-chosen transcode codec (e.g. "hevc"), or null for automatic best-codec. */
     val preferredVideoCodec: String? = null,
+    val localTranscodeMode: LocalTranscodeMode? = null,
+    val localTranscodeUnavailableReason: String? = null,
     /** Saved automatic resolution cap, retained while a playback-only override is active. */
     val automaticMaxVideoHeight: Int? = null,
-    /** Active server-stream resolution cap, or null when this is a local session. */
+    /** Active output resolution cap. Local encoding also respects phone/receiver limits. */
     val maxVideoHeight: Int? = null,
     /** True when the current session overrides the saved resolution cap. */
     val isManualMaxVideoHeight: Boolean = false,
@@ -270,6 +273,9 @@ class PlaybackEngine(
     @Volatile private var forcedLocalCodec: VideoCodec? = null
     // Codecs the current TV can decode AND this phone can encode (best-first), for the local codec picker.
     @Volatile private var localTranscodeCodecOptions: List<VideoCodec> = emptyList()
+    private var localTranscodeMode = LocalTranscodeMode.AUTOMATIC
+    private var localPlayWhenReady = true
+    private var localTranscodeUnavailableReason: String? = null
     // On-device output codecs already tried and rejected by the TV this session, so auto-fallback advances.
     // Concurrent-safe: added under recoveryLock (the failure path) but cleared under mutex (play/stop paths).
     private val localCodecFallbacksTried = java.util.concurrent.ConcurrentHashMap.newKeySet<VideoCodec>()
@@ -790,6 +796,8 @@ class PlaybackEngine(
         val t = target ?: return
         t.play()
         isPlaying = true
+        if (localPlayback != null) localPlayWhenReady = true
+        if (localPlayback != null && !playbackStarted) armStartupWatchdog()
         controlErrorMessage = null
         reportSourceProgressSoon()
     }
@@ -803,6 +811,10 @@ class PlaybackEngine(
         val t = target ?: return
         t.pause()
         isPlaying = false
+        if (localPlayback != null) {
+            localPlayWhenReady = false
+            startupWatchdogJob?.cancel()
+        }
         holdProgressEstimate()
         controlErrorMessage = null
         smartResume.checkpoint(SmartResumeCheckpointKind.PAUSED)
@@ -901,12 +913,14 @@ class PlaybackEngine(
         onForegrounded: () -> Unit = {},
         recoveryContinuation: PlaybackRecoveryContinuation? = null,
         preserveManualWatchOverride: Boolean = recoveryContinuation != null,
+        prefs: StreamPreferences = StreamPreferences(),
     ) = withContext(dispatcher) {
         // Off the main thread so the foreground service can foreground within its deadline (see play()).
         mutex.withLock {
         requireLocalNetworkAccess()
         val preservedNightVolumeSession = if (recoveryContinuation != null) nightVolumeSession else null
         stopInternalLocked("starting downloaded playback")
+        this@PlaybackEngine.prefs = prefs
         nightVolumeSession = preservedNightVolumeSession ?: NightVolumeSession(
             startedAt = Instant.ofEpochMilli(clock()),
         )
@@ -966,30 +980,31 @@ class PlaybackEngine(
      * [reloadLocalInPlace] (a manual codec change or an auto codec fallback), which reuse the live
      * connection. Assumes [target]/[selectedTarget]/[localPlayback] are set; throws on load failure.
      */
-    private suspend fun loadLocalStreamLocked(startPos: Long) {
+    private suspend fun loadLocalStreamLocked(startPos: Long, playWhenReady: Boolean = true) {
+        localPlayWhenReady = playWhenReady
         requireLocalNetworkAccess()
         val params = localPlayback ?: error("No local media selected")
         val sel = selectedTarget ?: error("No target")
         val tgt = target ?: error("No target")
-        var transcodeTarget = if (params.allowClientTranscode) {
+        var transcodeTarget = run {
             runCatching { chooseClientTranscodeTarget(params.filePath, params.contentType, sel) }
-                .onFailure { logger.w("transcode", "On-device transcode negotiation failed; direct-playing as-is", it) }
+                .onFailure {
+                    if (localTranscodeMode == LocalTranscodeMode.ON_DEVICE) throw it
+                    localTranscodeUnavailableReason = "This phone cannot encode a compatible format for this TV."
+                    logger.w("transcode", "On-device transcode negotiation failed; direct-playing as-is", it)
+                }
                 .getOrNull()
-        } else {
-            null // default: hand the TV the file and let it decode (direct play), like a native gallery share
         }
-        // Every local mode needs a real timeline for the phone scrubber, lock-screen absolute seek, resume,
-        // and VOD HLS planning. Probe it whenever the caller lacks one, including direct play (the old code
-        // only did this for on-device transcode and silently disabled seeking for SAF-picked direct files).
-        var effectiveRuntimeSeconds = params.runtimeSeconds?.takeIf { it > 0 }
-        if (effectiveRuntimeSeconds == null) {
-            effectiveRuntimeSeconds = LocalMediaProbe.probeDurationSeconds(appContext, params.filePath)
-            if (effectiveRuntimeSeconds != null) {
-                logger.event("playback", "Probed local video duration: ${effectiveRuntimeSeconds}s (caller had none)")
-            } else if (transcodeTarget != null) {
-                logger.w("transcode", "Couldn't determine local video duration; on-device transcode isn't possible — direct-playing as-is")
-                transcodeTarget = null
+        val exactRuntimeSeconds = LocalMediaProbe.probeDurationSecondsExact(appContext, params.filePath)
+        val effectiveRuntimeSeconds = exactRuntimeSeconds?.let { kotlin.math.ceil(it).toLong() }
+            ?: params.runtimeSeconds?.takeIf { it > 0 }
+        if (exactRuntimeSeconds == null) {
+            localTranscodeUnavailableReason = "The video duration could not be read. Try another local file."
+            localTranscodeCodecOptions = emptyList()
+            if (localTranscodeMode == LocalTranscodeMode.ON_DEVICE) {
+                throw PlaybackPreparationException(localTranscodeUnavailableReason!!)
             }
+            transcodeTarget = null
         }
         val boundedStartPos = PlaybackPositionPolicy.clamp(startPos, effectiveRuntimeSeconds)
         this@PlaybackEngine.item = MediaItem(
@@ -1026,7 +1041,7 @@ class PlaybackEngine(
         if (transcodeTarget != null) {
             val cacheDir = File(File(appContext.cacheDir, "transcode"), "ct_$playGeneration")
             val session = ClientTranscodeSession(
-                onDeviceTranscoder, params.filePath, (effectiveRuntimeSeconds ?: 0L).toDouble(), transcodeTarget, cacheDir, logger,
+                onDeviceTranscoder, params.filePath, requireNotNull(exactRuntimeSeconds), transcodeTarget, cacheDir, logger,
             )
             url = coordinator.startClientTranscodeAndBuildUrl(session, phoneIp).second
             // Media3's active phone transcode path always emits fragmented MP4 behind HLS.
@@ -1082,10 +1097,10 @@ class PlaybackEngine(
             params.title,
             effectiveRuntimeSeconds,
             startPositionSeconds = reportedPositionSeconds,
-            playWhenReady = true,
+            playWhenReady = playWhenReady,
         )
         armRendererStartSettle(reportedPositionSeconds)
-        armStartupWatchdog(attemptGeneration)
+        if (playWhenReady) armStartupWatchdog(attemptGeneration)
         publishStatus()
         logger.event("playback", "Playing ${params.title} -> ${sel.displayName} (${sel.protocol})")
     }
@@ -1095,7 +1110,8 @@ class PlaybackEngine(
      * auto codec fallback): reuse the live connection/proxy/foreground service and just re-resolve + reload
      * the on-device stream at [startPos]. Mirrors [reloadStream]/[playNext] for the offline path.
      */
-    private suspend fun reloadLocalInPlace(startPos: Long, reason: String) {
+    private suspend fun reloadLocalInPlace(startPos: Long, reason: String, playWhenReady: Boolean = true) {
+        startupWatchdogJob?.cancel()
         playGeneration++
         completedGeneration = null // supersede the current stream (its stray end-of-media/watchdog is now stale)
         val wasReloading = isReloadingStream
@@ -1110,7 +1126,7 @@ class PlaybackEngine(
             // renderers need it), then reload in place from the current position.
             runCatching { target?.prepareReload() }
             runCatching { coordinator.stop(reason) }
-            loadLocalStreamLocked(startPos)
+            loadLocalStreamLocked(startPos, playWhenReady)
         } finally {
             isReloadingStream = wasReloading
         }
@@ -1272,7 +1288,57 @@ class PlaybackEngine(
      * requests a server transcode so choosing 1080p/720p is a reliable escape hatch from a broken direct
      * play or 4K profile; null returns to the saved automatic policy.
      */
+    suspend fun selectLocalTranscodeMode(mode: LocalTranscodeMode) = mutex.withLock {
+        if (localPlayback == null) return@withLock
+        changeLocalTranscodeOptions(mode, codec = null, height = null)
+    }
+
+    /** Validate before stopping the working stream, then reuse the current TV connection and position. */
+    private suspend fun changeLocalTranscodeOptions(mode: LocalTranscodeMode, codec: VideoCodec?, height: Int?) = withContext(dispatcher) {
+        if (mode == localTranscodeMode && codec == forcedLocalCodec && height == manualMaxVideoHeight) return@withContext
+        if (mode == LocalTranscodeMode.ON_DEVICE) {
+            localTranscodeUnavailableReason?.let { throw PlaybackPreparationException(it) }
+        }
+        val previousMode = localTranscodeMode
+        val previousCodec = forcedLocalCodec
+        val previousHeight = manualMaxVideoHeight
+        val previousFallbacks = localCodecFallbacksTried.toSet()
+        val pos = absolutePositionSeconds
+        val playWhenReady = localPlayWhenReady
+        localTranscodeMode = mode
+        forcedLocalCodec = codec
+        manualMaxVideoHeight = height
+        localCodecFallbacksTried.clear()
+        var reloadStarted = false
+        try {
+            val params = requireNotNull(localPlayback)
+            chooseClientTranscodeTarget(params.filePath, params.contentType, requireNotNull(selectedTarget))
+            reloadStarted = true
+            reloadLocalInPlace(pos, "local output change", playWhenReady)
+        } catch (failure: Throwable) {
+            localTranscodeMode = previousMode
+            forcedLocalCodec = previousCodec
+            manualMaxVideoHeight = previousHeight
+            localCodecFallbacksTried.clear()
+            localCodecFallbacksTried.addAll(previousFallbacks)
+            if (reloadStarted && failure !is CancellationException) {
+                runCatching { reloadLocalInPlace(pos, "restore local output", playWhenReady) }
+                    .onFailure { failure.addSuppressed(it) }
+            }
+            publishStatus()
+            throw failure
+        }
+    }
+
     suspend fun selectMaxVideoHeight(height: Int?) = mutex.withLock {
+        if (localPlayback != null && height in setOf(null, 2160, 1080, 720, 480)) {
+            changeLocalTranscodeOptions(
+                mode = if (height != null) LocalTranscodeMode.ON_DEVICE else localTranscodeMode,
+                codec = forcedLocalCodec,
+                height = height,
+            )
+            return@withLock
+        }
         if (currentProviderSession == null || height !in setOf(null, 2160, 1080, 720, 480)) return@withLock
         if (manualMaxVideoHeight == height) return@withLock
         val previousHeight = manualMaxVideoHeight
@@ -1304,36 +1370,18 @@ class PlaybackEngine(
      * automatic. For an ONLINE source this replans the stream to the chosen codec at the
      * current position. For a LOCAL on-device transcode it re-encodes the file to the chosen codec and
      * reloads it in place (seamless — reuses the live TV connection). A codec the phone can't encode or the
-     * TV can't decode is ignored. No-op for a direct-play local file (there's no transcode to steer).
+     * TV can't decode is ignored. A concrete local codec pick starts phone conversion from direct play.
      */
     suspend fun selectPreferredCodec(codec: String?) = mutex.withLock {
         // Local on-device transcode: steer the phone's encoder and reload in place.
         if (localPlayback != null && currentProviderSession == null) {
-            if (onDeviceTranscodeTarget == null) return@withLock // direct-play local file: nothing to transcode
-            val requested = codec?.let { parseVideoCodec(it) }?.takeIf { it in localTranscodeCodecOptions }
-            if (forcedLocalCodec == requested) return@withLock
-            val previousCodec = forcedLocalCodec
-            val previousFallbacks = localCodecFallbacksTried.toSet()
-            val previousStreamStart = streamStartSeconds
-            val previousReportedPosition = reportedPositionSeconds
-            forcedLocalCodec = requested
-            localCodecFallbacksTried.clear() // a manual pick supersedes any in-progress auto-fallback
-            logger.event("quality", "Local transcode codec -> ${requested?.name?.lowercase() ?: "auto"}; reloading on-device")
-            val pos = absolutePositionSeconds
-            streamStartSeconds = pos // hold the position so a torn-down status can't flash it to 0
-            reportedPositionSeconds = 0
-            publishStatus()
-            try {
-                reloadLocalInPlace(pos, "local codec change")
-            } catch (failure: Throwable) {
-                forcedLocalCodec = previousCodec
-                localCodecFallbacksTried.clear()
-                localCodecFallbacksTried.addAll(previousFallbacks)
-                streamStartSeconds = previousStreamStart
-                reportedPositionSeconds = previousReportedPosition
-                publishStatus()
-                throw failure
-            }
+            val requested = codec?.let { parseVideoCodec(it) ?: return@withLock }
+            if (requested != null && requested !in localTranscodeCodecOptions) return@withLock
+            changeLocalTranscodeOptions(
+                mode = if (requested != null) LocalTranscodeMode.ON_DEVICE else localTranscodeMode,
+                codec = requested,
+                height = manualMaxVideoHeight,
+            )
             return@withLock
         }
         if (currentProviderSession == null) return@withLock
@@ -1969,6 +2017,7 @@ class PlaybackEngine(
         // and by !playbackStarted so a working stream isn't disrupted by a transient mid-stream hiccup.
         val localFallbackTo: VideoCodec? = synchronized(recoveryLock) {
             if (terminalFailureSurfaced || isReloadingStream || playbackStarted) return@synchronized null
+            if (localTranscodeMode == LocalTranscodeMode.ON_DEVICE && forcedLocalCodec != null) return@synchronized null
             if (localPlayback == null) return@synchronized null
             // Snapshot the volatile once: stopInternalLocked (under mutex, not recoveryLock) can null it out
             // between a separate check and a !! deref, which — on the unjoined watchdog path — would NPE.
@@ -2117,15 +2166,14 @@ class PlaybackEngine(
     private fun startupFailureMessage(): String = when {
         currentProviderSession == null && currentIsTranscoding ->
             "The TV didn't start playing the on-device transcode. Try a different maximum resolution or " +
-                "format in Settings, or cast a directly-playable file."
+                "format under TV output, or cast a directly-playable file."
         // A local direct-play on a DLNA renderer that never started: on-device transcoding is Cast-only, so
         // don't send the user down that dead end — the file's format simply isn't supported by this TV.
         currentProviderSession == null && selectedTarget?.protocol != Protocol.CAST ->
             "Your DLNA TV couldn't play this file's format. Try a directly-playable file (H.264/AAC MP4), " +
                 "or cast to a Chromecast, which can transcode on the phone."
         currentProviderSession == null ->
-            "The TV didn't start playing this file. It may not support the format — try enabling on-device " +
-                "transcoding in Settings."
+            "The TV didn't start playing this file. Try On device under TV output, or use a compatible file."
         else -> "The TV didn't start playing."
     }
 
@@ -2407,10 +2455,15 @@ class PlaybackEngine(
                 seekSettleTargetSeconds = null // no seek pending, confirmed near target, or window expired
                 reportedPositionSeconds = event.positionSeconds
                 isPlaying = event.isPlaying
+                if (localPlayback != null && !isReloadingStream && !isBuffering && (playbackStarted || event.isPlaying)) {
+                    localPlayWhenReady = event.isPlaying
+                }
                 rendererPlaybackRevision.incrementAndGet()
                 recoverySession = recoverySession.transition(if (event.isPlaying) PlaybackPhase.PLAYING else PlaybackPhase.PAUSED)
                 // Evidence the stream actually started playing on the TV — cancels the startup watchdog.
-                if (event.isPlaying || event.positionSeconds > 0) markPlaybackStarted()
+                if (event.isPlaying || (event.positionSeconds > 0 && (localPlayback == null || localPlayWhenReady))) {
+                    markPlaybackStarted()
+                }
                 if (event.isPositionConfirmed) {
                     synchronized(progressLock) {
                         progressEstimator.confirm(absolutePositionSeconds, event.isPlaying && !isBuffering,
@@ -2565,19 +2618,29 @@ class PlaybackEngine(
         val container = containerForMime(contentType)
         val profile = LocalMediaProbe.probe(appContext, uri, container)
         localSourceProfile = profile // remember the source format for the "what's playing" UI (may be null)
-        if (profile == null) {
-            logger.event("transcode", "Local media probe failed for a $container file; direct-playing as-is")
+        localTranscodeCodecOptions = emptyList()
+        localTranscodeUnavailableReason = when {
+            target.protocol != Protocol.CAST -> "On-device transcoding requires a Chromecast receiver."
+            profile == null -> "The video format could not be read. Try another local file."
+            profile.isHdr || profile.bitDepth > 8 -> "On-device transcoding is unavailable for HDR or 10-bit video. Use the original file."
+            !LocalMediaProbe.isByteSeekable(appContext, uri) -> "This file cannot be reopened for seeking. Save a local copy to transcode it."
+            else -> null
+        }
+        if (localTranscodeUnavailableReason == null) {
+            localTranscodeCodecOptions = localTranscodeCodecOptions(target.capabilities)
+            if (localTranscodeCodecOptions.isEmpty()) {
+                localTranscodeUnavailableReason = "This phone has no compatible hardware encoder for this TV."
+            }
+        }
+        if (localTranscodeUnavailableReason != null) {
+            if (localTranscodeMode == LocalTranscodeMode.ON_DEVICE) {
+                throw PlaybackPreparationException(localTranscodeUnavailableReason!!)
+            }
             return null
         }
-        // Transformer has no receiver-aware HDR preservation or tone-mapping contract. Do not silently
-        // turn an HDR/Main10 local source into an unspecified output; leave it on the direct-play path.
-        if (profile.isHdr || profile.bitDepth > 8) {
-            logger.event(
-                "transcode",
-                "Local ${profile.videoCodec}/$container is HDR or >8-bit; on-device transcoding is disabled until color conversion is explicit",
-            )
-            return null
-        }
+        if (localTranscodeMode == LocalTranscodeMode.ORIGINAL) return null
+        if (localTranscodeMode == LocalTranscodeMode.AUTOMATIC && localPlayback?.allowClientTranscode != true) return null
+        requireNotNull(profile)
         val decision = streamSelection.select(target.capabilities, profile, StreamPreferences())
         val route = playbackRouter.route(
             decision,
@@ -2587,29 +2650,17 @@ class PlaybackEngine(
                 isReopenable = true,
                 canStreamToClientTranscoder = true,
             ),
+            preferClientTranscode = localTranscodeMode == LocalTranscodeMode.ON_DEVICE ||
+                (profile.heightPx?.let { it > effectiveMaxVideoHeight() } == true),
         )
         if (route.kind != RouteKind.CLIENT_TRANSCODE) {
             logger.event("transcode", "Local ${profile.videoCodec}/$container is direct-playable to this TV (${route.kind}); no on-device transcode")
             return null
         }
-        // The on-device transcoder serves a phone-hosted HLS/CMAF origin, which Cast plays but a baseline
-        // DLNA renderer cannot. Attempting it on DLNA yields an HLS-over-DLNA hang / UPnP 701, so don't:
-        // direct-play the original instead (it may fail, but with a clear reason — see startupFailureMessage).
-        if (target.protocol != Protocol.CAST) {
-            logger.event(
-                "transcode",
-                "Local ${profile.videoCodec}/$container needs a transcode but ${target.displayName} is a " +
-                    "${target.protocol} renderer, which can't play the phone's HLS on-device transcode; " +
-                    "attempting direct play (on-device transcoding currently supports Chromecast)",
-            )
-            return null
-        }
         // Codecs the TV can decode AND this phone can encode, for the manual picker. A selected codec
         // is fed back through the negotiator rather than copied onto an automatic tier: H.264 and HEVC
         // often have different phone/renderer height ceilings.
-        val options = localTranscodeCodecOptions(target.capabilities)
-        localTranscodeCodecOptions = options
-        val forced = forcedLocalCodec?.takeIf { it in options }
+        val forced = forcedLocalCodec
         val chosen = transcodeNegotiator.negotiate(
             deviceEncodeCaps,
             receiverCapsFor(target.capabilities),
@@ -2694,7 +2745,7 @@ class PlaybackEngine(
     /** The source resolution tier, capped by the user's max-resolution setting ([prefs].maxVideoHeight). */
     private fun cappedSourceTier(sourceHeightPx: Int?): ResolutionTier {
         val source = resolutionTierFor(sourceHeightPx)
-        val cap = resolutionTierFor(prefs.maxVideoHeight.takeIf { it > 0 })
+        val cap = resolutionTierFor(effectiveMaxVideoHeight().takeIf { it > 0 })
         return if (source.maxHeightPx <= cap.maxHeightPx) source else cap
     }
 
@@ -2753,6 +2804,8 @@ class PlaybackEngine(
         localPlayback = null
         forcedLocalCodec = null
         localTranscodeCodecOptions = emptyList()
+        localTranscodeMode = LocalTranscodeMode.AUTOMATIC
+        localTranscodeUnavailableReason = null
         localCodecFallbacksTried.clear()
         isPlaying = false
         isBuffering = false
@@ -2841,12 +2894,15 @@ class PlaybackEngine(
             // pick); a local on-device transcode offers the TV∩phone-encodable codecs (the phone re-encodes).
             availableVideoCodecs = when {
                 currentProviderSession != null -> tvVideoCodecs(sel.capabilities)
-                odt != null -> localTranscodeCodecOptions.map { it.name.lowercase() }
+                localPlayback != null && localTranscodeUnavailableReason == null -> localTranscodeCodecOptions.map { it.name.lowercase() }
                 else -> emptyList()
             },
             preferredVideoCodec = if (currentProviderSession != null) preferredCodec else forcedLocalCodec?.name?.lowercase(),
-            automaticMaxVideoHeight = currentProviderSession?.let { prefs.maxVideoHeight },
-            maxVideoHeight = currentProviderSession?.let { effectiveMaxVideoHeight() },
+            localTranscodeMode = localPlayback?.let { localTranscodeMode },
+            localTranscodeUnavailableReason = localTranscodeUnavailableReason,
+            automaticMaxVideoHeight = if (currentProviderSession != null ||
+                (localPlayback != null && localTranscodeUnavailableReason == null)) prefs.maxVideoHeight else null,
+            maxVideoHeight = if (currentProviderSession != null || localPlayback != null) effectiveMaxVideoHeight() else null,
             isManualMaxVideoHeight = manualMaxVideoHeight != null,
             videoWidth = srcProfile?.widthPx,
             videoHeight = srcProfile?.heightPx,

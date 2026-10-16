@@ -134,6 +134,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.repeatOnLifecycle
 import coil.compose.AsyncImage
 import com.adsamcik.streamferry.core.adaptive.QualityMenu
+import com.adsamcik.streamferry.core.transcode.LocalTranscodeMode
 import com.adsamcik.streamferry.core.chapter.chapterIndexForPosition
 import com.adsamcik.streamferry.core.stream.Protocol
 import com.adsamcik.streamferry.core.stream.TargetCapabilities
@@ -1062,6 +1063,7 @@ private fun PlaybackOptionsSheet(
                     onSelectQuality = viewModel::selectQuality,
                     onSelectCodec = viewModel::selectPreferredCodec,
                     onSelectResolution = viewModel::selectMaxVideoHeight,
+                    onSelectLocalTranscodeMode = viewModel::selectLocalTranscodeMode,
                 )
             }
             if (p.attemptHistory.isNotEmpty()) {
@@ -1751,7 +1753,10 @@ private fun <T> PickerRow(
         Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
         Text(label, style = MaterialTheme.typography.titleSmall, modifier = Modifier.width(84.dp))
         Box(Modifier.weight(1f)) {
-            OutlinedButton(onClick = { expanded = true }, modifier = Modifier.fillMaxWidth()) {
+            OutlinedButton(onClick = { expanded = true }, modifier = Modifier.fillMaxWidth().semantics {
+                contentDescription = label
+                stateDescription = selectedLabel
+            }) {
                 Text(selectedLabel, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
             }
             DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
@@ -1767,7 +1772,13 @@ private fun <T> PickerRow(
 }
 
 @Composable
-private fun TvOutputCard(p: PlaybackUiState, onSelectQuality: (Long?) -> Unit, onSelectCodec: (String?) -> Unit, onSelectResolution: (Int?) -> Unit) {
+internal fun TvOutputCard(
+    p: PlaybackUiState,
+    onSelectQuality: (Long?) -> Unit,
+    onSelectCodec: (String?) -> Unit,
+    onSelectResolution: (Int?) -> Unit,
+    onSelectLocalTranscodeMode: (LocalTranscodeMode) -> Unit = {},
+) {
     Card(
         shape = RoundedCornerShape(22.dp),
         modifier = Modifier.fillMaxWidth(),
@@ -1787,11 +1798,24 @@ private fun TvOutputCard(p: PlaybackUiState, onSelectQuality: (Long?) -> Unit, o
                     color = MaterialTheme.colorScheme.onSecondaryContainer,
                 )
             }
-            Text(
-                "Override automatic playback when the TV needs a specific format or resolution.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSecondaryContainer,
-            )
+            p.localTranscodeMode?.let { mode ->
+                val modes = listOf(
+                    LocalTranscodeMode.AUTOMATIC to "Auto",
+                    LocalTranscodeMode.ORIGINAL to "Original",
+                ) + if (p.localTranscodeUnavailableReason == null) {
+                    listOf(LocalTranscodeMode.ON_DEVICE to "On device")
+                } else emptyList()
+                PickerRow(
+                    icon = Icons.Rounded.Memory,
+                    label = "Transcoding",
+                    selectedLabel = modes.firstOrNull { it.first == mode }?.second ?: "Auto",
+                    options = modes,
+                    onSelect = onSelectLocalTranscodeMode,
+                )
+                p.localTranscodeUnavailableReason?.let { reason ->
+                    Text(reason, style = MaterialTheme.typography.bodySmall)
+                }
+            }
             val formatMenu = TvOutputMenu.formatOptions(
                 availableVideoCodecs = p.availableVideoCodecs,
                 preferredVideoCodec = p.preferredVideoCodec,

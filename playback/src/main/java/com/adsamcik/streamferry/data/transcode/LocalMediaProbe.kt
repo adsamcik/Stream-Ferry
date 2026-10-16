@@ -94,21 +94,27 @@ object LocalMediaProbe {
      * TV sits in LOADING forever (the "local file won't start playing" bug); the duration lives in the
      * container the extractor already reads, so it costs one cheap open.
      */
-    fun probeDurationSeconds(context: Context, uriString: String): Long? {
+    fun probeDurationSeconds(context: Context, uriString: String): Long? =
+        probeDurationMicros(context, uriString)?.let { ((it - 1L) / MICROS_PER_SECOND) + 1L }
+
+    /** Keep fractional seconds for HLS: rounding up can advertise an empty final segment. */
+    fun probeDurationSecondsExact(context: Context, uriString: String): Double? =
+        probeDurationMicros(context, uriString, videoOnly = true)?.toDouble()?.div(MICROS_PER_SECOND)
+
+    private fun probeDurationMicros(context: Context, uriString: String, videoOnly: Boolean = false): Long? {
         val extractor = MediaExtractor()
         return try {
             setDataSource(extractor, context, uriString)
             var maxUs = -1L
             for (i in 0 until extractor.trackCount) {
                 val format = extractor.getTrackFormat(i)
+                // Audio padding must not create a final HLS clip beyond the last video sample.
+                if (videoOnly && format.getString(MediaFormat.KEY_MIME)?.startsWith("video/") != true) continue
                 if (format.containsKey(MediaFormat.KEY_DURATION)) {
                     maxUs = maxOf(maxUs, format.getLong(MediaFormat.KEY_DURATION))
                 }
             }
-            // A floor loses the partial final segment (e.g. 120.9 s became 120 s). The current
-            // playback contract uses seconds, so round up rather than advertising a playlist shorter than
-            // the source. Use (n - 1) first to avoid overflowing on a malformed very-large duration.
-            if (maxUs > 0) ((maxUs - 1L) / MICROS_PER_SECOND) + 1L else null
+            maxUs.takeIf { it > 0 }
         } catch (e: Exception) {
             null
         } finally {

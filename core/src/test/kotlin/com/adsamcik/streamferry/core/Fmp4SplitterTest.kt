@@ -197,6 +197,35 @@ class Fmp4SplitterTest {
 
     // ----- codecInfo (init-segment codec/resolution parse for the HLS master playlist) -----
 
+    private fun independentClip(audioSamples: Int = 95, videoSamples: Int = 60): ByteArray =
+        box(
+            "moof", box("mfhd", verFlags0 + u32(1)) +
+                timedTraf(1, tfdtV1(90_000), *LongArray(videoSamples) { 3_000L }) +
+                timedTraf(2, tfdtV1(1_024), *LongArray(audioSamples) { 1_024L }),
+        ) + box("mdat", byteArrayOf(1, 2))
+
+    @Test fun independentClipAcceptsAacPrimingAndPaddingWithoutRewritingItsTimestamps() {
+        val media = independentClip()
+        val original = media.copyOf()
+        assertTrue(Fmp4Splitter.hasBoundedIndependentTrackTimelines(media, mapOf(1 to 90_000L, 2 to 48_000L), 2.0))
+        assertTrue(original.contentEquals(media))
+    }
+
+    @Test fun independentClipRejectsMissingTracksAndTruncatedOrOversizedTrackDurations() {
+        val timescales = mapOf(1 to 90_000L, 2 to 48_000L)
+        assertFalse(Fmp4Splitter.hasBoundedIndependentTrackTimelines(independentClip(audioSamples = 45), timescales, 2.0))
+        assertFalse(Fmp4Splitter.hasBoundedIndependentTrackTimelines(independentClip(audioSamples = 120), timescales, 2.0))
+        assertFalse(Fmp4Splitter.hasBoundedIndependentTrackTimelines(independentClip(videoSamples = 20), timescales, 2.0))
+        assertFalse(Fmp4Splitter.hasBoundedIndependentTrackTimelines(independentClip(), timescales + (3 to 48_000L), 2.0))
+    }
+
+    @Test fun independentClipRejectsGapWithinOneTrackEvenWhenTotalDurationMatches() {
+        val first = box("moof", box("mfhd", verFlags0 + u32(1)) + timedTraf(1, tfdtV1(0), *LongArray(30) { 3_000L }))
+        val second = box("moof", box("mfhd", verFlags0 + u32(2)) + timedTraf(1, tfdtV1(90_001), *LongArray(30) { 3_000L }))
+        val media = first + box("mdat", byteArrayOf(1)) + second + box("mdat", byteArrayOf(2))
+        assertFalse(Fmp4Splitter.hasBoundedIndependentTrackTimelines(media, mapOf(1 to 90_000L), 2.0))
+    }
+
     private fun stsd(entry: ByteArray) = box("stsd", verFlags0 + u32(1) + entry)
 
     private fun avc1(width: Int, height: Int, profile: Int, constraints: Int, level: Int): ByteArray {

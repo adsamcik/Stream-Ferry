@@ -7,16 +7,11 @@ import java.security.MessageDigest
  * `moof`: `ftyp` + `moov` + setup boxes) and a **media** segment (the first `moof` to end).
  *
  * On-device transcoding produces a self-contained fragmented MP4 per HLS segment; serving each whole
- * file would repeat `ftyp`/`moov`. Instead we publish ONE `EXT-X-MAP` init (from the first segment) and
- * serve every segment as a bare CMAF media chunk — valid because the encoder is configured identically
- * for all segments. Pure ISO-BMFF box parsing; unit-tested.
+ * file would repeat `ftyp`/`moov`. Split each export into its own `EXT-X-MAP` init and bare media chunk.
+ * Independent clips use HLS discontinuities, preserving their original timestamps and edit lists.
  *
- * **Cross-segment timing.** Each segment is transcoded as an independent clip `[startMs, endMs)`, so its
- * encoder resets the media timeline to 0 — every segment's `tfdt` baseMediaDecodeTime is ~0. Concatenated
- * over HLS that makes all segments claim to start at t=0, so the renderer can't sequence them (Cast never
- * leaves LOADING; DLNA shows a few frames on repeat). [applyMediaTiming] rewrites each media segment's
- * `tfdt` to its true cumulative offset (and `mfhd` sequence number) so the segments form one continuous,
- * monotonic timeline. In-place edits only (no box grows), so no parent size needs fixing.
+ * [applyMediaTiming] remains available for callers that already have sample-aligned continuous media;
+ * it must not turn independent exports with encoder priming into a claimed continuous timeline.
  */
 object Fmp4Splitter {
 
@@ -432,6 +427,47 @@ object Fmp4Splitter {
     }
 
     /**
+     * Independent HLS clips can differ from the requested trim by encoder delay/padding and one video
+     * frame. Require continuous decoding within each clip, every declared track, and durations within
+     * two actual samples of the planned clip (never more than 250 ms). Cross-clip timestamps are left
+     * untouched: each clip's EXT-X-MAP/edit list and HLS discontinuity describe its own timeline.
+     */
+    fun hasBoundedIndependentTrackTimelines(
+        mediaSegment: ByteArray,
+        timescales: Map<Int, Long>,
+        durationSeconds: Double,
+    ): Boolean {
+        if (timescales.isEmpty() || !durationSeconds.isFinite() || durationSeconds <= 0.0) return false
+        data class TrackTiming(var end: Long, var total: Long, var maxSample: Long)
+        val tracks = LinkedHashMap<Int, TrackTiming>()
+        for (moof in childrenOfType(mediaSegment, 0, mediaSegment.size, "moof")) {
+            for (traf in childrenOfType(mediaSegment, moof.contentStart, moof.end, "traf")) {
+                val trackId = trafTrackId(mediaSegment, traf) ?: return false
+                if ((timescales[trackId] ?: 0L) <= 0L) return false
+                val tfdt = findChild(mediaSegment, traf.contentStart, traf.end, "tfdt") ?: return false
+                val start = readTfdtBase(mediaSegment, tfdt) ?: return false
+                val samples = trafSampleDurations(mediaSegment, traf) ?: return false
+                if (samples.total <= 0L || start > Long.MAX_VALUE - samples.total) return false
+                val prior = tracks[trackId]
+                if (prior == null) {
+                    tracks[trackId] = TrackTiming(start + samples.total, samples.total, samples.maxSample)
+                } else {
+                    if (prior.end != start || prior.total > Long.MAX_VALUE - samples.total) return false
+                    prior.end = start + samples.total
+                    prior.total += samples.total
+                    prior.maxSample = maxOf(prior.maxSample, samples.maxSample)
+                }
+            }
+        }
+        if (tracks.keys != timescales.keys) return false
+        return tracks.all { (trackId, timing) ->
+            val timescale = timescales.getValue(trackId).toDouble()
+            val tolerance = (2.0 * timing.maxSample / timescale).coerceAtMost(0.25)
+            kotlin.math.abs(timing.total / timescale - durationSeconds) <= tolerance + 1.0 / timescale
+        }
+    }
+
+    /**
      * Verify that every declared track exactly occupies the planned decode-time interval after timing
      * has been rewritten. Looking only at the longest track can hide an audio gap or overlap even when
      * the video duration looks correct; the next independently exported segment would then start at a
@@ -481,18 +517,24 @@ object Fmp4Splitter {
         return true
     }
 
-    private fun trafDuration(d: ByteArray, traf: Box): Long? {
+    private data class SampleDurations(val total: Long, val maxSample: Long)
+
+    private fun trafDuration(d: ByteArray, traf: Box): Long? = trafSampleDurations(d, traf)?.total
+
+    private fun trafSampleDurations(d: ByteArray, traf: Box): SampleDurations? {
         val tfhd = findChild(d, traf.contentStart, traf.end, "tfhd") ?: return null
         val defaultDuration = tfhdDefaultSampleDuration(d, tfhd)
         var total = 0L
+        var maxSample = 0L
         var sawTrun = false
         for (trun in childrenOfType(d, traf.contentStart, traf.end, "trun")) {
-            val duration = trunDuration(d, trun, defaultDuration) ?: return null
-            if (total > Long.MAX_VALUE - duration) return null
-            total += duration
+            val samples = trunSampleDurations(d, trun, defaultDuration) ?: return null
+            if (total > Long.MAX_VALUE - samples.total) return null
+            total += samples.total
+            maxSample = maxOf(maxSample, samples.maxSample)
             sawTrun = true
         }
-        return total.takeIf { sawTrun }
+        return if (sawTrun) SampleDurations(total, maxSample) else null
     }
 
     private fun tfhdDefaultSampleDuration(d: ByteArray, tfhd: Box): Long? {
@@ -508,7 +550,7 @@ object Fmp4Splitter {
         }
     }
 
-    private fun trunDuration(d: ByteArray, trun: Box, defaultDuration: Long?): Long? {
+    private fun trunSampleDurations(d: ByteArray, trun: Box, defaultDuration: Long?): SampleDurations? {
         if (trun.contentStart + 8 > trun.end) return null
         val flags = fullBoxFlags(d, trun.contentStart)
         val sampleCount = readU32(d, trun.contentStart + 4)
@@ -522,6 +564,7 @@ object Fmp4Splitter {
         val hasFlags = (flags and 0x000400) != 0
         val hasCompositionOffset = (flags and 0x000800) != 0
         var total = 0L
+        var maxSample = 0L
         repeat(sampleCount.toInt()) {
             val duration = if (hasDuration) {
                 if (offset + 4 > trun.end) return null
@@ -531,11 +574,12 @@ object Fmp4Splitter {
             }
             if (duration <= 0L || total > Long.MAX_VALUE - duration) return null
             total += duration
+            maxSample = maxOf(maxSample, duration)
             if (hasSize) { if (offset + 4 > trun.end) return null; offset += 4 }
             if (hasFlags) { if (offset + 4 > trun.end) return null; offset += 4 }
             if (hasCompositionOffset) { if (offset + 4 > trun.end) return null; offset += 4 }
         }
-        return total
+        return SampleDurations(total, maxSample)
     }
 
     /** track_ID from a `traf`'s `tfhd` (version(1)+flags(3) then track_ID(4)), or null. */

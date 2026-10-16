@@ -119,4 +119,22 @@ class TranscodeNegotiatorTest {
         val target = negotiator.negotiate(capableDevice, receiver, sourceMaxResolution = ResolutionTier.FHD_1080P)
         assertEquals(ResolutionTier.FHD_1080P, target.maxResolution)
     }
+
+    @Test fun selectedHevcCanUse720pAnd480pCaps() {
+        val device = capableDevice.copy(hevcMaxResolution = ResolutionTier.HD_720P)
+        val receiver = ReceiverPlaybackCapabilities(hevcMaxResolution = ResolutionTier.UHD_4K)
+        for (cap in listOf(ResolutionTier.HD_720P, ResolutionTier.SD_480P)) {
+            val target = negotiator.negotiate(device, receiver, sourceMaxResolution = cap, preferredCodec = VideoCodec.HEVC)
+            assertEquals(VideoCodec.HEVC, target.videoCodec)
+            assertEquals(cap, target.maxResolution)
+        }
+    }
+
+    @Test fun hardwareLimitedTo480pStillHasAValidTarget() {
+        val device = capableDevice.copy(h264MaxResolution = ResolutionTier.SD_480P, hevcMaxResolution = null)
+        assertEquals(
+            ResolutionTier.SD_480P,
+            negotiator.negotiate(device, ReceiverPlaybackCapabilities.CONSERVATIVE).maxResolution,
+        )
+    }
 }

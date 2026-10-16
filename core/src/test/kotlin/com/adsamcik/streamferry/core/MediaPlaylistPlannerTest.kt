@@ -19,6 +19,13 @@ class MediaPlaylistPlannerTest {
         assertTrue(segments.all { it.durationSeconds == 2.0 })
     }
 
+    @Test fun tinyFinalTailStaysInThePreviousClip() {
+        val segments = planner.planSegments(6.0001)
+        assertEquals(3, segments.size)
+        assertEquals(2.0001, segments.last().durationSeconds, 0.000001)
+        assertEquals(2, planner.segmentIndexForPosition(6.0, 6.0001))
+    }
+
     @Test fun remainderGoesInFinalSegment() {
         val segments = planner.planSegments(9.5)
         assertEquals(5, segments.size)
@@ -126,6 +133,22 @@ class MediaPlaylistPlannerTest {
         val segments = planner.planSegments(4.0)
         assertFailsWith<IllegalArgumentException> {
             planner.buildVodPlaylist(segments, fmp4 = true, segmentUri = { "seg/$it" })
+        }
+    }
+
+    @Test fun independentClipsAdvertiseTheirOwnInitAndTimestampDiscontinuities() {
+        val playlist = planner.buildVodPlaylist(
+            planner.planSegments(5.5), fmp4 = true, segmentUri = { "seg/$it.m4s" },
+            segmentInitUri = { "init/$it.mp4" }, discontinuityBetweenSegments = true,
+        )
+        val lines = playlist.lines()
+        assertEquals(2, lines.count { it == "#EXT-X-DISCONTINUITY" })
+        for (index in 0..2) {
+            val map = lines.indexOf("#EXT-X-MAP:URI=\"init/$index.mp4\"")
+            assertTrue(map >= 0)
+            assertEquals("#EXTINF:${if (index == 2) "1.500" else "2.000"},", lines[map + 1])
+            assertEquals("seg/$index.m4s", lines[map + 2])
+            if (index > 0) assertEquals("#EXT-X-DISCONTINUITY", lines[map - 1])
         }
     }
 }

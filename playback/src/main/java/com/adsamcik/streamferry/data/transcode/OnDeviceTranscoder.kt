@@ -9,6 +9,7 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
 import androidx.media3.effect.Presentation
 import androidx.media3.transformer.Composition
+import androidx.media3.transformer.DefaultEncoderFactory
 import androidx.media3.transformer.EditedMediaItem
 import androidx.media3.transformer.Effects
 import androidx.media3.transformer.ExportException
@@ -81,7 +82,9 @@ class OnDeviceTranscoder(
     ) {
         check(!released) { "on-device transcoder is released" }
         require(endMs > startMs) { "transcode segment must have a positive duration" }
-        val localSourceUri = Uri.parse(sourceUri)
+        // Downloaded copies use absolute filesystem paths, whereas gallery/SAF items use URIs.
+        val parsedSourceUri = Uri.parse(sourceUri)
+        val localSourceUri = if (parsedSourceUri.scheme == null) Uri.fromFile(File(sourceUri)) else parsedSourceUri
         require(localSourceUri.scheme == "content" || localSourceUri.scheme == "file") {
             "on-device transcoding accepts only local content:// or file:// sources"
         }
@@ -97,7 +100,14 @@ class OnDeviceTranscoder(
         }
 
         val codec = codecLabel(target.videoCodec)
-        val maxHeight = target.maxResolution.maxHeightPx
+        val sourceProfile = LocalMediaProbe.probe(appContext, sourceUri, "mp4")
+        val sourceHeight = if (sourceProfile?.rotationDegrees?.mod(180) == 90) {
+            sourceProfile.widthPx
+        } else {
+            sourceProfile?.heightPx
+        }
+        val maxHeight = sourceHeight?.takeIf { it > 0 }
+            ?.coerceAtMost(target.maxResolution.maxHeightPx) ?: target.maxResolution.maxHeightPx
         val startedAt = System.currentTimeMillis()
         val deadlineMs = exportDeadlineMs(startMs, endMs)
         logger.trace(
@@ -128,6 +138,14 @@ class OnDeviceTranscoder(
                     val builder = Transformer.Builder(appContext)
                         .setVideoMimeType(videoMimeFor(target.videoCodec))
                         .setAudioMimeType(MimeTypes.AUDIO_AAC)
+                        // Negotiation already admitted this output. Fail rather than silently change
+                        // a user's codec/resolution choice when a device cannot actually encode it.
+                        .setEncoderFactory(
+                            DefaultEncoderFactory.Builder(appContext)
+                                .setEnableFallback(false)
+                                .setEnableFormatFallback(false)
+                                .build(),
+                        )
                         .setMuxerFactory(InAppFragmentedMp4Muxer.Factory())
                         .setLooper(thread.looper)
                     val transformer = builder
@@ -236,9 +254,16 @@ class OnDeviceTranscoder(
                     completeFailure(flight, CancellationException(reason))
                 } else {
                     runCatching { transformer.cancel() }
-                    // Unblock the HTTP caller now, but leave [stopped] and the reservation for Media3's
-                    // completion callback so a late native export cannot overlap the next request.
-                    flight.done.completeExceptionally(CancellationException(reason))
+                        .onSuccess {
+                            // Media3 cancellation returns after its export is released and does not
+                            // dispatch onCompleted/onError. Waiting for a callback strands the encoder
+                            // reservation, preventing the next conversion after a quality change/Stop.
+                            completeFailure(flight, CancellationException(reason))
+                        }
+                        .onFailure {
+                            logger.w(TAG, "Failed to cancel on-device export; encoder remains reserved", it)
+                            flight.done.completeExceptionally(CancellationException(reason))
+                        }
                 }
             }
         }.getOrDefault(false)
@@ -251,15 +276,15 @@ class OnDeviceTranscoder(
         runCatching { flight.abortIf?.invoke() == true }.getOrDefault(true)
 
     private fun completeSuccess(flight: InFlight) {
-        flight.done.complete(Unit)
-        flight.stopped.complete(Unit)
         clearInFlight(flight)
+        flight.stopped.complete(Unit)
+        flight.done.complete(Unit)
     }
 
     private fun completeFailure(flight: InFlight, error: Throwable) {
-        flight.done.completeExceptionally(error)
-        flight.stopped.complete(Unit)
         clearInFlight(flight)
+        flight.stopped.complete(Unit)
+        flight.done.completeExceptionally(error)
     }
 
     private fun awaitStopped(flight: InFlight, timeoutMs: Long): Boolean = runBlocking {

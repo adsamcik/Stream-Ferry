@@ -30,7 +30,12 @@ class MediaPlaylistPlanner(
         require(countAsDouble <= MAX_SEGMENTS.toDouble()) {
             "runtime exceeds the ${MAX_SEGMENTS}-segment on-device HLS safety limit"
         }
-        val count = countAsDouble.toInt()
+        val nominalCount = countAsDouble.toInt()
+        // Fold a tiny final tail into its neighbour so seeking never requests a sub-frame export.
+        val finalDuration = runtimeSeconds - (nominalCount - 1) * targetSegmentSeconds
+        val count = if (nominalCount > 1 && finalDuration < minOf(0.1, targetSegmentSeconds / 2)) {
+            nominalCount - 1
+        } else nominalCount
         return (0 until count).map { i ->
             val start = i * targetSegmentSeconds
             val duration = if (i == count - 1) runtimeSeconds - start else targetSegmentSeconds
@@ -58,6 +63,9 @@ class MediaPlaylistPlanner(
         fmp4: Boolean,
         segmentUri: (Int) -> String,
         initUri: (() -> String)? = null,
+        /** Independent exports can retain their own timestamps/edit lists and codec initialization. */
+        segmentInitUri: ((Int) -> String)? = null,
+        discontinuityBetweenSegments: Boolean = false,
     ): String {
         require(segments.size <= MAX_SEGMENTS) { "too many HLS segments" }
         require(segments.all { it.durationSeconds.isFinite() && it.durationSeconds > 0.0 }) {
@@ -71,12 +79,17 @@ class MediaPlaylistPlanner(
         sb.append("#EXT-X-PLAYLIST-TYPE:VOD\n")
         sb.append("#EXT-X-TARGETDURATION:").append(target).append('\n')
         sb.append("#EXT-X-MEDIA-SEQUENCE:0\n")
-        if (fmp4) {
+        require(segmentInitUri == null || fmp4) { "per-segment init requires fMP4" }
+        if (fmp4 && segmentInitUri == null) {
             val init = initUri?.invoke()
                 ?: throw IllegalArgumentException("fMP4 playlist requires an init segment URI")
             sb.append("#EXT-X-MAP:URI=\"").append(init).append("\"\n")
         }
-        for (segment in segments) {
+        for ((position, segment) in segments.withIndex()) {
+            if (discontinuityBetweenSegments && position > 0) sb.append("#EXT-X-DISCONTINUITY\n")
+            if (fmp4 && segmentInitUri != null) {
+                sb.append("#EXT-X-MAP:URI=\"").append(segmentInitUri(segment.index)).append("\"\n")
+            }
             sb.append("#EXTINF:").append(formatSeconds(segment.durationSeconds)).append(",\n")
             sb.append(segmentUri(segment.index)).append('\n')
         }

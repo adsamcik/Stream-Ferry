@@ -196,9 +196,11 @@ data class PlaybackUiState(
     val availableVideoCodecs: List<String> = emptyList(),
     /** Manually-chosen transcode codec (e.g. "hevc"), or null for automatic. */
     val preferredVideoCodec: String? = null,
+    val localTranscodeMode: com.adsamcik.streamferry.core.transcode.LocalTranscodeMode? = null,
+    val localTranscodeUnavailableReason: String? = null,
     /** Saved automatic resolution cap, retained while a playback-only override is active. */
     val automaticMaxVideoHeight: Int? = null,
-    /** Active server-stream resolution cap, or null when this is a local session. */
+    /** Active output resolution cap. */
     val maxVideoHeight: Int? = null,
     /** True when the current session overrides the saved resolution cap. */
     val isManualMaxVideoHeight: Boolean = false,

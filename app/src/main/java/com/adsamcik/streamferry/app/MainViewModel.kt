@@ -1557,6 +1557,7 @@ class MainViewModel(
                     title = entry.title,
                     runtimeSeconds = entry.runtimeSeconds,
                     allowClientTranscode = container.playbackPreferences.transcodeLocalOnDevice,
+                    prefs = streamPreferences(),
                     resumePositionSeconds = resumeAt,
                     smartResumeSeed = downloadedSmartResumeSeed(entry),
                     smartResumeDeviceContext = resumeDeviceContext,
@@ -1587,6 +1588,7 @@ class MainViewModel(
                         title = item.title,
                         runtimeSeconds = item.runtimeSeconds,
                         allowClientTranscode = container.playbackPreferences.transcodeLocalOnDevice,
+                        prefs = streamPreferences(item),
                         resumePositionSeconds = resumeAt,
                         smartResumeSeed = localSmartResumeSeed(item),
                         smartResumeDeviceContext = resumeDeviceContext,
@@ -2624,6 +2626,16 @@ class MainViewModel(
     }
 
     /** Override the stream resolution for this playback only; null returns to the saved automatic cap. */
+    fun selectLocalTranscodeMode(mode: com.adsamcik.streamferry.core.transcode.LocalTranscodeMode) = viewModelScope.launch {
+        try {
+            container.playbackEngine.selectLocalTranscodeMode(mode)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handlePlaybackControlFailure("change on-device transcoding", e)
+        }
+    }
+
     fun selectMaxVideoHeight(height: Int?) = viewModelScope.launch {
         try {
             container.playbackEngine.selectMaxVideoHeight(height)
@@ -3558,6 +3570,7 @@ class MainViewModel(
                 title = context.title,
                 runtimeSeconds = context.runtimeSeconds,
                 allowClientTranscode = container.playbackPreferences.transcodeLocalOnDevice,
+                prefs = streamPreferences(),
                 resumePositionSeconds = resumeAtSeconds,
                 smartResumeSeed = context.smartResumeSeed,
                 smartResumeDeviceContext = deviceContext,
@@ -4285,6 +4298,8 @@ class MainViewModel(
         isManualQuality = isManualQuality,
         availableVideoCodecs = availableVideoCodecs,
         preferredVideoCodec = preferredVideoCodec,
+        localTranscodeMode = localTranscodeMode,
+        localTranscodeUnavailableReason = localTranscodeUnavailableReason,
         automaticMaxVideoHeight = automaticMaxVideoHeight,
         maxVideoHeight = maxVideoHeight,
         isManualMaxVideoHeight = isManualMaxVideoHeight,

@@ -79,6 +79,7 @@ class MainViewModelUiController(
     override fun selectSubtitleTrack(index: Int?) { viewModel.selectSubtitleTrack(index) }
     override fun selectQuality(bitrateBps: Long?) { viewModel.selectQuality(bitrateBps) }
     override fun selectMaxVideoHeight(height: Int?) { viewModel.selectMaxVideoHeight(height) }
+    override fun selectLocalTranscodeMode(mode: com.adsamcik.streamferry.core.transcode.LocalTranscodeMode) { viewModel.selectLocalTranscodeMode(mode) }
     override fun skipBy(deltaSeconds: Long) = viewModel.skipBy(deltaSeconds)
     override fun selectPreferredCodec(codec: String?) { viewModel.selectPreferredCodec(codec) }
     override fun skipSegment() { viewModel.skipSegment() }

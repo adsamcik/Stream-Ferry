@@ -859,8 +859,8 @@ class LocalProxyServer(
     }
 
     /**
-     * Serve an on-device transcode session: with no `seg` param the VOD HLS playlist; `seg=init` the
-     * shared CMAF init segment; `seg=<index>` an on-demand transcoded media segment (full seek). The TV
+     * Serve an on-device transcode session: no `seg` selects the master HLS playlist; `seg=init_N`
+     * selects clip N's CMAF init; `seg=<index>` selects an on-demand media segment (full seek). The TV
      * only ever fetches these phone proxy URLs — never the source.
      */
     private fun serveClientTranscode(session: ProxySession, source: ClientTranscodeSource, req: RequestLine, out: OutputStream, head: Boolean) {
@@ -892,6 +892,13 @@ class LocalProxyServer(
                 serveSegmentResource(source.initSegment(allowExport = !head), out, head)
             }
             else -> {
+                if (seg.startsWith("init_")) {
+                    val rawIndex = seg.removePrefix("init_")
+                    val index = rawIndex.takeIf { it.isNotEmpty() && it.all(Char::isDigit) }?.toIntOrNull()
+                    if (index == null || index < 0) { writeStatus(out, 404, "Not Found"); return }
+                    serveSegmentResource(source.initSegment(index, allowExport = !head), out, head)
+                    return
+                }
                 val index = seg.toIntOrNull()
                 if (index == null) { writeStatus(out, 404, "Not Found"); return }
                 logger.trace(TAG, "TV fetched on-device transcode segment #$index")

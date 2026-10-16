@@ -25,18 +25,13 @@ class TranscodeNegotiator {
             "on-device transcoding requires an HLS fragmented-MP4 capable receiver"
         }
         val fpsAdmissionBound = device.maxFps.coerceAtLeast(1)
-        val fourK = minTier(ResolutionTier.UHD_4K, sourceMaxResolution)
-        val fhd = minTier(ResolutionTier.FHD_1080P, sourceMaxResolution)
-        val hd = minTier(ResolutionTier.HD_720P, sourceMaxResolution)
-
         val ladder = buildList {
-            if (prefer4k) {
-                add(VideoCodec.HEVC to fourK)
-                add(VideoCodec.H264 to fourK)
+            for (tier in ResolutionTier.entries.reversed()) {
+                if (tier.maxHeightPx > sourceMaxResolution.maxHeightPx) continue
+                if (!prefer4k && tier.maxHeightPx > ResolutionTier.FHD_1080P.maxHeightPx) continue
+                add(VideoCodec.HEVC to tier)
+                add(VideoCodec.H264 to tier)
             }
-            add(VideoCodec.HEVC to fhd)
-            add(VideoCodec.H264 to fhd)
-            add(VideoCodec.H264 to hd)
         }
 
         for ((codec, tier) in ladder) {
@@ -65,6 +60,4 @@ class TranscodeNegotiator {
         )
     }
 
-    private fun minTier(a: ResolutionTier, b: ResolutionTier): ResolutionTier =
-        if (a.maxHeightPx <= b.maxHeightPx) a else b
 }

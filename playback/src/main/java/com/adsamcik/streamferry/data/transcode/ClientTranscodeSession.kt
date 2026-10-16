@@ -14,8 +14,8 @@ import java.io.File
  * One on-device client-transcode playback session: a seekable VOD HLS/CMAF origin backed by
  * [OnDeviceTranscoder]. The playlist advertises the whole runtime (via [MediaPlaylistPlanner]); each
  * segment is transcoded on demand when the TV requests it, so seeking anywhere just triggers a fresh
- * segment transcode (full seek). Transcoded fragments are split into one shared init segment + bare
- * media segments by [Fmp4Splitter]. A small LRU keeps recently-served media segments.
+ * segment transcode (full seek). Each independent export retains its timestamps and edit lists, with
+ * its own init segment and an HLS discontinuity. A byte-bounded LRU keeps matching init/media pairs.
  *
  * Methods are blocking (called from the proxy's connection threads); transcoding is serialized so only
  * one HW encode runs at a time.
@@ -33,14 +33,13 @@ class ClientTranscodeSession(
     private val segments = planner.planSegments(runtimeSeconds)
 
     /** A byte-bounded LRU. A count cap alone allowed a handful of 4K segments to consume tens of MiB. */
-    private val mediaCache = LinkedHashMap<Int, ByteArray>(16, 0.75f, true)
+    private data class CachedClip(val init: ByteArray, val media: ByteArray) {
+        val byteSize: Long get() = init.size.toLong() + media.size.toLong()
+    }
+    private val mediaCache = LinkedHashMap<Int, CachedClip>(16, 0.75f, true)
     private var mediaCacheBytes = 0L
     private var observedPeakBandwidthBps: Long = 0L
 
-    @Volatile private var initSeg: ByteArray? = null
-    @Volatile private var initFingerprint: Fmp4Splitter.InitFingerprint? = null
-    /** Track timescales from the init segment's moov, needed to place each segment's tfdt on the timeline. */
-    @Volatile private var timescales: Map<Int, Long> = emptyMap()
     /** Codecs/resolution parsed from the init segment, for the master playlist's CODECS attribute. */
     @Volatile private var codecInfo: Fmp4Splitter.CodecInfo? = null
     /** Set once [release] is called so no new segment transcode starts during/after teardown. */
@@ -69,7 +68,7 @@ class ClientTranscodeSession(
     override fun playlist(proxyBase: String, allowExport: Boolean): String {
         // A GET may prepare segment zero to derive the actual init metadata. A HEAD probe must be cheap
         // and side-effect free, so it receives the target fallback until a normal GET has published init.
-        if (allowExport && initSeg == null && !released) {
+        if (allowExport && codecInfo == null && !released) {
             transcodeInto(0)
         }
         val info = codecInfo
@@ -85,22 +84,27 @@ class ClientTranscodeSession(
     @Synchronized
     override fun mediaPlaylist(proxyBase: String): String =
         planner.buildVodPlaylist(
-            // tfdt is placed on this planned source cadence. Do not mix a measured EXTINF for only a
-            // subset of out-of-order exports with those planned timestamp offsets.
+            // Source clipping follows this stable cadence, including out-of-order seeks. Discontinuities
+            // permit each export's own sample-aligned timestamps and encoder priming/edit lists.
             segments,
             fmp4 = true,
             segmentUri = { "$proxyBase/stream?seg=$it" },
-            initUri = { "$proxyBase/stream?seg=init" },
+            segmentInitUri = { "$proxyBase/stream?seg=init_$it" },
+            discontinuityBetweenSegments = true,
         )
 
     @Synchronized
-    override fun initSegment(allowExport: Boolean): ClientTranscodeSource.Resource {
+    override fun initSegment(allowExport: Boolean): ClientTranscodeSource.Resource = initSegment(0, allowExport)
+
+    @Synchronized
+    override fun initSegment(index: Int, allowExport: Boolean): ClientTranscodeSource.Resource {
         if (released) return ClientTranscodeSource.Resource.Unavailable
-        initSeg?.let { return ClientTranscodeSource.Resource.Ready(it) }
+        if (segments.getOrNull(index) == null) return ClientTranscodeSource.Resource.NotFound
+        mediaCache[index]?.let { return ClientTranscodeSource.Resource.Ready(it.init) }
         if (!allowExport) return ClientTranscodeSource.Resource.Unavailable
-        return when (val result = transcodeInto(0)) {
+        return when (val result = transcodeInto(index)) {
             is ClientTranscodeSource.Resource.Ready ->
-                initSeg?.let { ClientTranscodeSource.Resource.Ready(it) } ?: unavailable()
+                mediaCache[index]?.let { ClientTranscodeSource.Resource.Ready(it.init) } ?: unavailable()
             else -> result
         }
     }
@@ -109,7 +113,7 @@ class ClientTranscodeSession(
     override fun mediaSegment(index: Int, allowExport: Boolean): ClientTranscodeSource.Resource {
         if (released) return ClientTranscodeSource.Resource.Unavailable
         if (segments.getOrNull(index) == null) return ClientTranscodeSource.Resource.NotFound
-        mediaCache[index]?.let { return ClientTranscodeSource.Resource.Ready(it) }
+        mediaCache[index]?.let { return ClientTranscodeSource.Resource.Ready(it.media) }
         if (!allowExport) return ClientTranscodeSource.Resource.Unavailable
         return transcodeInto(index)
     }
@@ -121,7 +125,7 @@ class ClientTranscodeSession(
     private fun transcodeInto(index: Int): ClientTranscodeSource.Resource {
         if (released) return ClientTranscodeSource.Resource.Unavailable
         val segment = segments.getOrNull(index) ?: return ClientTranscodeSource.Resource.NotFound
-        mediaCache[index]?.let { return ClientTranscodeSource.Resource.Ready(it) }
+        mediaCache[index]?.let { return ClientTranscodeSource.Resource.Ready(it.media) }
 
         val startMs = (segment.startSeconds * 1_000).toLong()
         val endMs = ((segment.startSeconds + segment.durationSeconds) * 1_000).toLong()
@@ -167,63 +171,43 @@ class ClientTranscodeSession(
                 return unavailable()
             }
 
-            val firstEver = initSeg == null
-            val candidateTimescales: Map<Int, Long>
-            val candidateCodecInfo: Fmp4Splitter.CodecInfo?
-            if (firstEver) {
-                if (init.size > MAX_INIT_BYTES) {
-                    logger.event("transcode", "On-device init segment exceeds the ${MAX_INIT_BYTES / 1024} KiB limit")
-                    return unavailable()
-                }
-                candidateTimescales = Fmp4Splitter.trackTimescales(init)
-                val expectedTrackIds = fingerprint.tracks.map { it.trackId }.toSet()
-                if (candidateTimescales.keys != expectedTrackIds) {
-                    logger.w("transcode", "On-device segment $index init has incomplete or duplicate track timing")
-                    return unavailable()
-                }
-                candidateCodecInfo = Fmp4Splitter.codecInfo(init)
-            } else {
-                if (initFingerprint != fingerprint) {
-                    // Independent Media3 exports are allowed to have different movie-level timing, but
-                    // their track ids, timescales, and sample descriptions must match the shared EXT-X-MAP.
-                    logger.w("transcode", "On-device segment $index init metadata differs from the published init; refusing it")
-                    return unavailable()
-                }
-                candidateTimescales = timescales
-                candidateCodecInfo = codecInfo
+            if (init.size > MAX_INIT_BYTES || init.size.toLong() + media.size.toLong() > MAX_MEDIA_CACHE_BYTES) {
+                // Init and media must remain paired. Serving an uncached init then regenerating its
+                // media could use a different sample description or encoder edit list.
+                logger.event("transcode", "On-device segment $index exceeds the paired init/media cache budget")
+                return unavailable()
             }
-
-            Fmp4Splitter.applyMediaTiming(
-                media,
-                sequenceNumber = sequenceNumberBase(index),
-                startSeconds = segment.startSeconds,
-                timescales = candidateTimescales,
-            )
-            if (!Fmp4Splitter.hasContinuousTrackTimeline(
+            val candidateTimescales = Fmp4Splitter.trackTimescales(init)
+            if (candidateTimescales.keys != fingerprint.tracks.map { it.trackId }.toSet()) {
+                logger.w("transcode", "On-device segment $index init has incomplete or duplicate track timing")
+                return unavailable()
+            }
+            val candidateCodecInfo = Fmp4Splitter.codecInfo(init)
+            val videoCodec = candidateCodecInfo?.videoCodec?.substringBefore('.')
+            val expectedCodecs = if (target.videoCodec == VideoCodec.H264) setOf("avc1", "avc3") else setOf("hvc1", "hev1")
+            if (videoCodec !in expectedCodecs) {
+                logger.w("transcode", "On-device segment $index did not produce requested ${target.videoCodec}; refusing it")
+                return unavailable()
+            }
+            if (!Fmp4Splitter.hasBoundedIndependentTrackTimelines(
                     media,
                     candidateTimescales,
-                    startSeconds = segment.startSeconds,
                     durationSeconds = segment.durationSeconds,
                 )
             ) {
                 logger.w(
                     "transcode",
-                    "On-device segment $index does not exactly fill its planned per-track fMP4 timeline; refusing it",
+                    "On-device segment $index exceeds sample-sized bounds around its ${segment.durationSeconds}s clip " +
+                        "(measured ${Fmp4Splitter.mediaDurationSeconds(media, candidateTimescales)}s); refusing it",
                 )
                 return unavailable()
             }
             val bandwidth = ((media.size.toDouble() * 8.0) /
                 segment.durationSeconds.coerceAtLeast(MIN_DURATION_FOR_RATE_SECONDS)).toLong()
-            // The shared EXT-X-MAP becomes visible only after segment zero also passes timing and
-            // duration validation. A rejected first export must not poison later retries with its init.
-            if (firstEver) {
-                initSeg = init
-                initFingerprint = fingerprint
-                timescales = candidateTimescales
-                codecInfo = candidateCodecInfo
-            }
+            val firstEver = codecInfo == null
+            if (firstEver) codecInfo = candidateCodecInfo
             observedPeakBandwidthBps = maxOf(observedPeakBandwidthBps, bandwidth)
-            cacheMedia(index, media)
+            cacheMedia(index, CachedClip(init, media))
 
             if (firstEver) {
                 logger.event(
@@ -254,18 +238,14 @@ class ClientTranscodeSession(
         }
     }
 
-    private fun cacheMedia(index: Int, media: ByteArray) {
-        if (media.size.toLong() > MAX_MEDIA_CACHE_BYTES) {
-            logger.trace("transcode", "On-device segment $index is larger than the cache budget; serving once without caching")
-            return
-        }
-        mediaCache.remove(index)?.let { mediaCacheBytes -= it.size.toLong() }
-        mediaCache[index] = media
-        mediaCacheBytes += media.size.toLong()
+    private fun cacheMedia(index: Int, clip: CachedClip) {
+        mediaCache.remove(index)?.let { mediaCacheBytes -= it.byteSize }
+        mediaCache[index] = clip
+        mediaCacheBytes += clip.byteSize
         val iterator = mediaCache.entries.iterator()
         while (mediaCacheBytes > MAX_MEDIA_CACHE_BYTES && iterator.hasNext()) {
             val evicted = iterator.next()
-            mediaCacheBytes -= evicted.value.size.toLong()
+            mediaCacheBytes -= evicted.value.byteSize
             iterator.remove()
         }
     }
@@ -284,9 +264,6 @@ class ClientTranscodeSession(
         synchronized(this) {
             mediaCache.clear()
             mediaCacheBytes = 0L
-            initSeg = null
-            initFingerprint = null
-            timescales = emptyMap()
             codecInfo = null
             if (stopped) {
                 runCatching { cacheDir.deleteRecursively() }
@@ -310,10 +287,6 @@ class ClientTranscodeSession(
     private fun declaredBandwidthBps(): Int =
         maxOf(observedPeakBandwidthBps, PROVISIONAL_BANDWIDTH_BPS).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
 
-    /** Reserve a non-overlapping mfhd sequence-number range for any multi-moof segment. */
-    private fun sequenceNumberBase(index: Int): Int =
-        (index.toLong() * MOOF_SEQUENCE_STRIDE + 1L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
-
     private companion object {
         const val MAX_MEDIA_CACHE_BYTES = 24L * 1024L * 1024L
         /** Reject an oversized completed export before reading it wholesale into memory. */
@@ -321,7 +294,6 @@ class ClientTranscodeSession(
         /** Preflight headroom for Media3's unbounded temporary export plus app-cache bookkeeping. */
         const val MIN_FREE_WORKING_SPACE_BYTES = 128L * 1024L * 1024L
         const val MAX_INIT_BYTES = 4 * 1024 * 1024
-        const val MOOF_SEQUENCE_STRIDE = 4_096L
         const val PROVISIONAL_BANDWIDTH_BPS = 100_000_000L
         const val MIN_DURATION_FOR_RATE_SECONDS = 0.001
     }

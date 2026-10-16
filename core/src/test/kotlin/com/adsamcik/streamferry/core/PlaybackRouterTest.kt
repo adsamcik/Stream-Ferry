@@ -33,6 +33,17 @@ class PlaybackRouterTest {
         assertEquals(RouteKind.DIRECT_PLAY, router.route(decision(PlayMethod.DIRECT_PLAY), localFile).kind)
     }
 
+    @Test fun explicitPhoneConversionOverridesCompatibleOriginal() {
+        assertEquals(
+            RouteKind.CLIENT_TRANSCODE,
+            router.route(decision(PlayMethod.DIRECT_PLAY), localFile, preferClientTranscode = true).kind,
+        )
+        assertEquals(
+            RouteKind.UNSUPPORTED,
+            router.route(decision(PlayMethod.DIRECT_PLAY), localFile.copy(isSeekable = false), preferClientTranscode = true).kind,
+        )
+    }
+
     @Test fun jellyfinTranscodeUsesServerByDefault() {
         assertEquals(RouteKind.SERVER_TRANSCODE, router.route(decision(PlayMethod.HLS_TRANSCODE), jellyfin).kind)
         assertEquals(RouteKind.SERVER_TRANSCODE, router.route(decision(PlayMethod.AUDIO_TRANSCODE), jellyfin).kind)
