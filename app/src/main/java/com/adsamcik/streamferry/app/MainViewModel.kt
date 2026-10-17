@@ -1054,8 +1054,12 @@ class MainViewModel(
         pendingQueueEntry = null
         smartResumeOverrideSeconds = null
         queueSelectionGeneration++
-        if (_state.value.searchQuery.isNotBlank()) clearSearch()
-        if (item.isFolder) openFolder(item) else openDetail(item)
+        if (item.isFolder) {
+            if (_state.value.searchQuery.isNotBlank()) clearSearch()
+            openFolder(item)
+        } else {
+            openDetail(item)
+        }
     }
 
     private fun openFolder(folder: MediaItem) {

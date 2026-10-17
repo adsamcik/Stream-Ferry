@@ -60,6 +60,38 @@ class MainViewModelQueueTest {
 
     private fun create() = MainViewModel(container).also { viewModel = it }
 
+    @Test fun `opening a video from search preserves the gallery query and results`() = runTest {
+        val movie = local.copy(id = "movie-1", title = "Movie", sourceId = "remote")
+        coEvery { container.jellyfinMediaSource.search("Movie") } returns Result.success(listOf(movie))
+        coEvery { container.jellyfinMediaSource.item(movie.id) } returns Result.failure(IllegalStateException("Offline"))
+        val vm = create()
+        vm.onSearchQueryChanged("Movie")
+        advanceUntilIdle()
+        assertEquals(listOf(movie), vm.state.value.searchResults)
+
+        vm.onItemClicked(movie)
+
+        assertEquals(Route.MEDIA_DETAIL, vm.state.value.route)
+        assertEquals("Movie", vm.state.value.searchQuery)
+        assertEquals(listOf(movie), vm.state.value.searchResults)
+    }
+
+    @Test fun `opening a folder from search still leaves search results`() = runTest {
+        val folder = local.copy(id = "folder-1", title = "Folder", isFolder = true, sourceId = "remote")
+        coEvery { container.jellyfinMediaSource.search("Folder") } returns Result.success(listOf(folder))
+        coEvery { container.jellyfinMediaSource.children(folder.id) } returns Result.success(emptyList())
+        val vm = create()
+        vm.onSearchQueryChanged("Folder")
+        advanceUntilIdle()
+        assertEquals(listOf(folder), vm.state.value.searchResults)
+
+        vm.onItemClicked(folder)
+
+        assertEquals(folder, vm.state.value.currentFolder)
+        assertEquals("", vm.state.value.searchQuery)
+        assertTrue(vm.state.value.searchResults.isEmpty())
+    }
+
     @Test fun `queue can be built and saved without starting playback`() {
         val vm = create()
         vm.enqueue(local)

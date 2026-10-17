@@ -63,6 +63,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -150,6 +151,7 @@ fun AppRoot(
 ) {
     val back = backActionFor(state, viewModel)
     val context = LocalContext.current
+    val galleryStateHolder = rememberSaveableStateHolder()
     val showUpNavigation = state.route in upNavigationRoutes
 
     BackHandler(enabled = back != null) { back?.invoke() }
@@ -239,17 +241,25 @@ fun AppRoot(
                         },
                         label = "route transition",
                     ) { route ->
-                        ScreenContent(
-                            state = state.copy(route = route),
-                            viewModel = viewModel,
-                            onScanDevices = onScanDevices,
-                            context = context,
-                            appVersion = appVersion,
-                            nightVolumePolicy = nightVolumePolicy,
-                            onNightVolumePolicyChange = onNightVolumePolicyChange,
-                            expanded = useNavigationRail,
-                            reserveMiniPlayerSpace = useNavigationRail && showMiniPlayer,
-                        )
+                        val screen: @Composable () -> Unit = {
+                            ScreenContent(
+                                state = state.copy(route = route),
+                                viewModel = viewModel,
+                                onScanDevices = onScanDevices,
+                                context = context,
+                                appVersion = appVersion,
+                                nightVolumePolicy = nightVolumePolicy,
+                                onNightVolumePolicyChange = onNightVolumePolicyChange,
+                                expanded = useNavigationRail,
+                                reserveMiniPlayerSpace = useNavigationRail && showMiniPlayer,
+                            )
+                        }
+                        if (route == Route.GALLERY) {
+                            // Keep the gallery's lazy-layout anchors when playback removes its composition.
+                            galleryStateHolder.SaveableStateProvider(Route.GALLERY.name) { screen() }
+                        } else {
+                            screen()
+                        }
                     }
                     if (useNavigationRail && showMiniPlayer) {
                         MiniPlayer(
