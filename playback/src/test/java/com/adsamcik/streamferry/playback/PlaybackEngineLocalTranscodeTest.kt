@@ -1025,6 +1025,40 @@ class PlaybackEngineLocalTranscodeTest {
         }
     }
 
+    @Test fun `automatic protocol fallback remains available after renderer format recovery for every source`() = runTest {
+        for (source in SourceCase.entries) {
+            val f = Fixture(this, Protocol.CAST)
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectMaxVideoHeight(2160); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(123, true)); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(200, true)); runCurrent()
+                f.engine.pause(); runCurrent()
+                val checkpoint = assertNotNull(f.engine.status.value).recoveryPositionSeconds
+                repeat(8) {
+                    if (f.engine.status.value?.isTerminal != true) {
+                        f.events.emit(PlaybackTargetEvent.Error(PlaybackFailureKind.FORMAT, "Cast rejected the format"))
+                        runCurrent()
+                    }
+                }
+                val failed = assertNotNull(f.engine.status.value)
+                assertTrue(failed.isTerminal, "$source did not exhaust renderer format recovery")
+                val attempt = failed.attemptHistory.last()
+                val continuation = assertNotNull(f.engine.reserveAlternateProtocolContinuation(
+                    hasAlternateProtocol = true,
+                    failureStage = assertNotNull(attempt.failureStage),
+                    failureCause = assertNotNull(attempt.failureCause),
+                    sameEndpointRecoveryExhausted = true,
+                ), "$source lost the protocol fallback after format retries")
+                assertEquals(checkpoint, continuation.positionSeconds)
+                f.continueSource(source, Protocol.DLNA, checkpoint, continuation); runCurrent()
+                assertFalse(f.loads.last().playWhenReady, "$source lost pause on automatic handoff")
+                assertEquals(failed.maxVideoHeight, f.engine.status.value?.maxVideoHeight)
+                assertTrue(f.engine.recoverySnapshot().alternateProtocolReserved)
+            } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
     @Test fun `renderer callbacks cannot revive terminal failure or erase its message for any source or protocol`() = runTest {
         for (protocol in Protocol.entries) for (source in SourceCase.entries) {
             val f = Fixture(this, protocol)

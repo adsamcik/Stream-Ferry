@@ -3632,8 +3632,8 @@ class MainViewModel(
         attemptQueueEntry = null
         pendingQueueEntry = null
         playbackStopping = true
+        cancelReconnect()
         viewModelScope.launch {
-            cancelReconnect()
             onlinePlaybackOwner = null
             reconnectContext = null
             pendingResumeDeviceContext = null
@@ -3880,13 +3880,36 @@ class MainViewModel(
             castResult.getOrDefault(emptyList()) + dlnaResult.getOrDefault(emptyList())
         }
 
+    /** The framework Cast chooser can select a TV before an app-level DLNA scan has run. */
+    private suspend fun discoverDlnaAlternate(context: ReconnectContext, generation: Long): ReconnectContext {
+        if (context.endpoint.protocol != Protocol.CAST || context.physicalTv.dlnaEndpoint != null ||
+            !PhysicalTvReconnectPolicy.hasStableIdentity(context.physicalTv, context.endpoint)
+        ) return context
+        val discovered = runCatching { container.dlnaController.discover(DLNA_SCAN_MS) }.getOrElse { error ->
+            val failure = playbackStartupFailure(error, (context as? ReconnectContext.Online)?.owner)
+            container.logger.w("discovery", "Couldn't discover a DLNA fallback for the selected TV", failure)
+            return context
+        }
+        if (generation != reconnectGeneration) return context
+        val physicalTvs = PhysicalTvAggregator.aggregate(
+            context.physicalTv.availableEndpoints + discovered,
+            container.physicalTvAssociations,
+        ).physicalTvs
+        val match = PhysicalTvReconnectPolicy.find(physicalTvs, context.physicalTv, context.endpoint)
+        val refreshed = match?.physicalTv?.takeIf { it.dlnaEndpoint != null } ?: return context
+        return context.withPhysicalTv(refreshed)
+    }
+
     private suspend fun tryAlternateProtocol(
         context: ReconnectContext,
         failureStage: PlaybackFailureStage,
         failureCause: PlaybackFailureCause,
         generation: Long,
     ): Boolean {
-        val alternate = context.physicalTv.alternateEndpoint(context.endpoint.protocol) ?: return false
+        if (failureCause == PlaybackFailureCause.UPSTREAM_OR_SERVER_UNAVAILABLE) return false
+        val resolvedContext = discoverDlnaAlternate(context, generation)
+        if (generation != reconnectGeneration) return false
+        val alternate = resolvedContext.physicalTv.alternateEndpoint(context.endpoint.protocol) ?: return false
         val continuation = container.playbackEngine.reserveAlternateProtocolContinuation(
             hasAlternateProtocol = true,
             failureStage = failureStage,
@@ -3896,10 +3919,11 @@ class MainViewModel(
             isOnlineSessionHint = context is ReconnectContext.Online,
         ) ?: return false
         if (generation != reconnectGeneration) return false
-        val alternateContext = context.withEndpoint(alternate)
+        val alternateContext = resolvedContext.withEndpoint(alternate)
         reconnectContext = alternateContext
         _state.update { current ->
             current.copy(
+                selectedPhysicalTv = alternateContext.physicalTv,
                 selectedTarget = alternate,
                 playback = current.playback?.copy(
                     protocol = alternate.protocol.name,

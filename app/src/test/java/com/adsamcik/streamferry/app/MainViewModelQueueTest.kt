@@ -5,6 +5,7 @@ import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.domain.SourceAvailability
 import com.adsamcik.streamferry.domain.UserSession
 import com.adsamcik.streamferry.domain.DiscoveredTarget
+import com.adsamcik.streamferry.domain.TargetDiscoveryMetadata
 import com.adsamcik.streamferry.core.stream.Protocol
 import com.adsamcik.streamferry.core.stream.TargetCapabilities
 import com.adsamcik.streamferry.core.transcode.LocalTranscodeMode
@@ -274,6 +275,128 @@ class MainViewModelQueueTest {
 
     @Test fun `manual protocol switch from Cast uses paired DLNA endpoint and confirmed position`() {
         assertManualProtocolSwitch(Protocol.CAST, Protocol.DLNA)
+    }
+
+    @Test fun `automatic Cast fallback discovers the same DLNA TV at startup and after failure for every source`() {
+        for (item in retrySources()) for (startup in listOf(true, false)) {
+            val fixture = automaticFallbackFixture(item, startup = startup)
+            assertEquals(listOf(Protocol.CAST, Protocol.DLNA), fixture.loads.map { it.first })
+            assertEquals(125L, fixture.loads.last().second)
+            assertSame(fixture.continuation, fixture.loads.last().third)
+            assertEquals(Protocol.DLNA, fixture.vm.state.value.selectedTarget?.protocol)
+            assertNotNull(fixture.vm.state.value.selectedPhysicalTv?.castEndpoint)
+            assertNotNull(fixture.vm.state.value.selectedPhysicalTv?.dlnaEndpoint)
+            assertEquals(PlaybackPhase.PAUSED, fixture.vm.state.value.playback?.phase)
+            assertEquals(LocalTranscodeMode.ON_DEVICE, fixture.vm.state.value.playback?.localTranscodeMode)
+            assertEquals("hevc", fixture.vm.state.value.playback?.preferredVideoCodec)
+            assertEquals(480, fixture.vm.state.value.playback?.maxVideoHeight)
+            fixture.vm.viewModelScope.cancel()
+        }
+    }
+
+    @Test fun `automatic Cast fallback refuses unrelated ambiguous and explicitly unlinked DLNA endpoints`() {
+        for (rejection in listOf("unrelated", "ambiguous", "unlinked")) {
+            val fixture = automaticFallbackFixture(rejection = rejection)
+            assertEquals(listOf(Protocol.CAST), fixture.loads.map { it.first }, rejection)
+            assertTrue(fixture.vm.state.value.playback?.isTerminal == true, rejection)
+            fixture.vm.viewModelScope.cancel()
+        }
+    }
+
+    @Test fun `failed DLNA fallback discovery remains actionable and Stop prevents a late handoff`() {
+        val failed = automaticFallbackFixture(discoveryError = CancellationException("Discovery interrupted"))
+        assertEquals(listOf(Protocol.CAST), failed.loads.map { it.first })
+        assertTrue(failed.vm.state.value.playback?.isTerminal == true)
+        failed.vm.viewModelScope.cancel()
+        val stopped = automaticFallbackFixture(stopDuringDiscovery = true)
+        assertEquals(listOf(Protocol.CAST), stopped.loads.map { it.first })
+        assertEquals(Route.GALLERY, stopped.vm.state.value.route)
+        assertNull(stopped.vm.state.value.playback)
+    }
+
+    private data class AutomaticFallbackFixture(
+        val vm: MainViewModel,
+        val continuation: PlaybackRecoveryContinuation,
+        val loads: List<Triple<Protocol, Long, PlaybackRecoveryContinuation?>>,
+    )
+
+    private fun automaticFallbackFixture(
+        item: MediaItem = local,
+        startup: Boolean = true,
+        rejection: String? = null,
+        discoveryError: Throwable? = null,
+        stopDuringDiscovery: Boolean = false,
+    ): AutomaticFallbackFixture {
+        val engine = container.playbackEngine
+        val statuses = MutableStateFlow<PlaybackStatus?>(null)
+        every { engine.status } returns statuses
+        every { container.permissions.hasLocalNetworkAccess() } returns true
+        every { container.localMediaSource.mimeTypeFor(any()) } returns "video/mp4"
+        every { container.jellyfinWatchMutationStore.pendingFor(any(), any(), any()) } returns null
+        every { container.smartResumeStore.current } returns null
+        every { container.authRepository.currentUser } returns MutableStateFlow(UserSession("user", "server"))
+        every { container.jellyfinConnectionMonitor.status } returns MutableStateFlow(SourceAvailability.ONLINE)
+        coEvery { container.jellyfinMediaSource.item(any()) } returns Result.failure(IllegalStateException("No details"))
+        coEvery { container.localMediaSource.item(any()) } returns Result.failure(IllegalStateException("No details"))
+        every { container.physicalTvAssociations.isLinked(any(), any()) } returns false
+        every { container.physicalTvAssociations.isBlocked(any(), any()) } returns (rejection == "unlinked")
+        every { container.physicalTvAssociations.linkedPeer(any()) } returns null
+        every { container.physicalTvAssociations.selectionFor(any()) } returns EndpointSelectionPreference()
+        val attempt = PlaybackAttemptDescriptor(
+            generation = 1, protocol = Protocol.CAST.name,
+            failureStage = PlaybackFailureStage.ENDPOINT_CONNECTION,
+            failureCause = PlaybackFailureCause.ENDPOINT_UNAVAILABLE,
+        )
+        every { engine.recoverySnapshot() } returns PlaybackRecoverySession(
+            phase = PlaybackPhase.FAILED, attempts = listOf(attempt),
+            usage = RecoveryBudgetUsage(automaticAttempts = 2, endpointConnectionRetries = mapOf(Protocol.CAST to 2)),
+        )
+        val continuation = mockk<PlaybackRecoveryContinuation>(relaxed = true)
+        every { continuation.positionSeconds } returns 125L
+        every { engine.reserveAlternateProtocolContinuation(any(), any(), any(), any(), any(), any()) } returns continuation
+        coEvery { engine.stop() } answers { statuses.value = null }
+        val cast = DiscoveredTarget("cast-route", "TV", Protocol.CAST, TargetCapabilities(Protocol.CAST), null,
+            discoveryMetadata = TargetDiscoveryMetadata(
+                castDeviceId = "cast-id", validatedSourceHost = "10.0.1.44", modelName = "OLED55C4PLA",
+            ))
+        val dlna = DiscoveredTarget("uuid:dlna", "TV", Protocol.DLNA, TargetCapabilities(Protocol.DLNA), null,
+            discoveryMetadata = TargetDiscoveryMetadata(
+                dlnaUdn = "uuid:dlna", validatedSourceHost = if (rejection == "unrelated") "10.0.1.99" else "10.0.1.44",
+                modelName = "OLED55C4PLA",
+            ))
+        val candidates = if (rejection == "ambiguous") listOf(dlna, dlna.copy(
+            id = "uuid:other", discoveryMetadata = dlna.discoveryMetadata.copy(dlnaUdn = "uuid:other"),
+        )) else listOf(dlna)
+        lateinit var vm: MainViewModel
+        coEvery { container.dlnaController.discover(any()) } coAnswers {
+            if (stopDuringDiscovery) vm.stopPlayback()
+            discoveryError?.let { throw it }
+            candidates
+        }
+        val loads = mutableListOf<Triple<Protocol, Long, PlaybackRecoveryContinuation?>>()
+        fun load(endpoint: DiscoveredTarget, position: Long, choices: PlaybackRecoveryContinuation?, foregrounded: () -> Unit) {
+            loads += Triple(endpoint.protocol, position, choices)
+            foregrounded()
+            if (endpoint.protocol == Protocol.CAST) {
+                if (startup) throw IllegalStateException("Cast could not connect")
+            } else statuses.value = statusesForRetry(Protocol.DLNA)
+        }
+        coEvery { engine.playLocal(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()) } coAnswers {
+            load(arg(9), arg(5), arg(11), arg(10))
+        }
+        coEvery { engine.play(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()) } coAnswers {
+            load(arg(2), arg<Long?>(4) ?: 0L, arg(9), arg(8))
+        }
+        vm = create()
+        vm.onItemClicked(item)
+        vm.selectPhysicalTv(PhysicalTv("cast-only", "TV", castEndpoint = cast))
+        if (!startup) {
+            statuses.value = statusesForRetry(Protocol.CAST)
+            statuses.value = statusesForRetry(Protocol.CAST).copy(
+                phase = PlaybackPhase.FAILED, isTerminal = true, attemptHistory = listOf(attempt),
+            )
+        }
+        return AutomaticFallbackFixture(vm, continuation, loads)
     }
 
     @Test fun `manual protocol switch from DLNA uses paired Cast endpoint and confirmed position`() {

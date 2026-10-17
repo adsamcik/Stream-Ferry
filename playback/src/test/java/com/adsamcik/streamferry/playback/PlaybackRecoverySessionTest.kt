@@ -43,6 +43,19 @@ class PlaybackRecoverySessionTest {
         assertNull(state.reserveRecovery(RecoveryAttemptKind.LOWER_RESOLUTION, PlaybackPhase.CHANGING_STREAM))
     }
 
+    @Test fun exhaustedFormatVariantsStillAllowOneProtocolFallbackWithinTheTotalBudget() {
+        var state = session()
+        repeat(3) {
+            state = assertNotNull(state.reserveRecovery(RecoveryAttemptKind.FORMAT_COMPATIBILITY, PlaybackPhase.CHANGING_STREAM))
+        }
+        assertNull(state.reserveRecovery(RecoveryAttemptKind.LOWER_RESOLUTION, PlaybackPhase.CHANGING_STREAM))
+        val alternate = assertNotNull(state.fail().reserveAlternateProtocol(protocolSwitchInput(state)))
+        state = state.stop().continueFrom(alternate)
+        assertEquals(3, state.usage.compatibilityOrQualityVariants)
+        assertEquals(4, state.usage.automaticAttempts)
+        assertNull(state.reserveAlternateProtocol(protocolSwitchInput(state)))
+    }
+
     @Test fun totalAutomaticWorkIsBoundedAtSix() {
         var state = session().copy(budget = RecoveryBudget(maxCompatibilityOrQualityVariants = 5))
         repeat(6) { index ->

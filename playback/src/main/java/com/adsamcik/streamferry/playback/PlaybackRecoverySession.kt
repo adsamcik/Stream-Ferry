@@ -98,7 +98,7 @@ data class RecoveryBudget(
     val maxEndpointConnectionRetriesPerProtocol: Int = 2,
     /** An established stream still retries a transient network failure only once. */
     val maxSameStreamNetworkRetries: Int = 1,
-    /** Format, resolution, and alternate-protocol variants share a conservative cap. */
+    /** Format and resolution variants share a conservative cap; protocol handoff is reserved separately. */
     val maxCompatibilityOrQualityVariants: Int = 3,
 )
 
@@ -129,9 +129,9 @@ fun RecoveryBudget.canSchedule(usage: RecoveryBudgetUsage, kind: RecoveryAttempt
         RecoveryAttemptKind.ENDPOINT_CONNECTION -> false
         RecoveryAttemptKind.SAME_STREAM_NETWORK -> usage.sameStreamNetworkRetries < maxSameStreamNetworkRetries
         RecoveryAttemptKind.FORMAT_COMPATIBILITY,
-        RecoveryAttemptKind.LOWER_RESOLUTION,
-        RecoveryAttemptKind.ALTERNATE_PROTOCOL ->
+        RecoveryAttemptKind.LOWER_RESOLUTION ->
             usage.compatibilityOrQualityVariants < maxCompatibilityOrQualityVariants
+        RecoveryAttemptKind.ALTERNATE_PROTOCOL -> true // reserveAlternateProtocol admits at most one.
     }
 }
 
@@ -180,7 +180,6 @@ private fun RecoveryBudgetUsage.consume(kind: RecoveryAttemptKind): RecoveryBudg
     compatibilityOrQualityVariants = compatibilityOrQualityVariants + if (kind in setOf(
         RecoveryAttemptKind.FORMAT_COMPATIBILITY,
         RecoveryAttemptKind.LOWER_RESOLUTION,
-        RecoveryAttemptKind.ALTERNATE_PROTOCOL,
     )) 1 else 0,
 )
 
