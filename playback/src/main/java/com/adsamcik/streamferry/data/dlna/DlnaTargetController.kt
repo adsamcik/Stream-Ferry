@@ -23,6 +23,7 @@ import com.adsamcik.streamferry.domain.RendererStream
 import com.adsamcik.streamferry.source.api.DiagnosticSink
 import com.adsamcik.streamferry.permissions.LocalNetworkAccessDeniedException
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
@@ -82,6 +83,7 @@ class DlnaTargetController(
     private val requireLocalNetworkAccess: () -> Unit = {},
     /** Optional deterministic peers for debug/integration environments; release wiring leaves this empty. */
     private val configuredRenderers: List<ConfiguredDlnaRenderer> = emptyList(),
+    private val pollingDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) : PlaybackTargetController {
 
     override val protocol = Protocol.DLNA
@@ -122,7 +124,7 @@ class DlnaTargetController(
     /** Last AVTransport state seen by the poll loop (PLAYING/TRANSITIONING/STOPPED/…), for diagnostics. */
     @Volatile private var lastTransportState: String? = null
 
-    private val pollScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val pollScope = CoroutineScope(SupervisorJob() + pollingDispatcher)
     private var pollJob: Job? = null
     private val pollSessionGate = DlnaPollSessionGate()
     // Signalled after a local control (seek/play/pause) so the status poll wakes early instead of waiting a
@@ -744,7 +746,13 @@ class DlnaTargetController(
                         }
                     }
                 }
-                if (position != null && !suppressPreSeekPosition) {
+                // TRANSITIONING is buffering, not a user pause. Send this before the status so the
+                // engine preserves the intended play/pause state until the renderer settles. A failed
+                // transport read cannot establish either state, even when position is available.
+                if (state != null) {
+                    emitPollEvent(pollToken, PlaybackTargetEvent.BufferingChanged(state == "TRANSITIONING"))
+                }
+                if (position != null && state != null && !suppressPreSeekPosition) {
                     furthestPositionSeconds = maxOf(furthestPositionSeconds, position)
                     emitPollEvent(pollToken, PlaybackTargetEvent.StatusChanged(position, isPlaying = state == "PLAYING"))
                 }

@@ -168,7 +168,7 @@ object PlaybackControlStatePolicy {
 }
 
 val PlaybackUiState.displayedIsPlaying: Boolean
-    get() = controls.playPause?.targetPlaying ?: isPlaying
+    get() = controls.playPause?.targetPlaying ?: playWhenReady
 
 val PlaybackUiState.displayedPositionSeconds: Long
     get() = controls.seek?.targetSeconds ?: positionSeconds

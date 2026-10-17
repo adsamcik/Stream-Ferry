@@ -233,6 +233,8 @@ data class PlaybackUiState(
     val skipSegmentLabel: String? = null,
     /** Responsive user intent layered over the renderer-confirmed values above. */
     val controls: PlaybackControlUiState = PlaybackControlUiState(),
+    /** Intended playback state, retained while the renderer is buffering. */
+    val playWhenReady: Boolean = isPlaying,
 )
 
 /** Compact now-playing snapshot for the diagnostics page (no secrets). */

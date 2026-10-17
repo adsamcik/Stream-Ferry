@@ -10,6 +10,7 @@ import com.adsamcik.streamferry.ui.state.PlaybackControlKind
 import com.adsamcik.streamferry.ui.state.displayedVolume
 import com.adsamcik.streamferry.ui.theme.ThemeMode
 import io.mockk.coEvery
+import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
 import kotlinx.coroutines.CompletableDeferred
@@ -67,6 +68,33 @@ class MainViewModelVolumeTest {
     @After fun tearDown() {
         viewModel.viewModelScope.cancel()
         Dispatchers.resetMain()
+    }
+
+    @Test fun `buffering play pause uses engine intent and a second tap reverses pending pause`() = runTest {
+        val engine = container.playbackEngine
+        statuses.value = assertNotNull(statuses.value).copy(
+            isPlaying = false, isBuffering = true, playWhenReady = true, rendererPlaybackRevision = 1,
+        )
+        runCurrent()
+        viewModel.togglePlayPause(); runCurrent()
+        coVerify(exactly = 1) { engine.pause() }
+        coVerify(exactly = 0) { engine.resume() }
+        assertEquals(false, assertNotNull(viewModel.state.value.playback).controls.playPause?.targetPlaying)
+        viewModel.togglePlayPause(); runCurrent()
+        coVerify(exactly = 1) { engine.resume() }
+    }
+
+    @Test fun `paused buffering play pause resumes after engine intent updates without renderer revision`() = runTest {
+        val engine = container.playbackEngine
+        statuses.value = assertNotNull(statuses.value).copy(
+            isPlaying = false, isBuffering = true, playWhenReady = true, rendererPlaybackRevision = 1,
+        )
+        runCurrent()
+        statuses.value = assertNotNull(statuses.value).copy(playWhenReady = false)
+        runCurrent()
+        viewModel.togglePlayPause(); runCurrent()
+        coVerify(exactly = 1) { engine.resume() }
+        coVerify(exactly = 0) { engine.pause() }
     }
 
     @Test fun `drag sends immediately and only the latest queued value follows a slow command`() = runTest {

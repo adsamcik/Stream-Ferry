@@ -2380,7 +2380,7 @@ class MainViewModel(
 
     fun togglePlayPause() {
         val playback = _state.value.playback ?: return
-        val targetPlaying = !(playback.controls.playPause?.targetPlaying ?: playback.isPlaying)
+        val targetPlaying = !(playback.controls.playPause?.targetPlaying ?: playback.playWhenReady)
         val commandId = beginPlaybackControl(PlaybackControlKind.PLAY_PAUSE) { current, id ->
             PlaybackControlStatePolicy.requestPlayPause(
                 current = current,
@@ -4287,6 +4287,7 @@ class MainViewModel(
         rendererPlaybackRevision = rendererPlaybackRevision,
         rendererVolumeRevision = rendererVolumeRevision,
         isPlaying = confirmedPlaying,
+        playWhenReady = playWhenReady,
         isBuffering = isBuffering,
         positionSeconds = confirmedPosition,
         durationSeconds = durationSeconds,

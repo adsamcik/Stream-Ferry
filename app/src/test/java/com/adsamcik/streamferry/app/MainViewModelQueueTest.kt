@@ -199,6 +199,7 @@ class MainViewModelQueueTest {
                 onForegrounded = any(),
                 recoveryContinuation = continuation,
                 preserveManualWatchOverride = true,
+                prefs = any(),
             )
         }
     }

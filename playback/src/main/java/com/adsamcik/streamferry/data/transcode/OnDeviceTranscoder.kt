@@ -129,7 +129,11 @@ class OnDeviceTranscoder(
                         .setUri(localSourceUri)
                     sourceMimeType?.let { mediaItemBuilder.setMimeType(it) }
                     if (startMs > 0) {
-                        val clipping = MediaItem.ClippingConfiguration.Builder().setStartPositionMs(startMs)
+                        val clipping = MediaItem.ClippingConfiguration.Builder()
+                            .setStartPositionMs(startMs)
+                            // Progressive extractors may have no seek map (for example unknown-length
+                            // TS). Let Media3 read forward to the clip rather than reject its timeline.
+                            .setAllowUnseekableMedia(true)
                         mediaItemBuilder.setClippingConfiguration(clipping.build())
                     }
                     val mediaItem = mediaItemBuilder.build()

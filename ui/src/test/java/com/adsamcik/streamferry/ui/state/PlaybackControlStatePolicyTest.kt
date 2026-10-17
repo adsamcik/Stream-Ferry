@@ -8,6 +8,11 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class PlaybackControlStatePolicyTest {
+    @Test fun `buffering transport button follows play intent and explicit pause`() {
+        val buffering = PlaybackUiState("TV", "CAST", isPlaying = false, isBuffering = true, playWhenReady = true)
+        assertTrue(buffering.displayedIsPlaying)
+        assertFalse(buffering.copy(playWhenReady = false).displayedIsPlaying)
+    }
     @Test fun `play intent is immediate but waits for a newer matching TV revision`() {
         val pending = PlaybackControlStatePolicy.requestPlayPause(
             current = PlaybackControlUiState(),

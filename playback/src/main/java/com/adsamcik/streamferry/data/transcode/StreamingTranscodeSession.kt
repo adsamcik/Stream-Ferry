@@ -18,6 +18,7 @@ import com.adsamcik.streamferry.data.proxy.ClientTranscodeSource
 import com.adsamcik.streamferry.source.api.DiagnosticSink
 import com.google.common.collect.ImmutableList
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -45,9 +46,10 @@ class StreamingTranscodeSession(
     private val sourceProfile: MediaProfile? = null,
     private val onFailure: (Throwable) -> Unit = {},
     private val onReconnectRequired: () -> Unit = {},
+    exportDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) : ClientTranscodeSource {
     private val lock = Object()
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val scope = CoroutineScope(SupervisorJob() + exportDispatcher)
     private val owner = Any()
     private val ready = CompletableDeferred<Unit>()
     private var started = false
@@ -99,7 +101,10 @@ class StreamingTranscodeSession(
             }
         }
         try {
-            withTimeout(STARTUP_TIMEOUT_MS) { ready.await() }
+            // Without a seek map Media3 must read forward from the beginning. Keep startup bounded,
+            // while allowing that catchup at real-time speed before the normal first-media budget.
+            val catchupMs = startPositionSeconds.coerceIn(0, (Long.MAX_VALUE - STARTUP_TIMEOUT_MS) / 1_000) * 1_000
+            withTimeout(STARTUP_TIMEOUT_MS + catchupMs) { ready.await() }
         } catch (error: Exception) {
             release()
             throw error

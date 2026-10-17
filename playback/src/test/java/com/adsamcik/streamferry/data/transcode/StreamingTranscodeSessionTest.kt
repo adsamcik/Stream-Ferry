@@ -19,10 +19,16 @@ import io.mockk.every
 import io.mockk.mockk
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.runTest
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -51,6 +57,73 @@ class StreamingTranscodeSessionTest {
     @Test
     fun `the same continuous export publishes DLNA transport bytes before completion`() = runBlocking {
         proveStreaming(hls = false)
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `nonzero Cast and DLNA restarts allow sequential catchup and start on first media`() = runTest {
+        for (hls in listOf(true, false)) {
+            val transcoder = mockk<OnDeviceTranscoder>()
+            every { transcoder.cancelOwnedInFlightAndAwait(any(), any()) } returns true
+            val completeExport = CompletableDeferred<Unit>()
+            coEvery { transcoder.transcodeStream(any(), any(), any(), any(), any(), any(), any(), any()) } coAnswers {
+                assertEquals(120_000L, arg<Long>(3))
+                delay(60_000) // A source without a seek map needs longer than the old 45 s deadline.
+                val muxer = arg<Muxer.Factory>(2).create("unused")
+                val video = muxer.addTrack(videoFormat())
+                writeFrames(muxer, video, segments = 2)
+                completeExport.await()
+                muxer.close()
+            }
+            val session = StreamingTranscodeSession(
+                transcoder, "https://source.test/unseekable.ts", target, mockk<DiagnosticSink>(relaxed = true), hls,
+                startPositionSeconds = 120, exportDispatcher = StandardTestDispatcher(testScheduler),
+            )
+            try {
+                val readiness = async { session.awaitReady() }
+                runCurrent()
+                advanceTimeBy(59_999)
+                assertFalse(readiness.isCompleted)
+                advanceTimeBy(1)
+                runCurrent()
+                readiness.await()
+                assertFalse(completeExport.isCompleted, "playback must not wait for complete conversion")
+                if (hls) {
+                    assertIs<ClientTranscodeSource.Resource.Ready>(session.mediaSegment(0, false))
+                } else {
+                    assertNotNull(session.openProgressive()).use { assertEquals(0x47, it.read()) }
+                }
+            } finally {
+                session.release()
+                completeExport.complete(Unit)
+                runCurrent()
+            }
+        }
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `stalled initial and nonzero startup still time out and cancel the export`() = runTest {
+        for (startSeconds in listOf(0L, 120L)) {
+            val transcoder = mockk<OnDeviceTranscoder>()
+            every { transcoder.cancelOwnedInFlightAndAwait(any(), any()) } returns true
+            coEvery { transcoder.transcodeStream(any(), any(), any(), any(), any(), any(), any(), any()) } coAnswers {
+                CompletableDeferred<Unit>().await()
+            }
+            val session = StreamingTranscodeSession(
+                transcoder, "content://source/unseekable", target, mockk<DiagnosticSink>(relaxed = true), hls = true,
+                startPositionSeconds = startSeconds, exportDispatcher = StandardTestDispatcher(testScheduler),
+            )
+            val readiness = async { runCatching { session.awaitReady() }.exceptionOrNull() }
+            runCurrent()
+            advanceTimeBy(45_000 + startSeconds * 1_000 - 1)
+            assertFalse(readiness.isCompleted)
+            advanceTimeBy(1)
+            runCurrent()
+            assertIs<TimeoutCancellationException>(readiness.await())
+            coVerify(exactly = 1) { transcoder.cancelOwnedInFlightAndAwait(any(), any()) }
+            assertEquals(null, session.openProgressive(), "timeout must release the session")
+        }
     }
 
     private suspend fun proveStreaming(hls: Boolean) {

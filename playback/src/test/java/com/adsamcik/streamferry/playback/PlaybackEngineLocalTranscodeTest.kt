@@ -1,6 +1,7 @@
 package com.adsamcik.streamferry.playback
 
 import android.content.Context
+import com.adsamcik.streamferry.core.adaptive.AdaptiveBitrateController
 import com.adsamcik.streamferry.core.session.SessionRegistry
 import com.adsamcik.streamferry.core.stream.MediaProfile
 import com.adsamcik.streamferry.core.stream.Protocol
@@ -557,6 +558,121 @@ class PlaybackEngineLocalTranscodeTest {
                 f.events.emit(PlaybackTargetEvent.Ended); runCurrent()
                 assertNull(f.engine.status.value, "$source/$protocol ignored normal end after fallback")
             } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `buffering toggle pauses and resumes intended playback for every source and protocol`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) {
+            val f = Fixture(this, protocol)
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(0, true)); runCurrent()
+                f.events.emit(PlaybackTargetEvent.BufferingChanged(true))
+                f.events.emit(PlaybackTargetEvent.StatusChanged(5, false)); runCurrent()
+                assertEquals(true, f.engine.status.value?.playWhenReady)
+                f.engine.togglePlayPause(); runCurrent()
+                coVerify(exactly = 1) { f.target.pause() }
+                coVerify(exactly = 0) { f.target.play() }
+                assertEquals(false, f.engine.status.value?.playWhenReady)
+                f.engine.selectMaxVideoHeight(480); runCurrent()
+                assertFalse(f.loads.last().playWhenReady, "$source/$protocol lost explicit pause")
+                f.engine.togglePlayPause(); runCurrent()
+                assertEquals(true, f.engine.status.value?.playWhenReady)
+                if (protocol == Protocol.CAST) coVerify(exactly = 1) { f.target.play() }
+                else assertTrue(f.loads.last().playWhenReady)
+            } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `endpoint reconnect preserves paused and playing phone output for every source and protocol`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) for (playing in listOf(false, true)) {
+            val f = Fixture(this, protocol)
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(0, true)); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(77, true)); runCurrent()
+                if (!playing) { f.engine.pause(); runCurrent() }
+                f.events.emit(PlaybackTargetEvent.Disconnected); runCurrent()
+                assertTrue(f.engine.retrySameEndpointAfterDisconnect())
+                runCurrent()
+                assertEquals(playing, f.loads.last().playWhenReady, "$source/$protocol reconnect")
+                assertEquals(0L, f.loads.last().position)
+                assertEquals(200L, f.engine.status.value?.positionSeconds)
+            } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `provider automatic output changes preserve pause and buffering intent on both protocols`() = runTest {
+        for (protocol in Protocol.entries) for (source in listOf(SourceCase.PROVIDER_FILE, SourceCase.PROVIDER_HLS)) {
+            val f = Fixture(this, protocol)
+            try {
+                f.startSource(source); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(123, true)); runCurrent()
+                f.engine.pause(); runCurrent()
+                f.engine.selectMaxVideoHeight(480); runCurrent()
+                assertFalse(f.loads.last().playWhenReady, "$source/$protocol resolution")
+                assertEquals(480, f.requests.last().maxVideoHeight)
+                f.engine.selectPreferredCodec("hevc"); runCurrent()
+                assertFalse(f.loads.last().playWhenReady, "$source/$protocol codec")
+                assertEquals("hevc", f.requests.last().preferredVideoCodec)
+                f.engine.resume(); runCurrent()
+                f.events.emit(PlaybackTargetEvent.BufferingChanged(true))
+                f.events.emit(PlaybackTargetEvent.StatusChanged(0, false)); runCurrent()
+                f.engine.selectMaxVideoHeight(720); runCurrent()
+                assertTrue(f.loads.last().playWhenReady, "$source/$protocol buffering resolution")
+                f.engine.seekTo(300); runCurrent()
+                assertTrue(f.engine.status.value?.playWhenReady == true)
+            } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `explicit output choices leave Original and encode for every source and protocol`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) {
+            val f = Fixture(this, protocol)
+            try {
+                f.startSource(source); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(123, true)); runCurrent()
+                f.engine.pause(); runCurrent()
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ORIGINAL); runCurrent()
+                f.engine.selectMaxVideoHeight(480); runCurrent()
+                assertEquals(LocalTranscodeMode.ON_DEVICE, f.engine.status.value?.localTranscodeMode)
+                assertEquals(480, f.engine.status.value?.maxVideoHeight)
+                assertFalse(f.loads.last().playWhenReady)
+                assertEquals(TRANSCODE_URL, f.loads.last().url)
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ORIGINAL); runCurrent()
+                f.engine.selectPreferredCodec("h264"); runCurrent()
+                assertEquals(LocalTranscodeMode.ON_DEVICE, f.engine.status.value?.localTranscodeMode)
+                assertEquals("h264", f.engine.status.value?.preferredVideoCodec)
+                assertEquals(TRANSCODE_URL, f.loads.last().url)
+                assertFalse(f.loads.last().playWhenReady)
+                assertEquals(123L, f.engine.status.value?.positionSeconds)
+            } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `repeated buffering polls count one stall and completion clears transport intent`() = runTest {
+        mockkConstructor(AdaptiveBitrateController::class)
+        every { anyConstructed<AdaptiveBitrateController>().recordRebuffer(any()) } just Runs
+        for (protocol in Protocol.entries) {
+            val f = Fixture(this, protocol)
+            try {
+                f.startOnline(); runCurrent()
+                f.engine.setAutoAdvance(true)
+                f.events.emit(PlaybackTargetEvent.StatusChanged(123, true)); runCurrent()
+                repeat(4) { f.events.emit(PlaybackTargetEvent.BufferingChanged(true)); runCurrent() }
+                f.events.emit(PlaybackTargetEvent.BufferingChanged(false)); runCurrent()
+                f.events.emit(PlaybackTargetEvent.Ended); runCurrent()
+                val completed = assertNotNull(f.engine.status.value)
+                assertEquals(PlaybackPhase.COMPLETED, completed.phase)
+                assertFalse(completed.playWhenReady)
+                assertFalse(completed.isPlaying)
+                assertFalse(completed.isBuffering)
+            } finally { f.engine.stop(); runCurrent() }
+        }
+        verify(exactly = Protocol.entries.size) {
+            anyConstructed<AdaptiveBitrateController>().recordRebuffer(any())
         }
     }
 

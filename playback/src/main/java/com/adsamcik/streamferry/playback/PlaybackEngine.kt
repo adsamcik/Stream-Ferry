@@ -138,6 +138,8 @@ data class PlaybackStatus(
     val skipSegment: SkipSegment? = null,
     /** Durable recovery position, potentially rewound from a bounded estimate; independent of UI ticks. */
     val recoveryPositionSeconds: Long = positionSeconds,
+    /** Playback intent survives buffering, when the renderer temporarily reports not playing. */
+    val playWhenReady: Boolean = isPlaying,
 )
 
 /** A skippable segment surfaced to the UI: a button [label] and the position to seek to on skip. */
@@ -784,7 +786,7 @@ class PlaybackEngine(
     suspend fun togglePlayPause() = mutex.withLock {
         // Decide while holding the same lock that executes the command. Two rapid UI/key events then
         // alternate deterministically instead of both observing one stale pre-command state.
-        if (isPlaying) pauseLocked() else resumeLocked()
+        if (localPlayWhenReady) pauseLocked() else resumeLocked()
     }
 
     suspend fun resume() = mutex.withLock {
@@ -806,6 +808,7 @@ class PlaybackEngine(
         if (!playbackStarted && startupWatchdogJob?.isActive != true) armStartupWatchdog()
         controlErrorMessage = null
         reportSourceProgressSoon()
+        publishStatus()
     }
 
     suspend fun pause() = mutex.withLock {
@@ -823,6 +826,7 @@ class PlaybackEngine(
         controlErrorMessage = null
         smartResume.checkpoint(SmartResumeCheckpointKind.PAUSED)
         reportSourceProgressSoon()
+        publishStatus()
     }
 
     /** Seek by a relative amount (used by UI, keyboard/media-button, and notification skip actions). */
@@ -1188,7 +1192,7 @@ class PlaybackEngine(
      * auto codec fallback): reuse the live connection/proxy/foreground service and just re-resolve + reload
      * the on-device stream at [startPos]. Mirrors [reloadStream]/[playNext] for the offline path.
      */
-    private suspend fun reloadLocalInPlace(startPos: Long, reason: String, playWhenReady: Boolean = true) {
+    private suspend fun reloadLocalInPlace(startPos: Long, reason: String, playWhenReady: Boolean = localPlayWhenReady) {
         startupWatchdogJob?.cancel()
         playGeneration++
         completedGeneration = null // supersede the current stream (its stray end-of-media/watchdog is now stale)
@@ -1245,7 +1249,7 @@ class PlaybackEngine(
                 pos,
                 requestedBitrate = adaptive?.currentBitrateBps,
                 reason = "seek",
-                playWhenReady = isPlaying,
+                playWhenReady = localPlayWhenReady,
             )
             controlErrorMessage = null
             adaptive?.let { it.noteApplied(it.currentIndex, clock()) } // reset window; don't change quality
@@ -1433,7 +1437,7 @@ class PlaybackEngine(
     }
 
     suspend fun selectMaxVideoHeight(height: Int?) = mutex.withLock {
-        if ((localPlayback != null || onDeviceTranscodeTarget != null || localTranscodeMode == LocalTranscodeMode.ON_DEVICE) && height in setOf(null, 2160, 1080, 720, 480)) {
+        if ((localPlayback != null || onDeviceTranscodeTarget != null || localTranscodeMode != LocalTranscodeMode.AUTOMATIC) && height in setOf(null, 2160, 1080, 720, 480)) {
             changeLocalTranscodeOptions(
                 mode = if (height != null) LocalTranscodeMode.ON_DEVICE else localTranscodeMode,
                 codec = forcedLocalCodec,
@@ -1476,7 +1480,7 @@ class PlaybackEngine(
      */
     suspend fun selectPreferredCodec(codec: String?) = mutex.withLock {
         // Local on-device transcode: steer the phone's encoder and reload in place.
-        if (localPlayback != null || onDeviceTranscodeTarget != null || localTranscodeMode == LocalTranscodeMode.ON_DEVICE) {
+        if (localPlayback != null || onDeviceTranscodeTarget != null || localTranscodeMode != LocalTranscodeMode.AUTOMATIC) {
             val requested = codec?.let { parseVideoCodec(it) ?: return@withLock }
             if (requested != null && requested !in localTranscodeCodecOptions) return@withLock
             changeLocalTranscodeOptions(
@@ -2054,7 +2058,7 @@ class PlaybackEngine(
         requestedBitrate: Long?,
         reason: String,
         armWatchdog: Boolean = false,
-        playWhenReady: Boolean = true,
+        playWhenReady: Boolean = localPlayWhenReady,
     ) {
         holdProgressEstimate(resetDelivery = true)
         // The coordinator reports a terminal position while replacing the source session. Record the
@@ -2660,6 +2664,7 @@ class PlaybackEngine(
                 publishStatus()
             }
             is PlaybackTargetEvent.BufferingChanged -> {
+                if (isBuffering == event.isBuffering) return
                 isBuffering = event.isBuffering
                 if (event.isBuffering) holdProgressEstimate()
                 recoverySession = recoverySession.transition(if (event.isBuffering) PlaybackPhase.BUFFERING else if (isPlaying) PlaybackPhase.PLAYING else PlaybackPhase.PAUSED)
@@ -2701,6 +2706,7 @@ class PlaybackEngine(
                     streamStartSeconds = 0L
                     reportedPositionSeconds = completedPosition
                     isPlaying = false
+                    localPlayWhenReady = false
                     isBuffering = false
                     seekSettleTargetSeconds = null
                     // Ended is an authoritative renderer transport/timeline transition just like a status
@@ -2748,6 +2754,7 @@ class PlaybackEngine(
             }
             is PlaybackTargetEvent.Stopped -> {
                 isPlaying = false
+                localPlayWhenReady = false
                 isBuffering = false
                 seekSettleTargetSeconds = null
                 logger.event("playback", "Renderer stopped playback at ${absolutePositionSeconds}s")
@@ -3028,6 +3035,7 @@ class PlaybackEngine(
             rendererPlaybackRevision = rendererPlaybackRevision.get(),
             rendererVolumeRevision = rendererVolumeRevision.get(),
             isPlaying = isPlaying,
+            playWhenReady = localPlayWhenReady,
             isBuffering = isBuffering,
             positionSeconds = absolutePositionSeconds,
             recoveryPositionSeconds = smartResume.recoveryPositionSeconds() ?: absolutePositionSeconds,
@@ -3048,11 +3056,11 @@ class PlaybackEngine(
             // Codec picker: an online session offers the TV's decodable codecs (server transcodes to the
             // pick); a local on-device transcode offers the TV∩phone-encodable codecs (the phone re-encodes).
             availableVideoCodecs = when {
-                currentProviderSession != null && localTranscodeMode != LocalTranscodeMode.ON_DEVICE && odt == null -> tvVideoCodecs(sel.capabilities)
+                currentProviderSession != null && localTranscodeMode == LocalTranscodeMode.AUTOMATIC && odt == null -> tvVideoCodecs(sel.capabilities)
                 localTranscodeUnavailableReason == null -> localTranscodeCodecOptions.map { it.name.lowercase() }
                 else -> emptyList()
             },
-            preferredVideoCodec = if (currentProviderSession != null && localTranscodeMode != LocalTranscodeMode.ON_DEVICE && odt == null)
+            preferredVideoCodec = if (currentProviderSession != null && localTranscodeMode == LocalTranscodeMode.AUTOMATIC && odt == null)
                 preferredCodec else forcedLocalCodec?.name?.lowercase(),
             localTranscodeMode = localTranscodeMode,
             localTranscodeUnavailableReason = localTranscodeUnavailableReason,

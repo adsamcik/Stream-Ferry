@@ -3,6 +3,12 @@ package com.adsamcik.streamferry.data.transcode
 import android.os.Looper
 import android.media.MediaExtractor
 import android.media.MediaFormat
+import androidx.media3.common.Timeline
+import androidx.media3.exoplayer.analytics.PlayerId
+import androidx.media3.exoplayer.source.ClippingMediaSource
+import androidx.media3.exoplayer.source.MediaSource
+import androidx.media3.exoplayer.source.SinglePeriodTimeline
+import androidx.media3.exoplayer.upstream.BandwidthMeter
 import androidx.media3.transformer.EditedMediaItem
 import androidx.media3.transformer.Composition
 import androidx.media3.muxer.Muxer
@@ -107,6 +113,42 @@ class OnDeviceTranscoderTest {
     }
 
     @Test
+    fun `nonzero local and remote restarts accept genuinely unseekable source timelines`() = runBlocking {
+        val sources = listOf(
+            "file:///download/video.ts" to "video/mp2t",
+            "content://media/external/video/media/42" to "video/mp2t",
+            "https://source.test/video.ts" to "video/mp2t",
+            "https://source.test/playlist.m3u8" to "application/x-mpegURL",
+        )
+        for ((uri, mime) in sources) {
+            val item = startAndCancel(uri, startMs = 60_000, sourceMimeType = mime).mediaItem
+            val child = mockk<MediaSource>(relaxed = true)
+            every { child.mediaItem } returns item
+            every { child.prepareSource(any(), any<PlayerId>(), any<BandwidthMeter>()) } answers {
+                firstArg<MediaSource.MediaSourceCaller>().onSourceInfoRefreshed(
+                    child, SinglePeriodTimeline(120_000_000, false, false, false, null, item),
+                )
+            }
+            // Exercise the real Media3 timeline guard, not a mock of clipping configuration.
+            val clipped = ClippingMediaSource.Builder(child)
+                .setClippingConfiguration(item.clippingConfiguration)
+                .build()
+            var timeline: Timeline? = null
+            val caller = MediaSource.MediaSourceCaller { _, refreshed -> timeline = refreshed }
+            try {
+                clipped.prepareSource(caller, PlayerId.UNSET, mockk<BandwidthMeter>(relaxed = true))
+                clipped.maybeThrowSourceInfoRefreshError()
+                val window = assertNotNull(timeline, "unseekable $uri was rejected")
+                    .getWindow(0, Timeline.Window())
+                assertEquals(60_000_000L, window.durationUs)
+                assertEquals(60_000_000L, window.positionInFirstPeriodUs)
+            } finally {
+                clipped.releaseSource(caller)
+            }
+        }
+    }
+
+    @Test
     fun `a small source keeps its height instead of being upscaled to the output ceiling`() = runBlocking {
         every { LocalMediaProbe.probe(any(), any(), any()) } returns MediaProfile(
             container = "mp4", videoCodec = "h264", audioCodec = "aac", widthPx = 640, heightPx = 360,
@@ -201,16 +243,27 @@ class OnDeviceTranscoderTest {
         assertEquals(7L, LocalMediaProbe.probeDurationSeconds(context, "/download/video.mp4"))
     }
 
-    private suspend fun startAndCancel(uri: String): EditedMediaItem = coroutineScope {
+    private suspend fun startAndCancel(
+        uri: String,
+        startMs: Long = 0,
+        sourceMimeType: String? = null,
+    ): EditedMediaItem = coroutineScope {
         val owner = Any()
         val failure = CompletableDeferred<Throwable?>()
         val export = launch(Dispatchers.Default) {
             failure.complete(runCatching {
-                transcoder.transcodeStream(uri, target, streamMuxer, owner = owner)
+                transcoder.transcodeStream(
+                    uri, target, streamMuxer, startMs = startMs, sourceMimeType = sourceMimeType, owner = owner,
+                )
             }.exceptionOrNull())
         }
         try {
-            val item = assertNotNull(startedItems.poll(5, TimeUnit.SECONDS), "export did not start")
+            val item = if (uri.startsWith("http")) {
+                assertNotNull(startedCompositions.poll(5, TimeUnit.SECONDS), "export did not start")
+                    .sequences.single().editedMediaItems.single()
+            } else {
+                assertNotNull(startedItems.poll(5, TimeUnit.SECONDS), "export did not start")
+            }
             assertTrue(transcoder.cancelOwnedInFlightAndAwait(owner, 5_000), "cancel did not release the export")
             assertIs<CancellationException>(withTimeout(5_000) { failure.await() })
             export.join()
