@@ -19,6 +19,7 @@ import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.domain.PlaybackTargetController
 import com.adsamcik.streamferry.domain.PlaybackTargetEvent
 import com.adsamcik.streamferry.domain.PlaybackFailureKind
+import com.adsamcik.streamferry.source.api.TrackRef
 import com.adsamcik.streamferry.playback.proxy.ProxyForegroundStartPath
 import com.adsamcik.streamferry.playback.session.DefaultPlaybackSessionCoordinator
 import com.adsamcik.streamferry.source.api.DiagnosticSink
@@ -33,6 +34,8 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.async
+import kotlinx.coroutines.yield
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.collect
@@ -73,6 +76,9 @@ class PlaybackEngineLocalTranscodeTest {
         var stops = 0
         val movie = MediaItem("movie", "Movie", null, 3600, null, 123, false)
         var providerStream = StreamDescriptor("video/mp4", "mp4", isTranscoding = false, isByteSeekable = true, totalLength = 100_000)
+        var providerAudioTracks = emptyList<com.adsamcik.streamferry.source.api.MediaTrack>()
+        var providerSubtitleTracks = emptyList<com.adsamcik.streamferry.source.api.MediaTrack>()
+        var providerSourceBitrate: Long? = null
         private val session = SessionRegistry().create("video/mp4", false, 100_000)
         val engine: PlaybackEngine
 
@@ -93,7 +99,8 @@ class PlaybackEngineLocalTranscodeTest {
             coEvery { coordinator.startAndBuildUrl(any(), any(), any(), any()) } returns
                 (session to ORIGINAL_URL)
             every { providerSession.descriptor } answers {
-                PlaybackDescriptor(movie.ref, compatibleProfile, 3600, stream = providerStream)
+                PlaybackDescriptor(movie.ref, compatibleProfile, 3600, sourceBitrateBps = providerSourceBitrate,
+                    audioTracks = providerAudioTracks, subtitleTracks = providerSubtitleTracks, stream = providerStream)
             }
             coEvery { providerSession.mediaSegments() } returns emptyList()
             coEvery { provider.prepare(any()) } answers {
@@ -157,9 +164,11 @@ class PlaybackEngineLocalTranscodeTest {
             protocol: Protocol,
             position: Long,
             continuation: PlaybackRecoveryContinuation,
+            volumeSupported: Boolean = false,
         ) {
             every { target.protocol } returns protocol
-            val endpoint = selected.copy(protocol = protocol, capabilities = selected.capabilities.copy(protocol = protocol))
+            val endpoint = selected.copy(protocol = protocol, capabilities = selected.capabilities.copy(protocol = protocol),
+                discoveryMetadata = selected.discoveryMetadata.copy(volumeControlAvailable = volumeSupported))
             when (source) {
                 SourceCase.FILE, SourceCase.CONTENT_URI -> engine.playLocal(
                     filePath = if (source == SourceCase.FILE) "/download/movie.mp4" else "content://media/external/video/42",
@@ -275,6 +284,159 @@ class PlaybackEngineLocalTranscodeTest {
                 assertEquals(position, switched.positionSeconds)
                 assertEquals("hevc", f.requests.last().preferredVideoCodec)
                 assertEquals(480, f.requests.last().maxVideoHeight)
+            } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `connected and volume reports retain handoff checkpoint through failed preparation and explicit retry for every source`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) {
+            val f = Fixture(this, protocol)
+            val volumeReady = CompletableDeferred<Unit>()
+            val positions = mutableListOf<Long>()
+            var collecting: kotlinx.coroutines.Job? = null
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE); runCurrent()
+                f.engine.selectPreferredCodec("h264"); runCurrent()
+                f.engine.selectMaxVideoHeight(480); runCurrent()
+                f.engine.seekTo(450); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(0, true)); runCurrent()
+                f.engine.pause(); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(0, false)); runCurrent()
+                val continuation = assertNotNull(f.engine.beginManualProtocolSwitch())
+                collecting = backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+                    f.engine.status.collect { it?.let { status -> positions += status.recoveryPositionSeconds } }
+                }
+                coEvery { f.target.connect(any()) } coAnswers {
+                    yield() // Register the real event collector before its connection notification.
+                    f.events.emit(PlaybackTargetEvent.Connected)
+                    yield()
+                }
+                coEvery { f.target.readCurrentVolume() } coAnswers { volumeReady.await(); 0.1f }
+                if (source == SourceCase.FILE || source == SourceCase.CONTENT_URI) {
+                    every { LocalMediaProbe.probe(any(), any(), any()) } throws IllegalArgumentException("Probe unavailable")
+                } else {
+                    coEvery { f.provider.prepare(any()) } returns Result.failure(IllegalStateException("Source unavailable"))
+                }
+                val alternate = Protocol.entries.first { it != protocol }
+                val preparing = async { runCatching { f.continueSource(source, alternate, 450, continuation, volumeSupported = true) } }
+                runCurrent()
+                assertFalse(preparing.isCompleted)
+                assertEquals(450L, f.engine.status.value?.positionSeconds, "$source/$protocol connected checkpoint")
+                assertFalse(assertNotNull(f.engine.status.value).playWhenReady)
+                volumeReady.complete(Unit); runCurrent()
+                assertTrue(preparing.await().isFailure)
+                assertTrue(positions.isNotEmpty())
+                assertTrue(positions.all { it == 450L }, "$source/$protocol saved a startup position: $positions")
+                val retry = assertNotNull(f.engine.continuationForExplicitRetry())
+                assertEquals(450L, retry.positionSeconds)
+                assertEquals(RecoveryBudgetUsage(), retry.session.usage)
+                assertTrue(retry.session.attempts.isEmpty())
+                f.engine.stop(); runCurrent()
+                assertNull(f.engine.continuationForExplicitRetry(), "real Stop must clear engine retry ownership")
+                every { LocalMediaProbe.probe(any(), any(), any()) } returns compatibleProfile
+                coEvery { f.provider.prepare(any()) } coAnswers { f.requests += firstArg<PlaybackRequest>(); Result.success(f.providerSession) }
+                f.continueSource(source, alternate, 450, retry, volumeSupported = true); runCurrent()
+                val restored = assertNotNull(f.engine.status.value)
+                assertEquals(450L, restored.positionSeconds)
+                assertFalse(f.loads.last().playWhenReady)
+                assertEquals(LocalTranscodeMode.ON_DEVICE, restored.localTranscodeMode)
+                assertEquals("h264", restored.preferredVideoCodec)
+                assertEquals(480, restored.maxVideoHeight)
+            } finally {
+                volumeReady.complete(Unit); collecting?.cancel()
+                every { LocalMediaProbe.probe(any(), any(), any()) } returns compatibleProfile
+                f.engine.stop(); runCurrent()
+            }
+        }
+    }
+
+    @Test fun `provider track references survive switches and failed switch retry in server and phone output`() = runTest {
+        for (protocol in Protocol.entries) for (source in listOf(SourceCase.PROVIDER_FILE, SourceCase.PROVIDER_HLS)) {
+            for (mode in listOf(LocalTranscodeMode.AUTOMATIC, LocalTranscodeMode.ON_DEVICE)) {
+                val f = Fixture(this, protocol)
+                f.providerAudioTracks = listOf(
+                    com.adsamcik.streamferry.source.api.MediaTrack(TrackRef("3"), "eng", "English", isDefault = true),
+                    com.adsamcik.streamferry.source.api.MediaTrack(TrackRef("7"), "ces", "Czech"),
+                )
+                f.providerSubtitleTracks = listOf(com.adsamcik.streamferry.source.api.MediaTrack(TrackRef("12"), "ces", "Czech subtitles"))
+                try {
+                    f.startSource(source); runCurrent()
+                    f.engine.selectAudioTrack(1); runCurrent()
+                    f.engine.selectSubtitleTrack(0); runCurrent()
+                    if (mode == LocalTranscodeMode.ON_DEVICE) { f.engine.selectLocalTranscodeMode(mode); runCurrent() }
+                    f.events.emit(PlaybackTargetEvent.StatusChanged(if (mode == LocalTranscodeMode.ON_DEVICE) 0 else 123, true)); runCurrent()
+                    f.engine.pause(); runCurrent()
+                    f.events.emit(PlaybackTargetEvent.StatusChanged(if (mode == LocalTranscodeMode.ON_DEVICE) 0 else 123, false)); runCurrent()
+                    val position = assertNotNull(f.engine.status.value).positionSeconds
+                    val continuation = assertNotNull(f.engine.beginManualProtocolSwitch())
+                    val alternate = Protocol.entries.first { it != protocol }
+                    f.continueSource(source, alternate, position, continuation); runCurrent()
+                    assertEquals(TrackRef("7"), f.requests.last().audioTrack, "$source/$protocol/$mode audio")
+                    assertEquals(TrackRef("12"), f.requests.last().subtitleTrack)
+                    assertFalse(f.requests.last().subtitlesDisabled)
+                    assertFalse(f.loads.last().playWhenReady)
+                    f.events.emit(PlaybackTargetEvent.StatusChanged(if (mode == LocalTranscodeMode.ON_DEVICE) 0 else position, false)); runCurrent()
+                    val returning = assertNotNull(f.engine.beginManualProtocolSwitch())
+                    coEvery { f.target.connect(any()) } throws IllegalStateException("Endpoint unavailable")
+                    assertFailsWith<IllegalStateException> { f.continueSource(source, protocol, position, returning) }
+                    val retry = assertNotNull(f.engine.continuationForExplicitRetry())
+                    f.engine.stop(); runCurrent()
+                    coEvery { f.target.connect(any()) } just Runs
+                    f.continueSource(source, protocol, position, retry); runCurrent()
+                    val restored = assertNotNull(f.engine.status.value)
+                    assertEquals(TrackRef("7"), f.requests.last().audioTrack)
+                    assertEquals(TrackRef("12"), f.requests.last().subtitleTrack)
+                    assertEquals(1, restored.currentAudioIndex)
+                    assertEquals(0, restored.currentSubtitleIndex)
+                    assertEquals(listOf("English", "Czech"), restored.audioTracks.map { it.label })
+                    assertFalse(f.loads.last().playWhenReady)
+                    assertEquals(mode, restored.localTranscodeMode)
+                } finally { f.engine.stop(); runCurrent() }
+            }
+        }
+    }
+
+    @Test fun `pinned provider bitrate survives switching and failed connection explicit retry`() = runTest {
+        for (protocol in Protocol.entries) for (source in listOf(SourceCase.PROVIDER_FILE, SourceCase.PROVIDER_HLS)) {
+            val f = Fixture(this, protocol)
+            f.providerSourceBitrate = 8_000_000
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectQuality(1_500_000); runCurrent()
+                val cap = assertNotNull(f.engine.status.value).currentBitrateBps
+                assertEquals(1_500_000L, cap)
+                f.engine.selectPreferredCodec("h264"); runCurrent()
+                f.engine.selectMaxVideoHeight(480); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(123, true)); runCurrent()
+                f.engine.pause(); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(123, false)); runCurrent()
+                val continuation = assertNotNull(f.engine.beginManualProtocolSwitch())
+                val alternate = Protocol.entries.first { it != protocol }
+                f.continueSource(source, alternate, 123, continuation); runCurrent()
+                assertEquals(cap, f.requests.last().maxBitrateBps)
+                assertTrue(assertNotNull(f.engine.status.value).isManualQuality)
+                assertEquals(cap, f.engine.status.value?.currentBitrateBps)
+                f.events.emit(PlaybackTargetEvent.StatusChanged(123, false)); runCurrent()
+                val returning = assertNotNull(f.engine.beginManualProtocolSwitch())
+                coEvery { f.target.connect(any()) } throws IllegalStateException("Endpoint unavailable")
+                assertFailsWith<IllegalStateException> { f.continueSource(source, protocol, 123, returning) }
+                val retry = assertNotNull(f.engine.continuationForExplicitRetry())
+                f.engine.stop(); runCurrent()
+                coEvery { f.target.connect(any()) } just Runs
+                f.continueSource(source, protocol, 123, retry); runCurrent()
+                assertEquals(cap, f.requests.last().maxBitrateBps)
+                assertTrue(assertNotNull(f.engine.status.value).isManualQuality)
+                assertEquals(cap, f.engine.status.value?.currentBitrateBps)
+                assertEquals("h264", f.requests.last().preferredVideoCodec)
+                assertEquals(480, f.requests.last().maxVideoHeight)
+                assertFalse(f.loads.last().playWhenReady)
+                f.engine.selectQuality(null); runCurrent()
+                assertFalse(assertNotNull(f.engine.status.value).isManualQuality)
+                f.engine.stop(); runCurrent()
+                f.startSource(source); runCurrent()
+                assertFalse(assertNotNull(f.engine.status.value).isManualQuality)
+                assertEquals(2_000_000L, f.requests.last().maxBitrateBps)
             } finally { f.engine.stop(); runCurrent() }
         }
     }

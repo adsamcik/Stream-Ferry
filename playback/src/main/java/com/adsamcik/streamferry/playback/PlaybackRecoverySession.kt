@@ -4,6 +4,8 @@ import com.adsamcik.streamferry.core.stream.Protocol
 import com.adsamcik.streamferry.core.transcode.LocalTranscodeMode
 import com.adsamcik.streamferry.core.transcode.VideoCodec
 import com.adsamcik.streamferry.domain.PlaybackFailureKind
+import com.adsamcik.streamferry.domain.MediaTrack
+import com.adsamcik.streamferry.source.api.TrackRef
 
 /** Coarse, UI-safe lifecycle of the one renderer playback session. */
 enum class PlaybackPhase {
@@ -209,7 +211,10 @@ class PlaybackRecoveryContinuation internal constructor(
     internal val session: PlaybackRecoverySession,
     internal val reservedKind: RecoveryAttemptKind?,
     internal val playbackChoices: PlaybackContinuationChoices? = null,
-)
+) {
+    /** Retained before teardown even when a conflated status update never reaches the UI. */
+    val positionSeconds: Long? get() = playbackChoices?.positionSeconds
+}
 
 /** User choices carried across a same-session controller replacement and its connection retries. */
 internal data class PlaybackContinuationChoices(
@@ -218,6 +223,14 @@ internal data class PlaybackContinuationChoices(
     val localCodec: VideoCodec?,
     val preferredCodec: String?,
     val maxVideoHeight: Int?,
+    val manualBitrateBps: Long?,
+    val audioSelection: Int?,
+    val subtitleSelection: Int?,
+    val audioTracks: List<MediaTrack>,
+    val subtitleTracks: List<MediaTrack>,
+    val audioTrackRefs: Map<Int, TrackRef>,
+    val subtitleTrackRefs: Map<Int, TrackRef>,
+    val positionSeconds: Long,
 )
 /**
  * Immutable, pure session ledger. The engine owns side effects; this type owns generations, concise

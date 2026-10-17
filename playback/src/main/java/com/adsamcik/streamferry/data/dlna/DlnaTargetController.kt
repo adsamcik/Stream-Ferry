@@ -115,6 +115,7 @@ class DlnaTargetController(
     // A resume/reload start position (seconds) requested by [load]. DLNA has no "start position" in
     // SetAVTransportURI, so we issue a REL_TIME Seek — but only once the renderer is actually PLAYING (the
     // poll loop applies it), because a Seek before the transport has started is widely rejected/ignored.
+    // Until applied, this position stays authoritative even if the paused renderer reports zero.
     // Cleared after it is applied so we never re-seek a later user scrub.
     @Volatile private var pendingResumeSeek: PendingDlnaResumeSeek? = null
     /** Orders the deferred load-time seek against explicit user/media-session seeks; the newest intent wins. */
@@ -512,6 +513,7 @@ class DlnaTargetController(
                 durationSeconds?.takeIf { it > 0 }?.let(requested::coerceAtMost) ?: requested
             }
             pendingResumeSeek = boundedStart.takeIf { it > 0 }?.let(::PendingDlnaResumeSeek)
+            lastTransportState = null
             val setUri = {
                 soap(r.avTransport, "SetAVTransportURI", buildString {
                     append("<InstanceID>0</InstanceID>")
@@ -574,8 +576,19 @@ class DlnaTargetController(
     override suspend fun seekTo(positionSeconds: Long) = seekMutex.withLock {
         // An explicit user/media-session seek supersedes a still-pending load-time resume. Serializing this
         // update with the deferred command guarantees an older resume can never execute after this seek.
-        pendingResumeSeek = null
-        seekRendererToUnlocked(positionSeconds)
+        if (pendingResumeSeek != null && lastTransportState != "PLAYING") {
+            // A paused handoff has not started the new URI yet. Many TVs reject Seek in STOPPED;
+            // retain the newest scrub for the same deferred application without starting playback.
+            val bounded = positionSeconds.coerceAtLeast(0).let { requested ->
+                loadedDurationSeconds?.let(requested::coerceAtMost) ?: requested
+            }
+            pendingResumeSeek = PendingDlnaResumeSeek(bounded)
+            pollWake.trySend(Unit)
+        } else {
+            pendingResumeSeek = null
+            seekRendererToUnlocked(positionSeconds)
+        }
+        Unit
     }
 
     private suspend fun seekRendererToUnlocked(positionSeconds: Long) = controlThenPoll(
@@ -753,8 +766,16 @@ class DlnaTargetController(
                     emitPollEvent(pollToken, PlaybackTargetEvent.BufferingChanged(state == "TRANSITIONING"))
                 }
                 if (position != null && state != null && !suppressPreSeekPosition) {
-                    furthestPositionSeconds = maxOf(furthestPositionSeconds, position)
-                    emitPollEvent(pollToken, PlaybackTargetEvent.StatusChanged(position, isPlaying = state == "PLAYING"))
+                    val pendingPosition = pendingResumeSeek?.positionSeconds
+                    if (pendingPosition == null) furthestPositionSeconds = maxOf(furthestPositionSeconds, position)
+                    emitPollEvent(
+                        pollToken,
+                        PlaybackTargetEvent.StatusChanged(
+                            pendingPosition ?: position,
+                            isPlaying = state == "PLAYING",
+                            isPositionConfirmed = pendingPosition == null,
+                        ),
+                    )
                 }
                 // The renderer couldn't decode the media: UPnP reports CurrentTransportStatus=ERROR_OCCURRED
                 // (often while parked in STOPPED, with no push callback of its own). Surface it so the engine

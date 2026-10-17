@@ -7,6 +7,7 @@ import com.adsamcik.streamferry.domain.UserSession
 import com.adsamcik.streamferry.domain.DiscoveredTarget
 import com.adsamcik.streamferry.core.stream.Protocol
 import com.adsamcik.streamferry.core.stream.TargetCapabilities
+import com.adsamcik.streamferry.core.transcode.LocalTranscodeMode
 import com.adsamcik.streamferry.physical.PhysicalTv
 import com.adsamcik.streamferry.physical.EndpointSelectionPreference
 import com.adsamcik.streamferry.playback.*
@@ -156,6 +157,163 @@ class MainViewModelQueueTest {
         assertManualProtocolSwitch(Protocol.DLNA, Protocol.CAST)
     }
 
+    @Test fun `failed Cast to DLNA switch retains choices and latest checkpoint through repeated explicit retries`() {
+        retrySources().forEach { assertFailedSwitchRetry(Protocol.CAST, it) }
+    }
+
+    @Test fun `failed DLNA to Cast switch retains choices and latest checkpoint through repeated explicit retries`() {
+        retrySources().forEach { assertFailedSwitchRetry(Protocol.DLNA, it) }
+    }
+
+    @Test fun `Stop and a new video discard failed switch retry choices`() {
+        for (stop in listOf(true, false)) {
+            val fixture = failedSwitchFixture(Protocol.CAST)
+            val vm = fixture.vm
+            if (stop) {
+                vm.stopPlayback()
+                val callsBeforeRetry = fixture.loads.size
+                vm.retryPlayback()
+                assertEquals(callsBeforeRetry, fixture.loads.size)
+            } else {
+                every { container.playbackEngine.continuationForExplicitRetry() } returns null
+                vm.onItemClicked(local.copy(id = "content://media/video/2", title = "Next video"))
+                vm.play()
+                vm.retryPlayback()
+                assertNull(fixture.loads.last().second)
+            }
+            vm.viewModelScope.cancel()
+        }
+    }
+
+    @Test fun `unrelated account change retains local failed switch retry choices`() {
+        for (protocol in Protocol.entries) {
+            val fixture = failedSwitchFixture(protocol)
+            fixture.users.value = UserSession("another-user", "another-server")
+            fixture.vm.retryPlayback()
+            assertEquals(125L to fixture.firstRetry, fixture.loads.last())
+            fixture.vm.viewModelScope.cancel()
+        }
+    }
+
+    @Test fun `manual watch state override suppresses retry checkpoint updates`() {
+        val fixture = failedSwitchFixture(Protocol.CAST)
+        val previous = fixture.vm.state.value.queues.working.current?.item?.resumePositionSeconds
+        every { container.playbackEngine.hasManualWatchStateOverride() } returns true
+        coEvery { container.playbackEngine.stop() } answers {
+            fixture.statuses.value = null
+        }
+        fixture.vm.retryPlayback()
+        assertEquals(previous, fixture.vm.state.value.queues.working.current?.item?.resumePositionSeconds)
+    }
+
+    private data class FailedSwitchFixture(
+        val vm: MainViewModel,
+        val statuses: MutableStateFlow<PlaybackStatus?>,
+        val loads: MutableList<Pair<Long, PlaybackRecoveryContinuation?>>,
+        val firstRetry: PlaybackRecoveryContinuation,
+        val secondRetry: PlaybackRecoveryContinuation,
+        val users: MutableStateFlow<UserSession?>,
+    )
+
+    private fun retrySources() = listOf(
+        local,
+        local.copy(id = "/storage/emulated/0/Movies/video.mp4"),
+        local.copy(id = "remote-video", sourceId = "remote"),
+    )
+
+    private fun assertFailedSwitchRetry(from: Protocol, item: MediaItem) {
+        val fixture = failedSwitchFixture(from, item)
+        val vm = fixture.vm
+        val failed = assertNotNull(vm.state.value.playback, "Failed handoff disappeared for $from/${item.sourceId}/${item.id}")
+        assertTrue(failed.isTerminal, "Expected failed switch for $from/${item.sourceId}/${item.id}: phase=${failed.phase}, loads=${fixture.loads}, error=${vm.state.value.errorMessage}")
+        assertFalse(failed.playWhenReady)
+        assertEquals(LocalTranscodeMode.ON_DEVICE, failed.localTranscodeMode)
+        assertEquals("hevc", failed.preferredVideoCodec)
+        assertEquals(480, failed.maxVideoHeight)
+        // stop() has discarded the engine's live state; Retry must use the captured continuation.
+        assertNull(fixture.statuses.value)
+        coVerify { container.playbackEngine.stop() }
+
+        vm.retryPlayback()
+        assertEquals(125L to fixture.firstRetry, fixture.loads.last())
+        assertTrue(vm.state.value.playback?.isTerminal == true)
+        vm.retryPlayback()
+        assertEquals(159L to fixture.secondRetry, fixture.loads.last())
+        assertEquals(159L, vm.state.value.queues.working.current?.item?.resumePositionSeconds)
+        vm.viewModelScope.cancel()
+    }
+
+    private fun failedSwitchFixture(from: Protocol, item: MediaItem = local): FailedSwitchFixture {
+        val statuses = MutableStateFlow<PlaybackStatus?>(null)
+        val playbackEngine = container.playbackEngine
+        every { playbackEngine.status } returns statuses
+        every { container.permissions.hasLocalNetworkAccess() } returns true
+        every { container.localMediaSource.mimeTypeFor(any()) } returns "video/mp4"
+        every { container.jellyfinWatchMutationStore.pendingFor(any(), any(), any()) } returns null
+        every { container.smartResumeStore.current } returns null
+        coEvery { container.localMediaSource.item(any()) } returns Result.failure(IllegalStateException("No detail refresh"))
+        coEvery { container.jellyfinMediaSource.item(any()) } returns Result.failure(IllegalStateException("No detail refresh"))
+        val owner = UserSession("user", "server")
+        val users = MutableStateFlow(owner.takeIf { item.sourceId == "remote" })
+        every { container.authRepository.currentUser } returns users
+        every { container.jellyfinConnectionMonitor.status } returns MutableStateFlow(SourceAvailability.ONLINE)
+        every { playbackEngine.recoverySnapshot() } returns PlaybackRecoverySession()
+        val manual = mockk<PlaybackRecoveryContinuation>(relaxed = true)
+        val firstRetry = mockk<PlaybackRecoveryContinuation>(relaxed = true)
+        val secondRetry = mockk<PlaybackRecoveryContinuation>(relaxed = true)
+        every { playbackEngine.beginManualProtocolSwitch() } returns manual
+        every { manual.positionSeconds } returns 125L
+        every { firstRetry.positionSeconds } returns 125L
+        every { secondRetry.positionSeconds } returns 159L
+        every { playbackEngine.continuationForExplicitRetry() } returnsMany listOf(firstRetry, secondRetry)
+        coEvery { playbackEngine.stop() } answers { statuses.value = null }
+        val loads = mutableListOf<Pair<Long, PlaybackRecoveryContinuation?>>()
+        fun recordLoad(resume: Long, continuation: PlaybackRecoveryContinuation?) {
+            loads += resume to continuation
+            when (continuation) {
+                manual -> throw IllegalStateException("Replacement stream failed")
+                firstRetry -> {
+                    statuses.value = statusesForRetry(if (from == Protocol.CAST) Protocol.DLNA else Protocol.CAST).copy(
+                        rendererPlaybackRevision = 2,
+                        positionSeconds = 159,
+                        recoveryPositionSeconds = 159,
+                    )
+                    throw IllegalStateException("Retry stream failed")
+                }
+                else -> Unit
+            }
+        }
+        coEvery {
+            playbackEngine.playLocal(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(),
+                any(), any(), any(), any())
+        } coAnswers { recordLoad(arg(5), arg(11)) }
+        coEvery {
+            playbackEngine.play(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any())
+        } coAnswers { recordLoad(arg<Long?>(4) ?: 0L, arg(9)) }
+        val cast = DiscoveredTarget("cast-tv", "TV", Protocol.CAST, TargetCapabilities(Protocol.CAST), null)
+        val dlna = DiscoveredTarget("dlna-tv", "TV", Protocol.DLNA, TargetCapabilities(Protocol.DLNA), null)
+        val tv = PhysicalTv("tv", "TV", castEndpoint = cast, dlnaEndpoint = dlna,
+            selectionPreference = EndpointSelectionPreference(preferredProtocol = from))
+        val vm = create()
+        vm.onItemClicked(item)
+        vm.selectPhysicalTv(tv)
+        assertTrue(loads.isNotEmpty(), "Initial playback did not start for $from/${item.sourceId}/${item.id}: ${vm.state.value.playback?.errorMessage}")
+        statuses.value = statusesForRetry(from)
+        vm.saveQueue("Protocol switch")
+        assertEquals(125L, vm.state.value.queues.working.current?.item?.resumePositionSeconds)
+        vm.selectPlaybackProtocol(if (from == Protocol.CAST) Protocol.DLNA else Protocol.CAST)
+        return FailedSwitchFixture(vm, statuses, loads, firstRetry, secondRetry, users)
+    }
+
+    private fun statusesForRetry(protocol: Protocol) = PlaybackStatus(
+        targetName = "TV", protocolName = protocol.name, rendererPlaybackRevision = 1,
+        isPlaying = false, playWhenReady = false, isBuffering = false,
+        positionSeconds = 125, durationSeconds = 600, streamMode = "Transcode",
+        currentBitrateBps = 2_000_000, measuredThroughputBps = 0, adaptiveNote = "",
+        phase = PlaybackPhase.PAUSED, localTranscodeMode = LocalTranscodeMode.ON_DEVICE,
+        preferredVideoCodec = "hevc", maxVideoHeight = 480,
+    )
+
     private fun assertManualProtocolSwitch(from: Protocol, to: Protocol) {
         val statuses = MutableStateFlow<PlaybackStatus?>(null)
         val playbackEngine = container.playbackEngine
@@ -163,6 +321,7 @@ class MainViewModelQueueTest {
         every { container.permissions.hasLocalNetworkAccess() } returns true
         every { container.localMediaSource.mimeTypeFor(local.id) } returns "video/mp4"
         val continuation = mockk<PlaybackRecoveryContinuation>(relaxed = true)
+        every { continuation.positionSeconds } returns 125L
         every { playbackEngine.beginManualProtocolSwitch() } returns continuation
         val cast = DiscoveredTarget(
             "cast-tv", "Living Room TV", Protocol.CAST, TargetCapabilities(Protocol.CAST), null,

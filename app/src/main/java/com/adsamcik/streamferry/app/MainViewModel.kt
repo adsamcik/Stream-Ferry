@@ -229,6 +229,8 @@ class MainViewModel(
     // What to re-play on reconnect (Jellyfin online OR an on-device / downloaded local file). Set after a
     // successful play()/playLocal(), cleared on stop / a new play.
     private var reconnectContext: ReconnectContext? = null
+    // Terminal cleanup releases the engine, but Retry still belongs to this exact playback session.
+    private var failedPlaybackContinuation: PlaybackRecoveryContinuation? = null
     private var pendingResumeDeviceContext: SmartResumeDeviceContext? = null
     private var lastRecordedPhysicalAttemptGeneration = -1L
     /**
@@ -324,7 +326,8 @@ class MainViewModel(
                 _state.update { cur ->
                     // A hand-off can briefly publish null while the old renderer tears down. Keep the
                     // now-playing presentation mounted until the replacement has begun.
-                    val retainingPlayback = playbackStarting || reconnecting || autoAdvancing
+                    val retainingPlayback = playbackStarting || reconnecting || autoAdvancing ||
+                        (cur.playback?.isTerminal == true && reconnectContext != null)
                     val ended = status == null && cur.route == Route.PLAYBACK && !retainingPlayback
                     val ui = status?.toUi(cur.playback)?.copy(reconnecting = reconnecting)
                         ?: cur.playback?.takeIf { retainingPlayback }
@@ -339,6 +342,9 @@ class MainViewModel(
         }
         viewModelScope.launch {
             container.authRepository.currentUser.collect { user ->
+                if (observedJellyfinSession != user && reconnectContext is ReconnectContext.Online) {
+                    failedPlaybackContinuation = null
+                }
                 // All normal rebind paths stop online playback first. Retain a fail-closed backstop for
                 // a future/background repository mutation: an A-owned renderer must never keep using a
                 // singleton client after B becomes current.
@@ -831,6 +837,7 @@ class MainViewModel(
         cancelWatchStateMutationsForSessionTransition()
         val hadOnlinePlayback = onlinePlaybackOwner != null || reconnectContext is ReconnectContext.Online
         if (!hadOnlinePlayback) return
+        failedPlaybackContinuation = null
 
         container.playbackEngine.status.value?.let { checkpointQueue(it, force = true) }
         playingQueueEntryId = null
@@ -1456,6 +1463,7 @@ class MainViewModel(
         }
         // A fresh, user-initiated play supersedes any in-flight auto-reconnect.
         cancelReconnect()
+        failedPlaybackContinuation = null
         // Stop any in-flight device scan and its progress spinner (an infinite Compose animation) BEFORE
         // we foreground the proxy service — a still-animating picker would keep posting main-thread frames
         // and could starve the service's onStartCommand, blowing the startForegroundService() deadline.
@@ -3354,6 +3362,7 @@ class MainViewModel(
     /** Explicit retry starts a fresh bounded recovery budget but keeps the same physical TV and checkpoint. */
     fun retryPlayback() {
         val ctx = reconnectContext ?: return
+        val continuation = failedPlaybackContinuation ?: container.playbackEngine.continuationForExplicitRetry()
         val queueEntry = attemptQueueEntry?.let { attempted ->
             _state.value.queues.working.current?.takeIf { it.entryId == attempted.entryId } ?: attempted
         }
@@ -3376,23 +3385,15 @@ class MainViewModel(
                 check(queueEntry == null || queueEntry.canPlayWith(activeJellyfinSession())) {
                     "Sign in to the Jellyfin account that owns this queued video."
                 }
-                playContext(ctx, ctx.endpoint, lastPlaybackPositionSeconds)
+                playContext(ctx, ctx.endpoint, lastPlaybackPositionSeconds, continuation)
+                failedPlaybackContinuation = null
                 queueEntry?.let(::queueEntryStarted)
             } catch (c: CancellationException) {
                 throw c
             } catch (error: Exception) {
                 val reason = LogRedactor.redact(bestFailureReason(error)).take(180)
                 container.logger.w("playback", "Explicit playback retry failed", error)
-                _state.update { current ->
-                    current.copy(
-                        route = Route.PLAYBACK,
-                        playback = current.playback?.copy(
-                            phase = PlaybackPhase.FAILED,
-                            isTerminal = true,
-                            errorMessage = "Couldn't start playback: $reason",
-                        ),
-                    )
-                }
+                surfaceTerminalPlaybackFailure(ctx, "Couldn't start playback: $reason")
             } finally {
                 playbackStarting = false
             }
@@ -3401,6 +3402,7 @@ class MainViewModel(
 
     /** User-requested device change leaves recovery intentionally and returns to one physical-TV picker. */
     fun changeTv() = viewModelScope.launch {
+        failedPlaybackContinuation = null
         val ctx = reconnectContext
         container.playbackEngine.status.value?.let { checkpointQueue(it, force = true) }
         pendingQueueEntry = attemptQueueEntry?.let { attempted ->
@@ -3550,6 +3552,7 @@ class MainViewModel(
         recoveryContinuation: PlaybackRecoveryContinuation? = null,
     ) {
         val deviceContext = smartResumeDeviceContext(context.physicalTv, endpoint)
+        val checkpoint = recoveryContinuation?.positionSeconds ?: resumeAtSeconds
         when (context) {
             is ReconnectContext.Online -> {
                 requireActiveOnlinePlaybackOwner(context.owner)
@@ -3558,7 +3561,7 @@ class MainViewModel(
                     controllerFor(endpoint),
                     endpoint,
                     streamPreferences(context.item),
-                    resumePositionOverrideSeconds = resumeAtSeconds,
+                    resumePositionOverrideSeconds = checkpoint,
                     autoAdvance = shouldAutoAdvance(context.item, _state.value.playlist),
                     smartResumeSeed = onlineSmartResumeSeed(context.item, context.owner),
                     smartResumeDeviceContext = deviceContext,
@@ -3573,7 +3576,7 @@ class MainViewModel(
                 runtimeSeconds = context.runtimeSeconds,
                 allowClientTranscode = container.playbackPreferences.transcodeLocalOnDevice,
                 prefs = streamPreferences(),
-                resumePositionSeconds = resumeAtSeconds,
+                resumePositionSeconds = checkpoint,
                 smartResumeSeed = context.smartResumeSeed,
                 smartResumeDeviceContext = deviceContext,
                 target = controllerFor(endpoint),
@@ -3586,6 +3589,7 @@ class MainViewModel(
 
     fun stopPlayback() {
         if (playbackStopping) return
+        failedPlaybackContinuation = null
         container.playbackEngine.status.value?.let { checkpointQueue(it, force = true) }
         playingQueueEntryId = null
         attemptQueueEntry = null
@@ -3899,6 +3903,12 @@ class MainViewModel(
     /** Release renderer/proxy resources while retaining a stable, actionable Now Playing error card. */
     private suspend fun surfaceTerminalPlaybackFailure(context: ReconnectContext, message: String) {
         val snapshot = container.playbackEngine.recoverySnapshot()
+        failedPlaybackContinuation = container.playbackEngine.continuationForExplicitRetry()
+            ?: failedPlaybackContinuation
+        val checkpoint = failedPlaybackContinuation?.positionSeconds
+        val queueEntryId = playingQueueEntryId
+        val shouldCheckpoint = !container.playbackEngine.hasManualWatchStateOverride()
+        if (checkpoint != null) lastPlaybackPositionSeconds = checkpoint
         try {
             container.playbackEngine.stop()
         } catch (c: CancellationException) {
@@ -3916,6 +3926,7 @@ class MainViewModel(
             current.copy(
                 route = Route.PLAYBACK,
                 playback = prior.copy(
+                    positionSeconds = checkpoint ?: prior.positionSeconds,
                     phase = PlaybackPhase.FAILED,
                     isTerminal = true,
                     reconnecting = false,
@@ -3924,6 +3935,9 @@ class MainViewModel(
                     attemptHistory = snapshot.attempts,
                     recoveryBudget = snapshot.budgetStatus,
                 ),
+                queues = if (checkpoint != null && queueEntryId != null && shouldCheckpoint) {
+                    current.queues.updateWorking(current.queues.working.checkpoint(queueEntryId, checkpoint))
+                } else current.queues,
                 errorMessage = null,
             )
         }
@@ -4120,6 +4134,7 @@ class MainViewModel(
     fun localNetworkPermissionSettingsIntent(): Intent = container.permissions.appDetailsSettingsIntent()
 
     private fun revokeLocalNetworkAccess(moveToTargetPicker: Boolean) {
+        failedPlaybackContinuation = null
         stopTargetDiscovery()
         cancelReconnect()
         onlinePlaybackOwner = null

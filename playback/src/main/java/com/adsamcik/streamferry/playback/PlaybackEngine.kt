@@ -340,6 +340,7 @@ class PlaybackEngine(
     @Volatile private var lastNote = "Measuring link speed…"
     // True when the user has pinned a specific quality rung; adaptation is paused until they pick Auto.
     @Volatile private var manualQuality = false
+    @Volatile private var manualQualityBitrateBps: Long? = null
     // Optional current-session cap. Choosing it forces a server transcode so it can recover a stream
     // without requiring the user to leave playback or edit their default in Settings.
     @Volatile private var manualMaxVideoHeight: Int? = null
@@ -490,8 +491,18 @@ class PlaybackEngine(
         continuation.withPlaybackChoices()
     }
 
+    /** Retry the same video with fresh recovery allowances, retaining its user choices across cleanup. */
+    fun continuationForExplicitRetry(): PlaybackRecoveryContinuation? = synchronized(recoveryLock) {
+        if (failedPlaybackChoices == null && target == null) return@synchronized null
+        PlaybackRecoveryContinuation(recoverySession.startSession(), reservedKind = null).withPlaybackChoices()
+    }
+
     private fun capturePlaybackChoices() = PlaybackContinuationChoices(
         localPlayWhenReady, localTranscodeMode, forcedLocalCodec, preferredCodec, manualMaxVideoHeight,
+        if (manualQuality) manualQualityBitrateBps ?: adaptive?.currentBitrateBps else null,
+        audioSelection, subtitleSelection, mediaAudioTracks.toList(), mediaSubtitleTracks.toList(),
+        mediaAudioTrackRefs.toMap(), mediaSubtitleTrackRefs.toMap(),
+        smartResume.recoveryPositionSeconds() ?: absolutePositionSeconds,
     )
 
     private fun PlaybackRecoveryContinuation.withPlaybackChoices() = PlaybackRecoveryContinuation(
@@ -505,6 +516,14 @@ class PlaybackEngine(
         forcedLocalCodec = choices.localCodec
         preferredCodec = choices.preferredCodec
         manualMaxVideoHeight = choices.maxVideoHeight
+        manualQualityBitrateBps = choices.manualBitrateBps
+        manualQuality = choices.manualBitrateBps != null
+        audioSelection = choices.audioSelection
+        subtitleSelection = choices.subtitleSelection
+        mediaAudioTracks = choices.audioTracks
+        mediaSubtitleTracks = choices.subtitleTracks
+        mediaAudioTrackRefs = choices.audioTrackRefs
+        mediaSubtitleTrackRefs = choices.subtitleTrackRefs
     }
 
     /**
@@ -653,6 +672,13 @@ class PlaybackEngine(
         this@PlaybackEngine.prefs = prefs
         restorePlaybackChoices(preservedPlaybackChoices)
         this@PlaybackEngine.autoAdvance = autoAdvance
+        val startPos = PlaybackPositionPolicy.clamp(
+            resumePositionOverrideSeconds ?: item.resumePositionSeconds ?: 0L,
+            item.runtimeSeconds,
+        )
+        // Connected/volume reports can arrive before source preparation. Retain the handoff checkpoint.
+        streamStartSeconds = startPos
+        reportedPositionSeconds = 0L
         lastNote = "Measuring link speed…"
         var endpointConnected = false
         try {
@@ -669,11 +695,7 @@ class PlaybackEngine(
             target.connect(selectedTarget)
             endpointConnected = true
             synchronizeVolumeFromTargetLocked()
-            val startPos = PlaybackPositionPolicy.clamp(
-                resumePositionOverrideSeconds ?: item.resumePositionSeconds ?: 0L,
-                item.runtimeSeconds,
-            )
-            startPlaybackWithFallback(startPos, requestedBitrate = prefs.maxBitrateBps,
+            startPlaybackWithFallback(startPos, requestedBitrate = manualQualityBitrateBps ?: prefs.maxBitrateBps,
                 playWhenReady = preservedPlaybackChoices?.playWhenReady ?: true)
             // Now that the first resolve has revealed the media's tracks, honor the user's preferred /
             // per-show-remembered audio & subtitle language (re-resolves once only when it differs from
@@ -1068,6 +1090,9 @@ class PlaybackEngine(
         localPlayback = LocalPlaybackParams(filePath, contentType, title, runtimeSeconds, allowClientTranscode, smartResumeSeed)
         forcedLocalCodec = null // a fresh file starts on automatic codec negotiation
         restorePlaybackChoices(preservedPlaybackChoices)
+        val startPos = PlaybackPositionPolicy.clamp(resumePositionSeconds, runtimeSeconds)
+        streamStartSeconds = startPos
+        reportedPositionSeconds = 0L
         localCodecFallbacksTried.clear()
         var endpointConnected = false
         try {
@@ -1080,7 +1105,7 @@ class PlaybackEngine(
             target.connect(selectedTarget)
             endpointConnected = true
             synchronizeVolumeFromTargetLocked()
-            loadLocalStreamLocked(PlaybackPositionPolicy.clamp(resumePositionSeconds, runtimeSeconds),
+            loadLocalStreamLocked(startPos,
                 playWhenReady = preservedPlaybackChoices?.playWhenReady ?: true)
             monitorJob = scope.launch { monitorLoop() }
         } catch (_: StreamStartupSuperseded) {
@@ -1505,6 +1530,7 @@ class PlaybackEngine(
         if (bitrateBps == null) {
             if (!manualQuality) return@withLock
             manualQuality = false
+            manualQualityBitrateBps = null
             lastNote = "Auto quality — adapting to the link"
             logger.event("quality", "Quality -> Auto (adaptation resumed)")
             publishStatus()
@@ -1513,10 +1539,12 @@ class PlaybackEngine(
         val index = BitrateLadder.indexAtOrBelow(a.ladder, bitrateBps)
         val target = a.ladder[index]
         val wasManual = manualQuality
+        val previousManualBitrate = manualQualityBitrateBps
         val previousNote = lastNote
         val previousStreamStart = streamStartSeconds
         val previousReportedPosition = reportedPositionSeconds
         manualQuality = true
+        manualQualityBitrateBps = target
         if (!wasManual || target != a.currentBitrateBps) {
             logger.event("quality", "Quality cap -> ${target / 1000} kbps (manual source override)")
             // An override must re-resolve even when the selected rung matches the current displayed rate:
@@ -1525,6 +1553,7 @@ class PlaybackEngine(
                 reloadStream(absolutePositionSeconds, requestedBitrate = target, reason = "manual quality override")
             } catch (failure: Throwable) {
                 manualQuality = wasManual
+                manualQualityBitrateBps = previousManualBitrate
                 lastNote = previousNote
                 streamStartSeconds = previousStreamStart
                 reportedPositionSeconds = previousReportedPosition
@@ -3218,6 +3247,7 @@ class PlaybackEngine(
         seekSettleTargetSeconds = null
         pendingRendererResumePosition = null
         manualQuality = false
+        manualQualityBitrateBps = null
         manualMaxVideoHeight = null
         lastThroughputBps = 0
         nightVolumeSession = NightVolumeSession()

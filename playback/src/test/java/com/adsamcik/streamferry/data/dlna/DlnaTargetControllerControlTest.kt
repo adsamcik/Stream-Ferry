@@ -1,6 +1,7 @@
 package com.adsamcik.streamferry.data.dlna
 
 import android.net.Network
+import com.adsamcik.streamferry.core.dlna.DidlLite
 import com.adsamcik.streamferry.diagnostics.NetworkInfoProvider
 import com.adsamcik.streamferry.domain.PlaybackTargetEvent
 import com.adsamcik.streamferry.domain.RendererStream
@@ -8,7 +9,9 @@ import com.adsamcik.streamferry.source.api.DiagnosticSink
 import io.mockk.every
 import io.mockk.mockk
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
@@ -21,6 +24,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Protocol
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
+import okio.Buffer
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -147,12 +151,71 @@ class DlnaTargetControllerControlTest {
         }
     }
 
+    @Test
+    fun `paused handoff holds requested position through idle polls without starting the TV`() = runTest {
+        val fixture = pollingFixture(startPosition = 63, initialState = "STOPPED", initialPosition = 0)
+        try {
+            // Longer than both the engine seek-settle window and several idle SOAP polls.
+            advanceTimeBy(30_001)
+            runCurrent()
+            val statuses = fixture.events.filterIsInstance<PlaybackTargetEvent.StatusChanged>()
+            assertTrue(statuses.size >= 3)
+            assertTrue(statuses.all { it.positionSeconds == 63L && !it.isPlaying && !it.isPositionConfirmed })
+            assertTrue(fixture.seekTargets.isEmpty())
+            assertEquals(0, fixture.playCommands)
+            assertFalse(fixture.controller.readIsPlaying()!!)
+        } finally {
+            fixture.controller.disconnect()
+        }
+    }
+
+    @Test
+    fun `new paused scrub replaces handoff position and resume retries the latest seek`() = runTest {
+        val fixture = pollingFixture(startPosition = 63, initialState = "STOPPED", initialPosition = 0)
+        try {
+            fixture.controller.seekTo(87)
+            advanceTimeBy(351)
+            runCurrent()
+            assertTrue(fixture.seekTargets.isEmpty())
+            assertEquals(
+                PlaybackTargetEvent.StatusChanged(87, false, isPositionConfirmed = false),
+                fixture.events.filterIsInstance<PlaybackTargetEvent.StatusChanged>().last(),
+            )
+            fixture.failedSeeksRemaining = 1
+            val confirmed = async(UnconfinedTestDispatcher(testScheduler)) {
+                fixture.controller.events.first {
+                    it is PlaybackTargetEvent.StatusChanged && it.isPositionConfirmed && it.positionSeconds == 87L
+                }
+            }
+            fixture.controller.play()
+            // Await real IO completion through the observable renderer confirmation. The test scheduler
+            // advances the poll delays while the mocked SOAP call uses the controller's normal IO path.
+            confirmed.await()
+            assertEquals(listOf("0:01:27", "0:01:27"), fixture.seekTargets)
+            assertEquals(1, fixture.playCommands)
+            assertTrue(fixture.events.filterIsInstance<PlaybackTargetEvent.StatusChanged>().none {
+                it.isPositionConfirmed && it.positionSeconds == 0L
+            })
+            assertTrue(fixture.events.none { it is PlaybackTargetEvent.ControlError })
+        } finally {
+            fixture.controller.disconnect()
+        }
+    }
+
     private class PollingFixture(val controller: DlnaTargetController) {
         var transportState: String? = "PLAYING"
+        var positionSeconds = 42L
+        var failedSeeksRemaining = 0
+        var playCommands = 0
+        val seekTargets = mutableListOf<String>()
         val events = mutableListOf<PlaybackTargetEvent>()
     }
 
-    private suspend fun TestScope.pollingFixture(): PollingFixture {
+    private suspend fun TestScope.pollingFixture(
+        startPosition: Long = 0,
+        initialState: String = "PLAYING",
+        initialPosition: Long = 42,
+    ): PollingFixture {
         val network = mockk<NetworkInfoProvider>(relaxed = true)
         every { network.lanNetwork() } returns mockk<Network>(relaxed = true)
         every { network.lanIpv4() } returns "10.0.1.81"
@@ -160,6 +223,7 @@ class DlnaTargetControllerControlTest {
         val http = OkHttpClient.Builder().addInterceptor { chain ->
             val request = chain.request()
             val action = request.header("SOAPACTION")?.substringAfter('#')?.trim('"')
+            var responseCode = 200
             val body = when {
                 request.url.encodedPath == "/description.xml" ->
                     """<root><device><deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType>
@@ -169,10 +233,28 @@ class DlnaTargetControllerControlTest {
                 action == "GetTransportInfo" -> fixture.transportState?.let {
                     "<CurrentTransportState>$it</CurrentTransportState><CurrentTransportStatus>OK</CurrentTransportStatus>"
                 } ?: "<CurrentTransportStatus>OK</CurrentTransportStatus>"
-                action == "GetPositionInfo" -> "<RelTime>0:00:42</RelTime>"
+                action == "GetPositionInfo" -> "<RelTime>${DidlLite.formatDuration(fixture.positionSeconds)}</RelTime>"
+                action == "Play" -> {
+                    fixture.playCommands++
+                    fixture.transportState = "PLAYING"
+                    "<Response/>"
+                }
+                action == "Seek" -> {
+                    val buffer = Buffer()
+                    request.body!!.writeTo(buffer)
+                    val target = Regex("<Target>([^<]+)</Target>").find(buffer.readUtf8())!!.groupValues[1]
+                    fixture.seekTargets += target
+                    if (fixture.failedSeeksRemaining-- > 0) {
+                        responseCode = 500
+                        "<errorCode>701</errorCode>"
+                    } else {
+                        fixture.positionSeconds = target.split(':').map(String::toLong).let { it[0] * 3600 + it[1] * 60 + it[2] }
+                        "<Response/>"
+                    }
+                }
                 else -> "<Response/>"
             }
-            Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(200).message("OK")
+            Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(responseCode).message("OK")
                 .body(body.toResponseBody("text/xml".toMediaType())).build()
         }.build()
         val controller = DlnaTargetController(
@@ -181,9 +263,11 @@ class DlnaTargetControllerControlTest {
             pollingDispatcher = StandardTestDispatcher(testScheduler),
         )
         fixture = PollingFixture(controller)
+        fixture.transportState = initialState
+        fixture.positionSeconds = initialPosition
         controller.connect(controller.discover(500).single())
         backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { controller.events.collect { fixture.events += it } }
-        controller.load("http://10.0.1.81/video", RendererStream("video/mp2t"), "Video", 120, 0, false)
+        controller.load("http://10.0.1.81/video", RendererStream("video/mp2t"), "Video", 120, startPosition, false)
         runCurrent()
         return fixture
     }
