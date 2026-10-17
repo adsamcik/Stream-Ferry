@@ -22,9 +22,9 @@ object AVTransport {
     private val TRANSPORT_STATUS = Regex("<(?:[\\w-]+:)?CurrentTransportStatus>([^<]*)</", RegexOption.IGNORE_CASE)
 
     /**
-     * Parse the transport state + status out of a raw `GetTransportInfo` SOAP response. A renderer that
-     * fails to decode the media reports `CurrentTransportStatus=ERROR_OCCURRED` (the UPnP-standard way to
-     * say "can't play that file"), which the caller uses to trigger a transcode fallback. Pure + testable.
+     * Parse the transport state + status out of a raw `GetTransportInfo` SOAP response. ERROR_OCCURRED
+     * is deliberately unclassified: UPnP also permits it for network congestion and server problems,
+     * including while playback continues. Only an explicit action fault can establish format rejection.
      */
     fun parseTransportInfo(soapResponse: String): TransportInfo = TransportInfo(
         state = TRANSPORT_STATE.find(soapResponse)?.groupValues?.get(1)?.trim()?.takeIf { it.isNotEmpty() },

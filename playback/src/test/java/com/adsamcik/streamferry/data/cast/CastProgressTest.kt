@@ -4,8 +4,11 @@ import androidx.mediarouter.media.MediaRouter
 import com.adsamcik.streamferry.core.stream.Protocol
 import com.adsamcik.streamferry.domain.DiscoveredTarget
 import com.adsamcik.streamferry.domain.PlaybackTargetEvent
+import com.adsamcik.streamferry.domain.PlaybackTargetException
+import com.adsamcik.streamferry.domain.PlaybackFailureKind
 import com.adsamcik.streamferry.domain.RendererStream
 import com.google.android.gms.cast.CastDevice
+import com.google.android.gms.cast.CastStatusCodes
 import com.google.android.gms.cast.MediaError
 import com.google.android.gms.cast.MediaInfo
 import com.google.android.gms.cast.MediaLoadRequestData
@@ -20,6 +23,7 @@ import com.google.android.gms.common.api.ResultCallback
 import com.google.android.gms.common.api.Status
 import io.mockk.*
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
@@ -35,6 +39,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
+import java.io.IOException
 
 @OptIn(ExperimentalCoroutinesApi::class)
 @RunWith(RobolectricTestRunner::class)
@@ -46,6 +51,7 @@ class CastProgressTest {
     private val mediaCallback = slot<RemoteMediaClient.Callback>()
     private val sessionListener = slot<SessionManagerListener<CastSession>>()
     private val pending = mockk<PendingResult<RemoteMediaClient.MediaChannelResult>>(relaxed = true)
+    private val loadPending = mockk<PendingResult<RemoteMediaClient.MediaChannelResult>>(relaxed = true)
     private val resultCallback = slot<ResultCallback<RemoteMediaClient.MediaChannelResult>>()
     private lateinit var controller: CastTargetController
     private lateinit var manager: SessionManager
@@ -57,6 +63,9 @@ class CastProgressTest {
     private var receiverState = MediaStatus.PLAYER_STATE_PLAYING
     private var cachedMediaUrl = "http://phone/previous/index.m3u8"
     private var loadStatus = Status.RESULT_SUCCESS
+    private var loadDetailedErrorCode: Int? = null
+    private var completeLoad = true
+    private var cachedIdleReason = MediaStatus.IDLE_REASON_NONE
     private var connected = true
     private var completeRefresh = true
     private var refreshStatus = Status.RESULT_SUCCESS
@@ -71,7 +80,6 @@ class CastProgressTest {
         val device = mockk<CastDevice>(relaxed = true)
         val status = mockk<MediaStatus>(relaxed = true)
         val mediaInfo = mockk<MediaInfo>(relaxed = true)
-        val loadPending = mockk<PendingResult<RemoteMediaClient.MediaChannelResult>>(relaxed = true)
         mockkStatic(MediaRouter::class, CastDevice::class)
         every { MediaRouter.getInstance(any()) } returns router
         every { CastDevice.getFromBundle(any()) } returns device
@@ -89,6 +97,7 @@ class CastProgressTest {
         every { client.registerCallback(capture(mediaCallback)) } just Runs
         every { client.mediaStatus } returns status
         every { status.playerState } answers { cachedState }
+        every { status.idleReason } answers { cachedIdleReason }
         every { status.mediaInfo } returns mediaInfo
         every { mediaInfo.contentId } answers { cachedMediaUrl }
         every { client.approximateStreamPosition } answers { cachedPositionMs }
@@ -97,7 +106,10 @@ class CastProgressTest {
         every { loadPending.setResultCallback(any<ResultCallback<RemoteMediaClient.MediaChannelResult>>()) } answers {
             val result = mockk<RemoteMediaClient.MediaChannelResult>()
             every { result.status } returns loadStatus
-            firstArg<ResultCallback<RemoteMediaClient.MediaChannelResult>>().onResult(result)
+            every { result.mediaError } returns loadDetailedErrorCode?.let { code ->
+                mockk<MediaError> { every { detailedErrorCode } returns code }
+            }
+            if (completeLoad) firstArg<ResultCallback<RemoteMediaClient.MediaChannelResult>>().onResult(result)
         }
         every { pending.setResultCallback(capture(resultCallback)) } answers {
             if (completeRefresh) finishRefresh()
@@ -128,6 +140,7 @@ class CastProgressTest {
         }
         val result = mockk<RemoteMediaClient.MediaChannelResult>()
         every { result.status } returns refreshStatus
+        every { result.mediaError } returns null
         resultCallback.captured.onResult(result)
         // Deliberately no onStatusUpdated: recovery must also work when the SDK stays quiet.
     }
@@ -381,8 +394,85 @@ class CastProgressTest {
         mediaCallback.captured.onMediaError(error)
         assertEquals(1, events.filterIsInstance<PlaybackTargetEvent.Error>().size)
         loadStatus = Status.RESULT_INTERNAL_ERROR
-        assertFailsWith<IllegalStateException> {
+        assertFailsWith<PlaybackTargetException> {
             controller.load("http://phone/rejected/video", RendererStream("video/mp4"), "Movie", 400, 0, true)
         }
+    }
+
+    @Test fun `failed initial load uses receiver details even while SDK still exposes the old media`() = progressTest {
+        startPlaying()
+        loadStatus = Status(CastStatusCodes.FAILED)
+        for ((code, kind) in listOf(
+            MediaError.DetailedErrorCode.HLS_NETWORK_PLAYLIST to PlaybackFailureKind.NETWORK,
+            MediaError.DetailedErrorCode.MEDIA_DECODE to PlaybackFailureKind.FORMAT,
+            MediaError.DetailedErrorCode.LOAD_FAILED to PlaybackFailureKind.UNKNOWN,
+        )) {
+            loadDetailedErrorCode = code
+            val failure = assertFailsWith<PlaybackTargetException> {
+                controller.load("http://phone/new/index.m3u8", RendererStream("application/vnd.apple.mpegurl"), "Movie", 400, 123, false)
+            }
+            assertEquals(kind, failure.kind)
+            assertEquals(kind == PlaybackFailureKind.FORMAT, failure.qualifiedFormatEvidence)
+        }
+    }
+
+    @Test fun `load command timeout is network evidence and cancels the pending request`() = progressTest {
+        startPlaying()
+        completeLoad = false
+        val loading = async { runCatching {
+            controller.load("http://phone/new/video", RendererStream("video/mp4"), "Movie", 400, 123, false)
+        } }
+        runCurrent()
+        advanceTimeBy(20_000); runCurrent()
+        val failure = loading.await().exceptionOrNull() as PlaybackTargetException
+        assertEquals(PlaybackFailureKind.NETWORK, failure.kind)
+        assertFalse(failure.qualifiedFormatEvidence)
+        verify(exactly = 1) { loadPending.cancel() }
+    }
+
+    @Test fun `superseded load timeout remains cancellation instead of triggering recovery`() = progressTest {
+        startPlaying()
+        completeLoad = false
+        val loading = async { runCatching {
+            controller.load("http://phone/new/video", RendererStream("video/mp4"), "Movie", 400, 123, false)
+        } }
+        runCurrent()
+        controller.prepareReload()
+        advanceTimeBy(20_000); runCurrent()
+        assertTrue(loading.await().exceptionOrNull() is CancellationException)
+    }
+
+    @Test fun `idle error without receiver details stays unknown`() = progressTest {
+        startPlaying()
+        cachedState = MediaStatus.PLAYER_STATE_IDLE
+        cachedIdleReason = MediaStatus.IDLE_REASON_ERROR
+        mediaCallback.captured.onStatusUpdated()
+        val failure = events.filterIsInstance<PlaybackTargetEvent.Error>().single()
+        assertEquals(PlaybackFailureKind.UNKNOWN, failure.kind)
+        assertFalse(failure.qualifiedFormatEvidence)
+    }
+
+    @Test fun `receiver canceled and replaced loads remain cancellation without format recovery`() = progressTest {
+        startPlaying()
+        for (status in listOf(CastStatusCodes.CANCELED, CastStatusCodes.REPLACED)) {
+            loadStatus = Status(status)
+            loadDetailedErrorCode = MediaError.DetailedErrorCode.MEDIA_DECODE
+            assertFailsWith<CancellationException> {
+                controller.load("http://phone/new/video", RendererStream("video/mp4"), "Movie", 400, 123, false)
+            }
+        }
+        assertTrue(events.none { it is PlaybackTargetEvent.Error })
+    }
+
+    @Test fun `synchronous command IO failure retains network cause without format evidence`() = progressTest {
+        startPlaying()
+        val ioFailure = IOException("Connection reset")
+        every { client.load(any<MediaLoadRequestData>()) } throws ioFailure
+        val failure = assertFailsWith<PlaybackTargetException> {
+            controller.load("http://phone/new/video", RendererStream("video/mp4"), "Movie", 400, 123, false)
+        }
+        assertEquals(PlaybackFailureKind.NETWORK, failure.kind)
+        assertEquals(ioFailure, failure.cause)
+        assertFalse(failure.qualifiedFormatEvidence)
     }
 }

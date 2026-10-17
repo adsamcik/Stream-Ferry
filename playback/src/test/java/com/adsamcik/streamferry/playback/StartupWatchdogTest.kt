@@ -9,14 +9,14 @@ import kotlin.test.assertTrue
 /** Covers the pure startup-watchdog heuristics (ideas 1+7): silent-failure classification + early-bail detection. */
 class StartupWatchdogTest {
 
-    @Test fun graceTimeoutWithRealProgressIsFormat() {
-        assertEquals(PlaybackFailureKind.FORMAT, StartupWatchdog.graceTimeoutKind(StartupWatchdog.MIN_PROGRESS_BYTES))
-        assertEquals(PlaybackFailureKind.FORMAT, StartupWatchdog.graceTimeoutKind(50L * 1024 * 1024))
+    @Test fun graceTimeoutWithRealProgressPreservesFormatAttempts() {
+        assertEquals(PlaybackFailureKind.NETWORK, StartupWatchdog.graceTimeoutKind(StartupWatchdog.MIN_PROGRESS_BYTES))
+        assertEquals(PlaybackFailureKind.NETWORK, StartupWatchdog.graceTimeoutKind(50L * 1024 * 1024))
     }
 
-    @Test fun graceTimeoutWithAlmostNoBytesIsUnknown() {
-        assertEquals(PlaybackFailureKind.UNKNOWN, StartupWatchdog.graceTimeoutKind(0))
-        assertEquals(PlaybackFailureKind.UNKNOWN, StartupWatchdog.graceTimeoutKind(StartupWatchdog.MIN_PROGRESS_BYTES - 1))
+    @Test fun graceTimeoutWithoutProgressIsAConnectivityFailure() {
+        assertEquals(PlaybackFailureKind.NETWORK, StartupWatchdog.graceTimeoutKind(0))
+        assertEquals(PlaybackFailureKind.NETWORK, StartupWatchdog.graceTimeoutKind(StartupWatchdog.MIN_PROGRESS_BYTES - 1))
     }
 
     @Test fun earlyRejectionWhenReadSomeThenBailedQuickly() {

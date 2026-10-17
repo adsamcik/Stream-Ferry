@@ -56,8 +56,39 @@ class PlaybackRecoverySessionTest {
         assertNull(state.reserveAlternateProtocol(protocolSwitchInput(state)))
     }
 
-    @Test fun totalAutomaticWorkIsBoundedAtSix() {
-        var state = session().copy(budget = RecoveryBudget(maxCompatibilityOrQualityVariants = 5))
+    @Test fun connectivityRecoveryCannotStarveTheFormatAllowanceOnEitherProtocol() {
+        for (first in Protocol.entries) {
+            val second = Protocol.entries.single { it != first }
+            var state = session()
+            fun connect(protocol: Protocol) {
+                repeat(2) {
+                    val retry = assertNotNull(state.reserveEndpointConnectionRetry(protocol))
+                    state = state.stop().continueFrom(retry)
+                }
+            }
+            connect(first)
+            state = assertNotNull(state.reserveRecovery(RecoveryAttemptKind.SAME_STREAM_NETWORK, PlaybackPhase.RECONNECTING))
+            val handoff = assertNotNull(state.fail().reserveAlternateProtocol(protocolSwitchInput(state)))
+            state = state.stop().continueFrom(handoff)
+            connect(second)
+            assertEquals(6, state.usage.automaticAttempts)
+            assertEquals(3, state.budgetStatus.compatibilityOrQualityVariantsRemaining)
+            repeat(3) { index ->
+                val kind = if (index == 0) RecoveryAttemptKind.FORMAT_COMPATIBILITY else RecoveryAttemptKind.LOWER_RESOLUTION
+                state = assertNotNull(state.reserveRecovery(kind, PlaybackPhase.CHANGING_STREAM))
+            }
+            assertEquals(9, state.usage.automaticAttempts)
+            assertEquals(0, state.budgetStatus.automaticAttemptsRemaining)
+            assertNull(state.reserveRecovery(RecoveryAttemptKind.FORMAT_COMPATIBILITY, PlaybackPhase.CHANGING_STREAM))
+            assertNull(state.reserveRecovery(RecoveryAttemptKind.SAME_STREAM_NETWORK, PlaybackPhase.RECONNECTING))
+            assertNull(state.reserveEndpointConnectionRetry(first))
+            assertNull(state.reserveEndpointConnectionRetry(second))
+            assertNull(state.reserveAlternateProtocol(protocolSwitchInput(state)))
+        }
+    }
+
+    @Test fun customTotalAutomaticWorkIsBoundedAtSix() {
+        var state = session().copy(budget = RecoveryBudget(maxAutomaticAttempts = 6, maxCompatibilityOrQualityVariants = 5))
         repeat(6) { index ->
             val kind = if (index == 0) RecoveryAttemptKind.SAME_STREAM_NETWORK else RecoveryAttemptKind.FORMAT_COMPATIBILITY
             state = assertNotNull(state.reserveRecovery(kind, PlaybackPhase.CHANGING_STREAM))

@@ -3755,12 +3755,19 @@ class MainViewModel(
                     container.logger.event("playback", "Playback resumed through the TV's alternate protocol")
                     return@launch
                 }
+                val terminalCause = container.playbackEngine.recoverySnapshot().attempts.lastOrNull()?.failureCause
+                    ?: latest?.failureCause ?: initialCause
                 surfaceTerminalPlaybackFailure(
                     recoveryContext,
-                    if (retrySameEndpoint) {
-                        "The connection to the TV couldn't be restored automatically."
-                    } else {
-                        "Stream Ferry tried the available compatible playback options."
+                    when (terminalCause) {
+                        PlaybackFailureCause.TRANSIENT_NETWORK, PlaybackFailureCause.ENDPOINT_UNAVAILABLE ->
+                            "The connection to the TV couldn't be restored. Check the TV and phone connection, then try again."
+                        PlaybackFailureCause.UPSTREAM_OR_SERVER_UNAVAILABLE ->
+                            "The media source is unavailable. Check its connection, then try again."
+                        PlaybackFailureCause.FORMAT_OR_CODEC, PlaybackFailureCause.AUDIO_OR_SUBTITLE ->
+                            "The TV couldn't play the available output formats. Choose another TV output or try again."
+                        else -> if (retrySameEndpoint) "The connection to the TV couldn't be restored automatically."
+                            else "Playback couldn't be restored. Check the connection and try again."
                     },
                 )
             } catch (c: CancellationException) {

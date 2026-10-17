@@ -17,6 +17,7 @@ import com.adsamcik.streamferry.diagnostics.NetworkInfoProvider
 import com.adsamcik.streamferry.domain.DiscoveredTarget
 import com.adsamcik.streamferry.domain.TargetDiscoveryMetadata
 import com.adsamcik.streamferry.domain.PlaybackFailureKind
+import com.adsamcik.streamferry.domain.PlaybackTargetException
 import com.adsamcik.streamferry.domain.PlaybackTargetController
 import com.adsamcik.streamferry.domain.PlaybackTargetEvent
 import com.adsamcik.streamferry.domain.RendererStream
@@ -84,6 +85,7 @@ class DlnaTargetController(
     /** Optional deterministic peers for debug/integration environments; release wiring leaves this empty. */
     private val configuredRenderers: List<ConfiguredDlnaRenderer> = emptyList(),
     private val pollingDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val monotonicMillis: () -> Long = { System.nanoTime() / 1_000_000 },
 ) : PlaybackTargetController {
 
     override val protocol = Protocol.DLNA
@@ -124,6 +126,8 @@ class DlnaTargetController(
     @Volatile private var loadedDurationSeconds: Long? = null
     /** Last AVTransport state seen by the poll loop (PLAYING/TRANSITIONING/STOPPED/…), for diagnostics. */
     @Volatile private var lastTransportState: String? = null
+    /** Null for an intentionally paused load; set only after a successful Play command. */
+    @Volatile private var playbackRequestedAtMillis: Long? = null
 
     private val pollScope = CoroutineScope(SupervisorJob() + pollingDispatcher)
     private var pollJob: Job? = null
@@ -514,6 +518,7 @@ class DlnaTargetController(
             }
             pendingResumeSeek = boundedStart.takeIf { it > 0 }?.let(::PendingDlnaResumeSeek)
             lastTransportState = null
+            playbackRequestedAtMillis = null
             val setUri = {
                 soap(r.avTransport, "SetAVTransportURI", buildString {
                     append("<InstanceID>0</InstanceID>")
@@ -532,7 +537,7 @@ class DlnaTargetController(
                     e is java.io.IOException
                 if (!transient) {
                     logger.e("dlna", "DLNA SetAVTransportURI failed (${stream.mimeType})", e)
-                    throw e
+                    throw classifyControlFailure(e)
                 }
                 logger.w("dlna", "DLNA SetAVTransportURI transient failure (${e.message}); settling ${SET_URI_RETRY_DELAY_MS}ms and retrying once")
                 delay(SET_URI_RETRY_DELAY_MS)
@@ -540,7 +545,7 @@ class DlnaTargetController(
                     setUri()
                 } catch (e2: Exception) {
                     logger.e("dlna", "DLNA SetAVTransportURI failed after retry (${stream.mimeType})", e2)
-                    throw e2
+                    throw classifyControlFailure(e2)
                 }
             }
             logger.event(
@@ -555,8 +560,16 @@ class DlnaTargetController(
             if (playWhenReady) play()
         }
 
-    override suspend fun play() = controlThenPoll("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
-    override suspend fun pause() = controlThenPoll("Pause", "<InstanceID>0</InstanceID>")
+    override suspend fun play() {
+        avAction("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+        playbackRequestedAtMillis = monotonicMillis()
+        pollWake.trySend(Unit)
+    }
+    override suspend fun pause() {
+        avAction("Pause", "<InstanceID>0</InstanceID>")
+        playbackRequestedAtMillis = null
+        pollWake.trySend(Unit)
+    }
     override suspend fun stop() = avAction("Stop", "<InstanceID>0</InstanceID>")
 
     override suspend fun diagnosticStatus(): String =
@@ -638,6 +651,7 @@ class DlnaTargetController(
         stopPolling()
         pendingResumeSeek = null
         loadedDurationSeconds = null
+        playbackRequestedAtMillis = null
         connected = null
         _events.tryEmit(PlaybackTargetEvent.Disconnected)
     }
@@ -661,16 +675,18 @@ class DlnaTargetController(
 
     /**
      * Poll AVTransport `GetPositionInfo` / `GetTransportInfo` so the engine receives position + ended
-     * events from DLNA renderers (which, unlike Cast, push no status updates). Best-effort: a renderer
-     * that doesn't answer simply yields no updates and adaptation falls back to proxy throughput only.
+     * events from DLNA renderers. Missing control replies and stalled startup are bounded separately
+     * from media-format recovery; neither proves that the renderer rejected a codec.
      */
     private fun startPolling() {
         stopPolling()
         val pollToken = pollSessionGate.begin()
         pollJob = pollScope.launch {
             var everPlayed = false
+            var hasObservedPlaying = false
             var furthestPositionSeconds = 0L
             var consecutiveFailures = 0
+            var transitionStartedAtMillis: Long? = null
             // Idea 8: poll fast while actively playing (need timely position + end/error detection), and
             // back off while paused/idle (position isn't moving) to cut SOAP chatter + battery.
             var intervalMs = POLL_INTERVAL_MS
@@ -687,10 +703,6 @@ class DlnaTargetController(
                     .getOrNull()
                 if (!isActive || !pollSessionGate.isCurrent(pollToken)) break
                 val state = info?.state
-                val position = runCatching { positionSeconds(r) }
-                    .onFailure { logger.trace(TAG, "GetPositionInfo failed: ${it.javaClass.simpleName}") }
-                    .getOrNull()
-                if (!isActive || !pollSessionGate.isCurrent(pollToken)) break
                 if (state == null && info?.status != "ERROR_OCCURRED") {
                     // Position alone cannot establish a usable transport (some TVs still return zero
                     // after dropping the stream). After a few missing transport replies,
@@ -702,9 +714,37 @@ class DlnaTargetController(
                         emitPollEvent(pollToken, PlaybackTargetEvent.Disconnected)
                         break
                     }
+                    // A failed paused/idle read should retry promptly. Do not spend another SOAP
+                    // timeout reading position when the transport itself did not answer.
+                    intervalMs = POLL_INTERVAL_MS
                     continue
                 }
                 consecutiveFailures = 0
+                // The status can remain ERROR_OCCURRED after a recovered server/network fault.
+                // A TV still reporting PLAYING must keep its stream rather than rotate formats.
+                if (info.status == "ERROR_OCCURRED" && state !in setOf("PLAYING", "PAUSED_PLAYBACK", "TRANSITIONING")) {
+                    emitPollEvent(pollToken, PlaybackTargetEvent.Error(PlaybackFailureKind.UNKNOWN,
+                        "The TV reported a playback error. Check its connection and try again."))
+                    break
+                }
+                val now = monotonicMillis()
+                if (state == "PLAYING") hasObservedPlaying = true
+                if (state == "PLAYING" || state == "PAUSED_PLAYBACK") {
+                    playbackRequestedAtMillis = null
+                }
+                transitionStartedAtMillis = if (state == "TRANSITIONING" &&
+                    (hasObservedPlaying || playbackRequestedAtMillis != null)
+                ) transitionStartedAtMillis ?: now else null
+                val waitingSince = transitionStartedAtMillis ?: playbackRequestedAtMillis
+                if (waitingSince != null && now - waitingSince >= TRANSPORT_READY_TIMEOUT_MS) {
+                    emitPollEvent(pollToken, PlaybackTargetEvent.Error(PlaybackFailureKind.NETWORK,
+                        "The TV did not start the stream. Check its connection and try again."))
+                    break
+                }
+                val position = runCatching { positionSeconds(r) }
+                    .onFailure { logger.trace(TAG, "GetPositionInfo failed: ${it.javaClass.simpleName}") }
+                    .getOrNull()
+                if (!isActive || !pollSessionGate.isCurrent(pollToken)) break
                 if (state != null && state != lastState) {
                     logger.event("dlna", "DLNA transport state ${lastState ?: "?"} -> $state")
                     lastState = state
@@ -778,18 +818,6 @@ class DlnaTargetController(
                         ),
                     )
                 }
-                // The renderer couldn't decode the media: UPnP reports CurrentTransportStatus=ERROR_OCCURRED
-                // (often while parked in STOPPED, with no push callback of its own). Surface it so the engine
-                // can fall back to a server transcode + retry — DLNA renderers vary wildly in codec/container
-                // support, so an optimistic direct-play can fail here just as it can on Cast.
-                if (info.status == "ERROR_OCCURRED") {
-                    logger.w("dlna", "DLNA transport status=ERROR_OCCURRED — treating as a FORMAT failure")
-                    emitPollEvent(
-                        pollToken,
-                        PlaybackTargetEvent.Error(PlaybackFailureKind.FORMAT, "DLNA playback error"),
-                    )
-                    break
-                }
                 if (state == "PLAYING" || state == "TRANSITIONING") everPlayed = true
                 val terminalOutcome = DlnaTerminalStatePolicy.classify(
                     everPlayed = everPlayed,
@@ -857,7 +885,7 @@ class DlnaTargetController(
             soap(renderer.avTransport, action, body)
         } catch (e: Exception) {
             logger.w(TAG, "DLNA $action failed", e)
-            throw e
+            throw classifyControlFailure(e)
         }
         Unit
     }
@@ -892,8 +920,8 @@ class DlnaTargetController(
             }
             val text = bytes.toString(Charsets.UTF_8)
             logger.trace(TAG, "SOAP <- $action ${resp.code}: ${LogRedactor.redact(text).take(1200)}")
-            if (!resp.isSuccessful) {
-                val upnp = TAG_UPNP_ERROR.find(text)?.groupValues?.get(1)?.toIntOrNull()
+            val upnp = TAG_UPNP_ERROR.find(text)?.groupValues?.get(1)?.toIntOrNull()
+            if (!resp.isSuccessful || upnp != null) {
                 throw SoapFaultException(action, resp.code, upnp)
             }
             return text
@@ -903,6 +931,23 @@ class DlnaTargetController(
     /** A SOAP control call rejected by the renderer, carrying the UPnP [upnpErrorCode] (e.g. 701) if present. */
     private class SoapFaultException(action: String, httpCode: Int, val upnpErrorCode: Int?) :
         IllegalStateException("SOAP $action failed: $httpCode${upnpErrorCode?.let { " (UPnP $it)" } ?: ""}")
+
+    private fun classifyControlFailure(error: Exception): Exception = when (error) {
+        is CancellationException, is PlaybackTargetException -> error
+        is IOException -> PlaybackTargetException(PlaybackFailureKind.NETWORK,
+            "Could not reach the TV. Check its connection and try again.", cause = error)
+        is SoapFaultException -> {
+            val kind = when (error.upnpErrorCode) {
+                704, 714 -> PlaybackFailureKind.FORMAT // Explicit format / MIME rejection.
+                703, 716 -> PlaybackFailureKind.NETWORK // Read failure / resource unavailable on the network.
+                null -> PlaybackFailureKind.NETWORK // HTTP failure without a structured UPnP fault.
+                else -> PlaybackFailureKind.UNKNOWN // State, busy, seek, and unspecified faults.
+            }
+            PlaybackTargetException(kind, "The TV rejected the playback command.",
+                qualifiedFormatEvidence = kind == PlaybackFailureKind.FORMAT, cause = error)
+        }
+        else -> error
+    }
 
     /**
      * Fetch a device description through the selected LAN client, bounded by the scan's remaining
@@ -962,6 +1007,7 @@ class DlnaTargetController(
         // Consecutive failed status polls (renderer unreachable) before declaring an unexpected
         // disconnect. >1 avoids reacting to a single transient SOAP timeout.
         private const val MAX_POLL_FAILURES = 3
+        private const val TRANSPORT_READY_TIMEOUT_MS = 30_000L
         // Starting a new stream while the renderer is still TRANSITIONING from the previous one fails with
         // UPnP 701 "Transition not available"; retry SetAVTransportURI once after a short settle delay so
         // switching videos quickly doesn't drop to a "TV won't play it" error.
@@ -969,7 +1015,7 @@ class DlnaTargetController(
         private const val SET_URI_RETRY_DELAY_MS = 800L
         private val TAG_REL_TIME = Regex("<(?:[\\w-]+:)?RelTime>([^<]*)</", RegexOption.IGNORE_CASE)
         private val TAG_CURRENT_VOLUME = Regex("<(?:[\\w-]+:)?CurrentVolume>\\s*([^<]+?)\\s*</", RegexOption.IGNORE_CASE)
-        private val TAG_UPNP_ERROR = Regex("<errorCode>\\s*(\\d+)\\s*</errorCode>", RegexOption.IGNORE_CASE)
+        private val TAG_UPNP_ERROR = Regex("<(?:[\\w-]+:)?errorCode>\\s*(\\d+)\\s*</(?:[\\w-]+:)?errorCode>", RegexOption.IGNORE_CASE)
 
         /**
          * Conservative capability baseline for an unknown DLNA renderer: assume common H.264 + AAC/AC3

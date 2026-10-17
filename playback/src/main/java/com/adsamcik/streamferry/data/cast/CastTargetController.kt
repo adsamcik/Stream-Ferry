@@ -7,9 +7,9 @@ import androidx.mediarouter.media.MediaRouter
 import com.google.android.gms.cast.Cast
 import com.google.android.gms.cast.CastDevice
 import com.google.android.gms.cast.CastMediaControlIntent
+import com.google.android.gms.cast.CastStatusCodes
 import com.google.android.gms.cast.HlsSegmentFormat as CastHlsSegmentFormat
 import com.google.android.gms.cast.HlsVideoSegmentFormat as CastHlsVideoSegmentFormat
-import com.google.android.gms.cast.MediaError
 import com.google.android.gms.cast.MediaInfo
 import com.google.android.gms.cast.MediaLoadRequestData
 import com.google.android.gms.cast.MediaMetadata
@@ -32,6 +32,7 @@ import com.adsamcik.streamferry.domain.HlsSegmentFormat
 import com.adsamcik.streamferry.domain.PlaybackFailureKind
 import com.adsamcik.streamferry.domain.PlaybackTargetController
 import com.adsamcik.streamferry.domain.PlaybackTargetEvent
+import com.adsamcik.streamferry.domain.PlaybackTargetException
 import com.adsamcik.streamferry.domain.RendererStream
 import com.adsamcik.streamferry.source.api.DiagnosticSink
 import kotlinx.coroutines.CancellationException
@@ -49,6 +50,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.resume
 import kotlin.time.Duration.Companion.milliseconds
+import java.io.IOException
 
 /**
  * Cast backend using the direct Google Cast Sender SDK + AndroidX MediaRouter (§10).
@@ -139,6 +141,7 @@ class CastTargetController(
     private data class MediaCommandOutcome(
         val succeeded: Boolean,
         val statusCode: Int,
+        val detailedErrorCode: Int?,
     )
 
     private var mediaCallbackRegistration: MediaCallbackRegistration? = null
@@ -335,37 +338,57 @@ class CastTargetController(
             "Cast load: type=${stream.mimeType} hlsFormat=${stream.hlsSegmentFormat} " +
                 "title=$title dur=${durationSeconds}s start=${startPositionSeconds}s autoplay=$playWhenReady url=$proxyUrl",
         )
-        awaitMediaCommand("load", activeClient.client.load(request), activeClient)
-        if (mediaLoadGeneration != loadGeneration) error("Cast load was superseded.")
+        awaitMediaCommand("load", activeClient, loadGeneration) { activeClient.client.load(request) }
+        if (mediaLoadGeneration != loadGeneration) throw CancellationException("Cast load was superseded.")
         startPositionHeartbeat(activeClient, loadGeneration)
         logger.i(TAG, "Cast load accepted (proxy URL, redacted)")
     }
 
     private suspend fun awaitMediaCommand(
         command: String,
-        pending: PendingResult<RemoteMediaClient.MediaChannelResult>,
         activeClient: ActiveMediaClient,
+        loadGeneration: Long? = null,
+        issue: () -> PendingResult<RemoteMediaClient.MediaChannelResult>,
     ) {
+        fun requireCurrentCommand() {
+            if (!isActiveMediaClient(activeClient) || (loadGeneration != null && mediaLoadGeneration != loadGeneration)) {
+                throw CancellationException("Cast $command was superseded.")
+            }
+        }
+        requireCurrentCommand()
+        val pending = try {
+            issue()
+        } catch (c: CancellationException) {
+            throw c
+        } catch (e: Exception) {
+            throw PlaybackTargetException(
+                if (e is IOException || !isActiveMediaClient(activeClient)) PlaybackFailureKind.NETWORK else PlaybackFailureKind.UNKNOWN,
+                "Couldn't send Cast $command.",
+                cause = e,
+            )
+        }
         val outcome = withTimeoutOrNull(LOAD_TIMEOUT_MS.milliseconds) {
             suspendCancellableCoroutine<MediaCommandOutcome> { cont ->
                 pending.setResultCallback { result ->
                     if (cont.isActive) {
-                        cont.resume(MediaCommandOutcome(result.status.isSuccess, result.status.statusCode))
+                        cont.resume(MediaCommandOutcome(result.status.isSuccess, result.status.statusCode, result.mediaError?.detailedErrorCode))
                     }
                 }
                 cont.invokeOnCancellation { runCatching { pending.cancel() } }
             }
-        } ?: run {
+        }
+        requireCurrentCommand()
+        if (outcome == null) {
             logger.w(TAG, "Cast $command did not complete within ${LOAD_TIMEOUT_MS}ms")
-            error("Cast $command timed out.")
+            throw PlaybackTargetException(PlaybackFailureKind.NETWORK, "Cast $command timed out.")
         }
         if (!outcome.succeeded) {
-            logger.w(TAG, "Cast $command failed (statusCode=${outcome.statusCode})")
-            error("Cast $command failed (status ${outcome.statusCode}).")
-        }
-        if (!isActiveMediaClient(activeClient)) {
-            logger.w(TAG, "Cast session changed while $command was in progress")
-            error("Cast session changed while $command was in progress.")
+            if (outcome.statusCode == CastStatusCodes.CANCELED || outcome.statusCode == CastStatusCodes.REPLACED) {
+                throw CancellationException("Cast $command was canceled or replaced (status ${outcome.statusCode}).")
+            }
+            val kind = CastFailureClassifier.command(outcome.statusCode, outcome.detailedErrorCode)
+            logger.w(TAG, "Cast $command failed (statusCode=${outcome.statusCode}, detailedCode=${outcome.detailedErrorCode}) -> $kind")
+            throw PlaybackTargetException(kind, "Cast $command failed (status ${outcome.statusCode}).", kind == PlaybackFailureKind.FORMAT)
         }
     }
 
@@ -400,7 +423,7 @@ class CastTargetController(
         action: (RemoteMediaClient) -> PendingResult<RemoteMediaClient.MediaChannelResult>,
     ) = withContext(Dispatchers.Main) {
         val activeClient = requireActiveMediaClient()
-        awaitMediaCommand(command, action(activeClient.client), activeClient)
+        awaitMediaCommand(command, activeClient) { action(activeClient.client) }
     }
 
     override suspend fun disconnect() = withContext(Dispatchers.Main) {
@@ -577,7 +600,7 @@ class CastTargetController(
         nextStatusRefreshAtMs = now + STATUS_REFRESH_INTERVAL_MS
         statusRefreshJob = callbackScope.launch {
             try {
-                awaitMediaCommand("progress refresh", activeClient.client.requestStatus(), activeClient)
+                awaitMediaCommand("progress refresh", activeClient) { activeClient.client.requestStatus() }
                 // Publish even if the SDK considers the returned status unchanged. In particular this
                 // restarts progress checkpoints after a suspended session has recovered.
                 emitStatus(activeClient.client, activeClient.generation, loadGeneration)
@@ -720,13 +743,13 @@ class CastTargetController(
                     !isExpectedMedia(activeClient.client)
                 ) return
                 // Always kept (not just under tracing): a Cast media error is a top diagnostic signal.
-                val kind = classifyCastError(e.detailedErrorCode)
+                val kind = CastFailureClassifier.mediaError(e.detailedErrorCode)
                 logger.w("cast", "Cast media error: reason=${e.reason} detailedCode=${e.detailedErrorCode} -> classified $kind")
                 _events.tryEmit(
                     PlaybackTargetEvent.Error(
                         kind,
                         "Cast playback error",
-                        qualifiedFormatEvidence = hasQualifiedFormatEvidence(e.detailedErrorCode),
+                        qualifiedFormatEvidence = kind == PlaybackFailureKind.FORMAT,
                     ),
                 )
             }
@@ -806,7 +829,7 @@ class CastTargetController(
     override suspend fun diagnosticStatus(): String = withContext(Dispatchers.Main) {
         val activeClient = activeMediaClientOrNull() ?: return@withContext "no active Cast session"
         val refreshState = try {
-            awaitMediaCommand("status refresh", activeClient.client.requestStatus(), activeClient)
+            awaitMediaCommand("status refresh", activeClient) { activeClient.client.requestStatus() }
             "ok"
         } catch (e: CancellationException) {
             throw e
@@ -830,26 +853,6 @@ class CastTargetController(
                 append(" mediaInfo=none")
             }
         }
-    }
-
-    /**
-     * Classify a Cast [MediaError.getDetailedErrorCode] so recovery can be precise: a decode / unsupported
-     * source is a FORMAT failure (transcode fallback), a media-network error is NETWORK (retry same), and
-     * anything else is UNKNOWN (treated optimistically like FORMAT for an online direct-play).
-     */
-    private fun classifyCastError(detailedErrorCode: Int?): PlaybackFailureKind = when (detailedErrorCode) {
-        MediaError.DetailedErrorCode.MEDIA_DECODE,
-        MediaError.DetailedErrorCode.MEDIA_SRC_NOT_SUPPORTED,
-        -> PlaybackFailureKind.FORMAT
-        MediaError.DetailedErrorCode.MEDIA_NETWORK -> PlaybackFailureKind.NETWORK
-        else -> PlaybackFailureKind.UNKNOWN
-    }
-
-    private fun hasQualifiedFormatEvidence(detailedErrorCode: Int?): Boolean = when (detailedErrorCode) {
-        MediaError.DetailedErrorCode.MEDIA_DECODE,
-        MediaError.DetailedErrorCode.MEDIA_SRC_NOT_SUPPORTED,
-        -> true
-        else -> false
     }
 
     private fun isCurrentGeneration(generation: Long): Boolean = connectionGeneration == generation
@@ -906,7 +909,7 @@ class CastTargetController(
     }
 
     private fun requireActiveMediaClient(): ActiveMediaClient =
-        activeMediaClientOrNull() ?: error("No active Cast session.")
+        activeMediaClientOrNull() ?: throw PlaybackTargetException(PlaybackFailureKind.NETWORK, "No active Cast session.")
 
     private fun isActiveMediaClient(activeClient: ActiveMediaClient): Boolean =
         isTrackedActiveSession(activeClient.session, activeClient.generation) &&

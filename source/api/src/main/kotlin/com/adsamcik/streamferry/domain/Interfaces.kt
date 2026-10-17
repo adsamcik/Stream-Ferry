@@ -223,6 +223,8 @@ sealed interface PlaybackTargetEvent {
      * [qualifiedFormatEvidence] is true only when the renderer supplied an explicit decode or
      * unsupported-source signal. It prevents an ambiguous transport/startup failure from being
      * remembered as a permanent "this container needs transcoding" capability rule.
+     * [PlaybackFailureKind.FORMAT] itself requires incompatible-content evidence; generic load
+     * failures, timeouts and disconnects must use NETWORK or UNKNOWN.
      */
     data class Error(
         val kind: PlaybackFailureKind,
@@ -241,6 +243,15 @@ sealed interface PlaybackTargetEvent {
  * [NETWORK] failure warrants retrying the same stream, and [UNKNOWN] is surfaced.
  */
 enum class PlaybackFailureKind { FORMAT, NETWORK, UNKNOWN }
+
+/** A failed renderer command, carrying the same classification as asynchronous receiver errors. */
+class PlaybackTargetException(
+    val kind: PlaybackFailureKind,
+    message: String,
+    val qualifiedFormatEvidence: Boolean = false,
+    cause: Throwable? = null,
+) : Exception(message, cause)
+
 
 /** Abstraction over Cast and DLNA. The controller receives ONLY the phone proxy URL. */
 interface PlaybackTargetController {

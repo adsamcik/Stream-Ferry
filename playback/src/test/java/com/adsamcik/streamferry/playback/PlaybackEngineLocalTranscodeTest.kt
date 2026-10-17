@@ -23,7 +23,9 @@ import com.adsamcik.streamferry.domain.DiscoveredTarget
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.domain.PlaybackTargetController
 import com.adsamcik.streamferry.domain.PlaybackTargetEvent
+import com.adsamcik.streamferry.domain.PlaybackTargetException
 import com.adsamcik.streamferry.domain.PlaybackFailureKind
+import com.adsamcik.streamferry.source.api.SourceHttpException
 import com.adsamcik.streamferry.source.api.TrackRef
 import com.adsamcik.streamferry.playback.proxy.ProxyForegroundStartPath
 import com.adsamcik.streamferry.playback.session.DefaultPlaybackSessionCoordinator
@@ -1283,7 +1285,7 @@ class PlaybackEngineLocalTranscodeTest {
             if (request.forceTranscode) Result.failure(IllegalStateException("Server conversion unavailable"))
             else Result.success(f.providerSession)
         }
-        coEvery { f.target.load(ORIGINAL_URL, any(), any(), any(), any(), any()) } throws IllegalStateException("Unsupported original")
+        coEvery { f.target.load(ORIGINAL_URL, any(), any(), any(), any(), any()) } throws PlaybackTargetException(PlaybackFailureKind.FORMAT, "Unsupported original", true)
         try {
             f.startOnline(); runCurrent()
             val status = assertNotNull(f.engine.status.value)
@@ -1311,7 +1313,7 @@ class PlaybackEngineLocalTranscodeTest {
             )
             Result.success(f.providerSession)
         }
-        coEvery { f.target.load(ORIGINAL_URL, any(), any(), any(), any(), any()) } throws IllegalStateException("Renderer rejected stream")
+        coEvery { f.target.load(ORIGINAL_URL, any(), any(), any(), any(), any()) } throws PlaybackTargetException(PlaybackFailureKind.FORMAT, "Renderer rejected stream", true)
         try {
             f.startOnline(); runCurrent()
             val status = assertNotNull(f.engine.status.value)
@@ -1837,6 +1839,205 @@ class PlaybackEngineLocalTranscodeTest {
                 coVerify(exactly = 1) { f.target.pause() }
                 assertEquals(false, f.engine.status.value?.playWhenReady)
                 collector.cancel()
+            } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `connectivity and ambiguous errors preserve codecs resolution and format budget for every source and protocol`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries)
+            for (kind in listOf(PlaybackFailureKind.NETWORK, PlaybackFailureKind.UNKNOWN)) {
+                val f = Fixture(this, protocol)
+                try {
+                    f.startSource(source); runCurrent()
+                    f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE); runCurrent()
+                    f.engine.pause(); runCurrent()
+                    val before = assertNotNull(f.engine.status.value)
+                    val loads = f.loads.size
+                    f.events.emit(PlaybackTargetEvent.Error(kind, "Connection interrupted")); runCurrent()
+                    val retried = assertNotNull(f.engine.status.value)
+                    assertEquals(loads + 1, f.loads.size, "$source/$protocol/$kind must retry the same output")
+                    assertEquals(before.outputFormat, retried.outputFormat)
+                    assertEquals(before.recoveryPositionSeconds, retried.recoveryPositionSeconds)
+                    assertFalse(f.loads.last().playWhenReady)
+                    assertEquals(0, f.engine.recoverySnapshot().usage.compatibilityOrQualityVariants)
+                    assertEquals(1, f.engine.recoverySnapshot().usage.sameStreamNetworkRetries)
+                    f.events.emit(PlaybackTargetEvent.Error(kind, "Still disconnected")); runCurrent()
+                    assertTrue(f.engine.status.value?.isTerminal == true)
+                    assertEquals(loads + 1, f.loads.size, "retry must be bounded")
+                    assertEquals(0, f.engine.recoverySnapshot().usage.compatibilityOrQualityVariants)
+                } finally { f.engine.stop(); runCurrent() }
+            }
+    }
+
+    @Test fun `unclassified and network load failures do not start format conversion for either protocol`() = runTest {
+        for (protocol in Protocol.entries) for (failure in listOf(
+            IllegalStateException("Receiver request timed out"),
+            PlaybackTargetException(PlaybackFailureKind.NETWORK, "Media fetch failed"),
+            java.io.IOException("Connection reset"),
+        )) {
+            val f = Fixture(this, protocol)
+            coEvery { f.target.load(any(), any(), any(), any(), any(), any()) } throws failure
+            try {
+                assertFailsWith<Exception> { f.startOnline() }
+                assertEquals(listOf(false), f.requests.map { it.forceTranscode })
+                assertEquals(0, f.engine.recoverySnapshot().usage.compatibilityOrQualityVariants)
+                coVerify(exactly = 0) { f.coordinator.startClientTranscodeAndBuildUrl(any(), any()) }
+            } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `source connection failures never trigger automatic phone conversion`() = runTest {
+        for (protocol in Protocol.entries) for (failure in listOf(
+            java.io.IOException("Source connection timed out"), SourceHttpException(401),
+            SourceHttpException(403), SourceHttpException(404), SourceHttpException(429),
+            SourceHttpException(502), SourceHttpException(503), SourceHttpException(504),
+        )) {
+            val f = Fixture(this, protocol)
+            coEvery { f.provider.prepare(any()) } answers {
+                f.requests += firstArg<PlaybackRequest>()
+                Result.failure(failure)
+            }
+            try {
+                assertFailsWith<Exception> { f.startOnline() }
+                assertEquals(1, f.requests.size)
+                assertEquals(0, f.engine.recoverySnapshot().usage.compatibilityOrQualityVariants)
+                val attempt = f.engine.recoverySnapshot().attempts.last()
+                assertEquals(protocol.name, attempt.protocol)
+                assertEquals(PlaybackFailureStage.STREAM_RESOLUTION, attempt.failureStage)
+                assertEquals(PlaybackFailureCause.UPSTREAM_OR_SERVER_UNAVAILABLE, attempt.failureCause)
+                assertNull(f.engine.reserveAlternateProtocolContinuation(
+                    hasAlternateProtocol = true, failureStage = assertNotNull(attempt.failureStage),
+                    failureCause = assertNotNull(attempt.failureCause), sameEndpointRecoveryExhausted = true,
+                    isOnlineSessionHint = true,
+                ), "A source outage must not try another TV protocol")
+                coVerify(exactly = 0) { f.coordinator.startClientTranscodeAndBuildUrl(any(), any()) }
+            } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `startup timeouts preserve format attempts and stop retrying for every source and protocol`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) {
+            val f = Fixture(this, protocol)
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE); runCurrent()
+                val output = f.engine.status.value?.outputFormat
+                val loads = f.loads.size
+                advanceTimeBy(StartupWatchdog.GRACE_MS + 1); runCurrent()
+                assertEquals(loads + 1, f.loads.size, "$source/$protocol timeout did not retry")
+                assertEquals(output, f.engine.status.value?.outputFormat)
+                advanceTimeBy(StartupWatchdog.GRACE_MS + 1); runCurrent()
+                assertTrue(f.engine.status.value?.isTerminal == true, "$source/$protocol startup remained stuck")
+                assertEquals(loads + 1, f.loads.size)
+                assertEquals(0, f.engine.recoverySnapshot().usage.compatibilityOrQualityVariants)
+            } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `connection failure during codec recovery retains network cause for every source and protocol`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) {
+            val f = Fixture(this, protocol)
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE); runCurrent()
+                coEvery { f.target.load(any(), any(), any(), any(), any(), any()) } throws
+                    PlaybackTargetException(PlaybackFailureKind.NETWORK, "TV unavailable")
+                f.events.emit(PlaybackTargetEvent.Error(PlaybackFailureKind.FORMAT, "Unsupported codec")); runCurrent()
+                assertTrue(f.engine.status.value?.isTerminal == true)
+                assertEquals(PlaybackFailureCause.TRANSIENT_NETWORK,
+                    f.engine.recoverySnapshot().attempts.last().failureCause)
+                assertEquals(1, f.engine.recoverySnapshot().usage.compatibilityOrQualityVariants)
+            } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `callback and failed load result make one format recovery decision`() = runTest {
+        for (protocol in Protocol.entries) {
+            val f = Fixture(this, protocol)
+            var rejected = false
+            coEvery { f.target.load(any(), any(), any(), any(), any(), any()) } coAnswers {
+                f.loads += LoadedStream(firstArg(), arg(3), arg(4), arg(5))
+                if (!rejected) {
+                    rejected = true
+                    while (f.events.subscriptionCount.value == 0) yield()
+                    f.events.emit(PlaybackTargetEvent.Error(PlaybackFailureKind.FORMAT, "Unsupported original", true))
+                    yield()
+                    throw PlaybackTargetException(PlaybackFailureKind.UNKNOWN, "Load failed")
+                }
+            }
+            try {
+                f.startOnline(); runCurrent()
+                assertEquals(2, f.loads.size, "$protocol lost or duplicated format fallback")
+                assertEquals(listOf(false, true), f.requests.map { it.forceTranscode })
+                assertEquals(1, f.engine.recoverySnapshot().usage.compatibilityOrQualityVariants)
+                assertNull(f.engine.status.value?.errorMessage)
+            } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `callback and failed network command cannot queue orphan recovery for any source or protocol`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) {
+            val f = Fixture(this, protocol)
+            var calls = 0
+            coEvery { f.target.load(any(), any(), any(), any(), any(), any()) } coAnswers {
+                calls++
+                while (f.events.subscriptionCount.value == 0) yield()
+                f.events.emit(PlaybackTargetEvent.Error(PlaybackFailureKind.NETWORK, "Fetch failed"))
+                yield()
+                throw PlaybackTargetException(PlaybackFailureKind.NETWORK, "Load failed")
+            }
+            try {
+                assertFailsWith<PlaybackTargetException> { f.startSource(source) }
+                runCurrent()
+                assertEquals(1, calls, "$source/$protocol queued recovery after failed startup cleanup")
+                assertEquals(0, f.engine.recoverySnapshot().usage.compatibilityOrQualityVariants)
+                assertEquals(PlaybackFailureCause.TRANSIENT_NETWORK,
+                    f.engine.recoverySnapshot().attempts.last().failureCause)
+            } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `callback during accepted load recovers once after startup for every source and protocol`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) {
+            val f = Fixture(this, protocol)
+            var first = true
+            coEvery { f.target.load(any(), any(), any(), any(), any(), any()) } coAnswers {
+                f.loads += LoadedStream(firstArg(), arg(3), arg(4), arg(5))
+                if (first) {
+                    first = false
+                    while (f.events.subscriptionCount.value == 0) yield()
+                    repeat(2) { f.events.emit(PlaybackTargetEvent.Error(PlaybackFailureKind.NETWORK, "Fetch failed")) }
+                    yield()
+                }
+            }
+            try {
+                f.startSource(source); runCurrent()
+                assertEquals(2, f.loads.size, "$source/$protocol lost or duplicated recovery")
+                assertEquals(1, f.engine.recoverySnapshot().usage.sameStreamNetworkRetries)
+                assertEquals(0, f.engine.recoverySnapshot().usage.compatibilityOrQualityVariants)
+                assertNull(f.engine.status.value?.errorMessage)
+            } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `disconnect owns recovery over queued load errors for every source and protocol`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) {
+            val f = Fixture(this, protocol)
+            coEvery { f.target.load(any(), any(), any(), any(), any(), any()) } coAnswers {
+                f.loads += LoadedStream(firstArg(), arg(3), arg(4), arg(5))
+                while (f.events.subscriptionCount.value == 0) yield()
+                f.events.emit(PlaybackTargetEvent.Error(PlaybackFailureKind.FORMAT, "Media failed"))
+                f.events.emit(PlaybackTargetEvent.Disconnected)
+                yield()
+            }
+            try {
+                f.startSource(source); runCurrent()
+                assertTrue(f.engine.status.value?.connectionLost == true)
+                advanceTimeBy(StartupWatchdog.GRACE_MS + 1); runCurrent()
+                assertEquals(1, f.loads.size, "$source/$protocol media fallback raced endpoint recovery")
+                assertEquals(0, f.engine.recoverySnapshot().usage.compatibilityOrQualityVariants)
+                assertEquals(PlaybackFailureCause.ENDPOINT_UNAVAILABLE,
+                    f.engine.recoverySnapshot().attempts.last().failureCause)
             } finally { f.engine.stop(); runCurrent() }
         }
     }

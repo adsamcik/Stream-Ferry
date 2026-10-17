@@ -14,8 +14,7 @@ object StartupWatchdog {
      *  a slow-but-healthy start isn't cut off; [isEarlyRejection] catches obvious rejections much sooner. */
     const val GRACE_MS = 12_000L
 
-    /** ">= this many bytes flowed but it never played" reads as a decode/format failure (transcodable);
-     *  less means the TV never really fetched (a connectivity/URL problem transcoding wouldn't fix). */
+    /** Diagnostic progress threshold. Downloaded bytes alone never establish decoder incompatibility. */
     const val MIN_PROGRESS_BYTES = 256L * 1024
 
     /** Lower bound for the fast path: a close under this is a range/HEAD probe, not a real read. */
@@ -28,14 +27,14 @@ object StartupWatchdog {
     const val FAST_FAIL_MS = 8_000L
 
     /** The failure kind to recover with when [GRACE_MS] elapses without playback starting. */
-    fun graceTimeoutKind(bytesServed: Long): PlaybackFailureKind =
-        if (bytesServed >= MIN_PROGRESS_BYTES) PlaybackFailureKind.FORMAT else PlaybackFailureKind.UNKNOWN
+    fun graceTimeoutKind(@Suppress("UNUSED_PARAMETER") bytesServed: Long): PlaybackFailureKind =
+        PlaybackFailureKind.NETWORK
 
     /**
      * True if a downstream connection that delivered [bytesServed] bytes over [durationMs] ms looks like a
-     * "tried to play, then bailed" rejection — read more than a probe but less than a viable amount, and
-     * closed quickly. Used only before playback has started, so a false positive merely triggers an early
-     * (harmless) transcode instead of aborting healthy playback.
+     * an interrupted progressive download — read more than a probe but less than a viable amount, and
+     * closed quickly. Used only before playback has started; recovery preserves the encoding because
+     * a disconnect is not decoder evidence.
      */
     fun isEarlyRejection(bytesServed: Long, durationMs: Long): Boolean =
         bytesServed in PROBE_BYTES until VIABLE_BYTES && durationMs < FAST_FAIL_MS

@@ -29,11 +29,8 @@ enum class RecoveryAction {
  *  - while a reload is in flight, any error is from the old stream -> [RecoveryAction.IGNORE_DURING_RELOAD];
  *  - a [PlaybackFailureKind.NETWORK] blip is retried once on the same stream ([RecoveryAction.RETRY_SAME_STREAM])
  *    — transcoding wouldn't fix connectivity;
- *  - a decode/format failure (or an [PlaybackFailureKind.UNKNOWN] one, treated optimistically the same way)
- *    on an online, direct-play session that isn't already transcoding falls back once to a server transcode
- *    ([RecoveryAction.TRANSCODE_FALLBACK]);
- *  - everything else (local file, already server-transcoding, or already recovered) is surfaced
- *    ([RecoveryAction.SURFACE]).
+ *  - ambiguous failures retry the unchanged stream once; they do not establish codec incompatibility;
+ *  - only explicit format failures change encoding or resolution.
  *
  * @param alreadyTranscoding true if the current stream is already a server transcode (Cast HLS, a prior
  *   fallback, or the user forced transcode) — nothing safer to fall back to server-side.
@@ -50,7 +47,7 @@ fun decideRecovery(
     hasLowerResolutionFallback: Boolean = false,
 ): RecoveryAction = when {
     isReloading -> RecoveryAction.IGNORE_DURING_RELOAD
-    failure == PlaybackFailureKind.NETWORK ->
+    failure != PlaybackFailureKind.FORMAT ->
         if (alreadyRetried) RecoveryAction.SURFACE else RecoveryAction.RETRY_SAME_STREAM
     isOnlineSession && preferDirectPlay && !alreadyTranscoding -> RecoveryAction.TRANSCODE_FALLBACK
     isOnlineSession && alreadyTranscoding && hasLowerResolutionFallback ->

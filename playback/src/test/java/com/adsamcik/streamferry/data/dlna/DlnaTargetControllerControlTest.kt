@@ -4,6 +4,8 @@ import android.net.Network
 import com.adsamcik.streamferry.core.dlna.DidlLite
 import com.adsamcik.streamferry.diagnostics.NetworkInfoProvider
 import com.adsamcik.streamferry.domain.PlaybackTargetEvent
+import com.adsamcik.streamferry.domain.PlaybackFailureKind
+import com.adsamcik.streamferry.domain.PlaybackTargetException
 import com.adsamcik.streamferry.domain.RendererStream
 import com.adsamcik.streamferry.source.api.DiagnosticSink
 import io.mockk.every
@@ -25,6 +27,7 @@ import okhttp3.Protocol
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import okio.Buffer
+import java.io.IOException
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -220,18 +223,123 @@ class DlnaTargetControllerControlTest {
     }
 
     @Test
-    fun `explicit transport error without state keeps its decoder failure instead of becoming a disconnect`() = runTest {
+    fun `generic transport error does not claim a decoder failure or emit misleading stopped status`() = runTest {
         val fixture = pollingFixture()
         try {
+            // Fixture loading uses real IO; discard any status observed before that load returned.
+            fixture.events.clear()
             val error = async(UnconfinedTestDispatcher(testScheduler)) {
                 fixture.controller.events.first { it is PlaybackTargetEvent.Error }
             }
             fixture.transportState = null
             fixture.transportStatus = "ERROR_OCCURRED"
             error.await()
-            assertEquals(com.adsamcik.streamferry.domain.PlaybackFailureKind.FORMAT,
+            assertEquals(PlaybackFailureKind.UNKNOWN,
                 fixture.events.filterIsInstance<PlaybackTargetEvent.Error>().single().kind)
+            assertTrue(fixture.events.none { it is PlaybackTargetEvent.StatusChanged })
             assertTrue(fixture.events.none { it is PlaybackTargetEvent.Disconnected })
+        } finally { fixture.controller.disconnect() }
+    }
+
+    @Test
+    fun `playing renderer survives sticky generic transport error`() = runTest {
+        val fixture = pollingFixture()
+        try {
+            fixture.transportStatus = "ERROR_OCCURRED"
+            repeat(3) {
+                fixture.positionSeconds++
+                val expectedPosition = fixture.positionSeconds
+                val progressed = async(UnconfinedTestDispatcher(testScheduler)) {
+                    fixture.controller.events.first {
+                        it is PlaybackTargetEvent.StatusChanged && it.positionSeconds == expectedPosition
+                    }
+                }
+                progressed.await()
+            }
+            assertTrue(fixture.events.filterIsInstance<PlaybackTargetEvent.StatusChanged>().size >= 3)
+            assertTrue(fixture.events.none { it is PlaybackTargetEvent.Error || it is PlaybackTargetEvent.Disconnected })
+        } finally { fixture.controller.disconnect() }
+    }
+
+    @Test
+    fun `transitioning is bounded without making a format claim`() = runTest {
+        val fixture = pollingFixture(initialState = "TRANSITIONING")
+        try {
+            fixture.playStartsPlayback = false
+            fixture.controller.play()
+            val startedAt = testScheduler.currentTime
+            val error = async(UnconfinedTestDispatcher(testScheduler)) {
+                fixture.controller.events.first { it is PlaybackTargetEvent.Error } as PlaybackTargetEvent.Error
+            }.await()
+            assertTrue(testScheduler.currentTime - startedAt in 30_000L..40_000L)
+            assertEquals(PlaybackFailureKind.NETWORK, error.kind)
+            assertFalse(error.qualifiedFormatEvidence)
+            advanceTimeBy(40_000); runCurrent()
+            assertEquals(1, fixture.events.filterIsInstance<PlaybackTargetEvent.Error>().size)
+        } finally { fixture.controller.disconnect() }
+    }
+
+    @Test
+    fun `accepted play that stays stopped has a startup deadline while paused load does not`() = runTest {
+        val fixture = pollingFixture(initialState = "STOPPED")
+        try {
+            advanceTimeBy(40_000); runCurrent()
+            assertTrue(fixture.events.none { it is PlaybackTargetEvent.Error })
+            fixture.playStartsPlayback = false
+            fixture.controller.play()
+            val startedAt = testScheduler.currentTime
+            val error = async(UnconfinedTestDispatcher(testScheduler)) {
+                fixture.controller.events.first { it is PlaybackTargetEvent.Error } as PlaybackTargetEvent.Error
+            }.await()
+            assertTrue(testScheduler.currentTime - startedAt in 30_000L..40_000L)
+            assertEquals(PlaybackFailureKind.NETWORK, error.kind)
+        } finally { fixture.controller.disconnect() }
+    }
+
+    @Test
+    fun `explicit UPnP format rejection is separated from busy network and transition faults`() = runTest {
+        val fixture = pollingFixture()
+        try {
+            for ((code, expected) in listOf(
+                704 to PlaybackFailureKind.FORMAT, 714 to PlaybackFailureKind.FORMAT,
+                701 to PlaybackFailureKind.UNKNOWN, 705 to PlaybackFailureKind.UNKNOWN,
+                715 to PlaybackFailureKind.UNKNOWN, 703 to PlaybackFailureKind.NETWORK,
+                716 to PlaybackFailureKind.NETWORK,
+            )) {
+                fixture.playFaultCode = code
+                val failure = assertFailsWith<PlaybackTargetException> { fixture.controller.play() }
+                assertEquals(expected, failure.kind, "UPnP $code")
+                assertEquals(expected == PlaybackFailureKind.FORMAT, failure.qualifiedFormatEvidence)
+            }
+            fixture.playFaultCode = null
+            fixture.playIoFailure = true
+            val failure = assertFailsWith<PlaybackTargetException> { fixture.controller.play() }
+            assertEquals(PlaybackFailureKind.NETWORK, failure.kind)
+            assertFalse(failure.qualifiedFormatEvidence)
+        } finally { fixture.controller.disconnect() }
+    }
+
+    @Test
+    fun `disconnect invalidates a pending startup timeout`() = runTest {
+        val fixture = pollingFixture(initialState = "TRANSITIONING")
+        fixture.playStartsPlayback = false
+        fixture.controller.play()
+        advanceTimeBy(10_000); runCurrent()
+        fixture.controller.disconnect()
+        advanceTimeBy(40_000); runCurrent()
+        assertTrue(fixture.events.none { it is PlaybackTargetEvent.Error })
+    }
+
+    @Test
+    fun `load preserves namespaced unsupported MIME fault even with successful HTTP status`() = runTest {
+        val fixture = pollingFixture()
+        try {
+            fixture.setUriFaultCode = 714
+            val failure = assertFailsWith<PlaybackTargetException> {
+                fixture.controller.load("http://10.0.1.81/video", RendererStream("video/mp2t"), "Video", 120, 0, false)
+            }
+            assertEquals(PlaybackFailureKind.FORMAT, failure.kind)
+            assertTrue(failure.qualifiedFormatEvidence)
         } finally { fixture.controller.disconnect() }
     }
 
@@ -241,6 +349,10 @@ class DlnaTargetControllerControlTest {
         var positionSeconds = 42L
         var failedSeeksRemaining = 0
         var playCommands = 0
+        var playStartsPlayback = true
+        var playFaultCode: Int? = null
+        var playIoFailure = false
+        var setUriFaultCode: Int? = null
         val seekTargets = mutableListOf<String>()
         val events = mutableListOf<PlaybackTargetEvent>()
     }
@@ -268,10 +380,19 @@ class DlnaTargetControllerControlTest {
                     "<CurrentTransportState>$it</CurrentTransportState><CurrentTransportStatus>${fixture.transportStatus}</CurrentTransportStatus>"
                 } ?: "<CurrentTransportStatus>${fixture.transportStatus}</CurrentTransportStatus>"
                 action == "GetPositionInfo" -> "<RelTime>${DidlLite.formatDuration(fixture.positionSeconds)}</RelTime>"
+                action == "SetAVTransportURI" && fixture.setUriFaultCode != null ->
+                    "<upnp:errorCode>${fixture.setUriFaultCode}</upnp:errorCode>"
                 action == "Play" -> {
                     fixture.playCommands++
-                    fixture.transportState = "PLAYING"
-                    "<Response/>"
+                    if (fixture.playIoFailure) throw IOException("Connection lost")
+                    val fault = fixture.playFaultCode
+                    if (fault != null) {
+                        responseCode = 500
+                        "<upnp:errorCode>$fault</upnp:errorCode>"
+                    } else {
+                        if (fixture.playStartsPlayback) fixture.transportState = "PLAYING"
+                        "<Response/>"
+                    }
                 }
                 action == "Seek" -> {
                     val buffer = Buffer()
@@ -295,6 +416,7 @@ class DlnaTargetControllerControlTest {
             mockk<DiagnosticSink>(relaxed = true), network, http,
             configuredRenderers = listOf(ConfiguredDlnaRenderer("http://10.0.1.44/description.xml", "uuid:test-tv", "10.0.1.44")),
             pollingDispatcher = StandardTestDispatcher(testScheduler),
+            monotonicMillis = { testScheduler.currentTime },
         )
         fixture = PollingFixture(controller)
         fixture.transportState = initialState

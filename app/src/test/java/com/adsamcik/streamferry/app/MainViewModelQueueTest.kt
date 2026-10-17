@@ -314,6 +314,18 @@ class MainViewModelQueueTest {
         assertNull(stopped.vm.state.value.playback)
     }
 
+    @Test fun `terminal network recovery reports connection failure instead of exhausted formats for every source`() {
+        for (item in retrySources()) {
+            val fixture = automaticFallbackFixture(item, startup = false, rejection = "unrelated",
+                failureCause = PlaybackFailureCause.TRANSIENT_NETWORK)
+            val failed = assertNotNull(fixture.vm.state.value.playback)
+            assertTrue(failed.isTerminal)
+            assertEquals("The connection to the TV couldn't be restored. Check the TV and phone connection, then try again.",
+                failed.errorMessage)
+            fixture.vm.viewModelScope.cancel()
+        }
+    }
+
     private data class AutomaticFallbackFixture(
         val vm: MainViewModel,
         val continuation: PlaybackRecoveryContinuation,
@@ -326,6 +338,7 @@ class MainViewModelQueueTest {
         rejection: String? = null,
         discoveryError: Throwable? = null,
         stopDuringDiscovery: Boolean = false,
+        failureCause: PlaybackFailureCause = PlaybackFailureCause.ENDPOINT_UNAVAILABLE,
     ): AutomaticFallbackFixture {
         val engine = container.playbackEngine
         val statuses = MutableStateFlow<PlaybackStatus?>(null)
@@ -345,7 +358,7 @@ class MainViewModelQueueTest {
         val attempt = PlaybackAttemptDescriptor(
             generation = 1, protocol = Protocol.CAST.name,
             failureStage = PlaybackFailureStage.ENDPOINT_CONNECTION,
-            failureCause = PlaybackFailureCause.ENDPOINT_UNAVAILABLE,
+            failureCause = failureCause,
         )
         every { engine.recoverySnapshot() } returns PlaybackRecoverySession(
             phase = PlaybackPhase.FAILED, attempts = listOf(attempt),

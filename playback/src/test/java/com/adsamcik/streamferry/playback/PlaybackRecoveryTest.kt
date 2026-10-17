@@ -33,11 +33,15 @@ class PlaybackRecoveryTest {
     @Test fun formatFailureFallsBackToTranscode() =
         assertEquals(RecoveryAction.TRANSCODE_FALLBACK, decide(failure = PlaybackFailureKind.FORMAT))
 
-    @Test fun unknownFailureFallsBackToTranscodeOptimistically() =
-        assertEquals(RecoveryAction.TRANSCODE_FALLBACK, decide(failure = PlaybackFailureKind.UNKNOWN))
+    @Test fun unknownFailureRetriesWithoutChangingFormat() =
+        assertEquals(RecoveryAction.RETRY_SAME_STREAM, decide(failure = PlaybackFailureKind.UNKNOWN))
 
     @Test fun networkFailureRetriesSameStreamOnce() =
         assertEquals(RecoveryAction.RETRY_SAME_STREAM, decide(failure = PlaybackFailureKind.NETWORK))
+
+    @Test fun unknownFailureAfterRetrySurfacesWithoutLoweringResolution() =
+        assertEquals(RecoveryAction.SURFACE, decide(failure = PlaybackFailureKind.UNKNOWN,
+            alreadyRetried = true, alreadyTranscoding = true, hasLowerResolutionFallback = true))
 
     @Test fun networkFailureAfterRetrySurfaces() =
         assertEquals(RecoveryAction.SURFACE, decide(failure = PlaybackFailureKind.NETWORK, alreadyRetried = true))

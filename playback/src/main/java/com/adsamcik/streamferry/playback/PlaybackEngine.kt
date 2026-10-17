@@ -20,6 +20,7 @@ import com.adsamcik.streamferry.domain.DiscoveredTarget
 import com.adsamcik.streamferry.domain.HlsSegmentFormat
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.domain.MediaTrack
+import com.adsamcik.streamferry.domain.PlaybackTargetException
 import com.adsamcik.streamferry.domain.PlaybackFailureKind
 import com.adsamcik.streamferry.domain.PlaybackTargetController
 import com.adsamcik.streamferry.domain.PlaybackTargetEvent
@@ -29,6 +30,7 @@ import com.adsamcik.streamferry.source.api.PlaybackProvider
 import com.adsamcik.streamferry.source.api.PlaybackRequest
 import com.adsamcik.streamferry.source.api.PlaybackStopReason
 import com.adsamcik.streamferry.source.api.ProviderPlaybackSession
+import com.adsamcik.streamferry.source.api.SourceHttpException
 import com.adsamcik.streamferry.source.api.TrackRef
 import com.adsamcik.streamferry.playback.session.DefaultPlaybackSessionCoordinator
 import com.adsamcik.streamferry.core.stream.StreamSelectionService
@@ -392,6 +394,9 @@ class PlaybackEngine(
     // Serializes the failure decision + re-entry flags so the event collector, the watchdog and the proxy
     // early-close signal can't race into a double recovery. See handlePlaybackFailure.
     private val recoveryLock = Any()
+    private class RendererLoadErrors(var pending: PlaybackTargetEvent.Error? = null)
+    private var rendererLoadErrors: RendererLoadErrors? = null
+
     // Monotonic id of the current live playback session, bumped on every new play()/playLocal(). An
     // end-of-media (Ended) handler captures the generation it belongs to and only tears the session down
     // if it is still current, so a stale "finished" from a just-stopped stream can't kill a newer session
@@ -630,7 +635,7 @@ class PlaybackEngine(
                 val cause = when {
                     e.isPreparationFailure() -> PlaybackFailureCause.UPSTREAM_OR_SERVER_UNAVAILABLE
                     !endpointConnected -> PlaybackFailureCause.ENDPOINT_UNAVAILABLE
-                    else -> PlaybackFailureCause.UNKNOWN
+                    else -> e.rendererFailureKind().toRecoveryCause()
                 }
                 recoverySession = recoverySession
                     .recordFailure(stage, cause)
@@ -757,7 +762,7 @@ class PlaybackEngine(
             val cause = when {
                 e.isPreparationFailure() -> PlaybackFailureCause.UPSTREAM_OR_SERVER_UNAVAILABLE
                 !endpointConnected -> PlaybackFailureCause.ENDPOINT_UNAVAILABLE
-                else -> PlaybackFailureCause.UNKNOWN
+                else -> e.rendererFailureKind().toRecoveryCause()
             }
             recordStartupFailure(stage, cause, PlaybackAttemptSourceKind.ONLINE)
             smartResume.checkpoint(SmartResumeCheckpointKind.FAILURE, smartResumeDeviceContext)
@@ -1177,7 +1182,7 @@ class PlaybackEngine(
             val cause = when {
                 e.isPreparationFailure() -> PlaybackFailureCause.UPSTREAM_OR_SERVER_UNAVAILABLE
                 !endpointConnected -> PlaybackFailureCause.ENDPOINT_UNAVAILABLE
-                else -> PlaybackFailureCause.UNKNOWN
+                else -> e.rendererFailureKind().toRecoveryCause()
             }
             recordStartupFailure(stage, cause, PlaybackAttemptSourceKind.LOCAL)
             smartResume.checkpoint(SmartResumeCheckpointKind.FAILURE, smartResumeDeviceContext)
@@ -1360,19 +1365,21 @@ class PlaybackEngine(
         armRendererResumeVerification(rendererStart)
         armRendererStartSettle(rendererStart)
         val loadIntent = localPlayWhenReady
-        tgt.load(
-            url,
-            streamForTv,
-            params.title,
-            effectiveRuntimeSeconds?.let { if (transcodeTarget != null) (it - boundedStartPos).coerceAtLeast(0) else it },
-            startPositionSeconds = rendererStart,
-            playWhenReady = loadIntent,
-        )
-        reconcileStartupPlaybackIntent(tgt, loadIntent)
-        armRendererStartSettle(rendererStart)
-        if (localPlayWhenReady && !playbackStarted) armStartupWatchdog(attemptGeneration)
-        publishStatus()
-        logger.event("playback", "Playing ${params.title} -> ${sel.displayName} (${sel.protocol})")
+        withRendererLoadErrors(attemptGeneration) {
+            tgt.load(
+                url,
+                streamForTv,
+                params.title,
+                effectiveRuntimeSeconds?.let { if (transcodeTarget != null) (it - boundedStartPos).coerceAtLeast(0) else it },
+                startPositionSeconds = rendererStart,
+                playWhenReady = loadIntent,
+            )
+            reconcileStartupPlaybackIntent(tgt, loadIntent)
+            armRendererStartSettle(rendererStart)
+            if (localPlayWhenReady && !playbackStarted) armStartupWatchdog(attemptGeneration)
+            publishStatus()
+            logger.event("playback", "Playing ${params.title} -> ${sel.displayName} (${sel.protocol})")
+        }
     }
 
     /** Every source uses the same encoder and output admission; only receiver delivery differs. */
@@ -2058,6 +2065,62 @@ class PlaybackEngine(
         throw PlaybackPreparationException(message, e)
     }
 
+    private fun Throwable.rendererFailureKind(): PlaybackFailureKind =
+        generateSequence(this) { it.cause }.filterIsInstance<PlaybackTargetException>().firstOrNull()?.kind
+            ?: if (generateSequence(this) { it.cause }.any { it is java.io.IOException })
+                PlaybackFailureKind.NETWORK else PlaybackFailureKind.UNKNOWN
+
+    /** HTTP availability, authentication and missing-source failures cannot be repaired by encoding. */
+    private fun Throwable.isSourceAccessFailure(): Boolean =
+        rendererFailureKind() == PlaybackFailureKind.NETWORK ||
+            generateSequence(this) { it.cause }.any { it is SourceHttpException }
+
+    private fun strongerRendererFailure(
+        first: PlaybackTargetEvent.Error?, second: PlaybackTargetEvent.Error,
+    ): PlaybackTargetEvent.Error {
+        fun rank(kind: PlaybackFailureKind) = when (kind) {
+            PlaybackFailureKind.NETWORK -> 2
+            PlaybackFailureKind.FORMAT -> 1
+            PlaybackFailureKind.UNKNOWN -> 0
+        }
+        return if (first != null && rank(first.kind) >= rank(second.kind)) first else second
+    }
+
+    /** One receiver load can fail through both a callback and its command result. Decide only once. */
+    private suspend fun withRendererLoadErrors(generation: Long, load: suspend () -> Unit) {
+        val errors = RendererLoadErrors()
+        synchronized(recoveryLock) { rendererLoadErrors = errors }
+        try {
+            load()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            val callback = synchronized(recoveryLock) { errors.pending }
+            if (callback != null) {
+                val combined = strongerRendererFailure(callback,
+                    PlaybackTargetEvent.Error(error.rendererFailureKind(), error.message.orEmpty()))
+                if (combined.kind != error.rendererFailureKind()) {
+                    throw PlaybackTargetException(combined.kind, combined.redactedMessage,
+                        combined.qualifiedFormatEvidence, error)
+                }
+            }
+            throw error
+        } finally {
+            synchronized(recoveryLock) {
+                if (rendererLoadErrors === errors) rendererLoadErrors = null
+            }
+        }
+        val pending = synchronized(recoveryLock) { errors.pending } ?: return
+        // Finish initial startup/reload bookkeeping before a callback can claim the recovery window.
+        // Stop or another load invalidates this exact generation while this delivery waits for mutex.
+        scope.launch {
+            mutex.withLock {
+                handlePlaybackFailure(pending.kind, pending.redactedMessage,
+                    pending.qualifiedFormatEvidence, expectedGeneration = generation)
+            }
+        }
+    }
+
     private fun Throwable.isPreparationFailure(): Boolean =
         generateSequence(this) { it.cause }.any { it is PlaybackPreparationException }
 
@@ -2075,19 +2138,21 @@ class PlaybackEngine(
         }
     }
 
-    /** A connect handshake can fail before normal media resolution creates its first load attempt. */
+    /** Connection or source preparation can fail before a renderer load creates its first attempt. */
     private fun recordStartupFailure(
         stage: PlaybackFailureStage,
         cause: PlaybackFailureCause,
         sourceKind: PlaybackAttemptSourceKind,
     ) {
-        if (stage == PlaybackFailureStage.ENDPOINT_CONNECTION) {
+        if (stage == PlaybackFailureStage.ENDPOINT_CONNECTION || stage == PlaybackFailureStage.STREAM_RESOLUTION ||
+            recoverySession.attempts.isEmpty()) {
             recoverySession = recoverySession.beginAttempt(
                 PlaybackAttemptDescriptor(
                     generation = 0,
                     protocol = selectedTarget?.protocol?.name,
                     sourceKind = sourceKind,
-                    reason = "endpoint connection",
+                    reason = if (stage == PlaybackFailureStage.ENDPOINT_CONNECTION) "endpoint connection"
+                        else "stream preparation",
                     automaticRecovery = pendingRecoveryKind,
                 ),
             )
@@ -2260,7 +2325,7 @@ class PlaybackEngine(
         } } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (failure: Exception) {
-            if (!admitPhoneFallback()) throw failure
+            if (failure.isSourceAccessFailure() || !admitPhoneFallback()) throw failure
             logger.w(TAG, "Server conversion unavailable; preparing the original with the phone encoder", failure)
             resolveAndLoad(positionSeconds, requestedBitrate, initialiseAdaptive, armWatchdog, localPlayWhenReady)
             return
@@ -2408,21 +2473,23 @@ class PlaybackEngine(
         armRendererResumeVerification(loadStart)
         if (!serverSideStart) armRendererStartSettle(loadStart)
         val loadIntent = localPlayWhenReady
-        target.load(
-            url,
-            rendererStream,
-            item.title,
-            descriptor.runtimeSeconds?.let { if (phoneTarget != null) (it - positionSeconds).coerceAtLeast(0) else it },
-            startPositionSeconds = loadStart,
-            playWhenReady = loadIntent,
-        )
-        reconcileStartupPlaybackIntent(target, loadIntent)
-        notePlaybackLoadIntent(localPlayWhenReady)
-        if (!serverSideStart) armRendererStartSettle(loadStart)
-        // Watch for the TV silently never starting (ideas 1+7). Only for a fresh start / recovery reload —
-        // not a seek or bitrate switch, where playback is already established.
-        if (armWatchdog && localPlayWhenReady && !playbackStarted) armStartupWatchdog(attemptGeneration)
-        publishStatus()
+        withRendererLoadErrors(attemptGeneration) {
+            target.load(
+                url,
+                rendererStream,
+                item.title,
+                descriptor.runtimeSeconds?.let { if (phoneTarget != null) (it - positionSeconds).coerceAtLeast(0) else it },
+                startPositionSeconds = loadStart,
+                playWhenReady = loadIntent,
+            )
+            reconcileStartupPlaybackIntent(target, loadIntent)
+            notePlaybackLoadIntent(localPlayWhenReady)
+            if (!serverSideStart) armRendererStartSettle(loadStart)
+            // Watch for the TV silently never starting (ideas 1+7). Only for a fresh start / recovery reload —
+            // not a seek or bitrate switch, where playback is already established.
+            if (armWatchdog && localPlayWhenReady && !playbackStarted) armStartupWatchdog(attemptGeneration)
+            publishStatus()
+        }
     }
 
     /**
@@ -2446,6 +2513,10 @@ class PlaybackEngine(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
+            // Receiver timeouts, fetch failures and ambiguous command failures do not prove that
+            // another encoding will work. Preserve format attempts for actual incompatibility.
+            if (!e.isPreparationFailure() && e.rendererFailureKind() != PlaybackFailureKind.FORMAT) throw e
+            if (e.isPreparationFailure() && e.isSourceAccessFailure()) throw e
             if (e.isPreparationFailure() || !prefs.preferDirectPlay || effectiveForceTranscode() ||
                 localTranscodeMode != LocalTranscodeMode.AUTOMATIC || automaticPhoneTranscode) {
                 if (!currentIsTranscoding || !admitPhoneFallback()) throw e
@@ -2454,9 +2525,7 @@ class PlaybackEngine(
                 return
             }
             logger.w(TAG, "Playback failed to start on the renderer; retrying once with a server transcode", e)
-            // A thrown startup/load exception has no qualified decoder evidence. Recover once, but do not
-            // permanently downgrade this renderer: the cause may have been the proxy, CORS, a range request,
-            // network loss, or an interrupted session rather than an unsupported media format.
+            // Only a classified format rejection can spend compatibility attempts here.
             val reserved = recoverySession.reserveRecovery(
                 RecoveryAttemptKind.FORMAT_COMPATIBILITY, PlaybackPhase.CHANGING_STREAM,
             ) ?: throw e
@@ -2477,7 +2546,10 @@ class PlaybackEngine(
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (serverFailure: Exception) {
-                    if (!admitPhoneFallback()) throw serverFailure
+                    if (!serverFailure.isPreparationFailure() &&
+                        serverFailure.rendererFailureKind() != PlaybackFailureKind.FORMAT) throw serverFailure
+                    if (serverFailure.isSourceAccessFailure() || !admitPhoneFallback())
+                        throw serverFailure
                     retireStartupAttempt("phone transcode fallback")
                     resolveAndLoad(positionSeconds, requestedBitrate, initialiseAdaptive = true, armWatchdog = true)
                 }
@@ -2576,7 +2648,11 @@ class PlaybackEngine(
                     return@withLock
                 }
                 try {
-                    reloadStream(resumeAt, requestedBitrate, reason, armWatchdog = true, playWhenReady = localPlayWhenReady)
+                    if (localPlayback != null) {
+                        reloadLocalInPlace(resumeAt, reason, localPlayWhenReady)
+                    } else {
+                        reloadStream(resumeAt, requestedBitrate, reason, armWatchdog = true, playWhenReady = localPlayWhenReady)
+                    }
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (error: Exception) {
@@ -2587,7 +2663,9 @@ class PlaybackEngine(
                             PlaybackFailureCause.UPSTREAM_OR_SERVER_UNAVAILABLE,
                         ).fail()
                     } else {
-                        recoverySession.fail()
+                        recoverySession.recordFailure(
+                            PlaybackFailureStage.RENDERER_LOAD, error.rendererFailureKind().toRecoveryCause(),
+                        ).fail()
                     }
                     smartResume.checkpoint(SmartResumeCheckpointKind.FAILURE, smartResumeDeviceContext)
                     publishStatus(error = "Couldn't start playback.")
@@ -2649,13 +2727,24 @@ class PlaybackEngine(
             logger.trace(TAG, "Ignoring stale playback failure for generation $expectedGeneration")
             return
         }
-        recoverySession = recoverySession.recordFailure(failureStage, kind.toRecoveryCause())
+        synchronized(recoveryLock) {
+            // Endpoint recovery owns a disconnected session; media errors cannot change its encoding.
+            if (connectionLost) return
+            rendererLoadErrors?.let { errors ->
+                errors.pending = strongerRendererFailure(errors.pending,
+                    PlaybackTargetEvent.Error(kind, message, qualifiedFormatEvidence))
+                return
+            }
+            if (terminalFailureSurfaced || isReloadingStream) return
+            recoverySession = recoverySession.recordFailure(failureStage, kind.toRecoveryCause())
+        }
         // Local on-device transcode AUTO-FALLBACK: if the TV rejected this format before playback started,
         // re-encode to the next codec it can decode (and this phone can encode) before giving up. Guarded by
         // recoveryLock + isReloadingStream so the burst of duplicate error events can't each trigger a reload,
         // and by !playbackStarted so a working stream isn't disrupted by a transient mid-stream hiccup.
         val localFallbackTo: VideoCodec? = synchronized(recoveryLock) {
-            if (terminalFailureSurfaced || isReloadingStream || playbackStarted) return@synchronized null
+            if (kind != PlaybackFailureKind.FORMAT || terminalFailureSurfaced || isReloadingStream || playbackStarted)
+                return@synchronized null
             if (localTranscodeMode == LocalTranscodeMode.ON_DEVICE && forcedLocalCodec != null) return@synchronized null
             // Snapshot the volatile once: stopInternalLocked (under mutex, not recoveryLock) can null it out
             // between a separate check and a !! deref, which — on the unjoined watchdog path — would NPE.
@@ -2663,6 +2752,11 @@ class PlaybackEngine(
             localCodecFallbacksTried.add(odt.videoCodec)
             val next = localTranscodeCodecOptions.firstOrNull { it !in localCodecFallbacksTried }
                 ?: return@synchronized null
+            val reserved = recoverySession.reserveRecovery(
+                RecoveryAttemptKind.FORMAT_COMPATIBILITY, PlaybackPhase.CHANGING_STREAM,
+            ) ?: return@synchronized null
+            recoverySession = reserved
+            pendingRecoveryKind = RecoveryAttemptKind.FORMAT_COMPATIBILITY
             forcedLocalCodec = next
             isReloadingStream = true // enter the reload window so the dying stream's further errors are ignored
             next
@@ -2683,11 +2777,15 @@ class PlaybackEngine(
                     } catch (error: Exception) {
                         logger.e("playback", "On-device codec fallback failed; giving up", error)
                         terminalFailureSurfaced = true
+                        val cause = if (error.isPreparationFailure()) PlaybackFailureCause.UPSTREAM_OR_SERVER_UNAVAILABLE
+                            else error.rendererFailureKind().toRecoveryCause()
                         recoverySession = recoverySession
-                            .recordFailure(PlaybackFailureStage.RENDERER_LOAD, PlaybackFailureCause.ON_DEVICE_TRANSCODE)
+                            .recordFailure(PlaybackFailureStage.RENDERER_LOAD, cause)
                             .fail()
                         smartResume.checkpoint(SmartResumeCheckpointKind.FAILURE, smartResumeDeviceContext)
-                        publishStatus(error = "Couldn't play this video on your TV.")
+                        publishStatus(error = if (cause == PlaybackFailureCause.TRANSIENT_NETWORK)
+                            "The connection to the TV was interrupted. Check its connection and try again."
+                            else "Couldn't play this video on your TV.")
                     } finally {
                         isReloadingStream = false
                     }
@@ -2803,15 +2901,9 @@ class PlaybackEngine(
         }
     }
 
-    /** An actionable message for a stream that never started, tailored to what we were doing. */
-    private fun startupFailureMessage(): String = when {
-        onDeviceTranscodeTarget != null ->
-            "The TV didn't start playing the on-device transcode. Try a different maximum resolution or " +
-                "format under TV output, or cast a directly-playable file."
-        currentProviderSession == null ->
-            "The TV didn't start playing this file. Try On device under TV output, or use a compatible file."
-        else -> "The TV didn't start playing."
-    }
+    /** A timeout cannot establish that changing format would fix playback. */
+    private fun startupFailureMessage(): String =
+        "The TV didn't start playing. Check the TV and phone connection, then try again."
 
     private fun markPlaybackStarted() {
         if (!playbackStarted) {
@@ -2839,7 +2931,7 @@ class PlaybackEngine(
         }
         if (StartupWatchdog.isEarlyRejection(bytesServed, durationMs)) {
             logger.event("playback", "TV aborted the stream early (~${bytesServed / 1024} KiB); attempting recovery")
-            handlePlaybackFailure(PlaybackFailureKind.FORMAT, "The TV couldn't play the file.")
+            handlePlaybackFailure(PlaybackFailureKind.NETWORK, "The TV stopped receiving the stream. Check its connection and try again.")
         }
     }
 
@@ -3249,6 +3341,8 @@ class PlaybackEngine(
                 scope.launch { stopIfCurrent(gen, "renderer stopped") }
             }
             is PlaybackTargetEvent.Disconnected -> {
+                startupWatchdogJob?.cancel()
+                startupWatchdogJob = null
                 updateProgressEstimate()
                 holdProgressEstimate()
                 isPlaying = false

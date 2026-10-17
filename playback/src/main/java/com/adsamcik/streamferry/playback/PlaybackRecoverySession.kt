@@ -92,8 +92,9 @@ fun redactPlaybackEndpoint(value: String?): String? = when {
 }
 
 data class RecoveryBudget(
-    /** Includes all automatically scheduled recovery attempts in this session. */
-    val maxAutomaticAttempts: Int = 6,
+    /** Four endpoint retries + one network retry + one handoff + three format/quality variants.
+     * Connectivity work must not consume the capacity promised to format recovery. */
+    val maxAutomaticAttempts: Int = 9,
     /** Each protocol receives its own finite connect-handshake allowance. */
     val maxEndpointConnectionRetriesPerProtocol: Int = 2,
     /** An established stream still retries a transient network failure only once. */
