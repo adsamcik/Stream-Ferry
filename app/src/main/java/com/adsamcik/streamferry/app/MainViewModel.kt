@@ -3275,7 +3275,7 @@ class MainViewModel(
      * Explicitly hand the current video to the other endpoint on the same confidently paired TV.
      * The engine continuation preserves playback-session policy and uses only renderer-confirmed progress.
      */
-    fun switchPlaybackProtocol() {
+    fun selectPlaybackProtocol(protocol: Protocol) {
         if (!container.permissions.hasLocalNetworkAccess()) {
             onLocalNetworkPermissionDenied()
             return
@@ -3286,12 +3286,14 @@ class MainViewModel(
         val currentPlayback = currentState.playback ?: return
         if (currentPlayback.isTerminal ||
             currentState.selectedPhysicalTv?.id != originalContext.physicalTv.id ||
-            currentState.selectedTarget?.protocol != originalContext.endpoint.protocol
+            currentState.selectedTarget?.protocol != originalContext.endpoint.protocol ||
+            protocol == originalContext.endpoint.protocol
         ) return
-        val alternate = originalContext.physicalTv.alternateEndpoint(originalContext.endpoint.protocol) ?: return
+        val tv = currentState.selectedPhysicalTv ?: return
+        val alternate = tv.availableEndpoints.singleOrNull { it.protocol == protocol } ?: return
         val continuation = container.playbackEngine.beginManualProtocolSwitch() ?: return
         val generation = ++reconnectGeneration
-        val alternateContext = originalContext.withEndpoint(alternate)
+        val alternateContext = originalContext.withPhysicalTv(tv).withEndpoint(alternate)
         reconnecting = true
         reconnectContext = alternateContext
         container.playbackEngine.status.value?.let { checkpointQueue(it, force = true) }

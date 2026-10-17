@@ -2,6 +2,7 @@ package com.adsamcik.streamferry.app
 
 import android.content.Intent
 import android.net.Uri
+import com.adsamcik.streamferry.core.stream.Protocol
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.physical.PhysicalTv
 import com.adsamcik.streamferry.source.api.DownloadFormat
@@ -87,7 +88,7 @@ class MainViewModelUiController(
     override fun resetQueueItemProgress(entryId: Long) = viewModel.resetQueueItemProgress(entryId)
     override fun markWatched(item: MediaItem, played: Boolean) = viewModel.markWatched(item, played)
     override fun resetEpisodeProgress(item: MediaItem) = viewModel.resetEpisodeProgress(item)
-    override fun switchPlaybackProtocol() = viewModel.switchPlaybackProtocol()
+    override fun selectPlaybackProtocol(protocol: Protocol) = viewModel.selectPlaybackProtocol(protocol)
     override fun retryPlayback() = viewModel.retryPlayback()
     override fun changeTv() { viewModel.changeTv() }
     override fun stopPlayback() = viewModel.stopPlayback()

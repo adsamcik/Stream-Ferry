@@ -289,6 +289,8 @@ class PlaybackEngine(
     private var localTranscodeMode = LocalTranscodeMode.AUTOMATIC
     private var automaticPhoneTranscode = false
     @Volatile private var localPlayWhenReady = true
+    // Failed handoffs clear live source/controller state; their endpoint retries keep the same choices.
+    private var failedPlaybackChoices: PlaybackContinuationChoices? = null
     private var localTranscodeUnavailableReason: String? = null
     // On-device output codecs already tried and rejected by the TV this session, so auto-fallback advances.
     // Concurrent-safe: added under recoveryLock (the failure path) but cleared under mutex (play/stop paths).
@@ -461,7 +463,7 @@ class PlaybackEngine(
             ),
         )
         if (continuation != null) recoverySession = continuation.session
-        continuation
+        continuation?.withPlaybackChoices()
     }
 
     /**
@@ -473,7 +475,7 @@ class PlaybackEngine(
             val continuation = recoverySession.reserveEndpointConnectionRetry(protocol)
                 ?: return@synchronized null
             recoverySession = continuation.session
-            continuation
+            continuation.withPlaybackChoices()
         }
 
     /**
@@ -485,7 +487,24 @@ class PlaybackEngine(
         val continuation = recoverySession.manualProtocolSwitchContinuation()
             ?: return@synchronized null
         recoverySession = continuation.session
-        continuation
+        continuation.withPlaybackChoices()
+    }
+
+    private fun capturePlaybackChoices() = PlaybackContinuationChoices(
+        localPlayWhenReady, localTranscodeMode, forcedLocalCodec, preferredCodec, manualMaxVideoHeight,
+    )
+
+    private fun PlaybackRecoveryContinuation.withPlaybackChoices() = PlaybackRecoveryContinuation(
+        session, reservedKind, failedPlaybackChoices ?: capturePlaybackChoices(),
+    )
+
+    private fun restorePlaybackChoices(choices: PlaybackContinuationChoices?) {
+        localPlayWhenReady = choices?.playWhenReady ?: true
+        if (choices == null) return
+        localTranscodeMode = choices.transcodeMode
+        forcedLocalCodec = choices.localCodec
+        preferredCodec = choices.preferredCodec
+        manualMaxVideoHeight = choices.maxVideoHeight
     }
 
     /**
@@ -597,6 +616,7 @@ class PlaybackEngine(
         streamPreparationRequest = streamChangeSequence.get()
         requireLocalNetworkAccess()
         val preservedNightVolumeSession = if (recoveryContinuation != null) nightVolumeSession else null
+        val preservedPlaybackChoices = recoveryContinuation?.playbackChoices
         stopInternalLocked("starting new playback")
         nightVolumeSession = preservedNightVolumeSession ?: NightVolumeSession(
             startedAt = Instant.ofEpochMilli(clock()),
@@ -631,6 +651,7 @@ class PlaybackEngine(
         this@PlaybackEngine.target = target
         this@PlaybackEngine.selectedTarget = selectedTarget
         this@PlaybackEngine.prefs = prefs
+        restorePlaybackChoices(preservedPlaybackChoices)
         this@PlaybackEngine.autoAdvance = autoAdvance
         lastNote = "Measuring link speed…"
         var endpointConnected = false
@@ -652,7 +673,8 @@ class PlaybackEngine(
                 resumePositionOverrideSeconds ?: item.resumePositionSeconds ?: 0L,
                 item.runtimeSeconds,
             )
-            startPlaybackWithFallback(startPos, requestedBitrate = prefs.maxBitrateBps)
+            startPlaybackWithFallback(startPos, requestedBitrate = prefs.maxBitrateBps,
+                playWhenReady = preservedPlaybackChoices?.playWhenReady ?: true)
             // Now that the first resolve has revealed the media's tracks, honor the user's preferred /
             // per-show-remembered audio & subtitle language (re-resolves once only when it differs from
             // the server default). Done before the monitor loop so it settles on the final stream.
@@ -1027,6 +1049,7 @@ class PlaybackEngine(
         streamPreparationRequest = streamChangeSequence.get()
         requireLocalNetworkAccess()
         val preservedNightVolumeSession = if (recoveryContinuation != null) nightVolumeSession else null
+        val preservedPlaybackChoices = recoveryContinuation?.playbackChoices
         stopInternalLocked("starting downloaded playback")
         this@PlaybackEngine.prefs = prefs
         nightVolumeSession = preservedNightVolumeSession ?: NightVolumeSession(
@@ -1044,6 +1067,7 @@ class PlaybackEngine(
         this@PlaybackEngine.selectedTarget = selectedTarget
         localPlayback = LocalPlaybackParams(filePath, contentType, title, runtimeSeconds, allowClientTranscode, smartResumeSeed)
         forcedLocalCodec = null // a fresh file starts on automatic codec negotiation
+        restorePlaybackChoices(preservedPlaybackChoices)
         localCodecFallbacksTried.clear()
         var endpointConnected = false
         try {
@@ -1056,7 +1080,8 @@ class PlaybackEngine(
             target.connect(selectedTarget)
             endpointConnected = true
             synchronizeVolumeFromTargetLocked()
-            loadLocalStreamLocked(PlaybackPositionPolicy.clamp(resumePositionSeconds, runtimeSeconds))
+            loadLocalStreamLocked(PlaybackPositionPolicy.clamp(resumePositionSeconds, runtimeSeconds),
+                playWhenReady = preservedPlaybackChoices?.playWhenReady ?: true)
             monitorJob = scope.launch { monitorLoop() }
         } catch (_: StreamStartupSuperseded) {
             if (monitorJob?.isActive != true) monitorJob = scope.launch { monitorLoop() }
@@ -2168,8 +2193,8 @@ class PlaybackEngine(
      * FORMAT recovery in [onTargetEvent]. Only when a fallback is possible (direct-play preferred, not
      * already forcing/fallen back).
      */
-    private suspend fun startPlaybackWithFallback(positionSeconds: Long, requestedBitrate: Long?) {
-        localPlayWhenReady = true
+    private suspend fun startPlaybackWithFallback(positionSeconds: Long, requestedBitrate: Long?, playWhenReady: Boolean = true) {
+        localPlayWhenReady = playWhenReady
         prepareStream {
             startPlaybackWithFallbackStream(positionSeconds, requestedBitrate)
             applyPreferredLanguageLocked()
@@ -3116,6 +3141,7 @@ class PlaybackEngine(
     }
 
     private suspend fun stopInternalLocked(reason: String) {
+        failedPlaybackChoices = if (reason.endsWith("failed")) capturePlaybackChoices() else null
         updateProgressEstimate()
         synchronized(progressLock) {
             progressEstimator.reset()

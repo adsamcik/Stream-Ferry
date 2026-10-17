@@ -2,6 +2,7 @@ package com.adsamcik.streamferry.ui
 
 import android.content.Intent
 import android.net.Uri
+import com.adsamcik.streamferry.core.stream.Protocol
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.physical.PhysicalTv
 import com.adsamcik.streamferry.source.api.DownloadFormat
@@ -84,7 +85,7 @@ interface UiController {
     fun resetQueueItemProgress(entryId: Long)
     fun markWatched(item: MediaItem, played: Boolean)
     fun resetEpisodeProgress(item: MediaItem)
-    fun switchPlaybackProtocol()
+    fun selectPlaybackProtocol(protocol: Protocol)
     fun retryPlayback()
     fun changeTv()
     fun stopPlayback()

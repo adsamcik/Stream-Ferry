@@ -8,6 +8,7 @@ import com.adsamcik.streamferry.domain.DiscoveredTarget
 import com.adsamcik.streamferry.core.stream.Protocol
 import com.adsamcik.streamferry.core.stream.TargetCapabilities
 import com.adsamcik.streamferry.physical.PhysicalTv
+import com.adsamcik.streamferry.physical.EndpointSelectionPreference
 import com.adsamcik.streamferry.playback.*
 import com.adsamcik.streamferry.ui.state.Route
 import com.adsamcik.streamferry.ui.theme.ThemeMode
@@ -147,7 +148,15 @@ class MainViewModelQueueTest {
         coVerify { container.playbackEngine.stop() }
     }
 
-    @Test fun `manual protocol switch uses paired endpoint and confirmed position`() {
+    @Test fun `manual protocol switch from Cast uses paired DLNA endpoint and confirmed position`() {
+        assertManualProtocolSwitch(Protocol.CAST, Protocol.DLNA)
+    }
+
+    @Test fun `manual protocol switch from DLNA uses paired Cast endpoint and confirmed position`() {
+        assertManualProtocolSwitch(Protocol.DLNA, Protocol.CAST)
+    }
+
+    private fun assertManualProtocolSwitch(from: Protocol, to: Protocol) {
         val statuses = MutableStateFlow<PlaybackStatus?>(null)
         val playbackEngine = container.playbackEngine
         every { playbackEngine.status } returns statuses
@@ -161,14 +170,16 @@ class MainViewModelQueueTest {
         val dlna = DiscoveredTarget(
             "dlna-tv", "Living Room TV", Protocol.DLNA, TargetCapabilities(Protocol.DLNA), null,
         )
-        val tv = PhysicalTv("living-room", "Living Room TV", castEndpoint = cast, dlnaEndpoint = dlna)
+        val tv = PhysicalTv("living-room", "Living Room TV", castEndpoint = cast, dlnaEndpoint = dlna,
+            selectionPreference = EndpointSelectionPreference(preferredProtocol = from))
+        val destination = if (to == Protocol.CAST) cast else dlna
         val vm = create()
 
         vm.onItemClicked(local)
         vm.selectPhysicalTv(tv)
         statuses.value = PlaybackStatus(
             targetName = tv.displayName,
-            protocolName = Protocol.CAST.name,
+            protocolName = from.name,
             rendererPlaybackRevision = 1,
             isPlaying = true,
             isBuffering = false,
@@ -181,9 +192,11 @@ class MainViewModelQueueTest {
             phase = PlaybackPhase.PLAYING,
         )
 
-        vm.switchPlaybackProtocol()
+        vm.selectPlaybackProtocol(from)
+        verify(exactly = 0) { playbackEngine.beginManualProtocolSwitch() }
+        vm.selectPlaybackProtocol(to)
 
-        assertEquals(Protocol.DLNA, vm.state.value.selectedTarget?.protocol)
+        assertEquals(to, vm.state.value.selectedTarget?.protocol)
         coVerify(exactly = 1) {
             playbackEngine.playLocal(
                 filePath = local.id,
@@ -193,9 +206,9 @@ class MainViewModelQueueTest {
                 allowClientTranscode = any(),
                 resumePositionSeconds = 125,
                 smartResumeSeed = any(),
-                smartResumeDeviceContext = match { it.lastSuccessfulProtocol == Protocol.DLNA },
+                smartResumeDeviceContext = match { it.lastSuccessfulProtocol == to },
                 target = any(),
-                selectedTarget = dlna,
+                selectedTarget = destination,
                 onForegrounded = any(),
                 recoveryContinuation = continuation,
                 preserveManualWatchOverride = true,

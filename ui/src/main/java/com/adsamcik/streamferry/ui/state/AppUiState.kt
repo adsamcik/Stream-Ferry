@@ -138,15 +138,12 @@ data class AppUiState(
         else -> SourceItemAvailability.AVAILABLE
     }
 
-    /** The other endpoint on this exact, confidently paired physical TV, if both are available. */
-    val alternatePlaybackProtocol: Protocol? get() {
-        val tv = selectedPhysicalTv ?: return null
-        if (tv.castEndpoint == null || tv.dlnaEndpoint == null) return null
-        return when (selectedTarget?.protocol) {
-            Protocol.CAST -> Protocol.DLNA
-            Protocol.DLNA -> Protocol.CAST
-            null -> null
-        }
+    /** Only offer connections belonging to the TV that owns the active endpoint. */
+    val playbackProtocols: List<Protocol> get() {
+        val tv = selectedPhysicalTv ?: return emptyList()
+        val endpoint = selectedTarget ?: return emptyList()
+        if (tv.availableEndpoints.none { it.id == endpoint.id && it.protocol == endpoint.protocol }) return emptyList()
+        return tv.availableEndpoints.map { it.protocol }
     }
 }
 

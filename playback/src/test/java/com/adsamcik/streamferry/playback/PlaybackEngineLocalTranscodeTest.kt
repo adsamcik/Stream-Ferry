@@ -151,6 +151,132 @@ class PlaybackEngineLocalTranscodeTest {
                 }
             }
         }
+
+        suspend fun continueSource(
+            source: SourceCase,
+            protocol: Protocol,
+            position: Long,
+            continuation: PlaybackRecoveryContinuation,
+        ) {
+            every { target.protocol } returns protocol
+            val endpoint = selected.copy(protocol = protocol, capabilities = selected.capabilities.copy(protocol = protocol))
+            when (source) {
+                SourceCase.FILE, SourceCase.CONTENT_URI -> engine.playLocal(
+                    filePath = if (source == SourceCase.FILE) "/download/movie.mp4" else "content://media/external/video/42",
+                    contentType = "video/mp4", title = "Movie", runtimeSeconds = 3600,
+                    allowClientTranscode = false, resumePositionSeconds = position,
+                    target = target, selectedTarget = endpoint, recoveryContinuation = continuation,
+                )
+                SourceCase.PROVIDER_FILE, SourceCase.PROVIDER_HLS -> engine.play(
+                    movie, target, endpoint, StreamPreferences(maxVideoHeight = 720, maxBitrateBps = 2_000_000),
+                    resumePositionOverrideSeconds = position, recoveryContinuation = continuation,
+                )
+            }
+        }
+    }
+
+    @Test fun `manual protocol switches retain phone output pause and position for every source in both directions`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) {
+            val f = Fixture(this, protocol)
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE); runCurrent()
+                f.engine.selectPreferredCodec("hevc"); runCurrent()
+                f.engine.selectMaxVideoHeight(480); runCurrent()
+                f.engine.seekTo(450); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(0, true)); runCurrent()
+                f.engine.pause(); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(0, false)); runCurrent()
+                val before = assertNotNull(f.engine.status.value)
+                val continuation = assertNotNull(f.engine.beginManualProtocolSwitch(), "$source/$protocol")
+                val alternate = Protocol.entries.first { it != protocol }
+                f.continueSource(source, alternate, before.positionSeconds, continuation); runCurrent()
+                val switched = assertNotNull(f.engine.status.value)
+                assertEquals(alternate.name, switched.protocolName)
+                assertEquals(450L, switched.positionSeconds, "$source/$protocol position")
+                assertFalse(f.loads.last().playWhenReady, "$source/$protocol autoplayed")
+                assertEquals(LocalTranscodeMode.ON_DEVICE, switched.localTranscodeMode)
+                assertEquals("hevc", switched.preferredVideoCodec)
+                assertEquals(480, switched.maxVideoHeight)
+                assertTrue(switched.isManualMaxVideoHeight)
+                assertEquals("HEVC · 480p · on device", switched.outputFormat)
+                assertEquals(continuation.session.usage, f.engine.recoverySnapshot().usage)
+
+                // The reverse handoff keeps an explicit original output and resumed playback too.
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ORIGINAL); runCurrent()
+                f.engine.resume(); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(450, true)); runCurrent()
+                val original = assertNotNull(f.engine.status.value)
+                val returnContinuation = assertNotNull(f.engine.beginManualProtocolSwitch())
+                f.continueSource(source, protocol, original.positionSeconds, returnContinuation); runCurrent()
+                assertTrue(f.loads.last().playWhenReady)
+                assertEquals(LocalTranscodeMode.ORIGINAL, f.engine.status.value?.localTranscodeMode)
+                assertEquals(original.outputFormat, f.engine.status.value?.outputFormat)
+            } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `manual protocol connection retries retain paused output and real stop clears choices for every source`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) {
+            val f = Fixture(this, protocol)
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE); runCurrent()
+                f.engine.selectPreferredCodec("h264"); runCurrent()
+                f.engine.selectMaxVideoHeight(480); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(0, true)); runCurrent()
+                f.engine.pause(); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(0, false)); runCurrent()
+                val continuation = assertNotNull(f.engine.beginManualProtocolSwitch())
+                val alternate = Protocol.entries.first { it != protocol }
+                coEvery { f.target.connect(any()) } throws IllegalStateException("Endpoint unavailable")
+                assertFailsWith<IllegalStateException> { f.continueSource(source, alternate, 123, continuation) }
+                val retry = assertNotNull(f.engine.reserveEndpointConnectionContinuation(alternate))
+                coEvery { f.target.connect(any()) } just Runs
+                f.continueSource(source, alternate, 123, retry); runCurrent()
+                assertFalse(f.loads.last().playWhenReady, "$source/$protocol retry autoplayed")
+                assertEquals(LocalTranscodeMode.ON_DEVICE, f.engine.status.value?.localTranscodeMode)
+                assertEquals("h264", f.engine.status.value?.preferredVideoCodec)
+                assertEquals(480, f.engine.status.value?.maxVideoHeight)
+                f.engine.stop(); runCurrent()
+                // A fresh video's failed connect must not inherit the previous video's pause.
+                coEvery { f.target.connect(any()) } throws IllegalStateException("Endpoint unavailable")
+                assertFailsWith<IllegalStateException> { f.startSource(source) }
+                val freshRetry = assertNotNull(f.engine.reserveEndpointConnectionContinuation(protocol))
+                coEvery { f.target.connect(any()) } just Runs
+                f.continueSource(source, protocol, 123, freshRetry); runCurrent()
+                assertTrue(f.loads.last().playWhenReady)
+                assertEquals(LocalTranscodeMode.AUTOMATIC, f.engine.status.value?.localTranscodeMode)
+                assertFalse(assertNotNull(f.engine.status.value).isManualMaxVideoHeight)
+            } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `manual protocol switches retain paused server codec and resolution choices on both provider paths`() = runTest {
+        for (protocol in Protocol.entries) for (source in listOf(SourceCase.PROVIDER_FILE, SourceCase.PROVIDER_HLS)) {
+            val f = Fixture(this, protocol)
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectPreferredCodec("hevc"); runCurrent()
+                f.engine.selectMaxVideoHeight(480); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(123, true)); runCurrent()
+                f.engine.pause(); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(123, false)); runCurrent()
+                val position = assertNotNull(f.engine.status.value).positionSeconds
+                val continuation = assertNotNull(f.engine.beginManualProtocolSwitch())
+                val alternate = Protocol.entries.first { it != protocol }
+                f.continueSource(source, alternate, position, continuation); runCurrent()
+                val switched = assertNotNull(f.engine.status.value)
+                assertEquals(LocalTranscodeMode.AUTOMATIC, switched.localTranscodeMode)
+                assertEquals("hevc", switched.preferredVideoCodec)
+                assertEquals(480, switched.maxVideoHeight)
+                assertTrue(switched.isManualMaxVideoHeight)
+                assertFalse(f.loads.last().playWhenReady)
+                assertEquals(position, switched.positionSeconds)
+                assertEquals("hevc", f.requests.last().preferredVideoCodec)
+                assertEquals(480, f.requests.last().maxVideoHeight)
+            } finally { f.engine.stop(); runCurrent() }
+        }
     }
 
     @Test fun `compatible local original offers output controls and explicit transcode overrides automatic preference`() = runTest {

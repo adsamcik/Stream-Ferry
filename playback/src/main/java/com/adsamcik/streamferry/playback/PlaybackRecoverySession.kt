@@ -1,6 +1,8 @@
 package com.adsamcik.streamferry.playback
 
 import com.adsamcik.streamferry.core.stream.Protocol
+import com.adsamcik.streamferry.core.transcode.LocalTranscodeMode
+import com.adsamcik.streamferry.core.transcode.VideoCodec
 import com.adsamcik.streamferry.domain.PlaybackFailureKind
 
 /** Coarse, UI-safe lifecycle of the one renderer playback session. */
@@ -206,6 +208,16 @@ fun isAlternateProtocolEligible(input: ProtocolSwitchInput): Boolean =
 class PlaybackRecoveryContinuation internal constructor(
     internal val session: PlaybackRecoverySession,
     internal val reservedKind: RecoveryAttemptKind?,
+    internal val playbackChoices: PlaybackContinuationChoices? = null,
+)
+
+/** User choices carried across a same-session controller replacement and its connection retries. */
+internal data class PlaybackContinuationChoices(
+    val playWhenReady: Boolean,
+    val transcodeMode: LocalTranscodeMode,
+    val localCodec: VideoCodec?,
+    val preferredCodec: String?,
+    val maxVideoHeight: Int?,
 )
 /**
  * Immutable, pure session ledger. The engine owns side effects; this type owns generations, concise

@@ -6,7 +6,6 @@ import com.adsamcik.streamferry.domain.DiscoveredTarget
 import com.adsamcik.streamferry.physical.PhysicalTv
 import kotlin.test.Test
 import kotlin.test.assertEquals
-import kotlin.test.assertNull
 
 class PlaybackProtocolUiStateTest {
     private val cast = DiscoveredTarget(
@@ -30,20 +29,25 @@ class PlaybackProtocolUiStateTest {
         dlnaEndpoint = dlna,
     )
 
-    @Test fun pairedTvOffersOnlyTheOtherProtocol() {
+    @Test fun pairedTvOffersBothExplicitConnections() {
         assertEquals(
-            Protocol.DLNA,
-            AppUiState(selectedPhysicalTv = pairedTv, selectedTarget = cast).alternatePlaybackProtocol,
+            listOf(Protocol.CAST, Protocol.DLNA),
+            AppUiState(selectedPhysicalTv = pairedTv, selectedTarget = cast).playbackProtocols,
         )
         assertEquals(
-            Protocol.CAST,
-            AppUiState(selectedPhysicalTv = pairedTv, selectedTarget = dlna).alternatePlaybackProtocol,
+            listOf(Protocol.CAST, Protocol.DLNA),
+            AppUiState(selectedPhysicalTv = pairedTv, selectedTarget = dlna).playbackProtocols,
         )
     }
 
     @Test fun singleProtocolOrUnselectedTvDoesNotOfferSwitch() {
         val castOnly = pairedTv.copy(dlnaEndpoint = null)
-        assertNull(AppUiState(selectedPhysicalTv = castOnly, selectedTarget = cast).alternatePlaybackProtocol)
-        assertNull(AppUiState(selectedPhysicalTv = pairedTv).alternatePlaybackProtocol)
+        assertEquals(listOf(Protocol.CAST), AppUiState(selectedPhysicalTv = castOnly, selectedTarget = cast).playbackProtocols)
+        assertEquals(emptyList(), AppUiState(selectedPhysicalTv = pairedTv).playbackProtocols)
+    }
+
+    @Test fun anotherTvCannotOfferConnectionsForTheActiveEndpoint() {
+        assertEquals(emptyList(), AppUiState(selectedPhysicalTv = pairedTv, selectedTarget = cast.copy(id = "other-tv")).playbackProtocols)
+        assertEquals(emptyList(), AppUiState(selectedPhysicalTv = pairedTv.copy(castEndpoint = null), selectedTarget = cast).playbackProtocols)
     }
 }
