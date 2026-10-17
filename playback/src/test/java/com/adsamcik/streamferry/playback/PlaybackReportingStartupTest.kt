@@ -224,4 +224,75 @@ class PlaybackReportingStartupTest {
         coVerify { source.report(PlaybackEvent.Progress(30, false)) }
         coordinator.stop("user stopped")
     }
+
+    @Test fun `cancelled stop awaiting Started still revokes both streams and closes source once`() = runTest {
+        val sessions = SessionRegistry()
+        val proxy = mockk<LocalProxyServer>(relaxed = true)
+        every { proxy.start(any()) } returns "127.0.0.1:1234"
+        val source = mockk<ProviderPlaybackSession>(relaxed = true)
+        every { source.descriptor.stream } returns StreamDescriptor(
+            "video/mp4", "mp4", isTranscoding = false, isByteSeekable = true, totalLength = 8,
+        )
+        val releaseStarted = CompletableDeferred<Unit>()
+        coEvery { source.report(any()) } coAnswers {
+            if (firstArg<PlaybackEvent>() is PlaybackEvent.Started) releaseStarted.await()
+        }
+        val coordinator = DefaultPlaybackSessionCoordinator(sessions, proxy, mockk(relaxed = true), StandardTestDispatcher(testScheduler))
+        coordinator.prepareTranscodeInput(source, "127.0.0.1", 30)
+        val input = coordinator.active.value!!
+        val (output, _) = coordinator.startClientTranscodeAndBuildUrl(mockk(relaxed = true), "127.0.0.1")
+        runCurrent()
+        val stop = launch { coordinator.stop("replacement") }
+        runCurrent()
+        assertFalse(stop.isCompleted)
+        assertFalse(sessions.isActive(input.id))
+        assertFalse(sessions.isActive(output.id))
+        assertNull(coordinator.active.value)
+        assertNull(coordinator.activeReportToken())
+        verify { proxy.unregisterStreamLease(input.id); proxy.unregisterStreamLease(output.id); proxy.stop() }
+
+        stop.cancelAndJoin()
+        assertTrue(stop.isCancelled)
+        coVerify(exactly = 1) { source.close(PlaybackStopReason.REPLACED) }
+        coVerify(exactly = 0) { source.report(any<PlaybackEvent.Stopped>()) }
+        coordinator.stop("replacement retried")
+        coVerify(exactly = 1) { source.close(any()) }
+        releaseStarted.complete(Unit)
+        runCurrent()
+    }
+
+    @Test fun `cancelled Stopped report closes source with bounded cleanup and retains cancellation`() = runTest {
+        val proxy = mockk<LocalProxyServer>(relaxed = true)
+        every { proxy.start(any()) } returns "127.0.0.1:1234"
+        val source = mockk<ProviderPlaybackSession>(relaxed = true)
+        every { source.descriptor.stream } returns StreamDescriptor(
+            "video/mp4", "mp4", isTranscoding = false, isByteSeekable = true, totalLength = 8,
+        )
+        coEvery { source.report(any()) } coAnswers {
+            if (firstArg<PlaybackEvent>() is PlaybackEvent.Stopped) awaitCancellation()
+        }
+        coEvery { source.close(any()) } coAnswers { awaitCancellation() }
+        val coordinator = DefaultPlaybackSessionCoordinator(SessionRegistry(), proxy, mockk(relaxed = true), StandardTestDispatcher(testScheduler))
+        coordinator.startAndBuildUrl(source, "127.0.0.1", 30)
+        runCurrent()
+        val stop = launch { coordinator.stop("replacement") }
+        runCurrent()
+        coVerify(exactly = 1) { source.report(PlaybackEvent.Stopped(30)) }
+        stop.cancel()
+        runCurrent()
+        coVerify(exactly = 1) { source.close(PlaybackStopReason.REPLACED) }
+        assertFalse(stop.isCompleted)
+        advanceTimeBy(3_000)
+        runCurrent()
+        stop.join()
+        assertTrue(stop.isCancelled)
+        assertNull(coordinator.active.value)
+        coVerifyOrder {
+            source.report(PlaybackEvent.Started(30))
+            source.report(PlaybackEvent.Stopped(30))
+            source.close(PlaybackStopReason.REPLACED)
+        }
+        coordinator.stop("replacement retried")
+        coVerify(exactly = 1) { source.close(any()) }
+    }
 }

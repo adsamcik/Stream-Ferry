@@ -35,6 +35,8 @@ import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.runCurrent
@@ -68,6 +70,7 @@ class PlaybackEngineLocalTranscodeTest {
         val providerSession = mockk<ProviderPlaybackSession>(relaxed = true)
         val requests = mutableListOf<PlaybackRequest>()
         val loads = mutableListOf<LoadedStream>()
+        var stops = 0
         val movie = MediaItem("movie", "Movie", null, 3600, null, 123, false)
         var providerStream = StreamDescriptor("video/mp4", "mp4", isTranscoding = false, isByteSeekable = true, totalLength = 100_000)
         private val session = SessionRegistry().create("video/mp4", false, 100_000)
@@ -77,6 +80,7 @@ class PlaybackEngineLocalTranscodeTest {
             every { target.events } returns events
             every { target.protocol } returns protocol
             coEvery { target.readCurrentVolume() } returns 0.1f
+            coEvery { target.stop() } answers { stops++ }
             coEvery { target.load(any(), any(), any(), any(), any(), any()) } coAnswers {
                 loads += LoadedStream(firstArg(), arg(3), arg(4), arg(5))
             }
@@ -673,6 +677,276 @@ class PlaybackEngineLocalTranscodeTest {
         }
         verify(exactly = Protocol.entries.size) {
             anyConstructed<AdaptiveBitrateController>().recordRebuffer(any())
+        }
+    }
+
+    @Test fun `end seeks complete once without exporting empty media for every source and protocol`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) {
+            val f = Fixture(this, protocol)
+            val completions = mutableListOf<PlaybackCompletion>()
+            val collecting = backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+                f.engine.endOfMedia.collect { completions += it }
+            }
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(0, true)); runCurrent()
+                f.engine.setAutoAdvance(true)
+                val loads = f.loads.size
+                val stops = f.stops
+                f.engine.seekTo(3600); runCurrent()
+                val ended = assertNotNull(f.engine.status.value)
+                assertEquals(PlaybackPhase.COMPLETED, ended.phase, "$source/$protocol")
+                assertEquals(3600L, ended.positionSeconds)
+                assertFalse(ended.isPlaying)
+                assertFalse(ended.playWhenReady)
+                assertNull(ended.errorMessage)
+                assertEquals(loads, f.loads.size, "EOF must not start another export")
+                assertEquals(1, completions.size)
+                if (protocol == Protocol.CAST) assertEquals(stops + 1, f.stops)
+                f.engine.seekTo(3700); runCurrent()
+                f.events.emit(PlaybackTargetEvent.Ended); runCurrent()
+                assertEquals(1, completions.size, "duplicate completion for $source/$protocol")
+                verify(atLeast = 1) { anyConstructed<StreamingTranscodeSession>().release() }
+            } finally { collecting.cancel(); f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `paused skip beyond the end completes and tears down every source and protocol`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) {
+            val f = Fixture(this, protocol)
+            val completions = mutableListOf<PlaybackCompletion>()
+            val collecting = backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+                f.engine.endOfMedia.collect { completions += it }
+            }
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE); runCurrent()
+                f.engine.seekTo(3550); runCurrent()
+                f.engine.pause(); runCurrent()
+                val loads = f.loads.size
+                f.engine.skip(100); runCurrent()
+                assertEquals(1, completions.size, "$source/$protocol")
+                assertNull(f.engine.status.value, "completion without autoplay must stop")
+                assertEquals(loads, f.loads.size)
+            } finally { collecting.cancel(); f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `startup pause and resume return before first media and control final load for every source and protocol`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) {
+            val f = Fixture(this, protocol)
+            val ready = CompletableDeferred<Unit>()
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE); runCurrent()
+                val stops = f.stops
+                coEvery { anyConstructed<StreamingTranscodeSession>().awaitReady() } coAnswers {
+                    if (protocol == Protocol.CAST) assertTrue(f.stops > stops, "old Cast buffer was not stopped")
+                    ready.await()
+                }
+                val seeking = launch { f.engine.seekTo(300) }; runCurrent()
+                val paused = launch { f.engine.pause() }; runCurrent()
+                assertTrue(paused.isCompleted, "$source/$protocol pause blocked")
+                assertFalse(ready.isCompleted)
+                assertEquals(false, f.engine.status.value?.playWhenReady)
+                val resumed = launch { f.engine.resume() }; runCurrent()
+                assertTrue(resumed.isCompleted, "$source/$protocol resume blocked")
+                assertEquals(true, f.engine.status.value?.playWhenReady)
+                f.engine.togglePlayPause(); runCurrent()
+                assertEquals(false, f.engine.status.value?.playWhenReady)
+                ready.complete(Unit); runCurrent(); seeking.join()
+                assertFalse(f.loads.last().playWhenReady, "$source/$protocol autoplayed despite pending pause")
+                assertEquals(300L, f.engine.status.value?.positionSeconds)
+                coVerify(exactly = 0) { f.target.play() }
+            } finally {
+                ready.complete(Unit); runCurrent(); f.engine.stop(); runCurrent()
+                coEvery { anyConstructed<StreamingTranscodeSession>().awaitReady() } returns Unit
+            }
+        }
+    }
+
+    @Test fun `new seek codec and resolution replace blocked startup and retain newest choices for every source and protocol`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) {
+            val f = Fixture(this, protocol)
+            val ready = CompletableDeferred<Unit>()
+            var starts = 0
+            var cancelled = 0
+            coEvery { anyConstructed<StreamingTranscodeSession>().awaitReady() } returns Unit
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE); runCurrent()
+                coEvery { anyConstructed<StreamingTranscodeSession>().awaitReady() } coAnswers {
+                    starts++
+                    try { ready.await() } finally { if (!ready.isCompleted) cancelled++ }
+                }
+                val loads = f.loads.size
+                val seeking = launch { f.engine.seekTo(300) }; runCurrent()
+                val newerSeek = launch { f.engine.seekTo(600) }; runCurrent()
+                assertTrue(seeking.isCompleted, "$source/$protocol old seek still blocks")
+                assertEquals(2, starts)
+                val format = launch { f.engine.selectPreferredCodec("h264") }; runCurrent()
+                assertTrue(newerSeek.isCompleted)
+                val resolution = launch { f.engine.selectMaxVideoHeight(480) }; runCurrent()
+                assertTrue(format.isCompleted)
+                assertEquals(3, cancelled)
+                assertEquals(loads, f.loads.size, "superseded startup loaded stale media")
+                f.engine.pause(); runCurrent()
+                ready.complete(Unit); runCurrent(); resolution.join()
+                assertEquals(loads + 1, f.loads.size)
+                assertFalse(f.loads.last().playWhenReady)
+                assertEquals(600L, f.engine.status.value?.positionSeconds)
+                assertEquals("H.264 · 480p · on device", f.engine.status.value?.outputFormat)
+                assertNull(f.engine.status.value?.errorMessage)
+            } finally {
+                ready.complete(Unit); runCurrent(); f.engine.stop(); runCurrent()
+                coEvery { anyConstructed<StreamingTranscodeSession>().awaitReady() } returns Unit
+            }
+        }
+    }
+
+    @Test fun `pause during receiver load is reconciled and initial startup can be superseded for every source and protocol`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) {
+            val f = Fixture(this, protocol)
+            val loading = CompletableDeferred<Unit>()
+            var first = true
+            coEvery { f.target.load(any(), any(), any(), any(), any(), any()) } coAnswers {
+                f.loads += LoadedStream(firstArg(), arg(3), arg(4), arg(5))
+                if (first) { first = false; loading.await() }
+            }
+            try {
+                val starting = launch { f.startSource(source) }; runCurrent()
+                val paused = launch { f.engine.pause() }; runCurrent()
+                assertTrue(paused.isCompleted, "$source/$protocol initial pause blocked")
+                val seeking = launch { f.engine.seekTo(450) }; runCurrent(); seeking.join()
+                assertTrue(starting.isCompleted)
+                assertFalse(starting.isCancelled, "supersession must not cancel the playback caller")
+                assertFalse(f.loads.last().playWhenReady)
+                assertEquals(450L, f.engine.status.value?.positionSeconds)
+                assertNull(f.engine.status.value?.errorMessage)
+                if (source == SourceCase.PROVIDER_FILE || source == SourceCase.PROVIDER_HLS) {
+                    coVerify(exactly = 1) { f.providerSession.mediaSegments() }
+                }
+
+                val accepted = CompletableDeferred<Unit>()
+                coEvery { f.target.load(any(), any(), any(), any(), any(), any()) } coAnswers {
+                    f.loads += LoadedStream(firstArg(), arg(3), arg(4), arg(5))
+                    accepted.await()
+                }
+                val changing = launch { f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE) }; runCurrent()
+                f.engine.resume(); runCurrent()
+                accepted.complete(Unit); runCurrent(); changing.join()
+                coVerify(exactly = 1) { f.target.play() }
+                assertEquals(true, f.engine.status.value?.playWhenReady)
+            } finally { loading.complete(Unit); f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `queued output choices and repeated selections retain latest intent for every source and protocol`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) {
+            val f = Fixture(this, protocol)
+            val ready = CompletableDeferred<Unit>()
+            var starts = 0
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE); runCurrent()
+                coEvery { anyConstructed<StreamingTranscodeSession>().awaitReady() } coAnswers { starts++; ready.await() }
+                val first = launch { f.engine.seekTo(300) }; runCurrent()
+                val format = launch { f.engine.selectPreferredCodec("h264") }
+                val height = launch { f.engine.selectMaxVideoHeight(480) }
+                val seek = launch { f.engine.seekTo(700) }
+                runCurrent()
+                assertTrue(first.isCompleted && format.isCompleted && height.isCompleted)
+                assertEquals(2, starts, "queued obsolete requests started encoding for $source/$protocol")
+                f.engine.selectPreferredCodec("av1")
+                f.engine.selectMaxVideoHeight(1234)
+                runCurrent()
+                assertFalse(seek.isCompleted, "invalid selections cancelled valid startup")
+                assertEquals(2, starts)
+                val same = launch { f.engine.selectMaxVideoHeight(480) }; runCurrent()
+                assertTrue(seek.isCompleted)
+                assertEquals(3, starts, "repeating a pending selection must still finish startup")
+                ready.complete(Unit); runCurrent(); same.join()
+                assertEquals(700L, f.engine.status.value?.positionSeconds)
+                assertEquals("H.264 · 480p · on device", f.engine.status.value?.outputFormat)
+            } finally {
+                ready.complete(Unit); runCurrent(); f.engine.stop(); runCurrent()
+                coEvery { anyConstructed<StreamingTranscodeSession>().awaitReady() } returns Unit
+            }
+        }
+    }
+
+    @Test fun `end seek supersedes pending startup immediately for every source and protocol`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) {
+            val f = Fixture(this, protocol)
+            val ready = CompletableDeferred<Unit>()
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE); runCurrent()
+                f.engine.setAutoAdvance(true)
+                coEvery { anyConstructed<StreamingTranscodeSession>().awaitReady() } coAnswers { ready.await() }
+                val loads = f.loads.size
+                val seeking = launch { f.engine.seekTo(300) }; runCurrent()
+                val completing = launch { f.engine.seekTo(3600) }; runCurrent()
+                assertTrue(seeking.isCompleted && completing.isCompleted, "$source/$protocol EOF remained blocked")
+                assertFalse(ready.isCompleted)
+                assertEquals(PlaybackPhase.COMPLETED, f.engine.status.value?.phase)
+                assertEquals(3600L, f.engine.status.value?.positionSeconds)
+                assertEquals(loads, f.loads.size)
+                assertNull(f.engine.status.value?.errorMessage)
+            } finally {
+                ready.complete(Unit); runCurrent(); f.engine.stop(); runCurrent()
+                coEvery { anyConstructed<StreamingTranscodeSession>().awaitReady() } returns Unit
+            }
+        }
+    }
+
+    @Test fun `queued relative skips accumulate while startup is blocked for every source and protocol`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) {
+            val f = Fixture(this, protocol)
+            val ready = CompletableDeferred<Unit>()
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE); runCurrent()
+                coEvery { anyConstructed<StreamingTranscodeSession>().awaitReady() } coAnswers { ready.await() }
+                val one = launch { f.engine.skip(30) }; runCurrent()
+                val two = launch { f.engine.skip(30) }
+                val three = launch { f.engine.skip(30) }
+                runCurrent()
+                assertTrue(one.isCompleted && two.isCompleted)
+                assertFalse(three.isCompleted)
+                ready.complete(Unit); runCurrent(); three.join()
+                assertEquals(213L, f.engine.status.value?.positionSeconds, "$source/$protocol lost a skip")
+                assertEquals(3387L, f.loads.last().duration)
+            } finally {
+                ready.complete(Unit); runCurrent(); f.engine.stop(); runCurrent()
+                coEvery { anyConstructed<StreamingTranscodeSession>().awaitReady() } returns Unit
+            }
+        }
+    }
+
+    @Test fun `pause after load acceptance reaches receiver for every source and protocol`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) {
+            val f = Fixture(this, protocol)
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE); runCurrent()
+                val initialLoads = f.loads.size
+                var requested = false
+                val collector = backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+                    f.engine.status.collect { status ->
+                        if (!requested && status?.positionSeconds == 300L && f.loads.size > initialLoads) {
+                            requested = true
+                            launch(UnconfinedTestDispatcher(testScheduler)) { f.engine.pause() }
+                        }
+                    }
+                }
+                f.engine.seekTo(300); runCurrent()
+                assertTrue(requested)
+                coVerify(exactly = 1) { f.target.pause() }
+                assertEquals(false, f.engine.status.value?.playWhenReady)
+                collector.cancel()
+            } finally { f.engine.stop(); runCurrent() }
         }
     }
 

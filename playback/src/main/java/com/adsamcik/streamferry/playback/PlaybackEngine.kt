@@ -52,17 +52,22 @@ import com.adsamcik.streamferry.data.transcode.StreamingTranscodeSession
 import android.content.Context
 import java.time.Instant
 import java.time.ZoneId
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -244,6 +249,7 @@ class PlaybackEngine(
     // One-shot per play: whether the preferred / per-show-remembered language has been applied (so a
     // re-resolve for quality/codec/manual-track changes doesn't keep re-applying it over the user).
     @Volatile private var languagePreferenceApplied = false
+    private var startupSegmentsPending = false
     // The media's selectable tracks, captured from the first resolve and kept stable across re-resolves
     // (a burn-in/transcode re-resolve can report fewer streams) so the pickers don't vanish mid-session.
     @Volatile private var mediaAudioTracks: List<MediaTrack> = emptyList()
@@ -264,6 +270,13 @@ class PlaybackEngine(
     @Volatile private var onDeviceTranscodeTarget: TranscodeTarget? = null
     @Volatile private var streamingTranscode: StreamingTranscodeSession? = null
     @Volatile private var transcodePreparationJob: Job? = null
+    private val preparationLock = Any()
+    private var preparationReceiverLoaded = false
+    private val streamChangeSequence = AtomicLong()
+    // Only changed while holding the command mutex. Ingress advances the sequence before waiting.
+    private var streamPreparationRequest = 0L
+    @Volatile private var startupWasInterrupted = false
+    private class StreamStartupSuperseded : CancellationException("A newer playback command replaced startup")
     // The probed source format of a LOCAL file (online sources use the provider descriptor), for the same UI.
     @Volatile private var localSourceProfile: MediaProfile? = null
     // Parameters of the current LOCAL playback, kept so the on-device stream can be reloaded in place (a
@@ -275,7 +288,7 @@ class PlaybackEngine(
     @Volatile private var localTranscodeCodecOptions: List<VideoCodec> = emptyList()
     private var localTranscodeMode = LocalTranscodeMode.AUTOMATIC
     private var automaticPhoneTranscode = false
-    private var localPlayWhenReady = true
+    @Volatile private var localPlayWhenReady = true
     private var localTranscodeUnavailableReason: String? = null
     // On-device output codecs already tried and rejected by the TV this session, so auto-fallback advances.
     // Concurrent-safe: added under recoveryLock (the failure path) but cleared under mutex (play/stop paths).
@@ -581,6 +594,7 @@ class PlaybackEngine(
         // call startForeground() within its deadline — otherwise the system raises
         // ForegroundServiceDidNotStartInTimeException (seen on Galaxy S24 / Android 16).
         mutex.withLock {
+        streamPreparationRequest = streamChangeSequence.get()
         requireLocalNetworkAccess()
         val preservedNightVolumeSession = if (recoveryContinuation != null) nightVolumeSession else null
         stopInternalLocked("starting new playback")
@@ -607,6 +621,7 @@ class PlaybackEngine(
             languagePreferenceApplied = true
         }
         mediaSegments = emptyList()
+        startupSegmentsPending = true
         skippedSegments.clear()
         mediaAudioTracks = emptyList()
         mediaSubtitleTracks = emptyList()
@@ -644,17 +659,10 @@ class PlaybackEngine(
             applyPreferredLanguageLocked()
             monitorJob = scope.launch { monitorLoop() }
             // Fetch skippable segments (intro/outro/recap) off the startup path; empty if unsupported.
-            val segItemId = item.id
-            val segmentSession = currentProviderSession
-            scope.launch {
-                val segments = runCatching { segmentSession?.mediaSegments().orEmpty() }.getOrDefault(emptyList())
-                if (segments.isNotEmpty() && item?.id == segItemId) {
-                    mediaSegments = segments
-                    logger.event("playback", "Loaded ${segments.size} skippable segment(s) (intro/outro)")
-                    publishStatus()
-                }
-            }
+            loadStartupSegments()
             logger.event("playback", "Playing ${item.title} -> ${selectedTarget.displayName} (${selectedTarget.protocol})")
+        } catch (_: StreamStartupSuperseded) {
+            if (monitorJob?.isActive != true) monitorJob = scope.launch { monitorLoop() }
         } catch (e: CancellationException) {
             withContext(NonCancellable) { stopInternalLocked("playback start cancelled") }
             throw e
@@ -694,6 +702,7 @@ class PlaybackEngine(
         autoAdvance: Boolean = false,
     ): Boolean = withContext(dispatcher) {
         mutex.withLock {
+        streamPreparationRequest = streamChangeSequence.get()
             requireLocalNetworkAccess()
             val tgt = target
             val sel = selectedTarget
@@ -715,6 +724,7 @@ class PlaybackEngine(
             automaticPhoneTranscode = false
             languagePreferenceApplied = false
             mediaSegments = emptyList()
+            startupSegmentsPending = true
             skippedSegments.clear()
             mediaAudioTracks = emptyList()
             mediaSubtitleTracks = emptyList()
@@ -745,16 +755,11 @@ class PlaybackEngine(
                 }
                 applyPreferredLanguageLocked()
                 if (monitorJob?.isActive != true) monitorJob = scope.launch { monitorLoop() }
-                val segItemId = item.id
-                val segmentSession = currentProviderSession
-                scope.launch {
-                    val segments = runCatching { segmentSession?.mediaSegments().orEmpty() }.getOrDefault(emptyList())
-                    if (segments.isNotEmpty() && this@PlaybackEngine.item?.id == segItemId) {
-                        mediaSegments = segments
-                        publishStatus()
-                    }
-                }
+                loadStartupSegments()
                 logger.event("playback", "Autoplay next -> ${item.title} on ${sel.displayName} (${sel.protocol}) — seamless (no reconnect)")
+                true
+            } catch (_: StreamStartupSuperseded) {
+                if (monitorJob?.isActive != true) monitorJob = scope.launch { monitorLoop() }
                 true
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
@@ -783,14 +788,106 @@ class PlaybackEngine(
         autoAdvance = enabled && target != null && item != null && completedGeneration != playGeneration
     }
 
-    suspend fun togglePlayPause() = mutex.withLock {
-        // Decide while holding the same lock that executes the command. Two rapid UI/key events then
-        // alternate deterministically instead of both observing one stale pre-command state.
-        if (localPlayWhenReady) pauseLocked() else resumeLocked()
+    private fun loadStartupSegments() {
+        if (!startupSegmentsPending) return
+        val mediaId = item?.id ?: return
+        val source = currentProviderSession ?: return
+        startupSegmentsPending = false
+        scope.launch {
+            val segments = runCatching { source.mediaSegments() }.getOrDefault(emptyList())
+            if (segments.isNotEmpty() && item?.id == mediaId) {
+                mediaSegments = segments
+                publishStatus()
+            }
+        }
     }
 
-    suspend fun resume() = mutex.withLock {
-        resumeLocked()
+    /** New stream commands retire pending startup without cancelling the UI/playback caller. */
+    private suspend fun withStreamChange(block: suspend () -> Unit) {
+        val request = streamChangeSequence.incrementAndGet()
+        synchronized(preparationLock) {
+            transcodePreparationJob?.let {
+                startupWasInterrupted = true
+                it.cancel(StreamStartupSuperseded())
+            }
+        }
+        try {
+            mutex.withLock {
+                streamPreparationRequest = request
+                block()
+                if (currentProviderSession != null && completedGeneration != playGeneration) {
+                    applyPreferredLanguageLocked()
+                    loadStartupSegments()
+                }
+            }
+        } catch (_: StreamStartupSuperseded) {
+            // The next command retains the selected output and owns its replacement.
+        }
+    }
+
+    /** Keep the command lock's ownership while giving slow startup an independently cancellable job. */
+    private suspend fun <T> prepareStream(block: suspend () -> T): T {
+        currentCoroutineContext().ensureActive()
+        if (currentCoroutineContext()[Job] === transcodePreparationJob) {
+            synchronized(preparationLock) { preparationReceiverLoaded = false }
+            return block()
+        }
+        return coroutineScope {
+            val request = streamPreparationRequest
+            val preparation = async(dispatcher, start = CoroutineStart.LAZY) { block() }
+            synchronized(preparationLock) {
+                transcodePreparationJob = preparation
+                preparationReceiverLoaded = false
+                if (request != streamChangeSequence.get()) preparation.cancel(StreamStartupSuperseded())
+            }
+            try {
+                preparation.await().also {
+                    if (request == streamChangeSequence.get()) startupWasInterrupted = false
+                }
+            } catch (error: Throwable) {
+                releaseStreamingTranscode()
+                throw error
+            } finally {
+                synchronized(preparationLock) {
+                    if (transcodePreparationJob === preparation) {
+                        transcodePreparationJob = null
+                        preparationReceiverLoaded = false
+                    }
+                }
+                preparation.cancel()
+            }
+        }
+    }
+
+    /** No renderer RPC is needed while its replacement is still being prepared. */
+    private fun setPreparingPlaybackIntent(requested: Boolean?): Boolean = synchronized(preparationLock) {
+        if (transcodePreparationJob == null || preparationReceiverLoaded) return@synchronized false
+        val playing = requested ?: !localPlayWhenReady
+        localPlayWhenReady = playing
+        isPlaying = false
+        startupWatchdogJob?.cancel()
+        controlErrorMessage = null
+        holdProgressEstimate()
+        if (!playing) smartResume.checkpoint(SmartResumeCheckpointKind.PAUSED)
+        reportSourceProgressSoon()
+        publishStatus()
+        true
+    }
+
+    suspend fun togglePlayPause() {
+        requireLocalNetworkAccess()
+        if (setPreparingPlaybackIntent(null)) return
+        mutex.withLock {
+            // Decide while holding the same lock that executes the command. Two rapid UI/key events then
+            // alternate deterministically instead of both observing one stale pre-command state.
+            if (localPlayWhenReady) pauseLocked() else resumeLocked()
+        }
+    }
+
+    suspend fun resume() {
+        requireLocalNetworkAccess()
+        if (setPreparingPlaybackIntent(true)) return
+        mutex.withLock { resumeLocked() }
     }
 
     private suspend fun resumeLocked() {
@@ -811,8 +908,10 @@ class PlaybackEngine(
         publishStatus()
     }
 
-    suspend fun pause() = mutex.withLock {
-        pauseLocked()
+    suspend fun pause() {
+        requireLocalNetworkAccess()
+        if (setPreparingPlaybackIntent(false)) return
+        mutex.withLock { pauseLocked() }
     }
 
     private suspend fun pauseLocked() {
@@ -830,7 +929,7 @@ class PlaybackEngine(
     }
 
     /** Seek by a relative amount (used by UI, keyboard/media-button, and notification skip actions). */
-    suspend fun skip(deltaSeconds: Long) = mutex.withLock {
+    suspend fun skip(deltaSeconds: Long) = withStreamChange {
         // Compute inside the command lock. Rapid presses then accumulate (+30, +30, +30 = +90) instead
         // of every queued action reading the same stale pre-command position.
         seekToLocked(absolutePositionSeconds + deltaSeconds)
@@ -925,6 +1024,7 @@ class PlaybackEngine(
     ) = withContext(dispatcher) {
         // Off the main thread so the foreground service can foreground within its deadline (see play()).
         mutex.withLock {
+        streamPreparationRequest = streamChangeSequence.get()
         requireLocalNetworkAccess()
         val preservedNightVolumeSession = if (recoveryContinuation != null) nightVolumeSession else null
         stopInternalLocked("starting downloaded playback")
@@ -958,6 +1058,8 @@ class PlaybackEngine(
             synchronizeVolumeFromTargetLocked()
             loadLocalStreamLocked(PlaybackPositionPolicy.clamp(resumePositionSeconds, runtimeSeconds))
             monitorJob = scope.launch { monitorLoop() }
+        } catch (_: StreamStartupSuperseded) {
+            if (monitorJob?.isActive != true) monitorJob = scope.launch { monitorLoop() }
         } catch (e: CancellationException) {
             withContext(NonCancellable) { stopInternalLocked("downloaded playback start cancelled") }
             throw e
@@ -989,7 +1091,11 @@ class PlaybackEngine(
      * connection. Assumes [target]/[selectedTarget]/[localPlayback] are set; throws on load failure.
      */
     private suspend fun loadLocalStreamLocked(startPos: Long, playWhenReady: Boolean = true) {
-        localPlayWhenReady = playWhenReady
+        if (currentCoroutineContext()[Job] !== transcodePreparationJob) localPlayWhenReady = playWhenReady
+        prepareStream { loadLocalStream(startPos) }
+    }
+
+    private suspend fun loadLocalStream(startPos: Long) {
         isBuffering = false
         requireLocalNetworkAccess()
         val params = localPlayback ?: error("No local media selected")
@@ -1088,16 +1194,18 @@ class PlaybackEngine(
         val rendererStart = if (transcodeTarget != null) 0L else boundedStartPos
         armRendererResumeVerification(rendererStart)
         armRendererStartSettle(rendererStart)
+        val loadIntent = localPlayWhenReady
         tgt.load(
             url,
             streamForTv,
             params.title,
             effectiveRuntimeSeconds?.let { if (transcodeTarget != null) (it - boundedStartPos).coerceAtLeast(0) else it },
             startPositionSeconds = rendererStart,
-            playWhenReady = playWhenReady,
+            playWhenReady = loadIntent,
         )
+        reconcileStartupPlaybackIntent(tgt, loadIntent)
         armRendererStartSettle(rendererStart)
-        if (playWhenReady && !playbackStarted) armStartupWatchdog(attemptGeneration)
+        if (localPlayWhenReady && !playbackStarted) armStartupWatchdog(attemptGeneration)
         publishStatus()
         logger.event("playback", "Playing ${params.title} -> ${sel.displayName} (${sel.protocol})")
     }
@@ -1112,8 +1220,7 @@ class PlaybackEngine(
         startPositionSeconds: Long,
     ): Pair<String, RendererStream> {
         val hls = selectedTarget?.protocol == Protocol.CAST
-        val preparation = currentCoroutineContext()[Job]
-        transcodePreparationJob = preparation
+        if (hls && !isReloadingStream) retireRendererStream()
         val generation = playGeneration
         lastNote = "Starting on-device stream…"
         recoverySession = recoverySession.transition(PlaybackPhase.CHANGING_STREAM)
@@ -1176,8 +1283,6 @@ class PlaybackEngine(
         } catch (error: Throwable) {
             releaseStreamingTranscode()
             throw error
-        } finally {
-            if (transcodePreparationJob === preparation) transcodePreparationJob = null
         }
     }
 
@@ -1187,12 +1292,25 @@ class PlaybackEngine(
         session?.release()
     }
 
+    private suspend fun retireRendererStream() {
+        runCatching { target?.prepareReload() }
+        currentCoroutineContext().ensureActive()
+        // Revoking the URL cannot evict media already buffered on a Cast receiver.
+        if (selectedTarget?.protocol == Protocol.CAST) runCatching { target?.stop() }
+        currentCoroutineContext().ensureActive()
+    }
+
     /**
      * Seamlessly reload the current LOCAL file on the ALREADY-CONNECTED target (a manual codec change or an
      * auto codec fallback): reuse the live connection/proxy/foreground service and just re-resolve + reload
      * the on-device stream at [startPos]. Mirrors [reloadStream]/[playNext] for the offline path.
      */
     private suspend fun reloadLocalInPlace(startPos: Long, reason: String, playWhenReady: Boolean = localPlayWhenReady) {
+        if (currentCoroutineContext()[Job] !== transcodePreparationJob) localPlayWhenReady = playWhenReady
+        prepareStream { reloadLocalStream(startPos, reason) }
+    }
+
+    private suspend fun reloadLocalStream(startPos: Long, reason: String) {
         startupWatchdogJob?.cancel()
         playGeneration++
         completedGeneration = null // supersede the current stream (its stray end-of-media/watchdog is now stale)
@@ -1202,20 +1320,22 @@ class PlaybackEngine(
         playbackStarted = false
         startupBytesServed = 0
         terminalFailureSurfaced = false
+        streamStartSeconds = startPos
+        reportedPositionSeconds = 0
         try {
             proxy.stop()
             releaseStreamingTranscode()
             // Tell a polled controller (DLNA) we're tearing down first, then Stop before the new URI (many
             // renderers need it), then reload in place from the current position.
-            runCatching { target?.prepareReload() }
+            retireRendererStream()
             runCatching { coordinator.stop(reason) }
-            loadLocalStreamLocked(startPos, playWhenReady)
+            loadLocalStreamLocked(startPos, localPlayWhenReady)
         } finally {
             isReloadingStream = wasReloading
         }
     }
 
-    suspend fun seekTo(absoluteSeconds: Long) = mutex.withLock {
+    suspend fun seekTo(absoluteSeconds: Long) = withStreamChange {
         seekToLocked(absoluteSeconds)
     }
 
@@ -1229,9 +1349,24 @@ class PlaybackEngine(
         val pos = PlaybackPositionPolicy.clamp(absoluteSeconds, duration)
         smartResume.noteSeekRequested(pos)
         holdProgressEstimate(resetDelivery = true)
+        if (duration != null && duration > 0 && pos == duration) {
+            // EOF is a normal completion, not a new clip with no samples to encode.
+            startupWatchdogJob?.cancel()
+            proxy.stop()
+            releaseStreamingTranscode()
+            startupWasInterrupted = false
+            onTargetEvent(t, PlaybackTargetEvent.Ended)
+            runCatching { t.prepareReload() }
+            // Cast's prepareReload only invalidates callbacks; stop its buffered receiver media too.
+            if (t.protocol == Protocol.CAST) runCatching { t.stop() }
+            return
+        }
         // Phone streams restart their encoder at the requested source position. Server output uses
         // its existing seek policy; direct files and full-timeline HLS can seek in the renderer.
-        if (onDeviceTranscodeTarget != null) {
+        if (onDeviceTranscodeTarget != null || startupWasInterrupted) {
+            // Record intent before a queued superseded startup can be cancelled without doing work.
+            streamStartSeconds = pos
+            reportedPositionSeconds = 0L
             reloadOutput(pos, "seek phone stream", localPlayWhenReady)
             controlErrorMessage = null
             return
@@ -1382,14 +1517,19 @@ class PlaybackEngine(
      * requests a server transcode so choosing 1080p/720p is a reliable escape hatch from a broken direct
      * play or 4K profile; null returns to the saved automatic policy.
      */
-    suspend fun selectLocalTranscodeMode(mode: LocalTranscodeMode) = mutex.withLock {
-        if (localPlayback == null && currentProviderSession == null) return@withLock
-        changeLocalTranscodeOptions(mode, codec = null, height = null)
+    suspend fun selectLocalTranscodeMode(mode: LocalTranscodeMode) {
+        if (mode == LocalTranscodeMode.ON_DEVICE) {
+            localTranscodeUnavailableReason?.let { throw PlaybackPreparationException(it) }
+        }
+        withStreamChange {
+            if (localPlayback == null && item == null) return@withStreamChange
+            changeLocalTranscodeOptions(mode, codec = null, height = null)
+        }
     }
 
     /** Validate before stopping the working stream, then reuse the current TV connection and position. */
     private suspend fun changeLocalTranscodeOptions(mode: LocalTranscodeMode, codec: VideoCodec?, height: Int?) = withContext(dispatcher) {
-        if (mode == localTranscodeMode && codec == forcedLocalCodec && height == manualMaxVideoHeight && !automaticPhoneTranscode) return@withContext
+        if (mode == localTranscodeMode && codec == forcedLocalCodec && height == manualMaxVideoHeight && !automaticPhoneTranscode && !startupWasInterrupted) return@withContext
         if (mode == LocalTranscodeMode.ON_DEVICE) {
             localTranscodeUnavailableReason?.let { throw PlaybackPreparationException(it) }
         }
@@ -1416,6 +1556,7 @@ class PlaybackEngine(
             reloadStarted = true
             reloadOutput(pos, "output change", playWhenReady)
         } catch (failure: Throwable) {
+            if (failure is StreamStartupSuperseded) throw failure
             localTranscodeMode = previousMode
             automaticPhoneTranscode = previousAutomaticPhoneTranscode
             forcedLocalCodec = previousCodec
@@ -1436,38 +1577,45 @@ class PlaybackEngine(
         else reloadStream(position, adaptive?.currentBitrateBps, reason, armWatchdog = true, playWhenReady = playWhenReady)
     }
 
-    suspend fun selectMaxVideoHeight(height: Int?) = mutex.withLock {
-        if ((localPlayback != null || onDeviceTranscodeTarget != null || localTranscodeMode != LocalTranscodeMode.AUTOMATIC) && height in setOf(null, 2160, 1080, 720, 480)) {
-            changeLocalTranscodeOptions(
-                mode = if (height != null) LocalTranscodeMode.ON_DEVICE else localTranscodeMode,
-                codec = forcedLocalCodec,
-                height = height,
-            )
-            return@withLock
+    suspend fun selectMaxVideoHeight(height: Int?) {
+        if (height !in setOf(null, 2160, 1080, 720, 480)) return
+        if (height != null && (localPlayback != null || onDeviceTranscodeTarget != null || localTranscodeMode != LocalTranscodeMode.AUTOMATIC)) {
+            localTranscodeUnavailableReason?.let { throw PlaybackPreparationException(it) }
         }
-        if (currentProviderSession == null || height !in setOf(null, 2160, 1080, 720, 480)) return@withLock
-        if (manualMaxVideoHeight == height) return@withLock
-        val previousHeight = manualMaxVideoHeight
-        val previousStreamStart = streamStartSeconds
-        val previousReportedPosition = reportedPositionSeconds
-        val previousNote = lastNote
-        manualMaxVideoHeight = height
-        val label = height?.let { "${it}p" } ?: "Auto"
-        lastNote = "Resolution -> $label; reloading stream…"
-        logger.event("quality", "Resolution override -> $label; forcing server transcode=${height != null}")
-        val pos = absolutePositionSeconds
-        streamStartSeconds = pos
-        reportedPositionSeconds = 0
-        publishStatus()
-        try {
-            reloadStream(pos, requestedBitrate = adaptive?.currentBitrateBps, reason = "manual resolution", armWatchdog = true)
-        } catch (failure: Throwable) {
-            manualMaxVideoHeight = previousHeight
-            streamStartSeconds = previousStreamStart
-            reportedPositionSeconds = previousReportedPosition
-            lastNote = previousNote
+        withStreamChange {
+            if ((localPlayback != null || onDeviceTranscodeTarget != null || localTranscodeMode != LocalTranscodeMode.AUTOMATIC) && height in setOf(null, 2160, 1080, 720, 480)) {
+                changeLocalTranscodeOptions(
+                    mode = if (height != null) LocalTranscodeMode.ON_DEVICE else localTranscodeMode,
+                    codec = forcedLocalCodec,
+                    height = height,
+                )
+                return@withStreamChange
+            }
+            if (item == null || height !in setOf(null, 2160, 1080, 720, 480)) return@withStreamChange
+            if (manualMaxVideoHeight == height && !startupWasInterrupted) return@withStreamChange
+            val previousHeight = manualMaxVideoHeight
+            val previousStreamStart = streamStartSeconds
+            val previousReportedPosition = reportedPositionSeconds
+            val previousNote = lastNote
+            manualMaxVideoHeight = height
+            val label = height?.let { "${it}p" } ?: "Auto"
+            lastNote = "Resolution -> $label; reloading stream…"
+            logger.event("quality", "Resolution override -> $label; forcing server transcode=${height != null}")
+            val pos = absolutePositionSeconds
+            streamStartSeconds = pos
+            reportedPositionSeconds = 0
             publishStatus()
-            throw failure
+            try {
+                reloadStream(pos, requestedBitrate = adaptive?.currentBitrateBps, reason = "manual resolution", armWatchdog = true)
+            } catch (failure: Throwable) {
+                if (failure is StreamStartupSuperseded) throw failure
+                manualMaxVideoHeight = previousHeight
+                streamStartSeconds = previousStreamStart
+                reportedPositionSeconds = previousReportedPosition
+                lastNote = previousNote
+                publishStatus()
+                throw failure
+            }
         }
     }
 
@@ -1478,28 +1626,37 @@ class PlaybackEngine(
      * reloads it in place (seamless — reuses the live TV connection). A codec the phone can't encode or the
      * TV can't decode is ignored. A concrete local codec pick starts phone conversion from direct play.
      */
-    suspend fun selectPreferredCodec(codec: String?) = mutex.withLock {
-        // Local on-device transcode: steer the phone's encoder and reload in place.
-        if (localPlayback != null || onDeviceTranscodeTarget != null || localTranscodeMode != LocalTranscodeMode.AUTOMATIC) {
-            val requested = codec?.let { parseVideoCodec(it) ?: return@withLock }
-            if (requested != null && requested !in localTranscodeCodecOptions) return@withLock
-            changeLocalTranscodeOptions(
-                mode = if (requested != null) LocalTranscodeMode.ON_DEVICE else localTranscodeMode,
-                codec = requested,
-                height = manualMaxVideoHeight,
-            )
-            return@withLock
+    suspend fun selectPreferredCodec(codec: String?) {
+        if (codec != null) {
+            val parsed = parseVideoCodec(codec) ?: return
+            val caps = selectedTarget?.capabilities ?: return
+            val options = if (localPlayback != null || onDeviceTranscodeTarget != null || localTranscodeMode != LocalTranscodeMode.AUTOMATIC)
+                localTranscodeCodecOptions(caps).map { it.name.lowercase() } else tvVideoCodecs(caps)
+            if (parsed.name.lowercase() !in options) return
         }
-        if (currentProviderSession == null) return@withLock
-        val requested = codec?.let { parseVideoCodec(it)?.name?.lowercase() ?: return@withLock }
-        if (requested != null && requested !in tvVideoCodecs(selectedTarget?.capabilities ?: return@withLock)) {
-            logger.w("quality", "Ignoring unsupported TV output format: $requested")
-            return@withLock
-        }
-        if (preferredCodec == requested) return@withLock
-        logger.event("quality", "Preferred codec -> ${requested ?: "auto"}; re-resolving")
-        reloadSelectionTransaction(preferredCodec, requested, { preferredCodec = it }) {
-            reloadStreamPreservingPosition("codec change")
+        withStreamChange {
+            // Local on-device transcode: steer the phone's encoder and reload in place.
+            if (localPlayback != null || onDeviceTranscodeTarget != null || localTranscodeMode != LocalTranscodeMode.AUTOMATIC) {
+                val requested = codec?.let { parseVideoCodec(it) ?: return@withStreamChange }
+                if (requested != null && requested !in localTranscodeCodecOptions(requireNotNull(selectedTarget).capabilities)) return@withStreamChange
+                changeLocalTranscodeOptions(
+                    mode = if (requested != null) LocalTranscodeMode.ON_DEVICE else localTranscodeMode,
+                    codec = requested,
+                    height = manualMaxVideoHeight,
+                )
+                return@withStreamChange
+            }
+            if (item == null) return@withStreamChange
+            val requested = codec?.let { parseVideoCodec(it)?.name?.lowercase() ?: return@withStreamChange }
+            if (requested != null && requested !in tvVideoCodecs(selectedTarget?.capabilities ?: return@withStreamChange)) {
+                logger.w("quality", "Ignoring unsupported TV output format: $requested")
+                return@withStreamChange
+            }
+            if (preferredCodec == requested && !startupWasInterrupted) return@withStreamChange
+            logger.event("quality", "Preferred codec -> ${requested ?: "auto"}; re-resolving")
+            reloadSelectionTransaction(preferredCodec, requested, { preferredCodec = it }) {
+                reloadStreamPreservingPosition("codec change")
+            }
         }
     }
 
@@ -1536,6 +1693,7 @@ class PlaybackEngine(
         try {
             reload()
         } catch (failure: Throwable) {
+            if (failure is StreamStartupSuperseded) throw failure
             apply(previous)
             streamStartSeconds = previousStreamStart
             reportedPositionSeconds = previousReportedPosition
@@ -1732,6 +1890,21 @@ class PlaybackEngine(
         if (!playWhenReady) logger.trace(TAG, "Loaded replacement stream paused at the requested position")
     }
 
+    /** A pause/resume can arrive after the TV load was sent but before it was accepted. */
+    private suspend fun reconcileStartupPlaybackIntent(controller: PlaybackTargetController, loadedIntent: Boolean) {
+        var applied = loadedIntent
+        while (true) {
+            val next = synchronized(preparationLock) {
+                if (applied == localPlayWhenReady) {
+                    preparationReceiverLoaded = true
+                    null
+                } else localPlayWhenReady
+            } ?: return
+            if (next) controller.play() else controller.pause()
+            applied = next
+        }
+    }
+
     private fun armRendererStartSettle(positionSeconds: Long) {
         if (positionSeconds <= 0L) return
         seekSettleTargetSeconds = positionSeconds
@@ -1777,12 +1950,23 @@ class PlaybackEngine(
         armWatchdog: Boolean = false,
         playWhenReady: Boolean = true,
     ) {
-        localPlayWhenReady = playWhenReady
+        if (currentCoroutineContext()[Job] !== transcodePreparationJob) localPlayWhenReady = playWhenReady
+        prepareStream { resolveAndLoadStream(positionSeconds, requestedBitrate, initialiseAdaptive, armWatchdog) }
+    }
+
+    private suspend fun resolveAndLoadStream(
+        positionSeconds: Long,
+        requestedBitrate: Long?,
+        initialiseAdaptive: Boolean,
+        armWatchdog: Boolean,
+    ) {
         isBuffering = false
         startupWatchdogJob?.cancel()
         startupWatchdogJob = null
         playbackStarted = false
         startupBytesServed = 0L
+        streamStartSeconds = positionSeconds
+        reportedPositionSeconds = 0L
         requireLocalNetworkAccess()
         val item = this.item ?: error("No media selected")
         val target = this.target ?: error("No target")
@@ -1837,7 +2021,7 @@ class PlaybackEngine(
         } catch (failure: Exception) {
             if (!admitPhoneFallback()) throw failure
             logger.w(TAG, "Server conversion unavailable; preparing the original with the phone encoder", failure)
-            resolveAndLoad(positionSeconds, requestedBitrate, initialiseAdaptive, armWatchdog, playWhenReady)
+            resolveAndLoad(positionSeconds, requestedBitrate, initialiseAdaptive, armWatchdog, localPlayWhenReady)
             return
         }
         val descriptor = providerSession.descriptor
@@ -1853,7 +2037,7 @@ class PlaybackEngine(
             forceTranscodeFallback = true
             runCatching { providerSession.close(PlaybackStopReason.REPLACED) }
             logger.event("playback", "Renderer previously rejected this format; transcoding from the start")
-            resolveAndLoad(positionSeconds, requestedBitrate, initialiseAdaptive, armWatchdog)
+            resolveAndLoad(positionSeconds, requestedBitrate, initialiseAdaptive, armWatchdog, localPlayWhenReady)
             return
         }
 
@@ -1959,19 +2143,21 @@ class PlaybackEngine(
         pendingRecoveryKind = null
         armRendererResumeVerification(loadStart)
         if (!serverSideStart) armRendererStartSettle(loadStart)
+        val loadIntent = localPlayWhenReady
         target.load(
             url,
             rendererStream,
             item.title,
             descriptor.runtimeSeconds?.let { if (phoneTarget != null) (it - positionSeconds).coerceAtLeast(0) else it },
             startPositionSeconds = loadStart,
-            playWhenReady = playWhenReady,
+            playWhenReady = loadIntent,
         )
-        notePlaybackLoadIntent(playWhenReady)
+        reconcileStartupPlaybackIntent(target, loadIntent)
+        notePlaybackLoadIntent(localPlayWhenReady)
         if (!serverSideStart) armRendererStartSettle(loadStart)
         // Watch for the TV silently never starting (ideas 1+7). Only for a fresh start / recovery reload —
         // not a seek or bitrate switch, where playback is already established.
-        if (armWatchdog && playWhenReady && !playbackStarted) armStartupWatchdog(attemptGeneration)
+        if (armWatchdog && localPlayWhenReady && !playbackStarted) armStartupWatchdog(attemptGeneration)
         publishStatus()
     }
 
@@ -1983,6 +2169,14 @@ class PlaybackEngine(
      * already forcing/fallen back).
      */
     private suspend fun startPlaybackWithFallback(positionSeconds: Long, requestedBitrate: Long?) {
+        localPlayWhenReady = true
+        prepareStream {
+            startPlaybackWithFallbackStream(positionSeconds, requestedBitrate)
+            applyPreferredLanguageLocked()
+        }
+    }
+
+    private suspend fun startPlaybackWithFallbackStream(positionSeconds: Long, requestedBitrate: Long?) {
         try {
             resolveAndLoad(positionSeconds, requestedBitrate = requestedBitrate, initialiseAdaptive = true, armWatchdog = true)
         } catch (e: CancellationException) {
@@ -2060,10 +2254,22 @@ class PlaybackEngine(
         armWatchdog: Boolean = false,
         playWhenReady: Boolean = localPlayWhenReady,
     ) {
+        if (currentCoroutineContext()[Job] !== transcodePreparationJob) localPlayWhenReady = playWhenReady
+        prepareStream { reloadProviderStream(positionSeconds, requestedBitrate, reason, armWatchdog) }
+    }
+
+    private suspend fun reloadProviderStream(
+        positionSeconds: Long,
+        requestedBitrate: Long?,
+        reason: String,
+        armWatchdog: Boolean,
+    ) {
         holdProgressEstimate(resetDelivery = true)
         // The coordinator reports a terminal position while replacing the source session. Record the
         // requested resume point first so a seek, bitrate switch, or recovery cannot save stale progress.
         noteSourcePosition(positionSeconds)
+        streamStartSeconds = positionSeconds
+        reportedPositionSeconds = 0L
         val wasReloading = isReloadingStream
         isReloadingStream = true
         try {
@@ -2074,14 +2280,14 @@ class PlaybackEngine(
             // Tell the target we're about to tear down the current stream so a polled controller (DLNA)
             // stops its poll BEFORE the renderer is forced to STOP — otherwise the old poll can emit a
             // stale end-of-media that survives the reload window and stops the new stream.
-            runCatching { target?.prepareReload() }
+            retireRendererStream()
             runCatching { coordinator.stop(reason) }
             resolveAndLoad(
                 positionSeconds,
                 requestedBitrate = requestedBitrate,
                 initialiseAdaptive = false,
                 armWatchdog = armWatchdog,
-                playWhenReady = playWhenReady,
+                playWhenReady = localPlayWhenReady,
             )
         } finally {
             isReloadingStream = wasReloading
@@ -2953,6 +3159,7 @@ class PlaybackEngine(
         adaptive = null
         mediaSegments = emptyList()
         skippedSegments.clear()
+        startupSegmentsPending = false
         mediaAudioTracks = emptyList()
         mediaSubtitleTracks = emptyList()
         mediaAudioTrackRefs = emptyMap()
@@ -2966,6 +3173,7 @@ class PlaybackEngine(
         forcedLocalCodec = null
         localTranscodeCodecOptions = emptyList()
         localTranscodeMode = LocalTranscodeMode.AUTOMATIC
+        startupWasInterrupted = false
         automaticPhoneTranscode = false
         localTranscodeUnavailableReason = null
         localCodecFallbacksTried.clear()

@@ -15,13 +15,17 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.withContext
 
 /**
  * Ties together the three session identities (§8): source play session ↔ phone proxy session ↔
@@ -232,16 +236,24 @@ class DefaultPlaybackSessionCoordinator(
         _active.value = null
 
         if (reporting != null) {
-            reporting.startReported.await()
-            if (reporting.shouldReport()) {
-                runBoundedRemoteCleanup("report stopped") {
-                    reporting.providerSession.report(PlaybackEvent.Stopped(reporting.positionSeconds, reporting.estimate))
+            try {
+                reporting.startReported.await()
+                if (reporting.shouldReport()) {
+                    runBoundedRemoteCleanup("report stopped") {
+                        reporting.providerSession.report(PlaybackEvent.Stopped(reporting.positionSeconds, reporting.estimate))
+                    }
+                }
+            } finally {
+                // Taking the reporting session transfers its sole cleanup ownership to this call.
+                // A superseding startup may cancel reporting, but must not abandon the source lease.
+                withContext(NonCancellable) {
+                    runBoundedRemoteCleanup("close source playback") {
+                        reporting.providerSession.close(stopReason(reason))
+                    }
                 }
             }
-            runBoundedRemoteCleanup("close source playback") {
-                reporting.providerSession.close(stopReason(reason))
-            }
         }
+        currentCoroutineContext().ensureActive()
         logger.event("session", "Session stopped ($reason); local proxy revoked before remote cleanup")
     }
 
