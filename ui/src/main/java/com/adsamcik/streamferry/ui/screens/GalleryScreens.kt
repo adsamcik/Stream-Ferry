@@ -141,7 +141,7 @@ import kotlinx.coroutines.withContext
 fun GalleryScreen(state: AppUiState, viewModel: UiController, compact: Boolean = false) {
     val searchActive = state.searchQuery.isNotBlank()
     val atRoot = state.folderStack.isEmpty()
-    var searchOpen by rememberSaveable { mutableStateOf(false) }
+    var searchOpen by rememberSaveable { mutableStateOf(searchActive) }
     val focusManager = LocalFocusManager.current
     val keyboard = LocalSoftwareKeyboardController.current
     fun closeSearch() {
@@ -194,24 +194,8 @@ fun GalleryScreen(state: AppUiState, viewModel: UiController, compact: Boolean =
             (entries.isNotEmpty() && entries.all { it.type.equals("Season", ignoreCase = true) })
         )
 
-    if (atRoot && !searchActive) {
-        LibraryHome(
-            state = state,
-            viewModel = viewModel,
-            entries = entries,
-            isLocalSource = isLocalSource,
-            needsRemoteLogin = needsRemoteLogin,
-            compact = compact,
-            gridState = gridState,
-            searchOpen = searchOpen,
-            onOpenSearch = { searchOpen = true },
-            onCloseSearch = { closeSearch() },
-        )
-        return
-    }
-
     Column(Modifier.fillMaxSize()) {
-        if (compact) {
+        if (compact && (!atRoot || searchActive || searchOpen)) {
             PhoneGalleryHeader(
                 title = if (searchActive) "Search results" else (state.currentFolder?.title ?: "Library"),
                 contextLabel = activeSourceName,
@@ -223,24 +207,35 @@ fun GalleryScreen(state: AppUiState, viewModel: UiController, compact: Boolean =
                 showSourceUnavailableNotice = remoteUnavailable,
                 onRetrySource = viewModel::refreshGallery,
             )
-            if (searchActive || searchOpen) {
-                LibrarySearchField(
-                    state = state,
-                    viewModel = viewModel,
-                    compact = true,
-                    label = searchLabel,
-                    onClose = {
-                        closeSearch()
-                    },
-                )
-            }
-        } else {
-            LibrarySearchField(state, viewModel, label = searchLabel)
+        }
+        // Keep the editor outside the home/results branch so the first character does not
+        // replace it and interrupt the IME's selection or composing text.
+        if (!compact || searchActive || searchOpen) {
+            LibrarySearchField(
+                state = state,
+                viewModel = viewModel,
+                compact = compact,
+                label = searchLabel,
+                onClose = if (compact) ({ closeSearch() }) else null,
+            )
+        }
+        if (!compact && (!atRoot || searchActive)) {
             LibrarySectionTitle(
                 if (searchActive) "Search results" else (state.currentFolder?.title ?: "Library"),
             )
         }
         when {
+            atRoot && !searchActive -> LibraryHome(
+                state = state,
+                viewModel = viewModel,
+                entries = entries,
+                isLocalSource = isLocalSource,
+                needsRemoteLogin = needsRemoteLogin,
+                compact = compact,
+                gridState = gridState,
+                searchOpen = searchOpen,
+                onOpenSearch = { searchOpen = true },
+            )
             needsRemoteLogin -> RemoteLoginPrompt(viewModel)
             (state.galleryLoading && entries.isEmpty()) || state.searching -> CenteredProgress("Loading…")
             entries.isEmpty() && searchActive -> Text("No results for \"${state.searchQuery}\".")
@@ -519,7 +514,6 @@ private fun LibraryHome(
     gridState: LazyGridState,
     searchOpen: Boolean,
     onOpenSearch: () -> Unit,
-    onCloseSearch: () -> Unit,
 ) {
     val smartResumeMediaId = state.smartResume
         ?.takeIf { it.sourceType == SmartResumeSourceType.REMOTE }
@@ -538,31 +532,13 @@ private fun LibraryHome(
     ) {
         item(span = { GridItemSpan(maxLineSpan) }) {
             Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                LibraryHomeHeader(
-                    onSearch = onOpenSearch,
-                    showSearch = compact && !searchOpen,
-                )
-                if (compact && remoteUnavailable) {
+                if (!compact || !searchOpen) {
+                    LibraryHomeHeader(onSearch = onOpenSearch, showSearch = compact)
+                }
+                if (compact && !searchOpen && remoteUnavailable) {
                     SourceUnavailableHeaderNotice(onRetry = viewModel::refreshGallery)
                 }
                 SourceSwitcher(viewModel.sources, state.activeSourceId, viewModel::selectSource)
-                if (!compact || searchOpen) {
-                    LibrarySearchField(
-                        state = state,
-                        viewModel = viewModel,
-                        compact = compact,
-                        label = if (isLocalSource) {
-                            "Search this device"
-                        } else {
-                            val sourceName = viewModel.sources
-                                .firstOrNull { it.first == state.activeSourceId }
-                                ?.second
-                                ?: "library"
-                            "Search $sourceName"
-                        },
-                        onClose = if (compact) onCloseSearch else null,
-                    )
-                }
                 if (isLocalSource) {
                     LocalAccessActions(viewModel)
                 }
