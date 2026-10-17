@@ -48,7 +48,10 @@ Stop wakes blocked readers/writers before cancelling and draining only that sess
 Online input and output use separate opaque proxy sessions. Provider Started/Progress/Stopped reporting
 survives phone conversion, and Stop revokes both sessions. Encoder reads never count as receiver
 throughput, playback progress, or evidence of a receiver format failure. Server bitrate adaptation is
-disabled while phone output is active. Existing provider audio/subtitle selection remains source-owned.
+disabled while phone output is active. Provider audio/subtitle selection remains source-owned: Jellyfin
+prepares the selected audio before the phone encoder reads it. Local multi-audio files instead pass an
+exact Media3 track identity to the phone decoder. This also applies to downloaded files and content
+URIs, with the same choice retained across seeking, pause/resume and output/protocol changes.
 
 ## Verification limits
 

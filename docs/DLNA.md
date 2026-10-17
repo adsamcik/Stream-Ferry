@@ -73,6 +73,13 @@ Settings → "Prefer original quality". The transport state/status parsing lives
 DIDL-Lite is provided when needed with the correct MIME type / `protocolInfo`, using **only** the
 phone proxy URL. `friendlyName` / `model` / `manufacturer` are escaped before display.
 
+## Audio languages
+
+The shared [audio-language controls](CAST.md#audio-languages) also apply to DLNA. Local multi-audio
+inputs are streamed with the exact selected track through the phone's MPEG-TS encoder; Jellyfin
+supplies a generated stream with the selected audio. The TV's native audio picker is not required.
+Language, position, pause state and caption/output choices are retained across stream replacements.
+
 ## Subtitles
 
 Subtitle delivery does not rely on vendor-specific sidecar headers or the TV's embedded-track picker.

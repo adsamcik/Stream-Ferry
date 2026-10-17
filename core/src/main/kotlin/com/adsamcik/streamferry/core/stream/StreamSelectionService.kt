@@ -17,14 +17,11 @@ package com.adsamcik.streamferry.core.stream
 enum class Protocol { CAST, DLNA }
 
 /**
- * Whether choosing an audio track requires the SERVER to transcode/remux. A non-default track can't be
- * honored on DIRECT PLAY through the phone proxy — the TV would just play the container's own default
- * track (the proxy can't switch an embedded audio stream on Cast/DLNA) — so the server must mux the
- * selected audio. Selecting the default track (or clearing the selection) needs no transcode. Pure logic.
+ * A selected audio track needs a generated stream: the TV's native default may differ from the
+ * source's negotiated default, so even an explicit default choice must be muxed into the output.
  */
 object AudioTrackSelection {
-    fun requiresServerTranscode(selectedIndex: Int?, defaultIndex: Int?): Boolean =
-        selectedIndex != null && selectedIndex != defaultIndex
+    fun requiresServerTranscode(selectedIndex: Int?): Boolean = selectedIndex != null
 }
 
 enum class PlayMethod {

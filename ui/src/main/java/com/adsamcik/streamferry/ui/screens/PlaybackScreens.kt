@@ -119,6 +119,7 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.progressBarRangeInfo
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.setProgress
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
@@ -807,6 +808,7 @@ private fun PlaybackQuickActions(
                     icon = Icons.Rounded.Audiotrack,
                     label = "Audio",
                     selectedLabel = current?.label ?: "Default",
+                    selectedValue = p.currentAudioIndex,
                     options = p.audioTracks.map { it.index to it.label },
                     onSelect = viewModel::selectAudioTrack,
                     modifier = Modifier.weight(1f),
@@ -818,6 +820,7 @@ private fun PlaybackQuickActions(
                     icon = Icons.Rounded.Subtitles,
                     label = "Captions",
                     selectedLabel = current?.label ?: "Off",
+                    selectedValue = p.currentSubtitleIndex,
                     options = listOf<Pair<Int?, String>>(null to "Off") + p.subtitleTracks.map { it.index to it.label },
                     onSelect = viewModel::selectSubtitleTrack,
                     onAdd = { subtitlePicker.launch(arrayOf("*/*")) },
@@ -956,6 +959,7 @@ private fun <T> QuickTrackAction(
     icon: ImageVector,
     label: String,
     selectedLabel: String,
+    selectedValue: T?,
     options: List<Pair<T, String>>,
     onSelect: (T) -> Unit,
     modifier: Modifier = Modifier,
@@ -974,6 +978,8 @@ private fun <T> QuickTrackAction(
             options.forEach { (value, optionLabel) ->
                 DropdownMenuItem(
                     text = { Text(optionLabel) },
+                    modifier = Modifier.semantics { selected = value == selectedValue },
+                    trailingIcon = { if (value == selectedValue) Icon(Icons.Rounded.Check, contentDescription = null) },
                     onClick = {
                         expanded = false
                         onSelect(value)

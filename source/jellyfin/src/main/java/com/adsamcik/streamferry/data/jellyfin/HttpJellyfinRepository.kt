@@ -42,12 +42,16 @@ class HttpJellyfinRepository(
         mediaSourceId: String?,
     ): Result<JellyfinPlaybackInfo> = withContext(Dispatchers.IO) {
         runCatching {
+            require(audioStreamIndex == null || audioStreamIndex >= 0) { "Invalid audio track" }
             require(subtitleStreamIndex == null || subtitleStreamIndex >= -1) { "Invalid subtitle track" }
             val burnSelectedSubtitle = subtitleStreamIndex?.let { it >= 0 } == true
             require(!burnSelectedSubtitle || allowSubtitleBurnIn) {
                 "The selected subtitle needs video transcoding for this output"
             }
-            val requireTranscode = forceTranscode || burnSelectedSubtitle
+            // Direct playback leaves every audio stream in the original container. Receivers can
+            // ignore the requested index and pick their own default, so explicitly map audio in a
+            // generated stream even when the original codec/container is otherwise compatible.
+            val requireTranscode = forceTranscode || burnSelectedSubtitle || audioStreamIndex != null
             fun deviceProfile(requiresTranscode: Boolean) = downloadProfile?.let { profile ->
                 DeviceProfiles.forDownload(
                     maxBitrateBps = profile.maxBitrateBps,
@@ -92,6 +96,14 @@ class HttpJellyfinRepository(
             if (stripSubtitles) {
                 check(api.resolveUpstreamFor(response.mediaSourceId).isTranscoding) {
                     "Jellyfin did not remove subtitle tracks from the video"
+                }
+            }
+            if (audioStreamIndex != null) {
+                check(response.audioTracks.any { it.index == audioStreamIndex }) {
+                    "The selected audio track is no longer available"
+                }
+                check(api.resolveUpstreamFor(response.mediaSourceId).isTranscoding) {
+                    "Jellyfin did not apply the selected audio track"
                 }
             }
             if (burnSelectedSubtitle) {

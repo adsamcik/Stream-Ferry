@@ -487,6 +487,11 @@ class JellyfinClient(
                 .selectPlayableSource(requireTranscode)
                 ?: error("Jellyfin did not provide the selected media source")
         }
+        audioStreamIndex?.let { selected ->
+            check(source.mediaStreams.any { it.type.equals("Audio", true) && it.index == selected }) {
+                "The selected audio track is no longer available"
+            }
+        }
         subtitleStreamIndex?.takeIf { it >= 0 }?.let { selected ->
             check(source.mediaStreams.any { it.type.equals("Subtitle", true) && it.index == selected }) {
                 "The selected subtitle track is no longer available"
@@ -503,8 +508,12 @@ class JellyfinClient(
             .filter { it.type.equals("Video", true) && it.codec?.lowercase() !in IMAGE_CODECS }
             .maxByOrNull { (it.width ?: 0).toLong() * (it.height ?: 0).toLong() }
             ?: source.mediaStreams.firstOrNull { it.type.equals("Video", true) }
-        val audio = source.mediaStreams.firstOrNull { it.type.equals("Audio", true) }
-        val audioTracks = source.mediaStreams.filter { it.type.equals("Audio", true) }.toMediaTracks()
+        val audioStreams = source.mediaStreams.filter { it.type.equals("Audio", true) }
+        val chosenAudioIndex = audioStreamIndex ?: source.defaultAudioStreamIndex
+        val audio = audioStreams.firstOrNull { chosenAudioIndex != null && it.index == chosenAudioIndex }
+            ?: audioStreams.firstOrNull { it.isDefault }
+            ?: audioStreams.firstOrNull()
+        val audioTracks = audioStreams.toMediaTracks().map { it.copy(isDefault = it.index == audio?.index) }
         val subtitleTracks = source.mediaStreams.filter { it.type.equals("Subtitle", true) }.toMediaTracks()
         logger.event(
             "jellyfin",
@@ -1252,6 +1261,7 @@ private data class MediaSourceDto(
     /** Actual mux/container selected by Jellyfin for TranscodingUrl (not the original media container). */
     @SerialName("TranscodingContainer") val transcodingContainer: String? = null,
     @SerialName("DirectStreamUrl") val directStreamUrl: String? = null,
+    @SerialName("DefaultAudioStreamIndex") val defaultAudioStreamIndex: Int? = null,
     @SerialName("MediaStreams") val mediaStreams: List<MediaStreamDto> = emptyList(),
 )
 

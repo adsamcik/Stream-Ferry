@@ -181,6 +181,62 @@ class JellyfinPlaybackInfoSelectionTest {
         }
     }
 
+    @Test
+    fun pinsAudioSelectionAndReportsTheSelectedCodecAndDefault() = runBlocking {
+        val bodies = mutableListOf<String>()
+        val client = client(FixedResponseInterceptor(audioResponse(), bodies))
+
+        val result = client.postPlaybackInfo("item-1", "{}", 2, null, null, 0, true)
+
+        assertEquals(2, bodies.size)
+        val selection = Json.parseToJsonElement(bodies[1]).jsonObject
+        assertEquals("version", selection["MediaSourceId"]?.jsonPrimitive?.content)
+        assertEquals("2", selection["AudioStreamIndex"]?.jsonPrimitive?.content)
+        assertEquals("ac3", result.audioCodec)
+        assertEquals(listOf(2), result.audioTracks.filter { it.isDefault }.map { it.index })
+    }
+
+    @Test
+    fun negotiatedAudioDefaultOverridesEmbeddedFlagsAndFirstStreamOrder() = runBlocking {
+        val result = client(audioResponse()).playbackInfo(requireTranscode = false)
+
+        assertEquals("ac3", result.audioCodec)
+        assertEquals(listOf(2), result.audioTracks.filter { it.isDefault }.map { it.index })
+        assertEquals(listOf("eng", "ces"), result.audioTracks.map { it.language })
+    }
+
+    @Test
+    fun audioDefaultsFallBackToEmbeddedFlagThenFirstTrack() = runBlocking {
+        for (embeddedDefault in listOf(true, false)) {
+            val response = audioResponse()
+                .replace("\"DefaultAudioStreamIndex\":2,", "")
+                .replace("\"IsDefault\":true", "\"IsDefault\":false")
+                .replace("\"Language\":\"ces\"", "\"Language\":\"ces\",\"IsDefault\":$embeddedDefault")
+
+            val result = client(response).playbackInfo(requireTranscode = false)
+
+            assertEquals(if (embeddedDefault) "ac3" else "aac", result.audioCodec)
+            assertEquals(listOf(if (embeddedDefault) 2 else 1), result.audioTracks.filter { it.isDefault }.map { it.index })
+        }
+    }
+
+    @Test
+    fun missingAudioSelectionFailsInsteadOfPlayingAnotherLanguage() = runBlocking {
+        val client = client(audioResponse())
+
+        assertFailsWith<IllegalStateException> {
+            client.postPlaybackInfo("item-1", "{}", 9, null, null, 0, true, "version")
+        }
+        Unit
+    }
+
+    private fun audioResponse() = """{"MediaSources":[{"Id":"version","Container":"mkv",
+        "SupportsDirectPlay":true,"SupportsTranscoding":true,
+        "TranscodingUrl":"/Videos/version/stream.ts","TranscodingContainer":"ts",
+        "DefaultAudioStreamIndex":2,"MediaStreams":[
+          {"Type":"Audio","Index":1,"Codec":"aac","Language":"eng","IsDefault":true},
+          {"Type":"Audio","Index":2,"Codec":"ac3","Language":"ces"}]}]}"""
+
     private suspend fun JellyfinClient.playbackInfo(requireTranscode: Boolean) = postPlaybackInfo(
         itemId = "item-1",
         deviceProfileJson = "{}",

@@ -24,6 +24,7 @@ import androidx.media3.extractor.text.CueDecoder
 import androidx.media3.extractor.text.DefaultSubtitleParserFactory
 import androidx.media3.extractor.text.SubtitleParser
 import com.adsamcik.streamferry.core.language.Languages
+import com.adsamcik.streamferry.data.audio.LocalAudioTrack
 import java.io.ByteArrayOutputStream
 import java.io.EOFException
 import java.io.File
@@ -51,6 +52,62 @@ object LocalSubtitleReader {
             continuation.invokeOnCancellation { cancellation.cancel(); worker.interrupt() }
             worker.start()
         }
+
+    /** Reads container headers only; cancellation also interrupts a blocked document-provider open. */
+    suspend fun discoverAudio(context: Context, videoUri: String, sourceMimeType: String?): List<LocalAudioTrack> =
+        suspendCancellableCoroutine { continuation ->
+            val cancellation = ReadCancellation()
+            val worker = Thread({
+                val result = runCatching { audioTracks(context, videoUri, sourceMimeType, cancellation) }
+                if (continuation.isActive) continuation.resumeWith(result)
+            }, "audio-discovery").apply { isDaemon = true }
+            continuation.invokeOnCancellation { cancellation.cancel(); worker.interrupt() }
+            worker.start()
+        }
+
+    private fun audioTracks(
+        context: Context,
+        videoUri: String,
+        sourceMimeType: String?,
+        cancellation: ReadCancellation,
+    ): List<LocalAudioTrack> {
+        val discovered = linkedMapOf<Int, LocalAudioTrack>()
+        var ended = false
+        val output = object : ExtractorOutput {
+            override fun track(id: Int, type: Int): TrackOutput = object : TrackOutput by DiscardingTrackOutput() {
+                override fun format(format: Format) {
+                    if (type != C.TRACK_TYPE_AUDIO) return
+                    val index = discovered[id]?.index ?: discovered.size
+                    val language = format.language?.takeUnless { it.isBlank() || it == "und" }
+                    discovered[id] = LocalAudioTrack(
+                        index = index,
+                        extractorTrackId = id,
+                        formatId = format.id,
+                        language = language,
+                        label = format.label ?: Languages.nameFor(language) ?: "Audio ${index + 1}",
+                        isDefault = format.selectionFlags and C.SELECTION_FLAG_DEFAULT != 0,
+                        roleFlags = format.roleFlags,
+                        mimeType = format.sampleMimeType,
+                        codecs = format.codecs,
+                        channelCount = format.channelCount,
+                        sampleRate = format.sampleRate,
+                        unsupportedReason = when {
+                            format.drmInitData != null -> "Encrypted audio cannot be converted on this device"
+                            format.sampleMimeType == null -> "Unknown audio format"
+                            else -> null
+                        },
+                    )
+                }
+            }
+            override fun endTracks() { ended = true }
+            override fun seekMap(seekMap: SeekMap) = Unit
+        }
+        ExtractorSession(context, videoUri, sourceMimeType, output, cancellation).use { session ->
+            while (!ended && session.read()) Unit
+        }
+        // ProgressiveMediaPeriod groups extractor tracks by ID, independent of header encounter order.
+        return discovered.values.sortedBy { it.extractorTrackId }.mapIndexed { index, track -> track.copy(index = index) }
+    }
 
     private fun tracks(context: Context, videoUri: String, sourceMimeType: String?, cancellation: ReadCancellation): List<LocalSubtitleTrack> {
         val discovered = ArrayList<LocalSubtitleTrack>()

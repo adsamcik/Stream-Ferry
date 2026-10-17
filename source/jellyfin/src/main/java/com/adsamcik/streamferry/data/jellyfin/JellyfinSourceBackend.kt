@@ -345,6 +345,9 @@ class JellyfinPlaybackProvider(
             check(selectedVersion == null || info.mediaSourceId == selectedVersion) {
                 "The selected media version is no longer available"
             }
+            check(audioIndex == null || info.audioTracks.any { it.index == audioIndex }) {
+                "The selected audio track is no longer available"
+            }
             val upstream = repository.resolveUpstream(info)
             JellyfinProviderPlaybackSession(this, request, info, upstream)
         }

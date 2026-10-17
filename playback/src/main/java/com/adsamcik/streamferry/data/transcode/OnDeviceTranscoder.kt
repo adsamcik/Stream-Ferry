@@ -13,6 +13,9 @@ import androidx.media3.effect.Presentation
 import androidx.media3.effect.OverlayEffect
 import com.adsamcik.streamferry.data.subtitle.SubtitleCueSource
 import com.adsamcik.streamferry.data.subtitle.SubtitleOverlay
+import com.adsamcik.streamferry.data.audio.LocalAudioTrack
+import com.adsamcik.streamferry.data.audio.AudioLanguageTrackSelector
+import androidx.media3.exoplayer.trackselection.TrackSelector
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.transformer.Composition
 import androidx.media3.transformer.DefaultEncoderFactory
@@ -81,6 +84,7 @@ class OnDeviceTranscoder(
         owner: Any? = null,
         abortIf: (() -> Boolean)? = null,
         subtitleCues: SubtitleCueSource? = null,
+        audioTrack: LocalAudioTrack? = null,
     ) {
         check(!released) { "on-device transcoder is released" }
         require(startMs >= 0) { "transcode start must not be negative" }
@@ -168,11 +172,13 @@ class OnDeviceTranscoder(
                         )
                         .setMuxerFactory(muxerFactory)
                         .setLooper(thread.looper)
-                    if (localSourceUri.scheme in setOf("http", "https")) {
+                    if (localSourceUri.scheme in setOf("http", "https") || audioTrack != null) {
                         builder.setAssetLoaderFactory(
                             ExoPlayerAssetLoader.Factory(
                                 appContext, DefaultDecoderFactory.Builder(appContext).build(), Clock.DEFAULT,
-                                DefaultMediaSourceFactory(appContext),
+                                DefaultMediaSourceFactory(appContext).setEnableClippingInMediaPeriod(true),
+                                audioTrack?.let { selected -> TrackSelector.Factory { ctx -> AudioLanguageTrackSelector(ctx, selected) } },
+                                null, null,
                             ),
                         )
                     }

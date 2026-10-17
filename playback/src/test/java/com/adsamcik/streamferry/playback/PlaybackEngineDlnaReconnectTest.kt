@@ -221,7 +221,7 @@ class PlaybackEngineDlnaReconnectTest {
             every { network.lanIpv4() } returns "127.0.0.1"
             val transcoder = mockk<OnDeviceTranscoder>()
             every { transcoder.cancelOwnedInFlightAndAwait(any(), any()) } returns true
-            coEvery { transcoder.transcodeStream(any(), any(), any(), any(), any(), any(), any(), any(), any()) } coAnswers {
+            coEvery { transcoder.transcodeStream(any(), any(), any(), any(), any(), any(), any(), any(), any(), any()) } coAnswers {
                 encoderStarts += arg<Long>(3)
                 val muxer = arg<Muxer.Factory>(2).create("unused")
                 val format = Format.Builder().setSampleMimeType(MimeTypes.VIDEO_H264).setWidth(640).setHeight(360)

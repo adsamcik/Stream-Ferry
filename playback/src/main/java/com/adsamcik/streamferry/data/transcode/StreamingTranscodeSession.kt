@@ -19,6 +19,7 @@ import com.adsamcik.streamferry.source.api.DiagnosticSink
 import com.adsamcik.streamferry.data.subtitle.LocalSubtitleTrack
 import com.adsamcik.streamferry.data.subtitle.LocalSubtitleReader
 import com.adsamcik.streamferry.data.subtitle.SubtitleCueSource
+import com.adsamcik.streamferry.data.audio.LocalAudioTrack
 import android.content.Context
 import com.google.common.collect.ImmutableList
 import kotlinx.coroutines.CompletableDeferred
@@ -53,6 +54,7 @@ class StreamingTranscodeSession(
     exportDispatcher: CoroutineDispatcher = Dispatchers.IO,
     private val subtitleTrack: LocalSubtitleTrack? = null,
     private val subtitleContext: Context? = null,
+    private val audioTrack: LocalAudioTrack? = null,
 ) : ClientTranscodeSource {
     private val lock = Object()
     private val scope = CoroutineScope(SupervisorJob() + exportDispatcher)
@@ -103,6 +105,7 @@ class StreamingTranscodeSession(
                             sourceMimeType = sourceMimeType, sourceProfile = sourceProfile,
                             owner = owner, abortIf = { released },
                             subtitleCues = cues,
+                            audioTrack = audioTrack,
                         )
                         finish(null)
                     } catch (error: Exception) {

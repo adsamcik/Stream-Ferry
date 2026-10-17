@@ -109,25 +109,18 @@ class StreamSelectionServiceTest {
         assertEquals(PlayMethod.HLS_TRANSCODE, d.playMethod)
     }
 
-    // ----- AudioTrackSelection: a non-default audio track can't be honored on direct play -----
+    // ----- AudioTrackSelection: selected audio cannot be honored on direct play -----
 
     @Test fun audioSelection_nonDefaultTrack_requiresTranscode() {
         // Picking a track that isn't the server default must force a server transcode so the chosen
         // audio is muxed into the stream (the proxy can't switch embedded tracks on the TV).
-        assertTrue(AudioTrackSelection.requiresServerTranscode(selectedIndex = 3, defaultIndex = 1))
+        assertTrue(AudioTrackSelection.requiresServerTranscode(selectedIndex = 3))
     }
 
-    @Test fun audioSelection_defaultTrackOrNone_directPlays() {
-        // Selecting the default track, or clearing the selection, needs no transcode — direct play
-        // already delivers that audio.
-        assertFalse(AudioTrackSelection.requiresServerTranscode(selectedIndex = 1, defaultIndex = 1))
-        assertFalse(AudioTrackSelection.requiresServerTranscode(selectedIndex = null, defaultIndex = 1))
-    }
-
-    @Test fun audioSelection_unknownDefault_forcesTranscodeToHonorChoice() {
-        // If the default track isn't known yet, honor an explicit choice by transcoding (safe default).
-        assertTrue(AudioTrackSelection.requiresServerTranscode(selectedIndex = 2, defaultIndex = null))
-        assertFalse(AudioTrackSelection.requiresServerTranscode(selectedIndex = null, defaultIndex = null))
+    @Test fun audioSelection_explicitDefault_requiresGeneratedOutput() {
+        // A source-negotiated default is not necessarily the TV's native default.
+        assertTrue(AudioTrackSelection.requiresServerTranscode(selectedIndex = 1))
+        assertFalse(AudioTrackSelection.requiresServerTranscode(selectedIndex = null))
     }
 
     // ----- max resolution / 4K-HDR passthrough -----

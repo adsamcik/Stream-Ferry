@@ -16,6 +16,7 @@ import com.adsamcik.streamferry.data.transcode.StreamingTranscodeSession
 import com.adsamcik.streamferry.data.subtitle.LocalSubtitleReader
 import com.adsamcik.streamferry.data.subtitle.LocalSubtitleTrack
 import com.adsamcik.streamferry.data.subtitle.LocalSubtitleSource
+import com.adsamcik.streamferry.data.audio.LocalAudioTrack
 import com.adsamcik.streamferry.diagnostics.NetworkInfoProvider
 import com.adsamcik.streamferry.domain.DiscoveredTarget
 import com.adsamcik.streamferry.domain.MediaItem
@@ -67,6 +68,7 @@ class PlaybackEngineLocalTranscodeTest {
         mockkConstructor(StreamingTranscodeSession::class)
         mockkObject(LocalSubtitleReader)
         coEvery { LocalSubtitleReader.discover(any(), any(), any()) } returns emptyList()
+        coEvery { LocalSubtitleReader.discoverAudio(any(), any(), any()) } returns emptyList()
         // Only first-media readiness is signalled. No source-EOF or export-completion event is sent.
         coEvery { anyConstructed<StreamingTranscodeSession>().awaitReady() } returns Unit
         every { anyConstructed<StreamingTranscodeSession>().release() } just Runs
@@ -154,7 +156,7 @@ class PlaybackEngineLocalTranscodeTest {
             prefs = prefs,
         )
 
-        suspend fun startOnline() = engine.play(movie, target, selected, StreamPreferences(maxVideoHeight = 720, maxBitrateBps = 2_000_000))
+        suspend fun startOnline(prefs: StreamPreferences = StreamPreferences(maxVideoHeight = 720, maxBitrateBps = 2_000_000)) = engine.play(movie, target, selected, prefs)
 
         suspend fun startSource(source: SourceCase) {
             when (source) {
@@ -196,6 +198,188 @@ class PlaybackEngineLocalTranscodeTest {
             }
         }
     }
+
+    @Test fun `audio language and captions survive seeks output changes handoffs and failed retries for every source`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) {
+            coEvery { LocalSubtitleReader.discoverAudio(any(), any(), any()) } returns audioTracks
+            val f = Fixture(this, protocol)
+            f.providerMediaVersion = "version"
+            f.providerAudioTracks = audioTracks.map { com.adsamcik.streamferry.source.api.MediaTrack(TrackRef("version:${it.extractorTrackId}"), it.language, it.label, it.isDefault) }
+            every { LocalSubtitleReader.external(any(), any()) } returns LocalSubtitleTrack(
+                0, "ces", "Czech captions", source = LocalSubtitleSource.External("content://subtitles/42", "text/vtt"),
+            )
+            every { LocalSubtitleReader.open(any(), any(), any(), any()) } returns mockk(relaxed = true)
+            try {
+                f.startSource(source); runCurrent()
+                assertEquals(0, f.engine.status.value?.currentAudioIndex)
+                f.engine.selectAudioTrack(1); runCurrent()
+                f.engine.attachSubtitle("content://subtitles/42"); runCurrent()
+                val captions = assertNotNull(f.engine.status.value?.currentSubtitleIndex)
+                f.events.emit(PlaybackTargetEvent.StatusChanged(0, true)); runCurrent()
+                f.engine.pause(); runCurrent()
+                f.engine.seekTo(450); runCurrent()
+                f.engine.selectPreferredCodec("hevc"); runCurrent()
+                f.engine.selectMaxVideoHeight(480); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(0, false)); runCurrent()
+                assertEquals(1, f.engine.status.value?.currentAudioIndex)
+                assertEquals(captions, f.engine.status.value?.currentSubtitleIndex)
+                val continuation = assertNotNull(f.engine.beginManualProtocolSwitch())
+                val alternate = Protocol.entries.first { it != protocol }
+                f.continueSource(source, alternate, 450, continuation); runCurrent()
+                assertEquals(1, f.engine.status.value?.currentAudioIndex)
+                assertEquals(captions, f.engine.status.value?.currentSubtitleIndex)
+                assertEquals(450L, f.engine.status.value?.positionSeconds)
+                assertEquals(480, f.engine.status.value?.maxVideoHeight)
+                assertFalse(f.loads.last().playWhenReady)
+                f.events.emit(PlaybackTargetEvent.StatusChanged(0, false)); runCurrent()
+                val returning = assertNotNull(f.engine.beginManualProtocolSwitch())
+                coEvery { f.target.connect(any()) } throws IllegalStateException("TV unavailable")
+                assertFailsWith<IllegalStateException> { f.continueSource(source, protocol, 450, returning) }
+                val retry = assertNotNull(f.engine.continuationForExplicitRetry())
+                f.engine.stop(); runCurrent()
+                coEvery { f.target.connect(any()) } just Runs
+                f.continueSource(source, protocol, 450, retry); runCurrent()
+                assertEquals(1, f.engine.status.value?.currentAudioIndex)
+                assertEquals(captions, f.engine.status.value?.currentSubtitleIndex)
+                assertFalse(f.loads.last().playWhenReady)
+                if (source in listOf(SourceCase.PROVIDER_FILE, SourceCase.PROVIDER_HLS)) {
+                    assertEquals(TrackRef("version:9"), f.requests.last().audioTrack)
+                    assertTrue(f.requests.last().forceTranscode)
+                    assertEquals("version", f.requests.last().mediaVersion)
+                }
+                f.engine.selectAudioTrack(2); runCurrent()
+                assertEquals("English commentary", f.engine.status.value?.audioTracks?.single { it.index == 2 }?.label)
+                f.engine.selectAudioTrack(null); runCurrent()
+                assertEquals(0, f.engine.status.value?.currentAudioIndex)
+                assertFalse(f.loads.last().playWhenReady)
+                f.engine.resume(); runCurrent()
+                assertEquals(captions, f.engine.status.value?.currentSubtitleIndex)
+            } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `preferred audio language applies to files and provider streams and default stays pinned in Original`() = runTest {
+        for (protocol in Protocol.entries) {
+            val f = Fixture(this, protocol)
+            coEvery { LocalSubtitleReader.discoverAudio(any(), any(), any()) } returns audioTracks
+            f.providerAudioTracks = audioTracks.map { com.adsamcik.streamferry.source.api.MediaTrack(TrackRef("version:${it.extractorTrackId}"), it.language, it.label, it.isDefault) }
+            try {
+                f.start(prefs = StreamPreferences(preferredAudioLanguage = "cs")); runCurrent()
+                assertEquals(1, f.engine.status.value?.currentAudioIndex)
+                assertEquals(LocalTranscodeMode.ON_DEVICE, f.engine.status.value?.localTranscodeMode)
+                assertFailsWith<IllegalArgumentException> { f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ORIGINAL) }
+                f.engine.stop(); runCurrent()
+                f.startOnline(StreamPreferences(preferredAudioLanguage = "cs")); runCurrent()
+                assertEquals(1, f.engine.status.value?.currentAudioIndex)
+                assertEquals(TrackRef("version:9"), f.requests.last().audioTrack)
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ORIGINAL); runCurrent()
+                assertTrue(f.requests.last().forceTranscode)
+                f.engine.selectAudioTrack(0); runCurrent()
+                assertEquals(TrackRef("version:7"), f.requests.last().audioTrack)
+                assertTrue(f.requests.last().forceTranscode)
+                assertFailsWith<IllegalArgumentException> { f.engine.selectAudioTrack(99) }
+                f.engine.playNext(f.movie.copy(id = "next"), StreamPreferences()); runCurrent()
+                assertEquals(0, f.engine.status.value?.currentAudioIndex)
+                f.engine.stop(); runCurrent()
+                f.providerAudioTracks = f.providerAudioTracks.take(1)
+                f.startOnline(StreamPreferences(preferredAudioLanguage = "eng")); runCurrent()
+                assertNull(f.requests.last().audioTrack, "a matching single audio stream needs no automatic conversion")
+                f.engine.selectAudioTrack(0); runCurrent()
+                assertTrue(f.requests.last().forceTranscode, "an explicit track choice must still be pinned")
+            } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `explicit audio default during discovery overrides language preference and a new video clears it`() = runTest {
+        val f = Fixture(this)
+        val discovered = CompletableDeferred<List<LocalAudioTrack>>()
+        coEvery { LocalSubtitleReader.discoverAudio(any(), any(), any()) } coAnswers { discovered.await() }
+        val starting = async { f.start(prefs = StreamPreferences(preferredAudioLanguage = "cs")) }
+        try {
+            runCurrent()
+            f.engine.selectAudioTrack(null)
+            discovered.complete(audioTracks); runCurrent(); starting.await()
+            assertEquals(0, f.engine.status.value?.currentAudioIndex)
+            f.engine.stop(); runCurrent()
+            f.start(prefs = StreamPreferences(preferredAudioLanguage = "cs")); runCurrent()
+            assertEquals(1, f.engine.status.value?.currentAudioIndex)
+        } finally { discovered.complete(emptyList()); starting.cancel(); f.engine.stop(); runCurrent() }
+    }
+
+    @Test fun `audio selection remains responsive while a provider stream is preparing`() = runTest {
+        for (protocol in Protocol.entries) {
+            val f = Fixture(this, protocol)
+            f.providerAudioTracks = audioTracks.map { com.adsamcik.streamferry.source.api.MediaTrack(TrackRef(it.extractorTrackId.toString()), it.language, it.label, it.isDefault) }
+            var calls = 0
+            coEvery { f.provider.prepare(any()) } coAnswers {
+                f.requests += firstArg<PlaybackRequest>()
+                if (++calls == 2) awaitCancellation() else Result.success(f.providerSession)
+            }
+            val starting = async { f.startOnline(StreamPreferences(preferredAudioLanguage = "cs")) }
+            try {
+                runCurrent()
+                assertFalse(starting.isCompleted)
+                f.engine.pause()
+                f.engine.selectAudioTrack(2); runCurrent(); starting.await()
+                assertEquals(2, f.engine.status.value?.currentAudioIndex)
+                assertEquals(TrackRef("10"), f.requests.last().audioTrack)
+                assertFalse(f.loads.last().playWhenReady)
+            } finally { starting.cancel(); f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `queued duplicate audio choices finish interrupted startup and duplicate labels stay distinct`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) {
+            val tracks = audioTracks.map { it.copy(label = "Audio") }
+            coEvery { LocalSubtitleReader.discoverAudio(any(), any(), any()) } returns tracks
+            val f = Fixture(this, protocol)
+            f.providerAudioTracks = tracks.map { com.adsamcik.streamferry.source.api.MediaTrack(TrackRef(it.extractorTrackId.toString()), it.language, it.label, it.isDefault) }
+            val ready = CompletableDeferred<Unit>()
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE); runCurrent()
+                val loads = f.loads.size
+                coEvery { anyConstructed<StreamingTranscodeSession>().awaitReady() } coAnswers { ready.await() }
+                val seeking = launch { f.engine.seekTo(300) }; runCurrent()
+                val first = launch { f.engine.selectAudioTrack(1) }
+                val second = launch { f.engine.selectAudioTrack(1) }
+                runCurrent()
+                assertTrue(seeking.isCompleted && first.isCompleted)
+                assertFalse(second.isCompleted, "duplicate audio cancelled startup without replacing it: $source/$protocol")
+                ready.complete(Unit); runCurrent(); second.join()
+                assertEquals(loads + 1, f.loads.size)
+                val status = assertNotNull(f.engine.status.value)
+                assertEquals(1, status.currentAudioIndex)
+                assertEquals(300L, status.positionSeconds)
+                assertEquals(listOf("Audio · Track 1", "Audio · Track 2", "Audio · Track 3"), status.audioTracks.map { it.label })
+            } finally {
+                ready.complete(Unit); runCurrent(); f.engine.stop(); runCurrent()
+                coEvery { anyConstructed<StreamingTranscodeSession>().awaitReady() } returns Unit
+            }
+        }
+    }
+
+    @Test fun `unsupported preferred audio leaves usable playback and manual invalid choices do not tear it down`() = runTest {
+        coEvery { LocalSubtitleReader.discoverAudio(any(), any(), any()) } returns audioTracks.map {
+            if (it.index == 1) it.copy(unsupportedReason = "Encrypted audio cannot be converted") else it
+        }
+        val f = Fixture(this)
+        try {
+            f.start(prefs = StreamPreferences(preferredAudioLanguage = "cs")); runCurrent()
+            assertEquals(0, f.engine.status.value?.currentAudioIndex)
+            val loads = f.loads.size
+            assertFailsWith<PlaybackPreparationException> { f.engine.selectAudioTrack(1) }
+            assertFailsWith<IllegalArgumentException> { f.engine.selectAudioTrack(99) }
+            assertEquals(loads, f.loads.size)
+            assertEquals(0, f.engine.status.value?.currentAudioIndex)
+        } finally { f.engine.stop(); runCurrent() }
+    }
+
+    private val audioTracks = listOf(
+        LocalAudioTrack(0, 7, "7", "eng", "English", true, 0, "audio/mp4a-latm", null, 2, 48_000),
+        LocalAudioTrack(1, 9, "9", "ces", "Czech", false, 0, "audio/ac3", null, 6, 48_000),
+        LocalAudioTrack(2, 10, "10", "eng", "English commentary", false, 8, "audio/mp4a-latm", null, 2, 48_000),
+    )
 
     @Test fun `embedded and picked subtitles retain selection pause timeline and output across handoff and failed retry for every source`() = runTest {
         for (protocol in Protocol.entries) for (source in SourceCase.entries) {

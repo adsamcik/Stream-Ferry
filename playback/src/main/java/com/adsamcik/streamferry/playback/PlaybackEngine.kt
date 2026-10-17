@@ -1,5 +1,7 @@
 package com.adsamcik.streamferry.playback
 
+import com.adsamcik.streamferry.core.stream.AudioTrackSelection
+
 import com.adsamcik.streamferry.core.adaptive.AdaptiveBitrateController
 import com.adsamcik.streamferry.core.adaptive.BitrateLadder
 import com.adsamcik.streamferry.core.resume.NoOpSmartResumeRecordStore
@@ -7,7 +9,6 @@ import com.adsamcik.streamferry.core.resume.SmartResumeCheckpointKind
 import com.adsamcik.streamferry.core.resume.SmartResumeDeviceContext
 import com.adsamcik.streamferry.core.resume.SmartResumeSeed
 import com.adsamcik.streamferry.core.resume.SmartResumeSessionTracker
-import com.adsamcik.streamferry.core.stream.AudioTrackSelection
 import com.adsamcik.streamferry.core.language.LanguageMatcher
 import com.adsamcik.streamferry.core.language.TrackLanguage
 import com.adsamcik.streamferry.core.stream.Protocol
@@ -52,6 +53,8 @@ import com.adsamcik.streamferry.data.transcode.StreamingTranscodeSession
 import com.adsamcik.streamferry.data.subtitle.LocalSubtitleReader
 import com.adsamcik.streamferry.data.subtitle.LocalSubtitleTrack
 import com.adsamcik.streamferry.data.subtitle.LocalSubtitleSource
+import com.adsamcik.streamferry.data.audio.LocalAudioTrack
+import com.adsamcik.streamferry.data.audio.codecName
 import android.content.Context
 import java.time.Instant
 import java.time.ZoneId
@@ -242,6 +245,13 @@ class PlaybackEngine(
     @Volatile private var providerMediaVersion: String? = null
     /** Chosen audio stream index, or null to let the server pick its default. Re-resolves playback. */
     @Volatile private var audioSelection: Int? = null
+    @Volatile private var audioSelectionExplicit = false
+    @Volatile private var localAudioTracks: List<LocalAudioTrack> = emptyList()
+    private var localAudioDiscovered = false
+
+    private fun selectedLocalAudio(): LocalAudioTrack? = localAudioTracks.firstOrNull { it.index == audioSelection }
+    private fun needsPhoneAudioOutput(): Boolean = localPlayback != null &&
+        (localAudioTracks.size > 1 || (audioSelectionExplicit && selectedLocalAudio() != null))
     /** Chosen subtitle stream index, or null for OFF (no subtitles). A non-null selection is burned in. */
     @Volatile private var subtitleSelection: Int? = null
     @Volatile private var subtitleSelectionExplicit = false
@@ -520,6 +530,7 @@ class PlaybackEngine(
         providerMediaVersion,
         subtitleSelectionExplicit,
         localSubtitlesDiscovered,
+        localAudioTracks.toList(), localAudioDiscovered, audioSelectionExplicit,
     )
 
     private fun PlaybackRecoveryContinuation.withPlaybackChoices() = PlaybackRecoveryContinuation(
@@ -545,6 +556,9 @@ class PlaybackEngine(
         localSubtitlesDiscovered = choices.localSubtitlesDiscovered
         providerMediaVersion = choices.providerMediaVersion
         subtitleSelectionExplicit = choices.subtitleSelectionExplicit
+        localAudioTracks = choices.localAudioTracks
+        localAudioDiscovered = choices.localAudioDiscovered
+        audioSelectionExplicit = choices.audioSelectionExplicit
     }
 
     /**
@@ -785,6 +799,9 @@ class PlaybackEngine(
             // Fresh per-item + recovery state. We do NOT tear the session down (that's the whole point), so
             // reset the flags stopInternalLocked would otherwise clear.
             audioSelection = null
+            audioSelectionExplicit = false
+            localAudioTracks = emptyList()
+            localAudioDiscovered = false
             subtitleSelection = null
             subtitleSelectionExplicit = false
             preferredCodec = null
@@ -1189,6 +1206,32 @@ class PlaybackEngine(
         val params = localPlayback ?: error("No local media selected")
         val sel = selectedTarget ?: error("No target")
         val tgt = target ?: error("No target")
+        if (!localAudioDiscovered) {
+            localAudioTracks = try {
+                LocalSubtitleReader.discoverAudio(appContext, params.filePath, params.contentType)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                logger.w("audio", "Couldn't discover local audio tracks", error)
+                emptyList()
+            }
+            localAudioDiscovered = true
+            mediaAudioTracks = distinguishAudioTracks(localAudioTracks.map { MediaTrack(it.index, it.language, it.label, it.isDefault) })
+            if (!audioSelectionExplicit) {
+                val preferred = LanguageMatcher.matchIndex(
+                    localAudioTracks.filter { it.unsupportedReason == null }.map { TrackLanguage(it.index, it.language) },
+                    prefs.preferredAudioLanguage,
+                )
+                audioSelection = preferred ?: localAudioTracks.firstOrNull { it.isDefault && it.unsupportedReason == null }?.index
+                    ?: localAudioTracks.firstOrNull { it.unsupportedReason == null }?.index ?: defaultAudioIndex()
+                if (preferred == null && LanguageMatcher.matchIndex(
+                        localAudioTracks.map { TrackLanguage(it.index, it.language) }, prefs.preferredAudioLanguage,
+                    ) != null) {
+                    controlErrorMessage = "The preferred audio format isn't supported. Choose another audio track."
+                }
+            } else if (audioSelection == null) audioSelection = defaultAudioIndex()
+            publishStatus()
+        }
         if (!localSubtitlesDiscovered) {
             val retained = localSubtitleTracks
             val discovered = try {
@@ -1226,7 +1269,7 @@ class PlaybackEngine(
         val transcodeTarget = run {
             runCatching { chooseClientTranscodeTarget(params.filePath, params.contentType, sel) }
                 .onFailure {
-                    if (localTranscodeMode == LocalTranscodeMode.ON_DEVICE || needsPhoneSubtitleOutput()) throw it
+                    if (localTranscodeMode == LocalTranscodeMode.ON_DEVICE || needsPhoneSubtitleOutput() || needsPhoneAudioOutput()) throw it
                     localTranscodeUnavailableReason = "This phone cannot encode a compatible format for this TV."
                     logger.w("transcode", "On-device transcode negotiation failed; direct-playing as-is", it)
                 }
@@ -1354,6 +1397,7 @@ class PlaybackEngine(
                 sourceMimeType = mimeType, sourceProfile = profile,
                 subtitleTrack = selectedLocalSubtitle(),
                 subtitleContext = appContext,
+                audioTrack = selectedLocalAudio().takeIf { localPlayback != null },
                 onReconnectRequired = {
                     scope.launch {
                         mutex.withLock {
@@ -1391,7 +1435,9 @@ class PlaybackEngine(
                             mutex.withLock {
                                 if (generation == playGeneration && streamingTranscode === session) {
                                     logger.w(TAG, "On-device streaming encoder failed", error)
-                                    handlePlaybackFailure(PlaybackFailureKind.UNKNOWN, "On-device encoding failed. Try another format or resolution.")
+                                    handlePlaybackFailure(PlaybackFailureKind.UNKNOWN, if (localAudioTracks.size > 1)
+                                        "On-device streaming failed. Try another audio track, format or resolution."
+                                    else "On-device encoding failed. Try another format or resolution.")
                                 }
                             }
                         }
@@ -1567,15 +1613,24 @@ class PlaybackEngine(
     }
 
     /**
-     * Switch the active audio track to the server stream [index] (null = server default) and re-resolve
-     * playback at the current position. Changing the audio track requires a fresh source stream (the
-     * proxy serves a single track), so this re-resolves like a seek. No-op for a non-online (local) session.
+     * Select an exact audio stream, or its source default. Both receivers get a stream containing
+     * the chosen audio, with the same timeline, pause intent and subtitle/output choices.
      */
-    suspend fun selectAudioTrack(index: Int?) = mutex.withLock {
-        if (currentProviderSession == null || audioSelection == index) return@withLock
-        logger.event("playback", "Audio track -> ${index ?: "default"}; re-resolving")
-        reloadSelectionTransaction(audioSelection, index, { audioSelection = it }) {
-            reloadStreamPreservingPosition("audio track change")
+    suspend fun selectAudioTrack(index: Int?) {
+        require(index == null || mediaAudioTracks.any { it.index == index }) { "That audio track is no longer available." }
+        val requested = index ?: defaultAudioIndex()
+        localAudioTracks.firstOrNull { it.index == requested }?.unsupportedReason?.let { throw PlaybackPreparationException(it) }
+        audioSelectionExplicit = true
+        if (audioSelection == requested && !startupWasInterrupted) return
+        withStreamChange {
+            if (localPlayback == null && item == null) return@withStreamChange
+            require(index == null || mediaAudioTracks.any { it.index == index }) { "That audio track is no longer available." }
+            val selected = index ?: defaultAudioIndex()
+            localAudioTracks.firstOrNull { it.index == selected }?.unsupportedReason?.let { throw PlaybackPreparationException(it) }
+            if (audioSelection == selected && !startupWasInterrupted) return@withStreamChange
+            reloadSelectionTransaction(audioSelection, selected, { audioSelection = it }) {
+                reloadOutput(absolutePositionSeconds, "audio track change", localPlayWhenReady)
+            }
         }
     }
 
@@ -1683,8 +1738,8 @@ class PlaybackEngine(
         }
         withStreamChange {
             if (localPlayback == null && item == null) return@withStreamChange
-            require(mode != LocalTranscodeMode.ORIGINAL || !needsPhoneSubtitleOutput()) {
-                "Subtitle control requires on-device output for this file. Choose Auto or On device."
+            require(mode != LocalTranscodeMode.ORIGINAL || (!needsPhoneSubtitleOutput() && !needsPhoneAudioOutput())) {
+                "Audio or subtitle control requires on-device output for this file. Choose Auto or On device."
             }
             changeLocalTranscodeOptions(mode, codec = null, height = null)
         }
@@ -1934,6 +1989,13 @@ class PlaybackEngine(
     private fun defaultAudioIndex(): Int? =
         mediaAudioTracks.firstOrNull { it.isDefault }?.index ?: mediaAudioTracks.firstOrNull()?.index
 
+    private fun distinguishAudioTracks(tracks: List<MediaTrack>): List<MediaTrack> {
+        val counts = tracks.groupingBy { it.label }.eachCount()
+        return tracks.map { track ->
+            if (counts[track.label]!! > 1) track.copy(label = "${track.label} · Track ${track.index + 1}") else track
+        }
+    }
+
     /**
      * Apply the caller-resolved preferred audio/subtitle language (per-show memory already merged over the
      * global preference in [prefs]) once per play, after the first resolve has revealed the tracks. Selects
@@ -1953,7 +2015,7 @@ class PlaybackEngine(
             mediaSubtitleTracks.map { TrackLanguage(it.index, it.language) },
             prefs.preferredSubtitleLanguage,
         )
-        val applyAudio = audioIdx != null && audioIdx != defaultAudioIndex()
+        val applyAudio = !audioSelectionExplicit && audioIdx != null && audioIdx != (audioSelection ?: defaultAudioIndex())
         val applySub = !subtitleSelectionExplicit && subIdx != null && subIdx != subtitleSelection
         if (!applyAudio && !applySub) return
         val previousAudio = audioSelection
@@ -2152,12 +2214,12 @@ class PlaybackEngine(
             ?: HDR_PASSTHROUGH_MAX_BITRATE_BPS.takeIf { effectiveMaxVideoHeight() >= 2160 }
         val providerSubtitle = subtitleSelection?.let(mediaSubtitleTrackRefs::get)
         val burnIn = prefs.allowSubtitleBurnIn || providerSubtitle != null
-        // A specific (non-default) audio track can only be delivered reliably through the proxy by
-        // transcoding: on DIRECT PLAY the TV receives the whole container and plays ITS OWN default track
-        // (the proxy can't switch an embedded audio track on Cast/DLNA). So force a transcode whenever the
-        // chosen track isn't the server default — the server then muxes only the selected audio into the
-        // stream. Mirrors how a chosen subtitle forces burn-in.
-        val audioTrackOverride = AudioTrackSelection.requiresServerTranscode(audioSelection, defaultAudioIndex())
+        // A generated stream carries the chosen audio only. A receiver's native container default
+        // can differ even from the source's negotiated default, so every pinned audio choice matters.
+        val selectedAudio = audioSelection?.let { index ->
+            mediaAudioTrackRefs[index] ?: throw PlaybackPreparationException("The selected audio track is no longer available.")
+        }
+        val audioTrackOverride = AudioTrackSelection.requiresServerTranscode(audioSelection)
         val forceTranscode = effectiveForceTranscode() || audioTrackOverride || providerSubtitle != null
         // A manual codec override advertises only that output codec and, through [effectiveForceTranscode],
         // prevents direct play so the source must either honor it or return a clear failure.
@@ -2168,11 +2230,11 @@ class PlaybackEngine(
                 target = caps,
                 maxBitrateBps = if (phoneOutput || originalOutput) null else bitrate,
                 forceTranscode = if (phoneOutput) audioTrackOverride || providerSubtitle != null
-                    else providerSubtitle != null || (!originalOutput && forceTranscode),
+                    else audioTrackOverride || providerSubtitle != null || (!originalOutput && forceTranscode),
                 // A selected subtitle is burned into the video (the only way to show it reliably through the
                 // proxy on both Cast and DLNA), so enable burn-in whenever one is chosen.
                 allowSubtitleBurnIn = burnIn,
-                audioTrack = audioSelection?.let(mediaAudioTrackRefs::get),
+                audioTrack = selectedAudio,
                 subtitleTrack = providerSubtitle,
                 subtitlesDisabled = providerSubtitle == null,
                 mediaVersion = providerMediaVersion,
@@ -2196,6 +2258,23 @@ class PlaybackEngine(
         }
         providerMediaVersion = descriptor.mediaVersion ?: providerMediaVersion
         val stream = descriptor.stream
+
+        // Discover first, then pin audio before the TV ever sees a multi-audio container. Its native
+        // default can differ from the source's negotiated default or our language preference.
+        if (descriptor.audioTracks.isNotEmpty() && mediaAudioTracks.isEmpty()) {
+            mediaAudioTracks = distinguishAudioTracks(descriptor.audioTracks.mapIndexed { index, track ->
+                MediaTrack(index, track.language, track.label, track.isDefault, track.isForced)
+            })
+            mediaAudioTrackRefs = descriptor.audioTracks.mapIndexed { index, track -> index to track.ref }.toMap()
+            if (mediaAudioTracks.size > 1 && audioSelection == null) {
+                audioSelection = if (!audioSelectionExplicit) LanguageMatcher.matchIndex(
+                    mediaAudioTracks.map { TrackLanguage(it.index, it.language) }, prefs.preferredAudioLanguage,
+                ) ?: defaultAudioIndex() else defaultAudioIndex()
+                runCatching { providerSession.close(PlaybackStopReason.REPLACED) }
+                resolveAndLoad(positionSeconds, requestedBitrate, initialiseAdaptive, armWatchdog, localPlayWhenReady)
+                return
+            }
+        }
 
         // If this renderer previously rejected this exact direct-play media format, don't hand it the
         // original again — force a transcode from the start (skips the doomed direct-play round-trip +
@@ -2230,12 +2309,6 @@ class PlaybackEngine(
         }
         // Capture selectable tracks the first time they're known and keep them (a burn-in/transcode
         // re-resolve may report fewer streams) so the pickers stay populated for the whole session.
-        if (descriptor.audioTracks.isNotEmpty() && mediaAudioTracks.isEmpty()) {
-            mediaAudioTracks = descriptor.audioTracks.mapIndexed { index, track ->
-                MediaTrack(index, track.language, track.label, track.isDefault, track.isForced)
-            }
-            mediaAudioTrackRefs = descriptor.audioTracks.mapIndexed { index, track -> index to track.ref }.toMap()
-        }
         if (descriptor.subtitleTracks.isNotEmpty() && mediaSubtitleTrackRefs.isEmpty()) {
             val used = localSubtitleTracks.mapTo(mutableSetOf()) { it.index }
             var next = 0
@@ -3175,7 +3248,12 @@ class PlaybackEngine(
      */
     private fun chooseClientTranscodeTarget(uri: String, contentType: String, target: DiscoveredTarget): TranscodeTarget? {
         val container = containerForMime(contentType)
-        val profile = LocalMediaProbe.probe(appContext, uri, container)
+        val originalProfile = LocalMediaProbe.probe(appContext, uri, container)
+        val audio = selectedLocalAudio()
+        val profile = if (originalProfile != null && audio != null) originalProfile.copy(
+            audioCodec = audio.codecName ?: originalProfile.audioCodec,
+            audioChannels = audio.channelCount.takeIf { it > 0 } ?: originalProfile.audioChannels,
+        ) else originalProfile
         localSourceProfile = profile // remember the source format for the "what's playing" UI (may be null)
         return chooseOnDeviceTarget(profile, target, automaticEnabled = localPlayback?.allowClientTranscode == true)
     }
@@ -3189,7 +3267,7 @@ class PlaybackEngine(
         localTranscodeCodecOptions = localTranscodeCodecOptions(target.capabilities)
         localTranscodeUnavailableReason = if (localTranscodeCodecOptions.isEmpty())
             "This phone has no compatible hardware encoder for this TV." else null
-        val subtitleOutput = needsPhoneSubtitleOutput()
+        val subtitleOutput = needsPhoneSubtitleOutput() || needsPhoneAudioOutput()
         if (localTranscodeUnavailableReason != null) {
             if (localTranscodeMode == LocalTranscodeMode.ON_DEVICE || subtitleOutput) {
                 throw PlaybackPreparationException(localTranscodeUnavailableReason!!)
@@ -3347,6 +3425,10 @@ class PlaybackEngine(
         mediaAudioTrackRefs = emptyMap()
         mediaSubtitleTrackRefs = emptyMap()
         localSubtitleTracks = emptyList()
+        localAudioTracks = emptyList()
+        localAudioDiscovered = false
+        audioSelectionExplicit = false
+        audioSelection = null
         localSubtitlesDiscovered = false
         subtitleSelectionExplicit = false
         currentProviderSession = null
@@ -3457,7 +3539,7 @@ class PlaybackEngine(
             },
             preferredVideoCodec = if (currentProviderSession != null && localTranscodeMode == LocalTranscodeMode.AUTOMATIC && odt == null)
                 preferredCodec else forcedLocalCodec?.name?.lowercase(),
-            localTranscodeMode = if (needsPhoneSubtitleOutput()) LocalTranscodeMode.ON_DEVICE else localTranscodeMode,
+            localTranscodeMode = if (needsPhoneSubtitleOutput() || needsPhoneAudioOutput()) LocalTranscodeMode.ON_DEVICE else localTranscodeMode,
             localTranscodeUnavailableReason = localTranscodeUnavailableReason,
             automaticMaxVideoHeight = if (currentProviderSession != null ||
                 (localPlayback != null && localTranscodeUnavailableReason == null)) prefs.maxVideoHeight else null,

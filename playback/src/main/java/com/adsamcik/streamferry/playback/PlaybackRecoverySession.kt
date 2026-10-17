@@ -236,6 +236,9 @@ internal data class PlaybackContinuationChoices(
     val providerMediaVersion: String? = null,
     val subtitleSelectionExplicit: Boolean = false,
     val localSubtitlesDiscovered: Boolean = false,
+    val localAudioTracks: List<com.adsamcik.streamferry.data.audio.LocalAudioTrack> = emptyList(),
+    val localAudioDiscovered: Boolean = false,
+    val audioSelectionExplicit: Boolean = false,
 )
 /**
  * Immutable, pure session ledger. The engine owns side effects; this type owns generations, concise

@@ -165,6 +165,19 @@ Permissive origin does not weaken the model: reachability is gated by the LAN-on
 unguessable 256-bit session id, and proxied bytes never contain the Jellyfin URL/token. CORS only
 controls which web origin may *read* a response it could already request.
 
+## Audio languages
+
+The Audio control lists source tracks, including separate commentary tracks. Local files, downloaded
+copies and content URIs discover embedded languages through Media3. Multi-audio local media uses the
+phone's continuous encoder so the receiver cannot substitute its own default track. Exact track IDs
+are retained; duplicate labels include a track number. Phone decoder support still applies.
+
+Jellyfin prepares a generated stream containing the chosen audio, even when choosing the source
+default or Original video output. The selected media version, language, pause state, subtitles and
+absolute position survive seeks, output changes, protocol switches and failed-switch retries. Saved
+language preferences apply to new playback; an explicit choice during startup takes precedence.
+Missing or unsupported selections report an error instead of silently switching language.
+
 ## Subtitles
 
 The Captions control offers available tracks, Off, and a local subtitle-file picker. Selected Jellyfin
