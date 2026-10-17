@@ -21,6 +21,7 @@ import com.google.android.gms.common.api.Status
 import io.mockk.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.*
 import org.junit.After
@@ -47,6 +48,8 @@ class CastProgressTest {
     private val pending = mockk<PendingResult<RemoteMediaClient.MediaChannelResult>>(relaxed = true)
     private val resultCallback = slot<ResultCallback<RemoteMediaClient.MediaChannelResult>>()
     private lateinit var controller: CastTargetController
+    private lateinit var manager: SessionManager
+    private var currentSession: CastSession? = session
     private var elapsedMs = 1_000L
     private var cachedPositionMs = 120_000L
     private var receiverPositionMs = 120_000L
@@ -62,7 +65,7 @@ class CastProgressTest {
     @Before fun setUp() {
         Dispatchers.setMain(dispatcher)
         val context = mockk<CastContext>(relaxed = true)
-        val manager = mockk<SessionManager>(relaxed = true)
+        manager = mockk(relaxed = true)
         val router = mockk<MediaRouter>(relaxed = true)
         val route = mockk<MediaRouter.RouteInfo>(relaxed = true)
         val device = mockk<CastDevice>(relaxed = true)
@@ -76,7 +79,8 @@ class CastProgressTest {
         every { route.id } returns "route"
         every { device.deviceId } returns "device"
         every { context.sessionManager } returns manager
-        every { manager.currentCastSession } returns session
+        every { manager.currentCastSession } answers { currentSession }
+        every { manager.endCurrentSession(true) } answers { currentSession = null }
         every { manager.addSessionManagerListener(capture(sessionListener), CastSession::class.java) } just Runs
         every { session.castDevice } returns device
         every { session.sessionId } returns "session"
@@ -263,6 +267,57 @@ class CastProgressTest {
         repeat(6) { tick() }
         assertEquals(countAfterDisconnect, events.size)
         verify(exactly = 1) { client.requestStatus() }
+    }
+
+    @Test fun `disconnect waits for receiver app shutdown before returning to a handoff`() = progressTest {
+        startPlaying()
+        every { manager.endCurrentSession(true) } just Runs
+        val closing = async { controller.disconnect() }
+        runCurrent()
+        assertFalse(closing.isCompleted)
+        verify(exactly = 1) { manager.endCurrentSession(true) }
+        // Old status and terminal callbacks must stay detached throughout asynchronous shutdown.
+        val eventCount = events.size
+        mediaCallback.captured.onStatusUpdated()
+        sessionListener.captured.onSessionEnded(session, 0)
+        advanceTimeBy(1_000); runCurrent()
+        assertFalse(closing.isCompleted)
+        assertEquals(eventCount, events.size)
+        currentSession = null
+        advanceTimeBy(50); runCurrent()
+        closing.await()
+        assertEquals(1, events.filterIsInstance<PlaybackTargetEvent.Disconnected>().size)
+    }
+
+    @Test fun `receiver shutdown timeout is bounded and a later disconnect can finish`() = progressTest {
+        startPlaying()
+        every { manager.endCurrentSession(true) } just Runs
+        val closing = async { runCatching { controller.disconnect() } }
+        runCurrent()
+        advanceTimeBy(5_000); runCurrent()
+        assertTrue(closing.isCompleted)
+        assertTrue(closing.await().exceptionOrNull() is IllegalStateException)
+        currentSession = null
+        controller.disconnect()
+    }
+
+    @Test fun `superseded disconnect neither waits for nor reports disconnection of replacement session`() = progressTest {
+        startPlaying()
+        every { manager.endCurrentSession(true) } just Runs
+        val closing = async { controller.disconnect() }
+        runCurrent()
+        val replacement = mockk<CastSession>(relaxed = true)
+        every { replacement.castDevice } returns session.castDevice
+        every { replacement.sessionId } returns "replacement"
+        every { replacement.isConnected } returns true
+        every { replacement.remoteMediaClient } returns client
+        currentSession = replacement
+        controller.connect(DiscoveredTarget("route", "TV", Protocol.CAST, mockk(relaxed = true), null))
+        advanceTimeBy(50); runCurrent()
+        closing.await()
+        assertTrue(events.none { it is PlaybackTargetEvent.Disconnected })
+        verify(exactly = 1) { manager.endCurrentSession(true) }
+        every { manager.endCurrentSession(true) } answers { currentSession = null }
     }
 
     @Test fun `reload rejects prior timeline before and after load while current pause resume remains live`() = progressTest {

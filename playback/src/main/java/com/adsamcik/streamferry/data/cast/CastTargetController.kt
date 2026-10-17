@@ -404,12 +404,14 @@ class CastTargetController(
     }
 
     override suspend fun disconnect() = withContext(Dispatchers.Main) {
-        ++connectionGeneration
+        val generation = ++connectionGeneration
         // Remove callbacks/listeners before our intentional end so it cannot look like a terminal drop.
         detachActiveSession()
         removeRouteCallback()
-        castContext?.sessionManager?.endCurrentSession(true)
-        _events.tryEmit(PlaybackTargetEvent.Disconnected)
+        // Session shutdown is asynchronous. Let the old receiver release the TV before a same-TV
+        // DLNA handoff starts, while bounding the wait if the receiver cannot acknowledge shutdown.
+        castContext?.let { clearCurrentSession(it, reason = "disconnecting") }
+        if (isCurrentGeneration(generation)) _events.tryEmit(PlaybackTargetEvent.Disconnected)
         Unit
     }
 
@@ -949,11 +951,11 @@ class CastTargetController(
 
     private suspend fun clearCurrentSession(ctx: CastContext, reason: String) {
         val manager = ctx.sessionManager
-        if (manager.currentCastSession == null) return
+        val endingSession = manager.currentCastSession ?: return
         logger.event("connect", "Ending existing Cast session before $reason")
         manager.endCurrentSession(true)
         val cleared = withTimeoutOrNull(SESSION_END_TIMEOUT_MS.milliseconds) {
-            while (manager.currentCastSession != null) delay(SESSION_END_POLL_MS.milliseconds)
+            while (manager.currentCastSession === endingSession) delay(SESSION_END_POLL_MS.milliseconds)
             true
         } ?: false
         if (!cleared) {

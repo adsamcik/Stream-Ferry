@@ -1,5 +1,7 @@
 package com.adsamcik.streamferry.playback
 
+import com.adsamcik.streamferry.core.stream.Protocol
+
 data class PlaybackControlAvailability(
     val canPlayPause: Boolean,
     val canSkip: Boolean,
@@ -37,5 +39,8 @@ object PlaybackControlPolicy {
 
 /** Teardown decisions kept pure so a known-dead renderer can never delay local session cleanup. */
 internal object PlaybackTeardownPolicy {
-    fun shouldSendRendererStop(connectionLost: Boolean): Boolean = !connectionLost
+    // Ending the Cast session stops the receiver app itself. Waiting for a separate media STOP first
+    // can strand an unresponsive receiver for the entire media-command timeout.
+    fun shouldSendRendererStop(connectionLost: Boolean, protocol: Protocol?): Boolean =
+        !connectionLost && protocol != Protocol.CAST
 }

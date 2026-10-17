@@ -553,6 +553,69 @@ class PlaybackEngineLocalTranscodeTest {
         } finally { f.engine.stop(); runCurrent() }
     }
 
+    @Test fun `buffering at a nonzero resume position cannot disable first frame recovery for any source or protocol`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) {
+            val f = Fixture(this, protocol)
+            try {
+                f.startSource(source); runCurrent()
+                val loadCount = f.loads.size
+                f.events.emit(PlaybackTargetEvent.BufferingChanged(true))
+                f.events.emit(PlaybackTargetEvent.StatusChanged(f.loads.last().position.coerceAtLeast(1), false))
+                runCurrent()
+                advanceTimeBy(StartupWatchdog.GRACE_MS); runCurrent()
+                assertTrue(f.engine.recoverySnapshot().attempts.any { it.failureStage == PlaybackFailureStage.FIRST_FRAME },
+                    "$source/$protocol accepted a buffering resume position as first-frame evidence")
+                assertTrue(f.loads.size > loadCount || f.engine.status.value?.isTerminal == true,
+                    "$source/$protocol neither recovered nor surfaced the stalled load")
+            } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `paused startup is allowed to wait but Resume still requires real playback for every source and protocol`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) {
+            val f = Fixture(this, protocol)
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.pause(); runCurrent()
+                val position = f.loads.last().position.coerceAtLeast(1)
+                f.events.emit(PlaybackTargetEvent.StatusChanged(position, false)); runCurrent()
+                val loadCount = f.loads.size
+                advanceTimeBy(StartupWatchdog.GRACE_MS * 2); runCurrent()
+                assertEquals(loadCount, f.loads.size)
+                assertFalse(assertNotNull(f.engine.status.value).isTerminal)
+                f.engine.resume(); runCurrent()
+                f.events.emit(PlaybackTargetEvent.BufferingChanged(true))
+                f.events.emit(PlaybackTargetEvent.StatusChanged(f.loads.last().position.coerceAtLeast(1), false)); runCurrent()
+                advanceTimeBy(StartupWatchdog.GRACE_MS); runCurrent()
+                assertTrue(f.engine.recoverySnapshot().attempts.any { it.failureStage == PlaybackFailureStage.FIRST_FRAME },
+                    "$source/$protocol resumed without retaining the first-frame deadline")
+            } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `final Cast teardown bypasses a hung media Stop while DLNA retains Stop before disconnect for every source`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) {
+            val f = Fixture(this, protocol)
+            val commands = mutableListOf<String>()
+            try {
+                f.startSource(source); runCurrent()
+                coEvery { f.target.stop() } coAnswers {
+                    commands += "stop"
+                    if (protocol == Protocol.CAST) awaitCancellation()
+                }
+                coEvery { f.target.disconnect() } answers { commands += "disconnect" }
+                val stopping = async { f.engine.stop() }; runCurrent()
+                assertTrue(stopping.isCompleted, "$source/$protocol waited for the hung media channel")
+                stopping.await()
+                assertEquals(if (protocol == Protocol.CAST) listOf("disconnect") else listOf("stop", "disconnect"), commands)
+                assertNull(f.engine.status.value)
+            } finally {
+                coEvery { f.target.stop() } returns Unit
+                f.engine.stop(); runCurrent()
+            }
+        }
+    }
+
     @Test fun `HDR unknown metadata DLNA and nonseekable local input all offer phone transcoding`() = runTest {
         val cases = listOf(
             compatibleProfile.copy(isHdr = true, bitDepth = 10) to Protocol.CAST,

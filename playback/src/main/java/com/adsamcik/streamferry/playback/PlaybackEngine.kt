@@ -2561,7 +2561,7 @@ class PlaybackEngine(
 
     /**
      * Arm the startup watchdog (ideas 1+7) for a freshly-loaded stream: if the renderer neither reaches
-     * PLAYING nor advances position within [STARTUP_GRACE_MS] — i.e. it failed *silently*, with no error
+     * PLAYING within the grace window — i.e. it failed *silently*, with no error
      * event — synthesize a failure so recovery still runs. Bytes-flowed distinguishes a decode/format
      * failure (transcodable) from a TV that never even fetched. Cancelled the moment playback starts.
      */
@@ -2892,8 +2892,9 @@ class PlaybackEngine(
                 }
                 rendererPlaybackRevision.incrementAndGet()
                 recoverySession = recoverySession.transition(if (event.isPlaying) PlaybackPhase.PLAYING else PlaybackPhase.PAUSED)
-                // Evidence the stream actually started playing on the TV — cancels the startup watchdog.
-                if (event.isPlaying || (event.positionSeconds > 0 && localPlayWhenReady)) {
+                // A resumed load can report its requested nonzero position while still buffering or
+                // paused. Only PLAYING proves startup succeeded and retires the first-frame watchdog.
+                if (event.isPlaying) {
                     markPlaybackStarted()
                 }
                 if (event.isPositionConfirmed) {
@@ -3198,10 +3199,12 @@ class PlaybackEngine(
         proxy.stop()
         releaseStreamingTranscode()
         target?.let {
-            if (PlaybackTeardownPolicy.shouldSendRendererStop(connectionLost)) {
+            if (PlaybackTeardownPolicy.shouldSendRendererStop(connectionLost, selectedTarget?.protocol)) {
                 runCatching { it.stop() }
-            } else {
+            } else if (connectionLost) {
                 logger.event("playback", "Skipping renderer Stop because the TV connection is already lost")
+            } else {
+                logger.event("playback", "Ending the Cast receiver directly without a separate media Stop")
             }
             runCatching { it.disconnect() }
         }

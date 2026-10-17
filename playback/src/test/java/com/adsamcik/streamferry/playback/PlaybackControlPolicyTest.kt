@@ -1,13 +1,15 @@
 package com.adsamcik.streamferry.playback
 
+import com.adsamcik.streamferry.core.stream.Protocol
 import kotlin.test.Test
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class PlaybackControlPolicyTest {
     @Test fun `teardown never waits for a known disconnected renderer`() {
-        assertTrue(PlaybackTeardownPolicy.shouldSendRendererStop(connectionLost = false))
-        assertFalse(PlaybackTeardownPolicy.shouldSendRendererStop(connectionLost = true))
+        assertTrue(PlaybackTeardownPolicy.shouldSendRendererStop(connectionLost = false, Protocol.DLNA))
+        assertFalse(PlaybackTeardownPolicy.shouldSendRendererStop(connectionLost = true, Protocol.DLNA))
+        assertFalse(PlaybackTeardownPolicy.shouldSendRendererStop(connectionLost = false, Protocol.CAST))
     }
 
     @Test fun `playing paused and buffering sessions remain controllable`() {
