@@ -35,6 +35,8 @@ interface JellyfinApi {
         val audioTracks: List<MediaTrack> = emptyList(),
         /** Selectable subtitle tracks reported by the server. */
         val subtitleTracks: List<MediaTrack> = emptyList(),
+        /** Sidecars do not put subtitle packets in the original video; null means not inspected. */
+        val hasEmbeddedSubtitleTracks: Boolean? = null,
     )
 
     suspend fun systemInfoPublic(): String?
@@ -48,6 +50,7 @@ interface JellyfinApi {
         maxBitrate: Long?,
         startTimeTicks: Long,
         requireTranscode: Boolean,
+        mediaSourceId: String? = null,
     ): PlaybackInfoResult
 
     /** Resolve the upstream source for a previously fetched media source id (held in memory). */

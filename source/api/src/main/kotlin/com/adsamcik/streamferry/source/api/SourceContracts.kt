@@ -166,6 +166,8 @@ data class PlaybackRequest(
     val startPositionSeconds: Long = 0,
     val maxVideoHeight: Int = 0,
     val preferredVideoCodec: String? = null,
+    /** Provider-owned version identity retained independently of the selected tracks. */
+    val mediaVersion: String? = null,
 )
 
 @Serializable
@@ -187,6 +189,7 @@ data class PlaybackDescriptor(
     val audioTracks: List<MediaTrack> = emptyList(),
     val subtitleTracks: List<MediaTrack> = emptyList(),
     val stream: StreamDescriptor,
+    val mediaVersion: String? = null,
 )
 
 enum class HlsSegmentFormat { MPEG2_TS, FMP4 }
@@ -238,6 +241,7 @@ data class PlaybackChange(
     val audioTrack: TrackRef? = null,
     val subtitleTrack: TrackRef? = null,
     val preferredVideoCodec: String? = null,
+    val subtitlesDisabled: Boolean? = null,
 )
 
 enum class PlaybackStopReason { USER, COMPLETED, REPLACED, ERROR, SHUTDOWN }

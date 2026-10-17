@@ -16,6 +16,7 @@ data class JellyfinPlaybackInfo(
     val audioTracks: List<MediaTrack> = emptyList(),
     val subtitleTracks: List<MediaTrack> = emptyList(),
     val itemId: String = mediaSourceId,
+    val hasEmbeddedSubtitleTracks: Boolean? = null,
 )
 
 data class JellyfinDownloadTranscodeProfile(
@@ -39,6 +40,7 @@ interface JellyfinPlaybackRepository {
         maxVideoHeight: Int = 0,
         preferredVideoCodec: String? = null,
         downloadProfile: JellyfinDownloadTranscodeProfile? = null,
+        mediaSourceId: String? = null,
     ): Result<JellyfinPlaybackInfo>
 
     suspend fun resolveUpstream(info: JellyfinPlaybackInfo): JellyfinUpstreamSource

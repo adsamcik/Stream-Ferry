@@ -165,11 +165,20 @@ Permissive origin does not weaken the model: reachability is gated by the LAN-on
 unguessable 256-bit session id, and proxied bytes never contain the Jellyfin URL/token. CORS only
 controls which web origin may *read* a response it could already request.
 
-## Tracks (test-required, not guaranteed)
+## Subtitles
 
-- Text subtitles are treated as test-required; embedded / ASS / SSA / PGS are not assumed to work.
-  PGS/ASS/SSA generally need server-side burn-in.
-- Audio/video track switching is treated as unavailable in MVP unless verified on the target.
+The Captions control offers available tracks, Off, and a local subtitle-file picker. Selected Jellyfin
+subtitles are burned into a server-generated stream, pinned to the selected media version. Local
+embedded captions and picked subtitle files use the phone's streaming encoder; the TV receives the
+same captioned video through HLS/CMAF. Selection and source timing survive seeking, pause/resume,
+output changes and protocol handoffs, including retries.
+
+Media3 decodes embedded text and supported bitmap subtitle codecs. External files support SRT,
+WebVTT, ASS/SSA and TTML. Styling follows Media3's subtitle renderer; unsupported or unreadable
+selections report an error. Captions are not sent as provider URLs or credentials. Off strips known
+embedded caption packets instead of relying on the TV's default track choice. This can require a
+generated stream even when video itself could direct-play. Physical receiver rendering still needs
+the acceptance checks in [PHYSICAL_TV_PLAYBACK.md](PHYSICAL_TV_PLAYBACK.md).
 
 ## Codec probing
 

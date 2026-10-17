@@ -59,6 +59,7 @@ class JellyfinDownloadProviderTest {
             maxVideoHeight: Int,
             preferredVideoCodec: String?,
             downloadProfile: JellyfinDownloadTranscodeProfile?,
+            mediaSourceId: String?,
         ): Result<JellyfinPlaybackInfo> {
             called = true
             this.forceTranscode = forceTranscode

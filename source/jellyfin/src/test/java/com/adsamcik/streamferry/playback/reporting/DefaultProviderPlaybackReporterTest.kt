@@ -99,6 +99,7 @@ class DefaultJellyfinPlaybackReporterTest {
             maxBitrate: Long?,
             startTimeTicks: Long,
             requireTranscode: Boolean,
+            mediaSourceId: String?,
         ): JellyfinApi.PlaybackInfoResult = error("unused")
 
         override fun resolveUpstreamFor(mediaSourceId: String): JellyfinUpstreamSource = error("unused")

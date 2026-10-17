@@ -13,6 +13,9 @@ import com.adsamcik.streamferry.core.transcode.ResolutionTier
 import com.adsamcik.streamferry.data.proxy.LocalProxyServer
 import com.adsamcik.streamferry.data.transcode.LocalMediaProbe
 import com.adsamcik.streamferry.data.transcode.StreamingTranscodeSession
+import com.adsamcik.streamferry.data.subtitle.LocalSubtitleReader
+import com.adsamcik.streamferry.data.subtitle.LocalSubtitleTrack
+import com.adsamcik.streamferry.data.subtitle.LocalSubtitleSource
 import com.adsamcik.streamferry.diagnostics.NetworkInfoProvider
 import com.adsamcik.streamferry.domain.DiscoveredTarget
 import com.adsamcik.streamferry.domain.MediaItem
@@ -31,6 +34,10 @@ import com.adsamcik.streamferry.source.api.StreamDescriptor
 import io.mockk.*
 import java.io.File
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.launch
@@ -58,6 +65,8 @@ class PlaybackEngineLocalTranscodeTest {
         every { LocalMediaProbe.isByteSeekable(any(), any()) } returns true
         every { LocalMediaProbe.probeDurationSecondsExact(any(), any()) } returns 3600.0
         mockkConstructor(StreamingTranscodeSession::class)
+        mockkObject(LocalSubtitleReader)
+        coEvery { LocalSubtitleReader.discover(any(), any(), any()) } returns emptyList()
         // Only first-media readiness is signalled. No source-EOF or export-completion event is sent.
         coEvery { anyConstructed<StreamingTranscodeSession>().awaitReady() } returns Unit
         every { anyConstructed<StreamingTranscodeSession>().release() } just Runs
@@ -65,7 +74,8 @@ class PlaybackEngineLocalTranscodeTest {
 
     @AfterTest fun releaseLocalProbe() = unmockkAll()
 
-    private class Fixture(scope: TestScope, protocol: Protocol = Protocol.CAST) {
+    private class Fixture(scope: TestScope, protocol: Protocol = Protocol.CAST,
+        dispatcher: CoroutineDispatcher = StandardTestDispatcher(scope.testScheduler)) {
         val events = MutableSharedFlow<PlaybackTargetEvent>(extraBufferCapacity = 16)
         val target = mockk<PlaybackTargetController>(relaxed = true)
         val coordinator = mockk<DefaultPlaybackSessionCoordinator>(relaxed = true)
@@ -79,6 +89,7 @@ class PlaybackEngineLocalTranscodeTest {
         var providerAudioTracks = emptyList<com.adsamcik.streamferry.source.api.MediaTrack>()
         var providerSubtitleTracks = emptyList<com.adsamcik.streamferry.source.api.MediaTrack>()
         var providerSourceBitrate: Long? = null
+        var providerMediaVersion: String? = null
         private val session = SessionRegistry().create("video/mp4", false, 100_000)
         val engine: PlaybackEngine
 
@@ -100,7 +111,8 @@ class PlaybackEngineLocalTranscodeTest {
                 (session to ORIGINAL_URL)
             every { providerSession.descriptor } answers {
                 PlaybackDescriptor(movie.ref, compatibleProfile, 3600, sourceBitrateBps = providerSourceBitrate,
-                    audioTracks = providerAudioTracks, subtitleTracks = providerSubtitleTracks, stream = providerStream)
+                    audioTracks = providerAudioTracks, subtitleTracks = providerSubtitleTracks, stream = providerStream,
+                    mediaVersion = providerMediaVersion)
             }
             coEvery { providerSession.mediaSegments() } returns emptyList()
             coEvery { provider.prepare(any()) } answers {
@@ -121,7 +133,7 @@ class PlaybackEngineLocalTranscodeTest {
                 { DeviceEncodeCapabilities(ResolutionTier.FHD_1080P, ResolutionTier.HD_720P) },
                 mockk(relaxed = true),
                 clock = { scope.testScheduler.currentTime },
-                dispatcher = StandardTestDispatcher(scope.testScheduler),
+                dispatcher = dispatcher,
                 elapsedRealtime = { scope.testScheduler.currentTime },
             )
         }
@@ -135,10 +147,11 @@ class PlaybackEngineLocalTranscodeTest {
             ), null,
         )
 
-        suspend fun start(allowClientTranscode: Boolean = true, filePath: String = "/download/movie.mp4") = engine.playLocal(
+        suspend fun start(allowClientTranscode: Boolean = true, filePath: String = "/download/movie.mp4", prefs: StreamPreferences = StreamPreferences()) = engine.playLocal(
             filePath = filePath, contentType = "video/mp4", title = "Movie",
             runtimeSeconds = 3600, allowClientTranscode = allowClientTranscode,
             resumePositionSeconds = 123, target = target, selectedTarget = selected,
+            prefs = prefs,
         )
 
         suspend fun startOnline() = engine.play(movie, target, selected, StreamPreferences(maxVideoHeight = 720, maxBitrateBps = 2_000_000))
@@ -181,6 +194,235 @@ class PlaybackEngineLocalTranscodeTest {
                     resumePositionOverrideSeconds = position, recoveryContinuation = continuation,
                 )
             }
+        }
+    }
+
+    @Test fun `embedded and picked subtitles retain selection pause timeline and output across handoff and failed retry for every source`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) {
+            val embedded = LocalSubtitleTrack(4, "eng", "English", source = LocalSubtitleSource.Embedded(7))
+            coEvery { LocalSubtitleReader.discover(any(), any(), any()) } returns listOf(embedded)
+            val sidecar = embedded.copy(source = LocalSubtitleSource.External("content://subtitles/42", "text/vtt"))
+            every { LocalSubtitleReader.external(any(), any()) } returns sidecar
+            every { LocalSubtitleReader.open(any(), any(), any(), any()) } returns mockk(relaxed = true)
+            val f = Fixture(this, protocol)
+            f.providerMediaVersion = "version"
+            try {
+                f.startSource(source); runCurrent()
+                if (source in listOf(SourceCase.FILE, SourceCase.CONTENT_URI)) f.engine.selectSubtitleTrack(4)
+                else f.engine.attachSubtitle("content://subtitles/42")
+                runCurrent()
+                val selected = assertNotNull(f.engine.status.value?.currentSubtitleIndex)
+                assertEquals("On-device transcode", f.engine.status.value?.streamMode)
+                assertEquals(LocalTranscodeMode.ON_DEVICE, f.engine.status.value?.localTranscodeMode)
+                f.events.emit(PlaybackTargetEvent.StatusChanged(0, true)); runCurrent()
+                f.engine.pause(); runCurrent()
+                f.engine.seekTo(450); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(0, false)); runCurrent()
+                val continuation = assertNotNull(f.engine.beginManualProtocolSwitch())
+                val alternate = Protocol.entries.first { it != protocol }
+                f.continueSource(source, alternate, 450, continuation); runCurrent()
+                assertEquals(selected, f.engine.status.value?.currentSubtitleIndex)
+                assertEquals(450L, f.engine.status.value?.positionSeconds)
+                assertFalse(f.loads.last().playWhenReady)
+                if (source in listOf(SourceCase.PROVIDER_FILE, SourceCase.PROVIDER_HLS)) {
+                    assertTrue(f.requests.last().subtitlesDisabled, "external subtitles must not enable a server default")
+                    assertNull(f.requests.last().subtitleTrack)
+                    assertEquals("version", f.requests.last().mediaVersion)
+                }
+                f.events.emit(PlaybackTargetEvent.StatusChanged(0, false)); runCurrent()
+                val returning = assertNotNull(f.engine.beginManualProtocolSwitch())
+                coEvery { f.target.connect(any()) } throws IllegalStateException("TV unavailable")
+                assertFailsWith<IllegalStateException> { f.continueSource(source, protocol, 450, returning) }
+                val retry = assertNotNull(f.engine.continuationForExplicitRetry())
+                f.engine.stop(); runCurrent()
+                coEvery { f.target.connect(any()) } just Runs
+                f.continueSource(source, protocol, 450, retry); runCurrent()
+                assertEquals(selected, f.engine.status.value?.currentSubtitleIndex)
+                assertEquals("English", f.engine.status.value?.subtitleTracks?.single()?.label)
+                assertFalse(f.loads.last().playWhenReady)
+                f.engine.selectSubtitleTrack(null); runCurrent()
+                assertNull(f.engine.status.value?.currentSubtitleIndex)
+                assertFalse(f.loads.last().playWhenReady)
+                assertEquals(450L, f.engine.status.value?.positionSeconds)
+                f.engine.stop(); runCurrent()
+                coEvery { LocalSubtitleReader.discover(any(), any(), any()) } returns emptyList()
+                f.startSource(source); runCurrent()
+                assertTrue(assertNotNull(f.engine.status.value).subtitleTracks.isEmpty(), "subtitle file leaked into a different video")
+            } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `autoplay next clears a picked subtitle and previous media version`() = runTest {
+        val f = Fixture(this)
+        f.providerMediaVersion = "version"
+        every { LocalSubtitleReader.external(any(), any()) } returns LocalSubtitleTrack(
+            0, "eng", "English", source = LocalSubtitleSource.External("content://subtitles/42", "text/vtt"),
+        )
+        every { LocalSubtitleReader.open(any(), any(), any(), any()) } returns mockk(relaxed = true)
+        try {
+            f.startOnline(); runCurrent()
+            f.engine.attachSubtitle("content://subtitles/42"); runCurrent()
+            assertNotNull(f.engine.status.value?.currentSubtitleIndex)
+            f.providerMediaVersion = "next-version"
+            assertTrue(f.engine.playNext(f.movie.copy(id = "next"), StreamPreferences()))
+            runCurrent()
+            assertNull(f.requests.first { it.media.nativeId == "next" }.mediaVersion)
+            assertTrue(assertNotNull(f.engine.status.value).subtitleTracks.isEmpty())
+            assertNull(f.engine.status.value?.currentSubtitleIndex)
+        } finally { f.engine.stop(); runCurrent() }
+    }
+
+    @Test fun `picking a subtitle during initial discovery preserves the file and incoming source tracks`() = runTest {
+        for (source in listOf(SourceCase.FILE, SourceCase.PROVIDER_FILE)) {
+            val f = Fixture(this)
+            var discoveries = 0
+            val embedded = LocalSubtitleTrack(0, "eng", "Embedded English", source = LocalSubtitleSource.Embedded(7))
+            coEvery { LocalSubtitleReader.discover(any(), any(), any()) } coAnswers {
+                if (++discoveries == 1) awaitCancellation() else listOf(embedded)
+            }
+            f.providerSubtitleTracks = listOf(com.adsamcik.streamferry.source.api.MediaTrack(TrackRef("7"), "eng", "Provider English"))
+            var preparations = 0
+            coEvery { f.provider.prepare(any()) } coAnswers {
+                f.requests += firstArg<PlaybackRequest>()
+                if (++preparations == 1) awaitCancellation() else Result.success(f.providerSession)
+            }
+            every { LocalSubtitleReader.external(any(), any()) } returns embedded.copy(
+                label = "Picked captions", source = LocalSubtitleSource.External("content://subtitles/42", "text/vtt"),
+            )
+            every { LocalSubtitleReader.open(any(), any(), any(), any()) } returns mockk(relaxed = true)
+            val starting = async { f.startSource(source) }
+            try {
+                runCurrent()
+                assertFalse(starting.isCompleted)
+                f.engine.attachSubtitle("content://subtitles/42"); runCurrent()
+                starting.await()
+                val status = assertNotNull(f.engine.status.value)
+                assertEquals("Picked captions", status.subtitleTracks.single { it.index == status.currentSubtitleIndex }.label)
+                assertEquals(2, status.subtitleTracks.size)
+                assertEquals(2, status.subtitleTracks.map { it.index }.distinct().size)
+                if (source == SourceCase.PROVIDER_FILE) {
+                    f.engine.selectSubtitleTrack(status.subtitleTracks.single { it.label == "Provider English" }.index)
+                    runCurrent()
+                    assertEquals(TrackRef("7"), f.requests.last().subtitleTrack)
+                }
+            } finally { starting.cancel(); f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `retry during subtitle discovery retains picked captions and discovers embedded tracks`() = runTest {
+        for (protocol in Protocol.entries) {
+            val f = Fixture(this, protocol)
+            var discoveries = 0
+            val embedded = LocalSubtitleTrack(0, "eng", "Embedded English", source = LocalSubtitleSource.Embedded(7))
+            coEvery { LocalSubtitleReader.discover(any(), any(), any()) } coAnswers {
+                if (++discoveries < 3) awaitCancellation() else listOf(embedded)
+            }
+            every { LocalSubtitleReader.external(any(), any()) } returns embedded.copy(
+                label = "Picked captions", source = LocalSubtitleSource.External("content://subtitles/42", "text/vtt"),
+            )
+            every { LocalSubtitleReader.open(any(), any(), any(), any()) } returns mockk(relaxed = true)
+            val starting = async { runCatching { f.startSource(SourceCase.FILE) } }
+            var attaching: kotlinx.coroutines.Deferred<Result<Unit>>? = null
+            try {
+                runCurrent()
+                attaching = async { runCatching { f.engine.attachSubtitle("content://subtitles/42") } }
+                runCurrent()
+                assertEquals(2, discoveries)
+                val continuation = assertNotNull(f.engine.continuationForExplicitRetry())
+                f.engine.stop(); runCurrent()
+                f.continueSource(SourceCase.FILE, protocol, 123, continuation)
+                runCurrent()
+                val status = assertNotNull(f.engine.status.value)
+                assertEquals(3, discoveries)
+                assertEquals(2, status.subtitleTracks.size)
+                assertEquals("Picked captions", status.subtitleTracks.single { it.index == status.currentSubtitleIndex }.label)
+            } finally { attaching?.cancel(); starting.cancel(); f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `explicit subtitle Off during discovery overrides a pending preferred language`() = runTest {
+        val f = Fixture(this)
+        val discovered = CompletableDeferred<List<LocalSubtitleTrack>>()
+        coEvery { LocalSubtitleReader.discover(any(), any(), any()) } coAnswers { discovered.await() }
+        val starting = async { f.start(prefs = StreamPreferences(preferredSubtitleLanguage = "eng")) }
+        try {
+            runCurrent()
+            f.engine.selectSubtitleTrack(null)
+            discovered.complete(listOf(LocalSubtitleTrack(0, "eng", "English", source = LocalSubtitleSource.Embedded(7))))
+            runCurrent(); starting.await()
+            assertNull(f.engine.status.value?.currentSubtitleIndex)
+            assertEquals("On-device transcode", f.engine.status.value?.streamMode, "Off must strip embedded subtitle packets")
+        } finally { discovered.complete(emptyList()); starting.cancel(); f.engine.stop(); runCurrent() }
+    }
+
+    @Test fun `unsupported or missing local subtitle selection leaves usable video untouched`() = runTest {
+        coEvery { LocalSubtitleReader.discover(any(), any(), any()) } returns listOf(
+            LocalSubtitleTrack(4, "eng", "English", source = LocalSubtitleSource.Embedded(7), unsupportedReason = "Unsupported subtitle format"),
+        )
+        val f = Fixture(this)
+        try {
+            f.start(prefs = StreamPreferences(preferredSubtitleLanguage = "eng")); runCurrent()
+            val loadCount = f.loads.size
+            assertNull(f.engine.status.value?.currentSubtitleIndex)
+            assertFalse(assertNotNull(f.engine.status.value).isTerminal)
+            assertFailsWith<PlaybackPreparationException> { f.engine.selectSubtitleTrack(4) }
+            assertFailsWith<IllegalArgumentException> { f.engine.selectSubtitleTrack(99) }
+            assertEquals(loadCount, f.loads.size)
+            assertNull(f.engine.status.value?.currentSubtitleIndex)
+        } finally { f.engine.stop(); runCurrent() }
+    }
+
+    @Test fun `slow subtitle file validation does not block Pause or Stop or attach to a later video`() = runTest {
+        val entered = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        val track = LocalSubtitleTrack(0, "eng", "English", source = LocalSubtitleSource.External("content://subtitles/42", "text/vtt"))
+        every { LocalSubtitleReader.external(any(), any()) } returns track
+        every { LocalSubtitleReader.open(any(), any(), any(), any()) } returns object : com.adsamcik.streamferry.data.subtitle.SubtitleCueSource {
+            override fun cuesAt(sourceTimeUs: Long): List<androidx.media3.common.text.Cue> {
+                entered.countDown()
+                check(release.await(10, java.util.concurrent.TimeUnit.SECONDS))
+                return emptyList()
+            }
+            override fun close() = Unit
+        }
+        val f = Fixture(this, dispatcher = Dispatchers.IO)
+        var attaching: kotlinx.coroutines.Deferred<Result<Unit>>? = null
+        try {
+            f.startSource(SourceCase.FILE)
+            val pending = async(Dispatchers.IO) { runCatching { f.engine.attachSubtitle("content://subtitles/42") } }
+            attaching = pending
+            assertTrue(withContext(Dispatchers.IO) { entered.await(5, java.util.concurrent.TimeUnit.SECONDS) })
+            withContext(Dispatchers.IO) { withTimeout(5_000) { f.engine.pause(); f.engine.stop(); f.startSource(SourceCase.FILE) } }
+            coVerify { f.target.pause() }
+            release.countDown()
+            assertTrue(withContext(Dispatchers.IO) { withTimeout(5_000) { pending.await().isFailure } })
+            assertTrue(assertNotNull(f.engine.status.value).subtitleTracks.isEmpty())
+            assertNull(f.engine.status.value?.currentSubtitleIndex)
+        } finally {
+            release.countDown(); attaching?.cancel()
+            f.engine.stop()
+        }
+    }
+
+    @Test fun `provider subtitle selection forces burn in even with Original output on both protocols`() = runTest {
+        for (protocol in Protocol.entries) {
+            val f = Fixture(this, protocol)
+            f.providerMediaVersion = "version"
+            f.providerSubtitleTracks = listOf(com.adsamcik.streamferry.source.api.MediaTrack(TrackRef("version:7"), "eng", "English"))
+            try {
+                f.startOnline(); runCurrent()
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ORIGINAL); runCurrent()
+                f.engine.selectSubtitleTrack(0); runCurrent()
+                assertEquals(TrackRef("version:7"), f.requests.last().subtitleTrack)
+                assertEquals("version", f.requests.last().mediaVersion)
+                assertTrue(f.requests.last().forceTranscode)
+                assertTrue(f.requests.last().allowSubtitleBurnIn)
+                assertFalse(f.requests.last().subtitlesDisabled)
+                f.engine.selectSubtitleTrack(null); runCurrent()
+                assertTrue(f.requests.last().subtitlesDisabled)
+                assertNull(f.requests.last().subtitleTrack)
+                assertEquals("version", f.requests.last().mediaVersion, "Off must retain the version independently from the subtitle ref")
+            } finally { f.engine.stop(); runCurrent() }
         }
     }
 

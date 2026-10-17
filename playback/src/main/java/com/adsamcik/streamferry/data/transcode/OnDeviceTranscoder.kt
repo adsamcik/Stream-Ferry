@@ -10,6 +10,9 @@ import androidx.media3.common.C
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.util.Clock
 import androidx.media3.effect.Presentation
+import androidx.media3.effect.OverlayEffect
+import com.adsamcik.streamferry.data.subtitle.SubtitleCueSource
+import com.adsamcik.streamferry.data.subtitle.SubtitleOverlay
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.transformer.Composition
 import androidx.media3.transformer.DefaultEncoderFactory
@@ -77,6 +80,7 @@ class OnDeviceTranscoder(
         sourceProfile: MediaProfile? = null,
         owner: Any? = null,
         abortIf: (() -> Boolean)? = null,
+        subtitleCues: SubtitleCueSource? = null,
     ) {
         check(!released) { "on-device transcoder is released" }
         require(startMs >= 0) { "transcode start must not be negative" }
@@ -141,7 +145,10 @@ class OnDeviceTranscoder(
                     // the encoder is handed the source's full resolution, which frequently makes a 4K
                     // source exceed a phone hardware encoder's practical throughput.
                     val edited = EditedMediaItem.Builder(mediaItem)
-                        .setEffects(Effects(emptyList(), listOf(Presentation.createForHeight(maxHeight))))
+                        .setEffects(Effects(emptyList(), buildList {
+                            add(Presentation.createForHeight(maxHeight))
+                            subtitleCues?.let { add(OverlayEffect(listOf(SubtitleOverlay(appContext, it, startMs * 1_000)))) }
+                        }))
                         .build()
                     val builder = Transformer.Builder(appContext)
                         .setVideoMimeType(videoMimeFor(target.videoCodec))

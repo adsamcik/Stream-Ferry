@@ -2,6 +2,8 @@ package com.adsamcik.streamferry.ui.screens
 
 import android.content.res.Configuration
 import android.os.SystemClock
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloatAsState
@@ -786,7 +788,9 @@ private fun PlaybackQuickActions(
     onStop: () -> Unit,
 ) {
     val showAudio = p.audioTracks.size > 1
-    val showSubtitles = p.subtitleTracks.isNotEmpty()
+    val subtitlePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        uri?.let { viewModel.attachSubtitle(it.toString()) }
+    }
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(24.dp),
@@ -808,7 +812,7 @@ private fun PlaybackQuickActions(
                     modifier = Modifier.weight(1f),
                 )
             }
-            if (showSubtitles) {
+            run {
                 val current = p.subtitleTracks.firstOrNull { it.index == p.currentSubtitleIndex }
                 QuickTrackAction(
                     icon = Icons.Rounded.Subtitles,
@@ -816,6 +820,7 @@ private fun PlaybackQuickActions(
                     selectedLabel = current?.label ?: "Off",
                     options = listOf<Pair<Int?, String>>(null to "Off") + p.subtitleTracks.map { it.index to it.label },
                     onSelect = viewModel::selectSubtitleTrack,
+                    onAdd = { subtitlePicker.launch(arrayOf("*/*")) },
                     modifier = Modifier.weight(1f),
                 )
             }
@@ -954,6 +959,7 @@ private fun <T> QuickTrackAction(
     options: List<Pair<T, String>>,
     onSelect: (T) -> Unit,
     modifier: Modifier = Modifier,
+    onAdd: (() -> Unit)? = null,
 ) {
     var expanded by remember { mutableStateOf(false) }
     Box(modifier = modifier, contentAlignment = Alignment.Center) {
@@ -972,6 +978,12 @@ private fun <T> QuickTrackAction(
                         expanded = false
                         onSelect(value)
                     },
+                )
+            }
+            onAdd?.let { add ->
+                DropdownMenuItem(
+                    text = { Text("Choose subtitle file…") },
+                    onClick = { expanded = false; add() },
                 )
             }
         }

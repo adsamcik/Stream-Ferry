@@ -16,6 +16,10 @@ import com.adsamcik.streamferry.core.transcode.TranscodeTarget
 import com.adsamcik.streamferry.core.transcode.VideoCodec
 import com.adsamcik.streamferry.data.proxy.ClientTranscodeSource
 import com.adsamcik.streamferry.source.api.DiagnosticSink
+import com.adsamcik.streamferry.data.subtitle.LocalSubtitleTrack
+import com.adsamcik.streamferry.data.subtitle.LocalSubtitleReader
+import com.adsamcik.streamferry.data.subtitle.SubtitleCueSource
+import android.content.Context
 import com.google.common.collect.ImmutableList
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
@@ -47,6 +51,8 @@ class StreamingTranscodeSession(
     private val onFailure: (Throwable) -> Unit = {},
     private val onReconnectRequired: () -> Unit = {},
     exportDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val subtitleTrack: LocalSubtitleTrack? = null,
+    private val subtitleContext: Context? = null,
 ) : ClientTranscodeSource {
     private val lock = Object()
     private val scope = CoroutineScope(SupervisorJob() + exportDispatcher)
@@ -54,6 +60,7 @@ class StreamingTranscodeSession(
     private val ready = CompletableDeferred<Unit>()
     private var started = false
     @Volatile private var released = false
+    @Volatile private var subtitleCues: SubtitleCueSource? = null
     private var finished = false
     private var failure: Throwable? = null
     private var init: ByteArray? = null
@@ -82,6 +89,11 @@ class StreamingTranscodeSession(
                 started = true
                 scope.launch {
                     try {
+                        val cues = subtitleTrack?.let {
+                            LocalSubtitleReader.open(requireNotNull(subtitleContext), sourceUri, sourceMimeType, it)
+                        }
+                        subtitleCues = cues
+                        if (released) { cues?.close(); return@launch }
                         val factory = if (hls) fragmentedFactory() else Media3TsMuxer.Factory(::publishPacket)
                         transcoder.transcodeStream(
                             sourceUri, target, TimestampOriginFactory(factory) { track, ptsUs ->
@@ -90,13 +102,14 @@ class StreamingTranscodeSession(
                             startMs = startPositionSeconds.coerceAtLeast(0) * 1_000,
                             sourceMimeType = sourceMimeType, sourceProfile = sourceProfile,
                             owner = owner, abortIf = { released },
+                            subtitleCues = cues,
                         )
                         finish(null)
                     } catch (error: Exception) {
                         if (!released) logger.w("transcode", "Continuous on-device stream failed", error)
                         finish(error)
                         if (!released) runCatching { onFailure(error) }
-                    }
+                    } finally { subtitleCues?.close() }
                 }
             }
         }
@@ -357,6 +370,8 @@ class StreamingTranscodeSession(
             if (!ready.isCompleted) ready.completeExceptionally(IOException("Transcode stopped"))
             lock.notifyAll()
         }
+        // Wake cue waits on the GL thread before waiting for the encoder lifecycle to drain.
+        subtitleCues?.close()
         transcoder.cancelOwnedInFlightAndAwait(owner)
         scope.cancel()
     }

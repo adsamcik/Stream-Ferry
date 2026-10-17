@@ -2617,6 +2617,16 @@ class MainViewModel(
         }
     }
 
+    fun attachSubtitle(uri: String) = viewModelScope.launch {
+        try {
+            container.playbackEngine.attachSubtitle(uri)
+        } catch (c: CancellationException) {
+            throw c
+        } catch (error: Exception) {
+            handlePlaybackControlFailure("load subtitle file", error)
+        }
+    }
+
     /** Run [remember] with the current show's memory key (series id for episodes, else item id). No-op if none. */
     private inline fun rememberShowLanguage(remember: (showKey: String) -> Unit) {
         showLanguageKey(_state.value.nowPlayingItem)?.let(remember)

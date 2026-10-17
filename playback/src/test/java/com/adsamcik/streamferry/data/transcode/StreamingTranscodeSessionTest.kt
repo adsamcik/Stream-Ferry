@@ -66,7 +66,7 @@ class StreamingTranscodeSessionTest {
             val transcoder = mockk<OnDeviceTranscoder>()
             every { transcoder.cancelOwnedInFlightAndAwait(any(), any()) } returns true
             val completeExport = CompletableDeferred<Unit>()
-            coEvery { transcoder.transcodeStream(any(), any(), any(), any(), any(), any(), any(), any()) } coAnswers {
+            coEvery { transcoder.transcodeStream(any(), any(), any(), any(), any(), any(), any(), any(), any()) } coAnswers {
                 assertEquals(120_000L, arg<Long>(3))
                 delay(60_000) // A source without a seek map needs longer than the old 45 s deadline.
                 val muxer = arg<Muxer.Factory>(2).create("unused")
@@ -107,7 +107,7 @@ class StreamingTranscodeSessionTest {
         for (startSeconds in listOf(0L, 120L)) {
             val transcoder = mockk<OnDeviceTranscoder>()
             every { transcoder.cancelOwnedInFlightAndAwait(any(), any()) } returns true
-            coEvery { transcoder.transcodeStream(any(), any(), any(), any(), any(), any(), any(), any()) } coAnswers {
+            coEvery { transcoder.transcodeStream(any(), any(), any(), any(), any(), any(), any(), any(), any()) } coAnswers {
                 CompletableDeferred<Unit>().await()
             }
             val session = StreamingTranscodeSession(
@@ -132,7 +132,7 @@ class StreamingTranscodeSessionTest {
         val completeExport = CompletableDeferred<Unit>()
         val exportCompleted = CompletableDeferred<Unit>()
         val reconnects = AtomicInteger()
-        coEvery { transcoder.transcodeStream(any(), any(), any(), any(), any(), any(), any(), any()) } coAnswers {
+        coEvery { transcoder.transcodeStream(any(), any(), any(), any(), any(), any(), any(), any(), any()) } coAnswers {
             val muxer = arg<Muxer.Factory>(2).create("unused")
             val video = muxer.addTrack(videoFormat())
             writeFrames(muxer, video, segments = 2, startUs = 12_000_000, finalBoundary = false)
@@ -150,7 +150,7 @@ class StreamingTranscodeSessionTest {
             session.playlist("http://phone/session/id", allowExport = false)
             session.initSegment(allowExport = false)
             assertEquals(0, reconnects.get())
-            coVerify(exactly = 0) { transcoder.transcodeStream(any(), any(), any(), any(), any(), any(), any(), any()) }
+            coVerify(exactly = 0) { transcoder.transcodeStream(any(), any(), any(), any(), any(), any(), any(), any(), any()) }
             withTimeout(5_000) { session.awaitReady() }
             assertFalse(exportCompleted.isCompleted, "readiness must not await the completed video")
             if (hls) {
@@ -190,7 +190,7 @@ class StreamingTranscodeSessionTest {
         every { transcoder.cancelOwnedInFlightAndAwait(any(), any()) } returns true
         val keepRunning = CompletableDeferred<Unit>()
         val reconnects = AtomicInteger()
-        coEvery { transcoder.transcodeStream(any(), any(), any(), any(), any(), any(), any(), any()) } coAnswers {
+        coEvery { transcoder.transcodeStream(any(), any(), any(), any(), any(), any(), any(), any(), any()) } coAnswers {
             val muxer = arg<Muxer.Factory>(2).create("unused")
             val video = muxer.addTrack(videoFormat())
             // Actual packetized output exceeds the two MiB byte-zero replay budget.
@@ -248,7 +248,7 @@ class StreamingTranscodeSessionTest {
         every { transcoder.cancelOwnedInFlightAndAwait(any(), any()) } returns true
         val tenSamples = CompletableDeferred<Unit>()
         val keepRunning = CompletableDeferred<Unit>()
-        coEvery { transcoder.transcodeStream(any(), any(), any(), any(), any(), any(), any(), any()) } coAnswers {
+        coEvery { transcoder.transcodeStream(any(), any(), any(), any(), any(), any(), any(), any(), any()) } coAnswers {
             val muxer = arg<Muxer.Factory>(2).create("unused")
             val video = muxer.addTrack(videoFormat())
             writeFrames(muxer, video, segments = 20) { if (it == 10) tenSamples.complete(Unit) }
@@ -282,7 +282,7 @@ class StreamingTranscodeSessionTest {
         every { transcoder.cancelOwnedInFlightAndAwait(any(), any()) } returns true
         val thirdPublished = CompletableDeferred<Unit>()
         val keepRunning = CompletableDeferred<Unit>()
-        coEvery { transcoder.transcodeStream(any(), any(), any(), any(), any(), any(), any(), any()) } coAnswers {
+        coEvery { transcoder.transcodeStream(any(), any(), any(), any(), any(), any(), any(), any(), any()) } coAnswers {
             val muxer = arg<Muxer.Factory>(2).create("unused")
             val video = muxer.addTrack(videoFormat())
             val sample = ByteArray(9 * 1024 * 1024) { 1 }.apply {

@@ -39,9 +39,16 @@ class HttpJellyfinRepository(
         maxVideoHeight: Int,
         preferredVideoCodec: String?,
         downloadProfile: JellyfinDownloadTranscodeProfile?,
+        mediaSourceId: String?,
     ): Result<JellyfinPlaybackInfo> = withContext(Dispatchers.IO) {
         runCatching {
-            val deviceProfile = downloadProfile?.let { profile ->
+            require(subtitleStreamIndex == null || subtitleStreamIndex >= -1) { "Invalid subtitle track" }
+            val burnSelectedSubtitle = subtitleStreamIndex?.let { it >= 0 } == true
+            require(!burnSelectedSubtitle || allowSubtitleBurnIn) {
+                "The selected subtitle needs video transcoding for this output"
+            }
+            val requireTranscode = forceTranscode || burnSelectedSubtitle
+            fun deviceProfile(requiresTranscode: Boolean) = downloadProfile?.let { profile ->
                 DeviceProfiles.forDownload(
                     maxBitrateBps = profile.maxBitrateBps,
                     container = profile.container,
@@ -51,20 +58,50 @@ class HttpJellyfinRepository(
             } ?: DeviceProfiles.forTarget(
                 caps = capabilities,
                 maxBitrateBps = maxBitrateBps,
-                forceTranscode = forceTranscode,
+                forceTranscode = requiresTranscode,
                 allowSubtitleBurnIn = allowSubtitleBurnIn,
                 preferredVideoCodec = preferredVideoCodec,
                 maxVideoHeight = maxVideoHeight,
             )
-            val response = api.postPlaybackInfo(
+            var response = api.postPlaybackInfo(
                 itemId = itemId,
-                deviceProfileJson = deviceProfile,
+                deviceProfileJson = deviceProfile(requireTranscode),
                 audioStreamIndex = audioStreamIndex,
                 subtitleStreamIndex = subtitleStreamIndex,
                 maxBitrate = maxBitrateBps,
                 startTimeTicks = startPositionSeconds * TICKS_PER_SECOND,
-                requireTranscode = forceTranscode,
+                requireTranscode = requireTranscode,
+                mediaSourceId = mediaSourceId,
             )
+            val stripSubtitles = subtitleStreamIndex == -1 &&
+                (response.hasEmbeddedSubtitleTracks ?: response.subtitleTracks.isNotEmpty())
+            if (stripSubtitles && !api.resolveUpstreamFor(response.mediaSourceId).isTranscoding) {
+                // A raw container can still auto-enable default/forced captions on the TV. A
+                // server-generated stream maps only video/audio when SubtitleStreamIndex is -1.
+                response = api.postPlaybackInfo(
+                    itemId = itemId,
+                    deviceProfileJson = deviceProfile(true),
+                    audioStreamIndex = audioStreamIndex,
+                    subtitleStreamIndex = -1,
+                    maxBitrate = maxBitrateBps,
+                    startTimeTicks = startPositionSeconds * TICKS_PER_SECOND,
+                    requireTranscode = true,
+                    mediaSourceId = response.mediaSourceId,
+                )
+            }
+            if (stripSubtitles) {
+                check(api.resolveUpstreamFor(response.mediaSourceId).isTranscoding) {
+                    "Jellyfin did not remove subtitle tracks from the video"
+                }
+            }
+            if (burnSelectedSubtitle) {
+                check(response.subtitleTracks.any { it.index == subtitleStreamIndex }) {
+                    "The selected subtitle track is no longer available"
+                }
+                check(api.resolveUpstreamFor(response.mediaSourceId).isTranscoding) {
+                    "Jellyfin did not transcode the selected subtitle into the video"
+                }
+            }
             // (The enriched "PlaybackInfo resolved …" event is logged in JellyfinClient.postPlaybackInfo.)
             JellyfinPlaybackInfo(
                 mediaSourceId = response.mediaSourceId,
@@ -84,6 +121,7 @@ class HttpJellyfinRepository(
                 audioTracks = response.audioTracks,
                 subtitleTracks = response.subtitleTracks,
                 itemId = itemId,
+                hasEmbeddedSubtitleTracks = response.hasEmbeddedSubtitleTracks,
             )
         }.onFailure { logger.e("jellyfin", "PlaybackInfo request failed (${it.javaClass.simpleName})", it) }
     }

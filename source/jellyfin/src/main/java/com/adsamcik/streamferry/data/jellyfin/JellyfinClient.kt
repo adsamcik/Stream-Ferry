@@ -441,11 +441,13 @@ class JellyfinClient(
         maxBitrate: Long?,
         startTimeTicks: Long,
         requireTranscode: Boolean,
+        mediaSourceId: String?,
     ): JellyfinApi.PlaybackInfoResult = withContext(Dispatchers.IO) {
         val uid = userId ?: error("Not authenticated")
         val profileElement = json.parseToJsonElement(deviceProfileJson)
-        val body = buildJsonObject {
+        fun playbackBody(mediaSourceId: String? = null) = buildJsonObject {
             put("UserId", uid)
+            mediaSourceId?.let { put("MediaSourceId", it) }
             maxBitrate?.let { put("MaxStreamingBitrate", it) }
             put("StartTimeTicks", startTimeTicks)
             audioStreamIndex?.let { put("AudioStreamIndex", it) }
@@ -458,11 +460,12 @@ class JellyfinClient(
             put("AllowAudioStreamCopy", true)
             put("AutoOpenLiveStream", true)
         }
-        val response = json.decodeFromString(
+        var response = json.decodeFromString(
             PlaybackInfoResponse.serializer(),
-            exec(post(path("Items", itemId, "PlaybackInfo"), body)),
+            exec(post(path("Items", itemId, "PlaybackInfo"), playbackBody(mediaSourceId))),
         )
-        val source = response.mediaSources.selectPlayableSource(requireTranscode)
+        var source = response.mediaSources.filter { mediaSourceId == null || it.id == mediaSourceId }
+            .selectPlayableSource(requireTranscode)
             ?: run {
                 logger.w(
                     "jellyfin",
@@ -471,6 +474,24 @@ class JellyfinClient(
                 )
                 error("PlaybackInfo returned no usable media source")
             }
+        if (mediaSourceId == null && (audioStreamIndex != null || subtitleStreamIndex != null)) {
+            // Jellyfin applies stream selections only when MediaSourceId matches the candidate.
+            // Discover the version first, then pin it for both selection and explicit subtitle Off.
+            val selectedSourceId = source.id?.takeIf { it.isNotBlank() }
+                ?: error("Jellyfin did not identify the media source for track selection")
+            response = json.decodeFromString(
+                PlaybackInfoResponse.serializer(),
+                exec(post(path("Items", itemId, "PlaybackInfo"), playbackBody(selectedSourceId))),
+            )
+            source = response.mediaSources.filter { it.id == selectedSourceId }
+                .selectPlayableSource(requireTranscode)
+                ?: error("Jellyfin did not provide the selected media source")
+        }
+        subtitleStreamIndex?.takeIf { it >= 0 }?.let { selected ->
+            check(source.mediaStreams.any { it.type.equals("Subtitle", true) && it.index == selected }) {
+                "The selected subtitle track is no longer available"
+            }
+        }
         val msId = source.id ?: itemId
         val resolved = resolveUpstream(itemId, source, response.playSessionId, requireTranscode)
         upstreamCache[msId] = resolved
@@ -512,6 +533,7 @@ class JellyfinClient(
             videoBitrateBps = video?.bitRate,
             audioTracks = audioTracks,
             subtitleTracks = subtitleTracks,
+            hasEmbeddedSubtitleTracks = source.mediaStreams.any { it.type.equals("Subtitle", true) && !it.isExternal },
         )
     }
 

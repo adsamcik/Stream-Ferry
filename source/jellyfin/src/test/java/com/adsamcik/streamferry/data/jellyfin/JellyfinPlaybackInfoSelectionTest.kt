@@ -9,6 +9,10 @@ import okhttp3.OkHttpClient
 import okhttp3.Protocol
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
+import okio.Buffer
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -112,6 +116,71 @@ class JellyfinPlaybackInfoSelectionTest {
         Unit
     }
 
+    @Test
+    fun pinsTheDiscoveredMediaSourceWhenSelectingOrDisablingSubtitles() = runBlocking {
+        for (selected in listOf(-1, 3)) {
+            val bodies = mutableListOf<String>()
+            val responder = FixedResponseInterceptor(
+                """{"MediaSources":[{"Id":"version-2","Container":"mkv",
+                  "SupportsTranscoding":true,"TranscodingUrl":"/Videos/version-2/stream.ts",
+                  "TranscodingContainer":"ts","MediaStreams":[{"Type":"Subtitle","Index":3,"Codec":"ass"}]}]}""",
+                bodies,
+            )
+            val client = client(responder)
+
+            client.postPlaybackInfo("item-1", "{}", null, selected, null, 0, true)
+
+            assertEquals(2, bodies.size)
+            val discovery = Json.parseToJsonElement(bodies[0]).jsonObject
+            val selection = Json.parseToJsonElement(bodies[1]).jsonObject
+            assertEquals(null, discovery["MediaSourceId"])
+            assertEquals("version-2", selection["MediaSourceId"]?.jsonPrimitive?.content)
+            assertEquals(selected.toString(), selection["SubtitleStreamIndex"]?.jsonPrimitive?.content)
+        }
+    }
+
+    @Test
+    fun failsInsteadOfSwitchingVersionsWhenThePinnedSourceDisappears() = runBlocking {
+        var requests = 0
+        val client = client(Interceptor { chain ->
+            requests++
+            FixedResponseInterceptor(
+                """{"MediaSources":[{"Id":"${if (requests == 1) "chosen" else "other"}",
+                  "Container":"mp4","SupportsDirectPlay":true}]}""",
+            ).intercept(chain)
+        })
+
+        assertFailsWith<IllegalStateException> {
+            client.postPlaybackInfo("item-1", "{}", null, -1, null, 0, false)
+        }
+        Unit
+    }
+
+    @Test
+    fun failsInsteadOfIgnoringASubtitleMissingFromTheSelectedVersion() = runBlocking {
+        val client = client("""{"MediaSources":[{"Id":"chosen","Container":"mp4","SupportsDirectPlay":true}]}""")
+
+        assertFailsWith<IllegalStateException> {
+            client.postPlaybackInfo("item-1", "{}", null, 7, null, 0, false)
+        }
+        Unit
+    }
+
+    @Test
+    fun distinguishesExternalSidecarsFromEmbeddedSubtitlePackets() = runBlocking {
+        for (external in listOf(true, false)) {
+            val client = client(
+                """{"MediaSources":[{"Id":"chosen","Container":"mkv","SupportsDirectPlay":true,
+                  "MediaStreams":[{"Type":"Subtitle","Index":3,"Codec":"subrip","IsExternal":$external}]}]}""",
+            )
+
+            val prepared = client.playbackInfo(requireTranscode = false)
+
+            assertEquals(1, prepared.subtitleTracks.size)
+            assertEquals(!external, prepared.hasEmbeddedSubtitleTracks)
+        }
+    }
+
     private suspend fun JellyfinClient.playbackInfo(requireTranscode: Boolean) = postPlaybackInfo(
         itemId = "item-1",
         deviceProfileJson = "{}",
@@ -123,7 +192,10 @@ class JellyfinPlaybackInfoSelectionTest {
     )
 
     private fun client(responseBody: String): JellyfinClient {
-        val responder = FixedResponseInterceptor(responseBody)
+        return client(FixedResponseInterceptor(responseBody))
+    }
+
+    private fun client(responder: Interceptor): JellyfinClient {
         return JellyfinClient(
             httpClient = OkHttpClient.Builder().addInterceptor(responder).build(),
             deviceId = "test-device",
@@ -136,12 +208,16 @@ class JellyfinPlaybackInfoSelectionTest {
         }
     }
 
-    private class FixedResponseInterceptor(private val body: String) : Interceptor {
+    private class FixedResponseInterceptor(
+        private val body: String,
+        private val requests: MutableList<String>? = null,
+    ) : Interceptor {
         override fun intercept(chain: Interceptor.Chain): Response {
             val request = chain.request()
             if (request.url.encodedPath != "/Items/item-1/PlaybackInfo") {
                 throw IOException("Unexpected request: ${request.url}")
             }
+            requests?.add(Buffer().also { request.body?.writeTo(it) }.readUtf8())
             return Response.Builder()
                 .request(request)
                 .protocol(Protocol.HTTP_1_1)

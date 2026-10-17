@@ -6,6 +6,7 @@ import com.adsamcik.streamferry.core.transcode.VideoCodec
 import com.adsamcik.streamferry.domain.PlaybackFailureKind
 import com.adsamcik.streamferry.domain.MediaTrack
 import com.adsamcik.streamferry.source.api.TrackRef
+import com.adsamcik.streamferry.data.subtitle.LocalSubtitleTrack
 
 /** Coarse, UI-safe lifecycle of the one renderer playback session. */
 enum class PlaybackPhase {
@@ -231,6 +232,10 @@ internal data class PlaybackContinuationChoices(
     val audioTrackRefs: Map<Int, TrackRef>,
     val subtitleTrackRefs: Map<Int, TrackRef>,
     val positionSeconds: Long,
+    val localSubtitleTracks: List<LocalSubtitleTrack> = emptyList(),
+    val providerMediaVersion: String? = null,
+    val subtitleSelectionExplicit: Boolean = false,
+    val localSubtitlesDiscovered: Boolean = false,
 )
 /**
  * Immutable, pure session ledger. The engine owns side effects; this type owns generations, concise

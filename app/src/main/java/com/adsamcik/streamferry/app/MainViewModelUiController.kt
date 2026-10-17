@@ -78,6 +78,7 @@ class MainViewModelUiController(
     override fun dismissPlaybackControlIssue() { viewModel.dismissPlaybackControlIssue() }
     override fun selectAudioTrack(index: Int?) { viewModel.selectAudioTrack(index) }
     override fun selectSubtitleTrack(index: Int?) { viewModel.selectSubtitleTrack(index) }
+    override fun attachSubtitle(uri: String) { viewModel.attachSubtitle(uri) }
     override fun selectQuality(bitrateBps: Long?) { viewModel.selectQuality(bitrateBps) }
     override fun selectMaxVideoHeight(height: Int?) { viewModel.selectMaxVideoHeight(height) }
     override fun selectLocalTranscodeMode(mode: com.adsamcik.streamferry.core.transcode.LocalTranscodeMode) { viewModel.selectLocalTranscodeMode(mode) }

@@ -73,6 +73,15 @@ Settings → "Prefer original quality". The transport state/status parsing lives
 DIDL-Lite is provided when needed with the correct MIME type / `protocolInfo`, using **only** the
 phone proxy URL. `friendlyName` / `model` / `manufacturer` are escaped before display.
 
+## Subtitles
+
+Subtitle delivery does not rely on vendor-specific sidecar headers or the TV's embedded-track picker.
+Selected provider tracks are burned in by Jellyfin; local embedded and picked SRT/WebVTT/ASS/SSA/TTML
+captions are rendered into the phone's continuous MPEG-TS output. Playback begins on first media while
+encoding continues. Off removes known embedded subtitle packets. Text and supported bitmap codecs
+follow Media3's decoder/renderer support; unsupported selections fail clearly. See the shared
+[subtitle behavior](CAST.md#subtitles) and the physical-TV acceptance requirements.
+
 ## XML / SOAP security (§11, §17)
 
 All DLNA XML is treated as untrusted: DTDs and external entities disabled, no external XML references

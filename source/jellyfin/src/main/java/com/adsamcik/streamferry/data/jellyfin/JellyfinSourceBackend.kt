@@ -310,18 +310,41 @@ class JellyfinPlaybackProvider(
         if (request.media.source != source) {
             return Result.failure(IllegalArgumentException("Media reference belongs to another source instance"))
         }
+        val audioIndex = request.audioTrack?.opaqueId?.substringAfterLast(':')?.toIntOrNull()
+        val subtitleIndex = request.subtitleTrack?.opaqueId?.substringAfterLast(':')?.toIntOrNull()
+        if (request.audioTrack != null && (audioIndex == null || audioIndex < 0)) {
+            return Result.failure(IllegalArgumentException("Invalid audio track reference"))
+        }
+        if (!request.subtitlesDisabled && request.subtitleTrack != null && (subtitleIndex == null || subtitleIndex < 0)) {
+            return Result.failure(IllegalArgumentException("Invalid subtitle track reference"))
+        }
+        val selectedSources = listOfNotNull(request.audioTrack, request.subtitleTrack.takeUnless { request.subtitlesDisabled })
+            .mapNotNull { it.opaqueId.takeIf { id -> ':' in id }?.substringBeforeLast(':') }.distinct()
+        if (selectedSources.size > 1 || selectedSources.any { it.isBlank() }) {
+            return Result.failure(IllegalArgumentException("Tracks belong to different media versions"))
+        }
+        if (request.mediaVersion?.isBlank() == true ||
+            (request.mediaVersion != null && selectedSources.any { it != request.mediaVersion })
+        ) {
+            return Result.failure(IllegalArgumentException("Tracks do not belong to the selected media version"))
+        }
+        val selectedVersion = request.mediaVersion ?: selectedSources.singleOrNull()
         return repository.playbackInfo(
             itemId = request.media.nativeId,
             capabilities = request.target,
             maxBitrateBps = request.maxBitrateBps,
             forceTranscode = request.forceTranscode,
             allowSubtitleBurnIn = request.allowSubtitleBurnIn,
-            audioStreamIndex = request.audioTrack?.opaqueId?.toIntOrNull(),
-            subtitleStreamIndex = if (request.subtitlesDisabled) -1 else request.subtitleTrack?.opaqueId?.toIntOrNull(),
+            audioStreamIndex = audioIndex,
+            subtitleStreamIndex = if (request.subtitlesDisabled) -1 else subtitleIndex,
             startPositionSeconds = request.startPositionSeconds,
             maxVideoHeight = request.maxVideoHeight,
             preferredVideoCodec = request.preferredVideoCodec,
+            mediaSourceId = selectedVersion,
         ).mapCatching { info ->
+            check(selectedVersion == null || info.mediaSourceId == selectedVersion) {
+                "The selected media version is no longer available"
+            }
             val upstream = repository.resolveUpstream(info)
             JellyfinProviderPlaybackSession(this, request, info, upstream)
         }
@@ -343,7 +366,7 @@ class JellyfinPlaybackProvider(
             sourceBitrateBps = info.sourceBitrateBps,
             audioTracks = info.audioTracks.map { track ->
                 MediaTrack(
-                    ref = TrackRef(track.index.toString()),
+                    ref = TrackRef("${info.mediaSourceId}:${track.index}"),
                     language = track.language,
                     label = track.label,
                     isDefault = track.isDefault,
@@ -352,7 +375,7 @@ class JellyfinPlaybackProvider(
             },
             subtitleTracks = info.subtitleTracks.map { track ->
                 MediaTrack(
-                    ref = TrackRef(track.index.toString()),
+                    ref = TrackRef("${info.mediaSourceId}:${track.index}"),
                     language = track.language,
                     label = track.label,
                     isDefault = track.isDefault,
@@ -360,6 +383,7 @@ class JellyfinPlaybackProvider(
                 )
             },
             stream = upstream.descriptor,
+            mediaVersion = info.mediaSourceId,
         )
 
         override suspend fun report(event: PlaybackEvent) {
@@ -386,7 +410,10 @@ class JellyfinPlaybackProvider(
                     forceTranscode = change.forceTranscode ?: request.forceTranscode,
                     audioTrack = change.audioTrack ?: request.audioTrack,
                     subtitleTrack = change.subtitleTrack ?: request.subtitleTrack,
+                    subtitlesDisabled = change.subtitlesDisabled
+                        ?: if (change.subtitleTrack != null) false else request.subtitlesDisabled,
                     preferredVideoCodec = change.preferredVideoCodec ?: request.preferredVideoCodec,
+                    mediaVersion = info.mediaSourceId,
                 ),
             )
 
