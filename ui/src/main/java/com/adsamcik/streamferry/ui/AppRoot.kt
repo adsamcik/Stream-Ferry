@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -213,7 +214,9 @@ fun AppRoot(
             Row(
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(scaffoldPadding),
+                    .padding(scaffoldPadding)
+                    // Let nested imePadding apply only the keyboard space not already reserved here.
+                    .consumeWindowInsets(scaffoldPadding),
             ) {
                 if (useNavigationRail && showTopLevelNavigation) {
                     WideNavigation(state, viewModel)

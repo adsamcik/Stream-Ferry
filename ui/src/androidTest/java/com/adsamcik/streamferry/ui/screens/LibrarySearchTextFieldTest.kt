@@ -1,15 +1,25 @@
 package com.adsamcik.streamferry.ui.screens
 
+import android.view.View
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.test.assertIsFocused
+import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.hasScrollToIndexAction
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performImeAction
+import androidx.compose.ui.test.performScrollToIndex
 import androidx.compose.ui.test.performTextInput
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.test.platform.app.InstrumentationRegistry
 import com.adsamcik.streamferry.core.volume.NightVolumePolicy
 import com.adsamcik.streamferry.domain.MediaItem
@@ -42,6 +52,12 @@ class LibrarySearchTextFieldTest {
                         overview = null, resumePositionSeconds = null, isFolder = true,
                     ),
                 ),
+                searchResults = (1..60).map {
+                    MediaItem(
+                        id = "matrix-$it", title = "Matrix $it", year = 1999, runtimeSeconds = 7200,
+                        overview = null, resumePositionSeconds = null, isFolder = false,
+                    )
+                },
             ),
         )
         val controller = Proxy.newProxyInstance(
@@ -56,7 +72,11 @@ class LibrarySearchTextFieldTest {
                 else -> null
             }
         } as UiController
+        lateinit var contentView: View
+        var density = 1f
         composeRule.setContent {
+            contentView = LocalView.current
+            density = LocalDensity.current.density
             StreamFerryTheme(dynamicColor = false) {
                 AppRoot(state, controller, {}, "test", NightVolumePolicy.Off, {})
             }
@@ -70,7 +90,28 @@ class LibrarySearchTextFieldTest {
         assertEquals(openedPosition, editor.fetchSemanticsNode().boundsInRoot.topLeft)
         editor.performTextInput("atrix")
         composeRule.runOnIdle { assertEquals("matrix", state.searchQuery) }
+        composeRule.waitUntil(10_000) {
+            ViewCompat.getRootWindowInsets(contentView)?.isVisible(WindowInsetsCompat.Type.ime()) == true
+        }
+        composeRule.waitForIdle()
+        val keyboardHeight = ViewCompat.getRootWindowInsets(contentView)!!
+            .getInsets(WindowInsetsCompat.Type.ime()).bottom
+        assertTrue("The keyboard must actually be open", keyboardHeight > 0)
+        val grid = composeRule.onNode(hasScrollToIndexAction())
+        val keyboardGridBottom = grid.fetchSemanticsNode().boundsInRoot.bottom
+        val rootBottom = composeRule.onRoot().fetchSemanticsNode().boundsInRoot.bottom
+        assertEquals("Videos should extend to the normal margin above the keyboard", rootBottom - keyboardHeight - 12 * density, keyboardGridBottom, 2 * density)
         captureScreen("search-typed.png")
+        grid.performScrollToIndex(59)
+        composeRule.onNodeWithText("Matrix 60").assertIsDisplayed()
+        captureScreen("search-keyboard-end.png")
+        editor.performImeAction()
+        composeRule.waitUntil(10_000) {
+            ViewCompat.getRootWindowInsets(contentView)?.isVisible(WindowInsetsCompat.Type.ime()) == false
+        }
+        assertTrue("Dismissing the keyboard should restore gallery space", grid.fetchSemanticsNode().boundsInRoot.bottom > keyboardGridBottom)
+        composeRule.runOnIdle { assertEquals("matrix", state.searchQuery) }
+        captureScreen("search-keyboard-closed.png")
     }
 
     private fun captureScreen(name: String) {
