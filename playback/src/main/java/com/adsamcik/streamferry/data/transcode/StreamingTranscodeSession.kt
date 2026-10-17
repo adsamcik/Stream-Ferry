@@ -44,6 +44,7 @@ class StreamingTranscodeSession(
     private val sourceMimeType: String? = null,
     private val sourceProfile: MediaProfile? = null,
     private val onFailure: (Throwable) -> Unit = {},
+    private val onReconnectRequired: () -> Unit = {},
 ) : ClientTranscodeSource {
     private val lock = Object()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -66,6 +67,7 @@ class StreamingTranscodeSession(
     private var progressiveOpen = false
     private val startupReplay = ByteArrayOutputStream()
     private var replayAvailable = true
+    private var reconnectRequested = false
 
     override val isProgressive: Boolean get() = !hls
     override val segmentContentType: String get() = "video/mp4"
@@ -231,61 +233,107 @@ class StreamingTranscodeSession(
         ClientTranscodeSource.Resource.Ready(segment.bytes)
     }
 
-    override fun openProgressive(): InputStream? = synchronized(lock) {
-        if (hls || released || progressiveOpen || !replayAvailable) return@synchronized null
-        progressiveOpen = true
-        object : InputStream() {
-            private var current: ByteArray? = startupReplay.toByteArray().takeIf { it.isNotEmpty() }
-            private var offset = 0
-            private var closed = false
-            override fun read(): Int {
-                val one = ByteArray(1)
-                return if (read(one, 0, 1) < 0) -1 else one[0].toInt() and 0xff
+    override fun openProgressive(): InputStream? {
+        var requestReconnect = false
+        val stream = synchronized(lock) {
+            if (hls || released || progressiveOpen) return@synchronized null
+            if (!replayAvailable) {
+                // Reopening at byte zero requires a new encoder and URL once the bounded startup
+                // replay is gone. A second request must never join an existing reader mid-stream.
+                if (!reconnectRequested) {
+                    reconnectRequested = true
+                    requestReconnect = true
+                }
+                return@synchronized reconnectWaiter()
             }
-            override fun read(bytes: ByteArray, off: Int, len: Int): Int = synchronized(lock) {
-                require(off >= 0 && len >= 0 && off <= bytes.size - len)
-                if (len == 0) return@synchronized 0
-                val deadline = System.nanoTime() + READ_TIMEOUT_MS * 1_000_000
-                while (!closed && !released && current == null && packets.isEmpty() && !finished) {
-                    val remainingMs = (deadline - System.nanoTime()) / 1_000_000
-                    if (remainingMs <= 0) throw IOException("Timed out waiting for encoded media")
-                    lock.wait(remainingMs.coerceAtLeast(1))
+            progressiveOpen = true
+            object : InputStream() {
+                private var current: ByteArray? = startupReplay.toByteArray().takeIf { it.isNotEmpty() }
+                private var offset = 0
+                private var closed = false
+                override fun read(): Int {
+                    val one = ByteArray(1)
+                    return if (read(one, 0, 1) < 0) -1 else one[0].toInt() and 0xff
                 }
-                if (closed || released) return@synchronized -1
-                if (current == null && packets.isEmpty()) {
-                    failure?.let { throw IOException("On-device encoding failed", it) }
-                    return@synchronized -1
-                }
-                var count = 0
-                while (count < len && (current != null || packets.isNotEmpty())) {
-                    if (current == null) {
-                        current = packets.removeFirst()
-                        bufferedBytes -= current!!.size
-                        if (replayAvailable) {
-                            if (startupReplay.size().toLong() + current!!.size <= MAX_TS_BUFFER_BYTES) {
-                                startupReplay.write(current!!)
-                            } else {
-                                replayAvailable = false
-                                startupReplay.reset()
-                            }
-                        }
-                        offset = 0
+                override fun read(bytes: ByteArray, off: Int, len: Int): Int = synchronized(lock) {
+                    require(off >= 0 && len >= 0 && off <= bytes.size - len)
+                    if (len == 0) return@synchronized 0
+                    val deadline = System.nanoTime() + READ_TIMEOUT_MS * 1_000_000
+                    while (!closed && !released && current == null && packets.isEmpty() && !finished) {
+                        val remainingMs = (deadline - System.nanoTime()) / 1_000_000
+                        if (remainingMs <= 0) throw IOException("Timed out waiting for encoded media")
+                        lock.wait(remainingMs.coerceAtLeast(1))
                     }
-                    val packet = current!!
-                    val copied = minOf(len - count, packet.size - offset)
-                    packet.copyInto(bytes, off + count, offset, offset + copied)
-                    offset += copied
-                    count += copied
-                    if (offset == packet.size) current = null
+                    if (closed || released) return@synchronized -1
+                    if (current == null && packets.isEmpty()) {
+                        failure?.let { throw IOException("On-device encoding failed", it) }
+                        return@synchronized -1
+                    }
+                    var count = 0
+                    while (count < len && (current != null || packets.isNotEmpty())) {
+                        if (current == null) {
+                            current = packets.removeFirst()
+                            bufferedBytes -= current!!.size
+                            if (replayAvailable) {
+                                if (startupReplay.size().toLong() + current!!.size <= MAX_TS_BUFFER_BYTES) {
+                                    startupReplay.write(current!!)
+                                } else {
+                                    replayAvailable = false
+                                    startupReplay.reset()
+                                }
+                            }
+                            offset = 0
+                        }
+                        val packet = current!!
+                        val copied = minOf(len - count, packet.size - offset)
+                        packet.copyInto(bytes, off + count, offset, offset + copied)
+                        offset += copied
+                        count += copied
+                        if (offset == packet.size) current = null
+                    }
+                    lock.notifyAll()
+                    count
                 }
-                lock.notifyAll()
-                count
+                override fun close() = synchronized(lock) {
+                    if (closed) return@synchronized
+                    closed = true
+                    progressiveOpen = false
+                    lock.notifyAll()
+                }
             }
-            override fun close() = synchronized(lock) {
-                closed = true
-                progressiveOpen = false
-                lock.notifyAll()
+        }
+        // Reloading can release this session and wait for the encoder, which needs this lock.
+        if (requestReconnect) runCatching { onReconnectRequired() }.onFailure {
+            logger.w("transcode", "Unable to restart the disconnected on-device stream", it)
+        }
+        return stream
+    }
+
+    private fun reconnectWaiter(): InputStream = object : InputStream() {
+        private var closed = false
+
+        override fun read(): Int {
+            val one = ByteArray(1)
+            return if (read(one, 0, 1) < 0) -1 else one[0].toInt() and 0xff
+        }
+
+        override fun read(bytes: ByteArray, off: Int, len: Int): Int = synchronized(lock) {
+            require(off >= 0 && len >= 0 && off <= bytes.size - len)
+            if (len == 0) return@synchronized 0
+            val deadline = System.nanoTime() + READ_TIMEOUT_MS * 1_000_000
+            // Keep the reconnect GET pending while the engine reads the TV's native play/pause
+            // state. An immediate HTTP failure could turn PLAYING into STOPPED before that read.
+            while (!closed && !released) {
+                val remainingMs = (deadline - System.nanoTime()) / 1_000_000
+                if (remainingMs <= 0) throw IOException("Timed out waiting for the replacement stream")
+                lock.wait(remainingMs.coerceAtLeast(1))
             }
+            -1
+        }
+
+        override fun close() = synchronized(lock) {
+            closed = true
+            lock.notifyAll()
         }
     }
 

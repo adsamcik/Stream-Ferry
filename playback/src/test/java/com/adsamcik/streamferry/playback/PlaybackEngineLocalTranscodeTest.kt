@@ -17,6 +17,7 @@ import com.adsamcik.streamferry.domain.DiscoveredTarget
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.domain.PlaybackTargetController
 import com.adsamcik.streamferry.domain.PlaybackTargetEvent
+import com.adsamcik.streamferry.domain.PlaybackFailureKind
 import com.adsamcik.streamferry.playback.proxy.ProxyForegroundStartPath
 import com.adsamcik.streamferry.playback.session.DefaultPlaybackSessionCoordinator
 import com.adsamcik.streamferry.source.api.DiagnosticSink
@@ -37,10 +38,14 @@ import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlin.test.*
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class PlaybackEngineLocalTranscodeTest {
+    private enum class SourceCase { FILE, CONTENT_URI, PROVIDER_FILE, PROVIDER_HLS }
+    private data class LoadedStream(val url: String, val duration: Long?, val position: Long, val playWhenReady: Boolean)
+
     @BeforeTest fun mockLocalProbe() {
         mockkObject(LocalMediaProbe)
         every { LocalMediaProbe.probe(any(), any(), any()) } returns compatibleProfile
@@ -61,6 +66,7 @@ class PlaybackEngineLocalTranscodeTest {
         val provider = mockk<PlaybackProvider>(relaxed = true)
         val providerSession = mockk<ProviderPlaybackSession>(relaxed = true)
         val requests = mutableListOf<PlaybackRequest>()
+        val loads = mutableListOf<LoadedStream>()
         val movie = MediaItem("movie", "Movie", null, 3600, null, 123, false)
         var providerStream = StreamDescriptor("video/mp4", "mp4", isTranscoding = false, isByteSeekable = true, totalLength = 100_000)
         private val session = SessionRegistry().create("video/mp4", false, 100_000)
@@ -70,6 +76,9 @@ class PlaybackEngineLocalTranscodeTest {
             every { target.events } returns events
             every { target.protocol } returns protocol
             coEvery { target.readCurrentVolume() } returns 0.1f
+            coEvery { target.load(any(), any(), any(), any(), any(), any()) } coAnswers {
+                loads += LoadedStream(firstArg(), arg(3), arg(4), arg(5))
+            }
             every { coordinator.active } returns MutableStateFlow(session)
             coEvery { coordinator.startLocalAndBuildUrl(any(), any(), any()) } returns
                 (session to ORIGINAL_URL)
@@ -114,13 +123,29 @@ class PlaybackEngineLocalTranscodeTest {
             ), null,
         )
 
-        suspend fun start(allowClientTranscode: Boolean = true) = engine.playLocal(
-            filePath = "/download/movie.mp4", contentType = "video/mp4", title = "Movie",
+        suspend fun start(allowClientTranscode: Boolean = true, filePath: String = "/download/movie.mp4") = engine.playLocal(
+            filePath = filePath, contentType = "video/mp4", title = "Movie",
             runtimeSeconds = 3600, allowClientTranscode = allowClientTranscode,
             resumePositionSeconds = 123, target = target, selectedTarget = selected,
         )
 
         suspend fun startOnline() = engine.play(movie, target, selected, StreamPreferences(maxVideoHeight = 720, maxBitrateBps = 2_000_000))
+
+        suspend fun startSource(source: SourceCase) {
+            when (source) {
+                SourceCase.FILE -> start(allowClientTranscode = false)
+                SourceCase.CONTENT_URI -> start(allowClientTranscode = false, filePath = "content://media/external/video/42")
+                SourceCase.PROVIDER_FILE -> startOnline()
+                SourceCase.PROVIDER_HLS -> {
+                    providerStream = StreamDescriptor(
+                        "application/vnd.apple.mpegurl", "hls", isTranscoding = true, isByteSeekable = false,
+                        hlsSegmentFormat = com.adsamcik.streamferry.source.api.HlsSegmentFormat.FMP4,
+                        totalLength = null,
+                    )
+                    startOnline()
+                }
+            }
+        }
     }
 
     @Test fun `compatible local original offers output controls and explicit transcode overrides automatic preference`() = runTest {
@@ -427,6 +452,112 @@ class PlaybackEngineLocalTranscodeTest {
             verify(atLeast = 1) { anyConstructed<StreamingTranscodeSession>().release() }
             coVerify(atLeast = 1) { f.coordinator.stop(any()) }
         } finally { f.engine.stop(); runCurrent() }
+    }
+
+    @Test fun `old renderer updates cannot change a replacement timeline for any source or protocol`() = runTest {
+        for (protocol in listOf(Protocol.CAST, Protocol.DLNA)) for (source in SourceCase.entries) {
+            val f = Fixture(this, protocol)
+            val waiting = CompletableDeferred<Unit>()
+            val ready = CompletableDeferred<Unit>()
+            try {
+                f.startSource(source); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(123, true)); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(200, true)); runCurrent()
+                f.events.emit(PlaybackTargetEvent.BufferingChanged(true)); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(200, false)); runCurrent()
+                coEvery { anyConstructed<StreamingTranscodeSession>().awaitReady() } coAnswers {
+                    waiting.complete(Unit)
+                    ready.await()
+                }
+                val changing = launch { f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE) }
+                runCurrent()
+                assertTrue(waiting.isCompleted, "$source/$protocol")
+                f.events.emit(PlaybackTargetEvent.StatusChanged(201, true))
+                f.events.emit(PlaybackTargetEvent.BufferingChanged(true)); runCurrent()
+                assertEquals(200L, f.engine.status.value?.positionSeconds, "$source/$protocol accepted old timeline")
+                assertEquals(false, f.engine.status.value?.isBuffering)
+                ready.complete(Unit); runCurrent(); changing.join()
+                assertEquals(0L, f.loads.last().position)
+                assertEquals(3400L, f.loads.last().duration)
+                f.events.emit(PlaybackTargetEvent.StatusChanged(5, true)); runCurrent()
+                assertEquals(205L, f.engine.status.value?.positionSeconds)
+                assertEquals(false, f.engine.status.value?.isBuffering)
+                f.events.emit(PlaybackTargetEvent.StatusChanged(5, false)); runCurrent()
+                f.engine.selectMaxVideoHeight(480); runCurrent()
+                assertEquals(false, f.loads.last().playWhenReady, "$source/$protocol lost pause after replacing a buffering stream")
+            } finally {
+                f.engine.stop(); ready.complete(Unit); runCurrent()
+                coEvery { anyConstructed<StreamingTranscodeSession>().awaitReady() } returns Unit
+            }
+        }
+    }
+
+    @Test fun `paused seeks and output changes stay paused and resume at source position for every source and protocol`() = runTest {
+        for (protocol in listOf(Protocol.CAST, Protocol.DLNA)) for (source in SourceCase.entries) {
+            val f = Fixture(this, protocol)
+            try {
+                f.startSource(source); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(123, true)); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(200, true)); runCurrent()
+                f.engine.pause(); runCurrent()
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE); runCurrent()
+                f.engine.selectPreferredCodec("h264"); runCurrent()
+                f.engine.selectMaxVideoHeight(480); runCurrent()
+                f.engine.seekTo(300); runCurrent()
+                assertEquals(false, f.loads.last().playWhenReady)
+                assertEquals(0L, f.loads.last().position)
+                assertEquals(3300L, f.loads.last().duration)
+                f.events.emit(PlaybackTargetEvent.StatusChanged(5, false)); runCurrent()
+                assertEquals(305L, f.engine.status.value?.positionSeconds)
+                val loadsBeforeWait = f.loads.size
+                advanceTimeBy(StartupWatchdog.GRACE_MS + 1); runCurrent()
+                assertEquals(loadsBeforeWait, f.loads.size, "$source/$protocol recovered an intentionally paused load")
+                assertNull(f.engine.status.value?.errorMessage)
+                assertEquals(false, f.engine.status.value?.isPlaying)
+                f.engine.resume(); runCurrent()
+                if (protocol == Protocol.DLNA) {
+                    assertEquals(loadsBeforeWait + 1, f.loads.size)
+                    assertEquals(0L, f.loads.last().position)
+                    assertEquals(3295L, f.loads.last().duration)
+                    assertEquals(true, f.loads.last().playWhenReady)
+                } else assertEquals(loadsBeforeWait, f.loads.size)
+                f.events.emit(PlaybackTargetEvent.StatusChanged(if (protocol == Protocol.DLNA) 0 else 5, true)); runCurrent()
+                assertEquals(305L, f.engine.status.value?.positionSeconds)
+                assertEquals(true, f.engine.status.value?.isPlaying)
+                assertEquals("H.264 · 480p · on device", f.engine.status.value?.outputFormat)
+                f.engine.selectPreferredCodec("hevc"); runCurrent()
+                f.engine.selectMaxVideoHeight(720); runCurrent()
+                f.engine.seekTo(600); runCurrent()
+                assertEquals(true, f.loads.last().playWhenReady)
+                assertEquals(0L, f.loads.last().position)
+                assertEquals(3000L, f.loads.last().duration)
+                f.events.emit(PlaybackTargetEvent.StatusChanged(2, true)); runCurrent()
+                assertEquals(602L, f.engine.status.value?.positionSeconds)
+                assertEquals("HEVC · 720p · on device", f.engine.status.value?.outputFormat)
+                coVerify(exactly = 0) { f.target.seekTo(any()) }
+            } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `successful codec fallback releases reload guard for remote pause output changes and completion`() = runTest {
+        for (protocol in listOf(Protocol.CAST, Protocol.DLNA)) for (source in SourceCase.entries) {
+            val f = Fixture(this, protocol)
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE); runCurrent()
+                val firstOutput = f.engine.status.value?.outputFormat
+                val firstLoads = f.loads.size
+                f.events.emit(PlaybackTargetEvent.Error(PlaybackFailureKind.FORMAT, "Unsupported output")); runCurrent()
+                assertEquals(firstLoads + 1, f.loads.size, "$source/$protocol did not attempt codec fallback")
+                assertNotEquals(firstOutput, f.engine.status.value?.outputFormat)
+                f.events.emit(PlaybackTargetEvent.StatusChanged(0, true)); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(5, false)); runCurrent()
+                f.engine.selectMaxVideoHeight(480); runCurrent()
+                assertEquals(false, f.loads.last().playWhenReady, "$source/$protocol lost remote pause after fallback")
+                f.events.emit(PlaybackTargetEvent.Ended); runCurrent()
+                assertNull(f.engine.status.value, "$source/$protocol ignored normal end after fallback")
+            } finally { f.engine.stop(); runCurrent() }
+        }
     }
 
     private companion object {

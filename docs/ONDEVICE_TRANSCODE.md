@@ -32,12 +32,17 @@ videos and provider movies/episodes; the continuous lifecycle itself does not re
 Bounded queues apply receiver backpressure to the encoder. HLS retains up to eight segments within a
 24 MiB budget, using the receiver cursor and a small retry window; skipped startup segments cannot
 permanently block production. DLNA has a 2 MiB producer queue and a bounded startup replay buffer for
-receivers that probe bytes then reopen the URL. A later unsupported reconnect fails explicitly rather
-than serving an arbitrary midstream byte as the beginning.
+receivers that probe bytes then reopen the URL. DLNA resume starts a fresh encoder at the retained
+source position. If a receiver reopens after that replay budget expires, the session requests the same
+reload instead of joining arbitrary midstream bytes. The replacement keeps the selected format,
+resolution and play/pause intent. The old reconnect request waits while the phone reads the TV's
+current transport state, so TV-originated Resume is respected even before the next status poll.
 
 All phone output is rebased to renderer time zero at the requested source position. App seeking and
 format/resolution changes restart the streaming encoder there, rather than waiting for prior content
-to be encoded or claiming byte access to future output. Source watch progress remains absolute.
+to be encoded or claiming byte access to future output. Old renderer updates are retired during the
+handoff. Paused replacements wait for Resume before startup monitoring begins. Source watch progress
+remains absolute.
 Stop wakes blocked readers/writers before cancelling and draining only that session's encoder.
 
 Online input and output use separate opaque proxy sessions. Provider Started/Progress/Stopped reporting

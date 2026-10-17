@@ -95,6 +95,7 @@ class CastTargetController(
         val client: RemoteMediaClient,
         val callback: RemoteMediaClient.Callback,
         val generation: Long,
+        val loadGeneration: Long,
     )
 
     /** Keep the originating manager as well as the listener for the same reason as media callbacks. */
@@ -151,6 +152,9 @@ class CastTargetController(
     private var nextStatusRefreshAtMs = 0L
     /** Incremented before every connect/disconnect so delayed callbacks from a superseded session are inert. */
     private var connectionGeneration = 0L
+    /** A receiver connection survives many loads; its previous media timeline must not survive them. */
+    private var mediaLoadGeneration = 0L
+    private var expectedMediaUrl: String? = null
     private var activeBinding: ActiveCastBinding? = null
     /** Prevent resume-failed followed by ended from emitting two disconnected events for one session. */
     private var terminalDisconnectGeneration: Long? = null
@@ -290,8 +294,10 @@ class CastTargetController(
         playWhenReady: Boolean,
     ) = withContext(Dispatchers.Main) {
         val activeClient = requireActiveMediaClient()
+        invalidateMediaLoad()
+        expectedMediaUrl = proxyUrl
+        val loadGeneration = mediaLoadGeneration
         registerMediaCallback()
-        cancelPositionHeartbeat()
         lastPlayerState = null // a fresh load: log the new session's first state transition from "none"
         val metadata = MediaMetadata(MediaMetadata.MEDIA_TYPE_MOVIE).apply {
             putString(MediaMetadata.KEY_TITLE, MetadataSanitizer.receiverTitle(title))
@@ -330,7 +336,8 @@ class CastTargetController(
                 "title=$title dur=${durationSeconds}s start=${startPositionSeconds}s autoplay=$playWhenReady url=$proxyUrl",
         )
         awaitMediaCommand("load", activeClient.client.load(request), activeClient)
-        startPositionHeartbeat(activeClient)
+        if (mediaLoadGeneration != loadGeneration) error("Cast load was superseded.")
+        startPositionHeartbeat(activeClient, loadGeneration)
         logger.i(TAG, "Cast load accepted (proxy URL, redacted)")
     }
 
@@ -369,6 +376,10 @@ class CastTargetController(
         client.seek(MediaSeekOptions.Builder().setPosition(positionSeconds.coerceAtLeast(0) * 1000L).build())
     }
     override suspend fun stop() = runMediaCommand("stop") { it.stop() }
+    override suspend fun prepareReload() = withContext(Dispatchers.Main) {
+        // Encoder startup can take seconds. Do not keep publishing the old stream in that interval.
+        invalidateMediaLoad()
+    }
     override suspend fun readCurrentVolume(): Float? = withContext(Dispatchers.Main) {
         requireActiveMediaClient().session.volume.toFloat().takeIf { level ->
             !level.isNaN() && !level.isInfinite() && level in 0f..1f
@@ -524,14 +535,14 @@ class CastTargetController(
      * that estimate with the receiver as well: a cached
      * PLAYING/PAUSED state can outlive screen-off network suspension or a missed TV status update.
      */
-    private fun startPositionHeartbeat(activeClient: ActiveMediaClient) {
+    private fun startPositionHeartbeat(activeClient: ActiveMediaClient, loadGeneration: Long = mediaLoadGeneration) {
         if (positionHeartbeatJob?.isActive == true) return
         positionHeartbeatJob = callbackScope.launch {
-            while (isActive && isCurrentMediaCallback(activeClient.client, activeClient.generation)) {
+            while (isActive && isCurrentMediaCallback(activeClient.client, activeClient.generation, loadGeneration)) {
                 delay(POSITION_HEARTBEAT_INTERVAL_MS)
-                if (isCurrentMediaCallback(activeClient.client, activeClient.generation)) {
-                    requestStatusRefresh(activeClient)
-                    emitStatus(activeClient.client, activeClient.generation, isHeartbeat = true)
+                if (isCurrentMediaCallback(activeClient.client, activeClient.generation, loadGeneration)) {
+                    requestStatusRefresh(activeClient, loadGeneration = loadGeneration)
+                    emitStatus(activeClient.client, activeClient.generation, loadGeneration, isHeartbeat = true)
                     // Paused/buffering state is checkpointed once above. A later PLAYING callback restarts
                     // this loop, so an idle TV does not keep writing unchanged progress to disk.
                     if (activeClient.client.mediaStatus?.playerState != MediaStatus.PLAYER_STATE_PLAYING) return@launch
@@ -554,8 +565,8 @@ class CastTargetController(
         }
     }
 
-    private fun requestStatusRefresh(activeClient: ActiveMediaClient, force: Boolean = false) {
-        if (!isCurrentMediaCallback(activeClient.client, activeClient.generation)) return
+    private fun requestStatusRefresh(activeClient: ActiveMediaClient, force: Boolean = false, loadGeneration: Long = mediaLoadGeneration) {
+        if (!isCurrentMediaCallback(activeClient.client, activeClient.generation, loadGeneration)) return
         if (statusRefreshJob?.isActive == true) return
         val now = elapsedRealtime()
         if (!force && now < nextStatusRefreshAtMs) return
@@ -567,7 +578,7 @@ class CastTargetController(
                 awaitMediaCommand("progress refresh", activeClient.client.requestStatus(), activeClient)
                 // Publish even if the SDK considers the returned status unchanged. In particular this
                 // restarts progress checkpoints after a suspended session has recovered.
-                emitStatus(activeClient.client, activeClient.generation)
+                emitStatus(activeClient.client, activeClient.generation, loadGeneration)
             } catch (c: CancellationException) {
                 throw c
             } catch (e: Exception) {
@@ -694,13 +705,18 @@ class CastTargetController(
 
     private fun registerMediaCallback() {
         val activeClient = activeMediaClientOrNull() ?: return
+        val loadGeneration = mediaLoadGeneration
         val current = mediaCallbackRegistration
-        if (current?.client === activeClient.client && current.generation == activeClient.generation) return
+        if (current?.client === activeClient.client && current.generation == activeClient.generation &&
+            current.loadGeneration == loadGeneration
+        ) return
         unregisterMediaCallback()
         val callback = object : RemoteMediaClient.Callback() {
-            override fun onStatusUpdated() = emitStatus(activeClient.client, activeClient.generation)
+            override fun onStatusUpdated() = emitStatus(activeClient.client, activeClient.generation, loadGeneration)
             override fun onMediaError(e: com.google.android.gms.cast.MediaError) {
-                if (!isCurrentMediaCallback(activeClient.client, activeClient.generation)) return
+                if (!isCurrentMediaCallback(activeClient.client, activeClient.generation, loadGeneration) ||
+                    !isExpectedMedia(activeClient.client)
+                ) return
                 // Always kept (not just under tracing): a Cast media error is a top diagnostic signal.
                 val kind = classifyCastError(e.detailedErrorCode)
                 logger.w("cast", "Cast media error: reason=${e.reason} detailedCode=${e.detailedErrorCode} -> classified $kind")
@@ -713,7 +729,7 @@ class CastTargetController(
                 )
             }
         }
-        mediaCallbackRegistration = MediaCallbackRegistration(activeClient.client, callback, activeClient.generation)
+        mediaCallbackRegistration = MediaCallbackRegistration(activeClient.client, callback, activeClient.generation, loadGeneration)
         activeClient.client.registerCallback(callback)
     }
 
@@ -726,8 +742,8 @@ class CastTargetController(
             .onFailure { logger.w(TAG, "Couldn't unregister Cast media callback: ${it.message ?: it.javaClass.simpleName}") }
     }
 
-    private fun emitStatus(client: RemoteMediaClient, generation: Long, isHeartbeat: Boolean = false) {
-        if (!isCurrentMediaCallback(client, generation)) return
+    private fun emitStatus(client: RemoteMediaClient, generation: Long, loadGeneration: Long, isHeartbeat: Boolean = false) {
+        if (!isCurrentMediaCallback(client, generation, loadGeneration) || !isExpectedMedia(client)) return
         val status = client.mediaStatus
         val positionSeconds = client.approximateStreamPosition / 1000L
         val state = status?.playerState
@@ -750,7 +766,7 @@ class CastTargetController(
             if (state == MediaStatus.PLAYER_STATE_PLAYING &&
                 activeClient?.client === client && activeClient.generation == generation
             ) {
-                startPositionHeartbeat(activeClient)
+                startPositionHeartbeat(activeClient, loadGeneration)
             } else if (state != MediaStatus.PLAYER_STATE_PLAYING) {
                 cancelPositionHeartbeat()
             }
@@ -896,13 +912,29 @@ class CastTargetController(
             activeClient.session.remoteMediaClient === activeClient.client &&
             castContext?.sessionManager?.currentCastSession === activeClient.session
 
-    private fun isCurrentMediaCallback(client: RemoteMediaClient, generation: Long): Boolean {
+    private fun isCurrentMediaCallback(client: RemoteMediaClient, generation: Long, loadGeneration: Long): Boolean {
         val registration = mediaCallbackRegistration
         return registration?.client === client && registration.generation == generation &&
+            registration.loadGeneration == loadGeneration && mediaLoadGeneration == loadGeneration &&
             activeMediaClientOrNull()?.let { it.client === client && it.generation == generation } == true
     }
 
+    private fun isExpectedMedia(client: RemoteMediaClient): Boolean =
+        expectedMediaUrl?.let { client.mediaStatus?.mediaInfo?.contentId == it } ?: true
+
+    private fun invalidateMediaLoad() {
+        ++mediaLoadGeneration
+        cancelPositionHeartbeat()
+        cancelStatusRefresh()
+        unregisterMediaCallback()
+        nextStatusRefreshAtMs = 0L
+        lastBuffering = false
+        lastPlayerState = null
+    }
+
     private fun detachActiveSession(clearTerminalDisconnectMarker: Boolean = true) {
+        ++mediaLoadGeneration
+        expectedMediaUrl = null
         cancelPositionHeartbeat()
         cancelStatusRefresh()
         nextStatusRefreshAtMs = 0L

@@ -557,6 +557,18 @@ class DlnaTargetController(
 
     override suspend fun diagnosticStatus(): String =
         "dlna transport=${lastTransportState ?: "?"} connected=${connected != null}"
+
+    override suspend fun readIsPlaying(): Boolean? = withContext(Dispatchers.IO) {
+        val renderer = connected ?: return@withContext null
+        // A native TV control can change state before the idle poll runs. Read it freshly without
+        // emitting a status event from a potentially superseded stream.
+        when (transportInfo(renderer).state) {
+            "PLAYING", "TRANSITIONING" -> true
+            "PAUSED_PLAYBACK", "PAUSED_RECORDING", "STOPPED" -> false
+            else -> null
+        }
+    }
+
     override suspend fun seekTo(positionSeconds: Long) = seekMutex.withLock {
         // An explicit user/media-session seek supersedes a still-pending load-time resume. Serializing this
         // update with the deferred command guarantees an older resume can never execute after this seek.

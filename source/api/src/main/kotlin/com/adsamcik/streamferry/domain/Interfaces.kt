@@ -271,6 +271,8 @@ interface PlaybackTargetController {
     suspend fun stop()
     /** Current normalized master volume from the renderer, or null when it cannot be read safely. */
     suspend fun readCurrentVolume(): Float? = null
+    /** Fresh transport state when a reconnect precedes the usual status event; null means unknown. */
+    suspend fun readIsPlaying(): Boolean? = null
     suspend fun setVolume(level: Float)
     suspend fun disconnect()
 
@@ -279,8 +281,8 @@ interface PlaybackTargetController {
      * adaptive bitrate switch, or a recovery reload). A polled controller (DLNA) uses this to (a) stop its
      * status poll BEFORE the old stream ends, so a transient "finished" isn't mistaken for end-of-media and
      * doesn't stop the freshly-reloaded stream, and (b) stop the renderer so the subsequent new-stream URI
-     * is accepted (many renderers reject a URI change while still PLAYING). Push-based controllers (Cast)
-     * need no action (default no-op).
+     * is accepted (many renderers reject a URI change while still PLAYING). Cast retires the old media
+     * callback so its positions and errors cannot be attributed to the replacement stream.
      */
     suspend fun prepareReload() {}
 

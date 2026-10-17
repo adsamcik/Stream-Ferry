@@ -18,6 +18,8 @@ import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeout
@@ -27,6 +29,7 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import java.io.IOException
 import java.nio.ByteBuffer
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -55,6 +58,7 @@ class StreamingTranscodeSessionTest {
         every { transcoder.cancelOwnedInFlightAndAwait(any(), any()) } returns true
         val completeExport = CompletableDeferred<Unit>()
         val exportCompleted = CompletableDeferred<Unit>()
+        val reconnects = AtomicInteger()
         coEvery { transcoder.transcodeStream(any(), any(), any(), any(), any(), any(), any(), any()) } coAnswers {
             val muxer = arg<Muxer.Factory>(2).create("unused")
             val video = muxer.addTrack(videoFormat())
@@ -66,11 +70,13 @@ class StreamingTranscodeSessionTest {
         val session = StreamingTranscodeSession(
             transcoder, "https://source.test/live.m3u8", target, mockk<DiagnosticSink>(relaxed = true), hls,
             startPositionSeconds = 12, sourceMimeType = "application/x-mpegURL",
+            onReconnectRequired = { reconnects.incrementAndGet() },
         )
         try {
             // Metadata probes do not even reserve an encoder.
             session.playlist("http://phone/session/id", allowExport = false)
             session.initSegment(allowExport = false)
+            assertEquals(0, reconnects.get())
             coVerify(exactly = 0) { transcoder.transcodeStream(any(), any(), any(), any(), any(), any(), any(), any()) }
             withTimeout(5_000) { session.awaitReady() }
             assertFalse(exportCompleted.isCompleted, "readiness must not await the completed video")
@@ -96,10 +102,71 @@ class StreamingTranscodeSessionTest {
             }
             completeExport.complete(Unit)
             withTimeout(5_000) { exportCompleted.await() }
+            assertEquals(0, reconnects.get(), "metadata and bounded probe replay must not restart playback")
         } finally {
             completeExport.complete(Unit)
             session.release()
         }
+        assertEquals(null, session.openProgressive())
+        assertEquals(0, reconnects.get(), "a released session must not request a reconnect")
+    }
+
+    @Test
+    fun `DLNA reconnect after startup replay expires requests exactly one fresh stream`() = runBlocking {
+        val transcoder = mockk<OnDeviceTranscoder>()
+        every { transcoder.cancelOwnedInFlightAndAwait(any(), any()) } returns true
+        val keepRunning = CompletableDeferred<Unit>()
+        val reconnects = AtomicInteger()
+        coEvery { transcoder.transcodeStream(any(), any(), any(), any(), any(), any(), any(), any()) } coAnswers {
+            val muxer = arg<Muxer.Factory>(2).create("unused")
+            val video = muxer.addTrack(videoFormat())
+            // Actual packetized output exceeds the two MiB byte-zero replay budget.
+            val keyframe = ByteArray(3 * 1024 * 1024) { 1 }.apply {
+                this[0] = 0; this[1] = 0; this[2] = 0; this[3] = 1; this[4] = 0x65
+            }
+            muxer.writeSampleData(video, ByteBuffer.wrap(keyframe), BufferInfo(0, keyframe.size, C.BUFFER_FLAG_KEY_FRAME))
+            keepRunning.await()
+            muxer.close()
+        }
+        val session = StreamingTranscodeSession(
+            transcoder, "https://source.test/video.mp4", target, mockk<DiagnosticSink>(relaxed = true), hls = false,
+            onReconnectRequired = { reconnects.incrementAndGet() },
+        )
+        try {
+            withTimeout(5_000) { session.awaitReady() }
+            val stream = assertNotNull(session.openProgressive())
+            val consumed = stream.readNBytes(2 * 1024 * 1024 + 6_016)
+            assertEquals(2 * 1024 * 1024 + 6_016, consumed.size)
+            assertEquals(null, session.openProgressive())
+            assertEquals(0, reconnects.get(), "parallel GETs must not replace an active reader")
+            stream.close()
+            // A retired HTTP reader may be closed twice; that must not affect reconnect ownership.
+            stream.close()
+            session.playlist("http://phone", allowExport = false)
+            session.initSegment(allowExport = false)
+            assertEquals(0, reconnects.get(), "HEAD and metadata probes must remain side-effect free")
+            val pending = assertNotNull(session.openProgressive())
+            assertEquals(1, reconnects.get(), "a closed receiver needs a replacement URL and encoder")
+            val retry = assertNotNull(session.openProgressive())
+            assertEquals(1, reconnects.get(), "HTTP retries must not repeatedly restart playback")
+            retry.close()
+            assertEquals(-1, retry.read())
+            val readStarted = CompletableDeferred<Unit>()
+            val pendingRead = async(Dispatchers.IO) {
+                readStarted.complete(Unit)
+                pending.read()
+            }
+            readStarted.await()
+            delay(50)
+            assertFalse(pendingRead.isCompleted, "reconnect must not fail HTTP or consume media before the TV state is read")
+            session.release()
+            assertEquals(-1, withTimeout(5_000) { pendingRead.await() })
+        } finally {
+            session.release()
+            keepRunning.complete(Unit)
+        }
+        assertEquals(null, session.openProgressive())
+        assertEquals(1, reconnects.get())
     }
 
     @Test

@@ -4,7 +4,11 @@ import androidx.mediarouter.media.MediaRouter
 import com.adsamcik.streamferry.core.stream.Protocol
 import com.adsamcik.streamferry.domain.DiscoveredTarget
 import com.adsamcik.streamferry.domain.PlaybackTargetEvent
+import com.adsamcik.streamferry.domain.RendererStream
 import com.google.android.gms.cast.CastDevice
+import com.google.android.gms.cast.MediaError
+import com.google.android.gms.cast.MediaInfo
+import com.google.android.gms.cast.MediaLoadRequestData
 import com.google.android.gms.cast.MediaStatus
 import com.google.android.gms.cast.framework.CastContext
 import com.google.android.gms.cast.framework.CastSession
@@ -28,6 +32,7 @@ import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -47,6 +52,8 @@ class CastProgressTest {
     private var receiverPositionMs = 120_000L
     private var cachedState = MediaStatus.PLAYER_STATE_PLAYING
     private var receiverState = MediaStatus.PLAYER_STATE_PLAYING
+    private var cachedMediaUrl = "http://phone/previous/index.m3u8"
+    private var loadStatus = Status.RESULT_SUCCESS
     private var connected = true
     private var completeRefresh = true
     private var refreshStatus = Status.RESULT_SUCCESS
@@ -60,6 +67,8 @@ class CastProgressTest {
         val route = mockk<MediaRouter.RouteInfo>(relaxed = true)
         val device = mockk<CastDevice>(relaxed = true)
         val status = mockk<MediaStatus>(relaxed = true)
+        val mediaInfo = mockk<MediaInfo>(relaxed = true)
+        val loadPending = mockk<PendingResult<RemoteMediaClient.MediaChannelResult>>(relaxed = true)
         mockkStatic(MediaRouter::class, CastDevice::class)
         every { MediaRouter.getInstance(any()) } returns router
         every { CastDevice.getFromBundle(any()) } returns device
@@ -76,8 +85,16 @@ class CastProgressTest {
         every { client.registerCallback(capture(mediaCallback)) } just Runs
         every { client.mediaStatus } returns status
         every { status.playerState } answers { cachedState }
+        every { status.mediaInfo } returns mediaInfo
+        every { mediaInfo.contentId } answers { cachedMediaUrl }
         every { client.approximateStreamPosition } answers { cachedPositionMs }
         every { client.requestStatus() } returns pending
+        every { client.load(any<MediaLoadRequestData>()) } returns loadPending
+        every { loadPending.setResultCallback(any<ResultCallback<RemoteMediaClient.MediaChannelResult>>()) } answers {
+            val result = mockk<RemoteMediaClient.MediaChannelResult>()
+            every { result.status } returns loadStatus
+            firstArg<ResultCallback<RemoteMediaClient.MediaChannelResult>>().onResult(result)
+        }
         every { pending.setResultCallback(capture(resultCallback)) } answers {
             if (completeRefresh) finishRefresh()
         }
@@ -246,5 +263,71 @@ class CastProgressTest {
         repeat(6) { tick() }
         assertEquals(countAfterDisconnect, events.size)
         verify(exactly = 1) { client.requestStatus() }
+    }
+
+    @Test fun `reload rejects prior timeline before and after load while current pause resume remains live`() = progressTest {
+        startPlaying()
+        val previousCallback = mediaCallback.captured
+        val beforeReload = events.size
+        controller.prepareReload()
+        cachedPositionMs = 201_000L
+        previousCallback.onStatusUpdated()
+        controller.refreshPlaybackStatus()
+        runCurrent()
+        tick(30_000L)
+        assertEquals(beforeReload, events.size)
+        verify(exactly = 0) { client.requestStatus() }
+
+        val newUrl = "http://phone/replacement/index.m3u8"
+        controller.load(newUrl, RendererStream("application/vnd.apple.mpegurl"), "Movie", 400, 0, false)
+        val currentCallback = mediaCallback.captured
+        // A fresh callback can still observe the previous media cached by the shared SDK client.
+        currentCallback.onStatusUpdated()
+        assertEquals(beforeReload, events.size)
+        cachedMediaUrl = newUrl
+        cachedPositionMs = 1_000L
+        cachedState = MediaStatus.PLAYER_STATE_PAUSED
+        // A callback already queued for the previous registration remains stale even after the SDK
+        // cache has switched to the new URI.
+        previousCallback.onStatusUpdated()
+        assertEquals(beforeReload, events.size)
+        currentCallback.onStatusUpdated()
+        assertEquals(1L, latestPosition().positionSeconds)
+        assertFalse(latestPosition().isPlaying)
+
+        cachedMediaUrl = "http://phone/previous/index.m3u8"
+        cachedPositionMs = 202_000L
+        cachedState = MediaStatus.PLAYER_STATE_PLAYING
+        val pausedCount = events.size
+        currentCallback.onStatusUpdated()
+        assertEquals(pausedCount, events.size)
+        cachedMediaUrl = newUrl
+        cachedPositionMs = 2_000L
+        currentCallback.onStatusUpdated()
+        assertEquals(2L, latestPosition().positionSeconds)
+        assertTrue(latestPosition().isPlaying)
+        cachedPositionMs = 7_000L
+        tick()
+        assertEquals(7L, latestPosition().positionSeconds)
+    }
+
+    @Test fun `reload ignores old media errors but preserves current failures and load rejection`() = progressTest {
+        startPlaying()
+        val previousCallback = mediaCallback.captured
+        controller.prepareReload()
+        val newUrl = "http://phone/replacement/index.m3u8"
+        controller.load(newUrl, RendererStream("video/mp4"), "Movie", 400, 0, true)
+        val error = mockk<MediaError>(relaxed = true)
+        every { error.detailedErrorCode } returns MediaError.DetailedErrorCode.MEDIA_DECODE
+        previousCallback.onMediaError(error)
+        mediaCallback.captured.onMediaError(error)
+        assertTrue(events.none { it is PlaybackTargetEvent.Error })
+        cachedMediaUrl = newUrl
+        mediaCallback.captured.onMediaError(error)
+        assertEquals(1, events.filterIsInstance<PlaybackTargetEvent.Error>().size)
+        loadStatus = Status.RESULT_INTERNAL_ERROR
+        assertFailsWith<IllegalStateException> {
+            controller.load("http://phone/rejected/video", RendererStream("video/mp4"), "Movie", 400, 0, true)
+        }
     }
 }

@@ -794,10 +794,16 @@ class PlaybackEngine(
     private suspend fun resumeLocked() {
         requireLocalNetworkAccess()
         val t = target ?: return
-        t.play()
+        if (selectedTarget?.protocol == Protocol.DLNA && !localPlayWhenReady &&
+            (onDeviceTranscodeTarget != null || localTranscodeMode == LocalTranscodeMode.ON_DEVICE || automaticPhoneTranscode)
+        ) {
+            // A DLNA renderer can close the unseekable TS response while paused. Give it a fresh
+            // stream at the retained source position instead of asking it to reopen expired bytes.
+            reloadOutput(absolutePositionSeconds, "resume phone stream", playWhenReady = true)
+        } else t.play()
         isPlaying = true
         localPlayWhenReady = true
-        if (!playbackStarted) armStartupWatchdog()
+        if (!playbackStarted && startupWatchdogJob?.isActive != true) armStartupWatchdog()
         controlErrorMessage = null
         reportSourceProgressSoon()
     }
@@ -980,6 +986,7 @@ class PlaybackEngine(
      */
     private suspend fun loadLocalStreamLocked(startPos: Long, playWhenReady: Boolean = true) {
         localPlayWhenReady = playWhenReady
+        isBuffering = false
         requireLocalNetworkAccess()
         val params = localPlayback ?: error("No local media selected")
         val sel = selectedTarget ?: error("No target")
@@ -1074,18 +1081,19 @@ class PlaybackEngine(
         pendingRecoveryKind = null
         // Arm before load as well as after it: Cast can synchronously deliver an initial position callback
         // while the load result is being awaited, and that pre-position status must not snap resume to zero.
-        armRendererResumeVerification(reportedPositionSeconds)
-        armRendererStartSettle(reportedPositionSeconds)
+        val rendererStart = if (transcodeTarget != null) 0L else boundedStartPos
+        armRendererResumeVerification(rendererStart)
+        armRendererStartSettle(rendererStart)
         tgt.load(
             url,
             streamForTv,
             params.title,
             effectiveRuntimeSeconds?.let { if (transcodeTarget != null) (it - boundedStartPos).coerceAtLeast(0) else it },
-            startPositionSeconds = reportedPositionSeconds,
+            startPositionSeconds = rendererStart,
             playWhenReady = playWhenReady,
         )
-        armRendererStartSettle(reportedPositionSeconds)
-        if (playWhenReady) armStartupWatchdog(attemptGeneration)
+        armRendererStartSettle(rendererStart)
+        if (playWhenReady && !playbackStarted) armStartupWatchdog(attemptGeneration)
         publishStatus()
         logger.event("playback", "Playing ${params.title} -> ${sel.displayName} (${sel.protocol})")
     }
@@ -1111,6 +1119,37 @@ class PlaybackEngine(
             session = StreamingTranscodeSession(
                 onDeviceTranscoder, uri, output, logger, hls, startPositionSeconds,
                 sourceMimeType = mimeType, sourceProfile = profile,
+                onReconnectRequired = {
+                    scope.launch {
+                        mutex.withLock {
+                            if (generation != playGeneration || streamingTranscode !== session || hls) return@withLock
+                            try {
+                                // A TV-originated Play can reopen HTTP before its next status poll.
+                                // A paused prefetch must remain paused, so query rather than infer Play
+                                // merely from the GET or trust the older phone-side status.
+                                val playing = try {
+                                    target?.readIsPlaying()
+                                } catch (cancelled: CancellationException) {
+                                    throw cancelled
+                                } catch (error: Exception) {
+                                    logger.w(TAG, "Couldn't refresh the TV transport state; retaining playback intent", error)
+                                    null
+                                } ?: localPlayWhenReady
+                                // Stop can release the source before obtaining the command lock.
+                                if (generation != playGeneration || streamingTranscode !== session) return@withLock
+                                reloadOutput(absolutePositionSeconds, "reconnect phone stream", playing)
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (error: Exception) {
+                                logger.w(TAG, "Couldn't reconnect the on-device stream", error)
+                                isPlaying = false
+                                localPlayWhenReady = false
+                                holdProgressEstimate()
+                                publishStatus(error = "Couldn't resume the on-device stream. Try Resume again.")
+                            }
+                        }
+                    }
+                },
                 onFailure = { error ->
                     if (generation == playGeneration && streamingTranscode === session) {
                         scope.launch {
@@ -1735,6 +1774,11 @@ class PlaybackEngine(
         playWhenReady: Boolean = true,
     ) {
         localPlayWhenReady = playWhenReady
+        isBuffering = false
+        startupWatchdogJob?.cancel()
+        startupWatchdogJob = null
+        playbackStarted = false
+        startupBytesServed = 0L
         requireLocalNetworkAccess()
         val item = this.item ?: error("No media selected")
         val target = this.target ?: error("No target")
@@ -1923,7 +1967,7 @@ class PlaybackEngine(
         if (!serverSideStart) armRendererStartSettle(loadStart)
         // Watch for the TV silently never starting (ideas 1+7). Only for a fresh start / recovery reload —
         // not a seek or bitrate switch, where playback is already established.
-        if (armWatchdog) armStartupWatchdog(attemptGeneration)
+        if (armWatchdog && playWhenReady && !playbackStarted) armStartupWatchdog(attemptGeneration)
         publishStatus()
     }
 
@@ -2058,7 +2102,7 @@ class PlaybackEngine(
                     return@withLock
                 }
                 try {
-                    reloadStream(resumeAt, requestedBitrate, reason, armWatchdog = true)
+                    reloadStream(resumeAt, requestedBitrate, reason, armWatchdog = true, playWhenReady = localPlayWhenReady)
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (error: Exception) {
@@ -2158,18 +2202,21 @@ class PlaybackEngine(
             val resumeAt = absolutePositionSeconds
             fallbackJob = scope.launch {
                 mutex.withLock {
-                    runCatching { reloadOutput(resumeAt, "on-device codec fallback", localPlayWhenReady) }
-                        .onFailure {
-                            if (it !is CancellationException) {
-                                logger.e("playback", "On-device codec fallback failed; giving up", it)
-                                terminalFailureSurfaced = true
-                                recoverySession = recoverySession
-                                    .recordFailure(PlaybackFailureStage.RENDERER_LOAD, PlaybackFailureCause.ON_DEVICE_TRANSCODE)
-                                    .fail()
-                                smartResume.checkpoint(SmartResumeCheckpointKind.FAILURE, smartResumeDeviceContext)
-                                publishStatus(error = "Couldn't play this video on your TV.")
-                            }
-                        }
+                    try {
+                        reloadOutput(resumeAt, "on-device codec fallback", localPlayWhenReady)
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (error: Exception) {
+                        logger.e("playback", "On-device codec fallback failed; giving up", error)
+                        terminalFailureSurfaced = true
+                        recoverySession = recoverySession
+                            .recordFailure(PlaybackFailureStage.RENDERER_LOAD, PlaybackFailureCause.ON_DEVICE_TRANSCODE)
+                            .fail()
+                        smartResume.checkpoint(SmartResumeCheckpointKind.FAILURE, smartResumeDeviceContext)
+                        publishStatus(error = "Couldn't play this video on your TV.")
+                    } finally {
+                        isReloadingStream = false
+                    }
                 }
             }
             return
@@ -2547,6 +2594,12 @@ class PlaybackEngine(
         }
         if (completedGeneration == playGeneration) {
             logger.trace(TAG, "Ignoring late renderer event after end-of-media")
+            return
+        }
+        if ((isReloadingStream || transcodePreparationJob != null) &&
+            (event is PlaybackTargetEvent.StatusChanged || event is PlaybackTargetEvent.BufferingChanged)
+        ) {
+            logger.trace(TAG, "Ignoring renderer status while replacing its stream")
             return
         }
         when (event) {
