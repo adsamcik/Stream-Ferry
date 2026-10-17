@@ -15,6 +15,9 @@ import com.adsamcik.streamferry.ui.state.Route
 import com.adsamcik.streamferry.ui.theme.ThemeMode
 import io.mockk.*
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -181,6 +184,94 @@ class MainViewModelQueueTest {
         coVerify { container.playbackEngine.stop() }
     }
 
+    @Test fun `cancelled renderer startup becomes actionable failure and explicit retry stays usable for every source`() {
+        for (item in retrySources()) {
+            val statuses = MutableStateFlow<PlaybackStatus?>(null)
+            every { container.playbackEngine.status } returns statuses
+            every { container.permissions.hasLocalNetworkAccess() } returns true
+            every { container.localMediaSource.mimeTypeFor(any()) } returns "video/mp4"
+            every { container.jellyfinWatchMutationStore.pendingFor(any(), any(), any()) } returns null
+            every { container.smartResumeStore.current } returns null
+            every { container.playbackEngine.recoverySnapshot() } returns PlaybackRecoverySession()
+            every { container.playbackEngine.continuationForExplicitRetry() } returns null
+            every { container.authRepository.currentUser } returns MutableStateFlow(UserSession("user", "server"))
+            every { container.jellyfinConnectionMonitor.status } returns MutableStateFlow(SourceAvailability.ONLINE)
+            coEvery { container.localMediaSource.item(any()) } returns Result.failure(IllegalStateException("No details"))
+            coEvery { container.jellyfinMediaSource.item(any()) } returns Result.failure(IllegalStateException("No details"))
+            coEvery { container.playbackEngine.stop() } answers { statuses.value = null }
+            var attempts = 0
+            coEvery { container.playbackEngine.playLocal(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()) } coAnswers {
+                attempts++
+                arg<() -> Unit>(10).invoke()
+                throw CancellationException("Renderer dropped the startup")
+            }
+            coEvery { container.playbackEngine.play(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()) } coAnswers {
+                attempts++
+                arg<() -> Unit>(8).invoke()
+                throw CancellationException("Renderer dropped the startup")
+            }
+            val vm = create()
+            vm.onItemClicked(item)
+            vm.selectPhysicalTv(PhysicalTv("tv", "TV", dlnaEndpoint = DiscoveredTarget(
+                "tv", "TV", Protocol.DLNA, TargetCapabilities(Protocol.DLNA), null,
+            )))
+            assertEquals(1, attempts, "Startup was not attempted for ${item.id}")
+            assertTrue(vm.state.value.playback?.isTerminal == true, "Cancelled ${item.id} stayed Connecting")
+            assertNull(vm.state.value.playbackStartingTargetId)
+            vm.retryPlayback()
+            assertEquals(2, attempts)
+            assertTrue(vm.state.value.playback?.isTerminal == true, "Cancelled retry stayed Connecting")
+            vm.viewModelScope.cancel()
+        }
+    }
+
+    @Test fun `cancelled Cast discovery cleanup does not prevent DLNA playback`() {
+        val statuses = MutableStateFlow<PlaybackStatus?>(null)
+        every { container.playbackEngine.status } returns statuses
+        every { container.permissions.hasLocalNetworkAccess() } returns true
+        every { container.localMediaSource.mimeTypeFor(any()) } returns "video/mp4"
+        coEvery { container.jellyfinMediaSource.item(any()) } returns Result.failure(IllegalStateException("No details"))
+        coEvery { container.castController.stopDiscovery() } throws CancellationException("Discovery already ended")
+        coEvery { container.playbackEngine.playLocal(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()) } coAnswers {
+            arg<() -> Unit>(10).invoke()
+            statuses.value = statusesForRetry(Protocol.DLNA).copy(
+                phase = PlaybackPhase.PLAYING, isPlaying = true, playWhenReady = true,
+            )
+        }
+        val vm = create()
+        vm.onItemClicked(local)
+        vm.selectPhysicalTv(PhysicalTv("tv", "TV", dlnaEndpoint = DiscoveredTarget(
+            "tv", "TV", Protocol.DLNA, TargetCapabilities(Protocol.DLNA), null,
+        )))
+        assertEquals(PlaybackPhase.PLAYING, vm.state.value.playback?.phase)
+        assertNull(vm.state.value.playbackStartingTargetId)
+    }
+
+    @Test fun `cancelling the playback caller during discovery clears the picker without starting a stream`() = runTest {
+        val playbackEngine = container.playbackEngine
+        every { container.permissions.hasLocalNetworkAccess() } returns true
+        coEvery { container.jellyfinMediaSource.item(any()) } returns Result.failure(IllegalStateException("No details"))
+        val stoppingDiscovery = CompletableDeferred<Unit>()
+        coEvery { container.castController.stopDiscovery() } coAnswers {
+            stoppingDiscovery.complete(Unit)
+            awaitCancellation()
+        }
+        val vm = create()
+        vm.onItemClicked(local)
+        vm.prepareCastDownload("pending-download")
+        vm.selectPhysicalTv(PhysicalTv("tv", "TV", dlnaEndpoint = DiscoveredTarget(
+            "tv", "TV", Protocol.DLNA, TargetCapabilities(Protocol.DLNA), null,
+        )))
+        assertTrue(stoppingDiscovery.isCompleted)
+        assertNotNull(vm.state.value.playbackStartingTargetId)
+        vm.viewModelScope.cancel()
+        runCurrent()
+        assertNull(vm.state.value.playbackStartingTargetId)
+        assertEquals("pending-download", vm.state.value.selectedDownloadId)
+        assertNull(vm.state.value.playback)
+        coVerify(exactly = 0) { playbackEngine.playLocal(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()) }
+    }
+
     @Test fun `manual protocol switch from Cast uses paired DLNA endpoint and confirmed position`() {
         assertManualProtocolSwitch(Protocol.CAST, Protocol.DLNA)
     }
@@ -225,6 +316,14 @@ class MainViewModelQueueTest {
             assertEquals(125L to fixture.firstRetry, fixture.loads.last())
             fixture.vm.viewModelScope.cancel()
         }
+    }
+
+    @Test fun `online failed switch retry cannot adopt another account`() {
+        val fixture = failedSwitchFixture(Protocol.CAST, retrySources().last())
+        val attempts = fixture.loads.size
+        fixture.users.value = UserSession("another-user", "another-server")
+        fixture.vm.retryPlayback()
+        assertEquals(attempts, fixture.loads.size)
     }
 
     @Test fun `manual watch state override suppresses retry checkpoint updates`() {

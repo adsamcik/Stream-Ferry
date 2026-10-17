@@ -10,6 +10,7 @@ import com.adsamcik.streamferry.core.stream.TargetCapabilities
 import com.adsamcik.streamferry.core.transcode.DeviceEncodeCapabilities
 import com.adsamcik.streamferry.core.transcode.LocalTranscodeMode
 import com.adsamcik.streamferry.core.transcode.ResolutionTier
+import com.adsamcik.streamferry.core.transcode.VideoCodec
 import com.adsamcik.streamferry.data.proxy.LocalProxyServer
 import com.adsamcik.streamferry.data.transcode.LocalMediaProbe
 import com.adsamcik.streamferry.data.transcode.StreamingTranscodeSession
@@ -35,6 +36,7 @@ import com.adsamcik.streamferry.source.api.StreamDescriptor
 import io.mockk.*
 import java.io.File
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -979,6 +981,82 @@ class PlaybackEngineLocalTranscodeTest {
         } finally { f.engine.stop(); runCurrent() }
     }
 
+    @Test fun `cancelled renderer startup retains retry position pause and output choices for every source`() = runTest {
+        for (source in SourceCase.entries) {
+            val f = Fixture(this, Protocol.DLNA)
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE)
+                f.engine.selectPreferredCodec("hevc")
+                f.engine.selectMaxVideoHeight(480)
+                f.events.emit(PlaybackTargetEvent.StatusChanged(0, true)); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(77, true)); runCurrent()
+                f.engine.pause()
+                val continuation = assertNotNull(f.engine.beginManualProtocolSwitch())
+                coEvery { f.target.load(any(), any(), any(), any(), any(), any()) } throws CancellationException("TV dropped startup")
+                assertFailsWith<CancellationException> { f.continueSource(source, Protocol.DLNA, 200, continuation) }
+                val retry = assertNotNull(f.engine.continuationForExplicitRetry(), "$source discarded the failed start")
+                assertEquals(200L, retry.positionSeconds)
+                assertEquals(false, retry.playbackChoices?.playWhenReady)
+                assertEquals(LocalTranscodeMode.ON_DEVICE, retry.playbackChoices?.transcodeMode)
+                assertEquals(VideoCodec.HEVC, retry.playbackChoices?.localCodec)
+                assertEquals(480, retry.playbackChoices?.maxVideoHeight)
+                assertEquals(PlaybackPhase.FAILED, f.engine.recoverySnapshot().phase)
+            } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `renderer stop before the first frame surfaces failure for every source`() = runTest {
+        for (source in SourceCase.entries) {
+            val f = Fixture(this, Protocol.DLNA)
+            try {
+                f.startSource(source); runCurrent()
+                f.events.emit(PlaybackTargetEvent.Stopped); runCurrent()
+                // Any permitted fallback must also reject the TV stopping before its first frame.
+                repeat(8) {
+                    if (f.engine.status.value?.isTerminal != true) {
+                        f.events.emit(PlaybackTargetEvent.Stopped); runCurrent()
+                    }
+                }
+                val failed = assertNotNull(f.engine.status.value, "$source silently stopped instead of reporting startup failure")
+                assertTrue(failed.isTerminal, "$source kept waiting after the TV rejected playback")
+                assertEquals(PlaybackFailureStage.FIRST_FRAME, failed.attemptHistory.last().failureStage)
+            } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `renderer callbacks cannot revive terminal failure or erase its message for any source or protocol`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) {
+            val f = Fixture(this, protocol)
+            try {
+                f.startSource(source); runCurrent()
+                repeat(8) {
+                    if (f.engine.status.value?.isTerminal != true) {
+                        f.events.emit(PlaybackTargetEvent.Error(com.adsamcik.streamferry.domain.PlaybackFailureKind.NETWORK, "TV disconnected"))
+                        runCurrent()
+                    }
+                }
+                val failure = assertNotNull(f.engine.status.value)
+                assertTrue(failure.isTerminal, "$source/$protocol did not reach a bounded failure")
+                for (event in listOf(
+                    PlaybackTargetEvent.Connected, PlaybackTargetEvent.StatusChanged(0, true),
+                    PlaybackTargetEvent.BufferingChanged(true), PlaybackTargetEvent.Disconnected,
+                    PlaybackTargetEvent.Stopped, PlaybackTargetEvent.Ended,
+                )) {
+                    f.events.emit(event); runCurrent()
+                    assertEquals(failure, f.engine.status.value, "$source/$protocol accepted late $event")
+                }
+                advanceTimeBy(15_000); runCurrent()
+                assertEquals(failure.errorMessage, f.engine.status.value?.errorMessage, "monitor erased the terminal error")
+                f.engine.stop(); runCurrent()
+                f.startSource(source); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(f.loads.last().position, true)); runCurrent()
+                assertEquals(PlaybackPhase.PLAYING, f.engine.status.value?.phase)
+                assertNull(f.engine.status.value?.errorMessage)
+            } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
     @Test fun `buffering at a nonzero resume position cannot disable first frame recovery for any source or protocol`() = runTest {
         for (protocol in Protocol.entries) for (source in SourceCase.entries) {
             val f = Fixture(this, protocol)
@@ -1255,6 +1333,8 @@ class PlaybackEngineLocalTranscodeTest {
                 runCurrent()
                 assertTrue(waiting.isCompleted, "$source/$protocol")
                 f.events.emit(PlaybackTargetEvent.StatusChanged(201, true))
+                f.events.emit(PlaybackTargetEvent.Stopped)
+                f.events.emit(PlaybackTargetEvent.Ended)
                 f.events.emit(PlaybackTargetEvent.BufferingChanged(true)); runCurrent()
                 assertEquals(200L, f.engine.status.value?.positionSeconds, "$source/$protocol accepted old timeline")
                 assertEquals(false, f.engine.status.value?.isBuffering)

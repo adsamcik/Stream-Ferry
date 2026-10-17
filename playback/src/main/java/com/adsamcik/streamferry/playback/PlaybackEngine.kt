@@ -745,7 +745,7 @@ class PlaybackEngine(
         } catch (_: StreamStartupSuperseded) {
             if (monitorJob?.isActive != true) monitorJob = scope.launch { monitorLoop() }
         } catch (e: CancellationException) {
-            withContext(NonCancellable) { stopInternalLocked("playback start cancelled") }
+            cleanupCancelledStartup(endpointConnected, PlaybackAttemptSourceKind.ONLINE)
             throw e
         } catch (e: Exception) {
             // Keep a classified terminal checkpoint even though cleanup invalidates the active generation.
@@ -1166,7 +1166,7 @@ class PlaybackEngine(
         } catch (_: StreamStartupSuperseded) {
             if (monitorJob?.isActive != true) monitorJob = scope.launch { monitorLoop() }
         } catch (e: CancellationException) {
-            withContext(NonCancellable) { stopInternalLocked("downloaded playback start cancelled") }
+            cleanupCancelledStartup(endpointConnected, PlaybackAttemptSourceKind.LOCAL)
             throw e
         } catch (e: Exception) {
             val stage = when {
@@ -2060,6 +2060,20 @@ class PlaybackEngine(
 
     private fun Throwable.isPreparationFailure(): Boolean =
         generateSequence(this) { it.cause }.any { it is PlaybackPreparationException }
+
+    private suspend fun cleanupCancelledStartup(endpointConnected: Boolean, sourceKind: PlaybackAttemptSourceKind) {
+        // A cancelled child can fail while the caller remains active. Retain its choices/checkpoint
+        // for the app's explicit Retry; cancellation by the caller remains normal teardown.
+        val failed = currentCoroutineContext().isActive
+        withContext(NonCancellable) {
+            if (failed) recordStartupFailure(
+                if (endpointConnected) PlaybackFailureStage.RENDERER_LOAD else PlaybackFailureStage.ENDPOINT_CONNECTION,
+                PlaybackFailureCause.UNKNOWN,
+                sourceKind,
+            )
+            stopInternalLocked(if (failed) "playback start failed" else "playback start cancelled")
+        }
+    }
 
     /** A connect handshake can fail before normal media resolution creates its first load attempt. */
     private fun recordStartupFailure(
@@ -3052,6 +3066,10 @@ class PlaybackEngine(
             logger.w(TAG, "Ignoring event from a replaced playback controller")
             return
         }
+        if (recoverySession.phase == PlaybackPhase.FAILED) {
+            logger.trace(TAG, "Ignoring renderer event after terminal playback failure")
+            return
+        }
         if (completedGeneration == playGeneration) {
             logger.trace(TAG, "Ignoring late renderer event after end-of-media")
             return
@@ -3210,6 +3228,17 @@ class PlaybackEngine(
                 }
             }
             is PlaybackTargetEvent.Stopped -> {
+                if (isReloadingStream) return
+                if (!playbackStarted) {
+                    if (localPlayWhenReady) {
+                        handlePlaybackFailure(
+                            PlaybackFailureKind.UNKNOWN,
+                            "The TV stopped before playback started. Try again or choose another TV output format.",
+                            failureStage = PlaybackFailureStage.FIRST_FRAME,
+                        )
+                    }
+                    return
+                }
                 isPlaying = false
                 localPlayWhenReady = false
                 isBuffering = false
@@ -3506,6 +3535,9 @@ class PlaybackEngine(
         val srcProfile = descriptor?.profile ?: localSourceProfile
         val odt = onDeviceTranscodeTarget
         val recovery = recoverySession
+        val terminalError = _status.value?.takeIf {
+            recovery.phase == PlaybackPhase.FAILED && it.isTerminal && it.attemptGeneration == recovery.generation
+        }?.errorMessage
         _status.value = PlaybackStatus(
             targetName = sel.displayName,
             protocolName = sel.protocol.name,
@@ -3553,7 +3585,7 @@ class PlaybackEngine(
             volume = volume,
             volumeSupported = sel.discoveryMetadata.volumeControlAvailable && volumeSynchronized,
             title = item?.title ?: localPlayback?.title.orEmpty(),
-            errorMessage = error ?: controlErrorMessage,
+            errorMessage = error ?: terminalError ?: controlErrorMessage,
             phase = recovery.phase,
             attemptGeneration = recovery.generation,
             attemptHistory = recovery.attempts,

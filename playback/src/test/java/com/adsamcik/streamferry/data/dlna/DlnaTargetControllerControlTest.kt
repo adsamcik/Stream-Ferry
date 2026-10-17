@@ -202,8 +202,42 @@ class DlnaTargetControllerControlTest {
         }
     }
 
+    @Test
+    fun `missing transport state disconnects even when position replies keep succeeding`() = runTest {
+        val fixture = pollingFixture()
+        try {
+            val disconnected = async(UnconfinedTestDispatcher(testScheduler)) {
+                fixture.controller.events.first { it is PlaybackTargetEvent.Disconnected }
+            }
+            fixture.transportState = null
+            disconnected.await()
+            assertEquals(1, fixture.events.count { it is PlaybackTargetEvent.Disconnected })
+            advanceTimeBy(20_000); runCurrent()
+            assertEquals(1, fixture.events.count { it is PlaybackTargetEvent.Disconnected })
+        } finally {
+            fixture.controller.disconnect()
+        }
+    }
+
+    @Test
+    fun `explicit transport error without state keeps its decoder failure instead of becoming a disconnect`() = runTest {
+        val fixture = pollingFixture()
+        try {
+            val error = async(UnconfinedTestDispatcher(testScheduler)) {
+                fixture.controller.events.first { it is PlaybackTargetEvent.Error }
+            }
+            fixture.transportState = null
+            fixture.transportStatus = "ERROR_OCCURRED"
+            error.await()
+            assertEquals(com.adsamcik.streamferry.domain.PlaybackFailureKind.FORMAT,
+                fixture.events.filterIsInstance<PlaybackTargetEvent.Error>().single().kind)
+            assertTrue(fixture.events.none { it is PlaybackTargetEvent.Disconnected })
+        } finally { fixture.controller.disconnect() }
+    }
+
     private class PollingFixture(val controller: DlnaTargetController) {
         var transportState: String? = "PLAYING"
+        var transportStatus = "OK"
         var positionSeconds = 42L
         var failedSeeksRemaining = 0
         var playCommands = 0
@@ -231,8 +265,8 @@ class DlnaTargetControllerControlTest {
                         <serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>
                         <controlURL>/control</controlURL></service></serviceList></device></root>"""
                 action == "GetTransportInfo" -> fixture.transportState?.let {
-                    "<CurrentTransportState>$it</CurrentTransportState><CurrentTransportStatus>OK</CurrentTransportStatus>"
-                } ?: "<CurrentTransportStatus>OK</CurrentTransportStatus>"
+                    "<CurrentTransportState>$it</CurrentTransportState><CurrentTransportStatus>${fixture.transportStatus}</CurrentTransportStatus>"
+                } ?: "<CurrentTransportStatus>${fixture.transportStatus}</CurrentTransportStatus>"
                 action == "GetPositionInfo" -> "<RelTime>${DidlLite.formatDuration(fixture.positionSeconds)}</RelTime>"
                 action == "Play" -> {
                     fixture.playCommands++

@@ -691,8 +691,9 @@ class DlnaTargetController(
                     .onFailure { logger.trace(TAG, "GetPositionInfo failed: ${it.javaClass.simpleName}") }
                     .getOrNull()
                 if (!isActive || !pollSessionGate.isCurrent(pollToken)) break
-                if (state == null && position == null) {
-                    // The renderer became unreachable (network blip / TV powered off). After a few
+                if (state == null && info?.status != "ERROR_OCCURRED") {
+                    // Position alone cannot establish a usable transport (some TVs still return zero
+                    // after dropping the stream). After a few missing transport replies,
                     // consecutive failures treat it as an UNEXPECTED disconnect so the app auto-reconnects
                     // (a single failure can be a transient SOAP timeout, hence the threshold). Guarded by
                     // isActive so a teardown-cancelled poll doesn't emit a stale event.
@@ -781,7 +782,7 @@ class DlnaTargetController(
                 // (often while parked in STOPPED, with no push callback of its own). Surface it so the engine
                 // can fall back to a server transcode + retry — DLNA renderers vary wildly in codec/container
                 // support, so an optimistic direct-play can fail here just as it can on Cast.
-                if (info?.status == "ERROR_OCCURRED") {
+                if (info.status == "ERROR_OCCURRED") {
                     logger.w("dlna", "DLNA transport status=ERROR_OCCURRED — treating as a FORMAT failure")
                     emitPollEvent(
                         pollToken,

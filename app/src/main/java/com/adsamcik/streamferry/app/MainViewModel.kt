@@ -93,6 +93,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -1459,6 +1460,8 @@ class MainViewModel(
     ): Job = viewModelScope.launch {
         playingQueueEntryId = null
         attemptQueueEntry = queueEntry
+        var started = false
+        try {
         if (!container.permissions.hasLocalNetworkAccess()) {
             onLocalNetworkPermissionDenied()
             _state.update { it.copy(playbackStartingTargetId = null) }
@@ -1476,7 +1479,8 @@ class MainViewModel(
         try {
             container.castController.stopDiscovery()
         } catch (c: CancellationException) {
-            throw c
+            currentCoroutineContext().ensureActive()
+            container.logger.w("discovery", "Couldn't stop Cast discovery before playback", c)
         } catch (e: Exception) {
             container.logger.w("discovery", "Couldn't stop Cast discovery before playback", e)
         }
@@ -1532,7 +1536,6 @@ class MainViewModel(
             }
         }
         playbackStarting = true
-        var started = false
         var onlineOwnerForAttempt: UserSession? = null
         runCatching {
             check(queueEntry == null || queueEntry.canPlayWith(activeJellyfinSession())) {
@@ -1654,10 +1657,9 @@ class MainViewModel(
                 // startup completion resurrect the now-invalid session or stop a newer account's play.
                 container.logger.event("playback", "Discarded a play start after its Jellyfin account changed")
             }
-        }.onFailure { initialFailure ->
-            if (initialFailure is CancellationException) {
-                throw initialFailure
-            } else if (isSessionExpired(initialFailure)) {
+        }.onFailure { error ->
+            val initialFailure = playbackStartupFailure(error, onlineOwnerForAttempt)
+            if (isSessionExpired(initialFailure)) {
                 if (onlinePlaybackOwner == onlineOwnerForAttempt) onlinePlaybackOwner = null
                 handleSessionExpired()
             } else {
@@ -1752,8 +1754,11 @@ class MainViewModel(
                 }
             }
         }
-        playbackStarting = false
-        _state.update { it.copy(selectedDownloadId = null, playbackStartingTargetId = null) }
+        } finally {
+            playbackStarting = false
+            _state.update { it.copy(playbackStartingTargetId = null) }
+        }
+        _state.update { it.copy(selectedDownloadId = null) }
         onResult(started)
     }
 
@@ -3399,6 +3404,12 @@ class MainViewModel(
                 check(queueEntry == null || queueEntry.canPlayWith(activeJellyfinSession())) {
                     "Sign in to the Jellyfin account that owns this queued video."
                 }
+                if (ctx is ReconnectContext.Online) {
+                    check(container.authRepository.currentUser.value == ctx.owner) {
+                        "Sign in to the Jellyfin account that owns this video."
+                    }
+                    onlinePlaybackOwner = ctx.owner
+                }
                 playContext(ctx, ctx.endpoint, lastPlaybackPositionSeconds, continuation)
                 failedPlaybackContinuation = null
                 queueEntry?.let(::queueEntryStarted)
@@ -3559,6 +3570,14 @@ class MainViewModel(
         throw CancellationException("Endpoint connection retry was cancelled")
     }
 
+    /** A cancelled renderer/source child is a failed start; actual caller/account cancellation stays cancellation. */
+    private suspend fun playbackStartupFailure(error: Throwable, owner: UserSession? = null): Throwable {
+        if (error !is CancellationException) return error
+        currentCoroutineContext().ensureActive()
+        if (owner != null && !isActiveOnlinePlaybackOwner(owner)) throw error
+        return IllegalStateException("Playback startup was interrupted.", error)
+    }
+
     private suspend fun playContext(
         context: ReconnectContext,
         endpoint: DiscoveredTarget,
@@ -3567,6 +3586,7 @@ class MainViewModel(
     ) {
         val deviceContext = smartResumeDeviceContext(context.physicalTv, endpoint)
         val checkpoint = recoveryContinuation?.positionSeconds ?: resumeAtSeconds
+        try {
         when (context) {
             is ReconnectContext.Online -> {
                 requireActiveOnlinePlaybackOwner(context.owner)
@@ -3598,6 +3618,9 @@ class MainViewModel(
                 recoveryContinuation = recoveryContinuation,
                 preserveManualWatchOverride = true,
             )
+        }
+        } catch (error: CancellationException) {
+            throw playbackStartupFailure(error, (context as? ReconnectContext.Online)?.owner)
         }
     }
 
