@@ -3452,6 +3452,157 @@ class PlaybackEngineLocalTranscodeTest {
         }
     }
 
+    @Test fun `failed phone output changes retain latest pause resume and choices for every source and protocol`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries)
+            for (wasPaused in listOf(false, true)) for (change in listOf("resolution", "audio")) {
+            val f = Fixture(this, protocol)
+            f.enableLanguageChoices()
+            val ready = CompletableDeferred<Unit>()
+            val label = "$source/$protocol/$change/wasPaused=$wasPaused"
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectAudioTrack(1)
+                f.engine.attachSubtitle("content://subtitles/42")
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE)
+                f.engine.selectPreferredCodec("hevc")
+                f.engine.selectMaxVideoHeight(480)
+                f.engine.seekTo(200); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(0, true)); runCurrent()
+                if (wasPaused) { f.engine.pause(); runCurrent() }
+                val before = assertNotNull(f.engine.status.value)
+                val loadsBefore = f.loads.size
+                var attempt = 0
+                coEvery { anyConstructed<StreamingTranscodeSession>().awaitReady() } coAnswers {
+                    if (attempt++ == 0) { ready.await(); throw IllegalStateException("Encoder startup failed") }
+                }
+                val changed = async { runCatching {
+                    if (change == "resolution") f.engine.selectMaxVideoHeight(720) else f.engine.selectAudioTrack(2)
+                } }; runCurrent()
+                assertFalse(changed.isCompleted, label)
+                if (wasPaused) f.engine.resume() else f.engine.pause()
+                runCurrent()
+                assertEquals(wasPaused, f.engine.status.value?.playWhenReady, label)
+                ready.complete(Unit)
+                assertTrue(changed.await().isFailure, label); runCurrent()
+                val after = assertNotNull(f.engine.status.value)
+                assertEquals(loadsBefore + 1, f.loads.size, label)
+                assertEquals(wasPaused, after.playWhenReady, label)
+                assertEquals(wasPaused, f.loads.last().playWhenReady, label)
+                assertEquals(before.recoveryPositionSeconds, after.positionSeconds, label)
+                assertEquals(before.currentAudioIndex, after.currentAudioIndex, label)
+                assertEquals(before.currentSubtitleIndex, after.currentSubtitleIndex, label)
+                assertEquals(before.preferredVideoCodec, after.preferredVideoCodec, label)
+                assertEquals(before.maxVideoHeight, after.maxVideoHeight, label)
+                assertEquals(before.localTranscodeMode, after.localTranscodeMode, label)
+                f.events.emit(PlaybackTargetEvent.StatusChanged(0, wasPaused)); runCurrent()
+                advanceTimeBy(StartupWatchdog.GRACE_MS + 1); runCurrent()
+                assertEquals(loadsBefore + 1, f.loads.size, "$label false recovery after restoration")
+                assertNull(f.engine.status.value?.errorMessage, label)
+            } finally {
+                ready.complete(Unit); runCurrent(); f.engine.stop(); runCurrent()
+                coEvery { anyConstructed<StreamingTranscodeSession>().awaitReady() } returns Unit
+                clearAllMocks(answers = false)
+            }
+        }
+    }
+
+    @Test fun `failed provider output changes retain latest pause resume and previous choices on both protocols`() = runTest {
+        for (protocol in Protocol.entries) for (source in listOf(SourceCase.PROVIDER_FILE, SourceCase.PROVIDER_HLS))
+            for (wasPaused in listOf(false, true)) {
+            val f = Fixture(this, protocol)
+            f.enableLanguageChoices()
+            val ready = CompletableDeferred<Unit>()
+            val label = "$source/$protocol/wasPaused=$wasPaused"
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectAudioTrack(1)
+                f.engine.selectPreferredCodec("hevc")
+                f.engine.selectMaxVideoHeight(480); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(123, true)); runCurrent()
+                if (wasPaused) { f.engine.pause(); runCurrent() }
+                val before = assertNotNull(f.engine.status.value)
+                val loadsBefore = f.loads.size
+                val budgetBefore = f.engine.recoverySnapshot().usage
+                coEvery { f.provider.prepare(any()) } coAnswers {
+                    val request = firstArg<PlaybackRequest>()
+                    f.requests += request
+                    if (request.preferredVideoCodec == "h264") {
+                        ready.await(); Result.failure(SourceHttpException(503))
+                    } else Result.success(f.providerSession)
+                }
+                val changed = async { runCatching { f.engine.selectPreferredCodec("h264") } }; runCurrent()
+                assertFalse(changed.isCompleted, label)
+                if (wasPaused) f.engine.resume() else f.engine.pause()
+                runCurrent()
+                assertEquals(wasPaused, f.engine.status.value?.playWhenReady, label)
+                ready.complete(Unit)
+                assertTrue(changed.await().isFailure, label); runCurrent()
+                val after = assertNotNull(f.engine.status.value)
+                assertEquals(loadsBefore + 1, f.loads.size, label)
+                assertEquals(wasPaused, after.playWhenReady, label)
+                assertEquals(wasPaused, f.loads.last().playWhenReady, label)
+                assertEquals(before.recoveryPositionSeconds, after.positionSeconds, label)
+                assertEquals(before.currentAudioIndex, after.currentAudioIndex, label)
+                assertEquals(before.currentSubtitleIndex, after.currentSubtitleIndex, label)
+                assertEquals(before.preferredVideoCodec, after.preferredVideoCodec, label)
+                assertEquals(before.maxVideoHeight, after.maxVideoHeight, label)
+                assertEquals(before.localTranscodeMode, after.localTranscodeMode, label)
+                assertEquals(budgetBefore, f.engine.recoverySnapshot().usage, label)
+            } finally {
+                ready.complete(Unit); runCurrent(); f.engine.stop(); runCurrent(); clearAllMocks(answers = false)
+            }
+        }
+    }
+
+    @Test fun `DLNA resume retains latest startup pause resume and choices for every source`() = runTest {
+        for (source in SourceCase.entries) for (resumeAgain in listOf(false, true)) {
+            val f = Fixture(this, Protocol.DLNA)
+            f.enableLanguageChoices()
+            val ready = CompletableDeferred<Unit>()
+            val label = "$source/DLNA/resumeAgain=$resumeAgain"
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectAudioTrack(1)
+                f.engine.attachSubtitle("content://subtitles/42")
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE)
+                f.engine.selectPreferredCodec("hevc")
+                f.engine.selectMaxVideoHeight(480)
+                f.engine.seekTo(200); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(0, true)); runCurrent()
+                f.engine.pause(); runCurrent()
+                val before = assertNotNull(f.engine.status.value)
+                val loadsBefore = f.loads.size
+                coEvery { anyConstructed<StreamingTranscodeSession>().awaitReady() } coAnswers { ready.await() }
+                val resumed = async { f.engine.resume() }; runCurrent()
+                assertFalse(resumed.isCompleted, label)
+                f.engine.pause(); runCurrent()
+                if (resumeAgain) { f.engine.resume(); runCurrent() }
+                assertEquals(resumeAgain, f.engine.status.value?.playWhenReady, label)
+                ready.complete(Unit); resumed.await(); runCurrent()
+                val after = assertNotNull(f.engine.status.value)
+                assertEquals(loadsBefore + 1, f.loads.size, label)
+                assertEquals(resumeAgain, after.playWhenReady, label)
+                assertEquals(resumeAgain, f.loads.last().playWhenReady, label)
+                assertFalse(after.isPlaying, "$label needs renderer confirmation")
+                assertEquals(before.recoveryPositionSeconds, after.positionSeconds, label)
+                assertEquals(before.currentAudioIndex, after.currentAudioIndex, label)
+                assertEquals(before.currentSubtitleIndex, after.currentSubtitleIndex, label)
+                assertEquals(before.preferredVideoCodec, after.preferredVideoCodec, label)
+                assertEquals(before.maxVideoHeight, after.maxVideoHeight, label)
+                assertEquals(before.localTranscodeMode, after.localTranscodeMode, label)
+                f.events.emit(PlaybackTargetEvent.StatusChanged(0, resumeAgain)); runCurrent()
+                advanceTimeBy(StartupWatchdog.GRACE_MS + 1); runCurrent()
+                assertEquals(loadsBefore + 1, f.loads.size, "$label false startup recovery")
+                assertEquals(resumeAgain, f.engine.status.value?.playWhenReady, label)
+                assertNull(f.engine.status.value?.errorMessage, label)
+            } finally {
+                ready.complete(Unit); runCurrent(); f.engine.stop(); runCurrent()
+                coEvery { anyConstructed<StreamingTranscodeSession>().awaitReady() } returns Unit
+                clearAllMocks(answers = false)
+            }
+        }
+    }
+
     private companion object {
         const val ORIGINAL_URL = "http://127.0.0.1/session/test/stream"
         const val TRANSCODE_URL = "http://127.0.0.1/session/test/transcode.m3u8"

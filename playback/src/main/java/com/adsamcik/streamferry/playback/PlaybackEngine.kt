@@ -1185,10 +1185,13 @@ class PlaybackEngine(
             // A DLNA renderer can close the unseekable TS response while paused. Give it a fresh
             // stream at the retained source position instead of asking it to reopen expired bytes.
             reloadOutput(recoveryPositionSeconds(), "resume phone stream", playWhenReady = true)
-        } else t.play()
-        isPlaying = true
-        localPlayWhenReady = true
-        if (!playbackStarted && startupWatchdogJob?.isActive != true) armStartupWatchdog()
+        } else {
+            t.play()
+            isPlaying = true
+            localPlayWhenReady = true
+        }
+        // A replacement load already reconciled any newer Pause/Resume issued during preparation.
+        if (localPlayWhenReady && !playbackStarted && startupWatchdogJob?.isActive != true) armStartupWatchdog()
         controlErrorMessage = null
         reportSourceProgressSoon()
         publishStatus()
@@ -2015,7 +2018,7 @@ class PlaybackEngine(
             localCodecFallbacksTried.clear()
             localCodecFallbacksTried.addAll(previousFallbacks)
             if (reloadStarted && failure !is CancellationException) {
-                restoreOutputAfterFailedChange(failure, pos, playWhenReady)
+                restoreOutputAfterFailedChange(failure, pos)
             }
             publishStatus()
             throw failure
@@ -2126,24 +2129,27 @@ class PlaybackEngine(
             reload()
         } catch (failure: Throwable) {
             if (failure is StreamStartupSuperseded) throw failure
-            restorePlaybackChoices(previousChoices)
+            synchronized(preparationLock) {
+                // Roll back output choices without undoing controls issued during preparation.
+                restorePlaybackChoices(previousChoices.copy(playWhenReady = localPlayWhenReady))
+            }
             automaticPhoneTranscode = previousAutomaticPhoneTranscode
             forceTranscodeFallback = previousForceTranscode
             streamStartSeconds = previousStreamStart
             reportedPositionSeconds = previousReportedPosition
             lastNote = previousNote
             if (failure !is CancellationException) {
-                restoreOutputAfterFailedChange(failure, previousChoices.positionSeconds, previousChoices.playWhenReady)
+                restoreOutputAfterFailedChange(failure, previousChoices.positionSeconds)
             }
             publishStatus()
             throw failure
         }
     }
 
-    private suspend fun restoreOutputAfterFailedChange(failure: Throwable, position: Long, playWhenReady: Boolean) {
+    private suspend fun restoreOutputAfterFailedChange(failure: Throwable, position: Long) {
         if (connectionLost || deferForUnavailableLan()) return
         try {
-            reloadOutput(position, "restore output", playWhenReady)
+            reloadOutput(position, "restore output", localPlayWhenReady)
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (restoreFailure: Exception) {
