@@ -53,8 +53,15 @@ class HlsSegmentRegistry(
      * are promoted before missing mappings are inserted, so an accepted batch can never evict itself.
      */
     @Synchronized
-    fun encodeBatch(upstreamUrls: Iterable<String>): Map<String, String> {
-        val protectedUrls = LinkedHashSet<String>().apply { addAll(upstreamUrls) }
+    fun encodeBatch(
+        upstreamUrls: Iterable<String>,
+        retainedUpstreamUrls: Iterable<String> = emptyList(),
+    ): Map<String, String> {
+        val batchUrls = LinkedHashSet<String>().apply { addAll(upstreamUrls) }
+        val protectedUrls = LinkedHashSet<String>().apply {
+            addAll(retainedUpstreamUrls)
+            addAll(batchUrls)
+        }
         require(protectedUrls.size <= maxEntries) { "HLS playlist exceeds the URI mapping limit" }
 
         val encoded = LinkedHashMap<String, String>(protectedUrls.size)
@@ -72,7 +79,7 @@ class HlsSegmentRegistry(
                 encoded[upstreamUrl] = opaque
             }
         }
-        return encoded
+        return encoded.filterKeys { it in batchUrls }
     }
 
     /** Resolve an opaque token back to the real upstream URL, or null if unknown/evicted. */
@@ -81,6 +88,10 @@ class HlsSegmentRegistry(
 
     @Synchronized
     fun size(): Int = byOpaque.size
+
+    /** Snapshot for pruning the provider-reference table alongside token eviction. */
+    @Synchronized
+    fun resources(): Set<String> = byUrl.keys.toSet()
 
     val capacity: Int get() = maxEntries
 

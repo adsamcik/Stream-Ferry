@@ -7,7 +7,7 @@ package com.adsamcik.streamferry.core.http
  */
 object UpstreamRangeVerifier {
 
-    private data class ParsedContentRange(val start: Long, val endInclusive: Long, val totalLength: Long)
+    data class VerifiedContentRange(val start: Long, val endInclusive: Long, val totalLength: Long)
 
     private val CONTENT_RANGE = Regex(
         """^bytes\s+(\d+)-(\d+)/(\d+)$""",
@@ -33,7 +33,7 @@ object UpstreamRangeVerifier {
         requested: ByteRange,
         expectedTotalLength: Long,
     ): Boolean {
-        val actual = parseContentRange(statusCode, contentRanges, contentLength) ?: return false
+        val actual = verifiedContentRange(statusCode, contentRanges, contentLength) ?: return false
         return actual.start == requested.start &&
             actual.endInclusive == requested.endInclusive &&
             actual.totalLength == expectedTotalLength
@@ -51,7 +51,7 @@ object UpstreamRangeVerifier {
         requestHeader: String,
     ): Boolean {
         val requested = REQUEST_RANGE.matchEntire(requestHeader.trim()) ?: return false
-        val actual = parseContentRange(statusCode, contentRanges, contentLength) ?: return false
+        val actual = verifiedContentRange(statusCode, contentRanges, contentLength) ?: return false
         val requestedStart = requested.groupValues[1].toLongOrNull()
         val requestedEnd = requested.groupValues[2].toLongOrNull()
         if (requestedStart == null && requestedEnd == null) return false
@@ -77,11 +77,11 @@ object UpstreamRangeVerifier {
         return match.groupValues[1].toLongOrNull()
     }
 
-    private fun parseContentRange(
+    fun verifiedContentRange(
         statusCode: Int,
         contentRanges: List<String>,
         contentLength: Long?,
-    ): ParsedContentRange? {
+    ): VerifiedContentRange? {
         if (statusCode != 206 || contentRanges.size != 1 || contentLength?.let { it < 0 } == true) return null
         val match = CONTENT_RANGE.matchEntire(contentRanges.single().trim()) ?: return null
         val start = match.groupValues[1].toLongOrNull() ?: return null
@@ -90,7 +90,7 @@ object UpstreamRangeVerifier {
         if (total <= 0 || start > end || end >= total) return null
         val span = spanLength(start, end) ?: return null
         if (contentLength != null && contentLength != span) return null
-        return ParsedContentRange(start, end, total)
+        return VerifiedContentRange(start, end, total)
     }
 
     private fun spanLength(start: Long, endInclusive: Long): Long? =

@@ -6,6 +6,12 @@ import androidx.media3.common.MimeTypes
 import androidx.media3.muxer.BufferInfo
 import androidx.media3.muxer.Muxer
 import com.adsamcik.streamferry.core.session.SessionRegistry
+import com.adsamcik.streamferry.core.resume.NoOpSmartResumeRecordStore
+import com.adsamcik.streamferry.core.resume.ProgressConfidence
+import com.adsamcik.streamferry.core.resume.ProgressEstimate
+import com.adsamcik.streamferry.core.resume.SmartResumeSeed
+import com.adsamcik.streamferry.core.resume.SmartResumeSessionTracker
+import com.adsamcik.streamferry.core.resume.SmartResumeSourceType
 import com.adsamcik.streamferry.core.stream.MediaProfile
 import com.adsamcik.streamferry.core.stream.Protocol
 import com.adsamcik.streamferry.core.stream.StreamPreferences
@@ -79,6 +85,14 @@ class PlaybackEngineDlnaReconnectTest {
         proveReconnect(providerSource = true)
     }
 
+    @Test fun `local HTTP reconnect after replay expiry starts at retained recovery progress rather than stale renderer position`() = runTest {
+        proveReconnect(providerSource = false, savedRecoveryPosition = 260)
+    }
+
+    @Test fun `provider HTTP reconnect after replay expiry starts at retained recovery progress rather than stale renderer position`() = runTest {
+        proveReconnect(providerSource = true, savedRecoveryPosition = 260)
+    }
+
     @Test fun `Stop while reconnect queries the TV cannot start a replacement stream`() = runTest {
         val f = Fixture(this)
         try {
@@ -104,11 +118,11 @@ class PlaybackEngineDlnaReconnectTest {
         }
     }
 
-    private suspend fun TestScope.proveReconnect(providerSource: Boolean) {
+    private suspend fun TestScope.proveReconnect(providerSource: Boolean, savedRecoveryPosition: Long? = null) {
         // True models TV Play reopening HTTP before its PLAYING poll. False models paused prefetch;
         // unknown must retain the last confirmed intent rather than infer Play from the HTTP GET.
         for (freshPlaying in listOf(true, false, null)) {
-            val f = Fixture(this)
+            val f = Fixture(this, trackResume = savedRecoveryPosition != null)
             try {
                 finish(launch { f.start(providerSource) })
                 finish(launch { f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE) })
@@ -126,6 +140,17 @@ class PlaybackEngineDlnaReconnectTest {
                 f.events.emit(PlaybackTargetEvent.StatusChanged(77, cachedPlaying))
                 runCurrent()
                 assertEquals(200L, f.engine.status.value?.positionSeconds)
+                if (savedRecoveryPosition != null) {
+                    // A delivered-media estimate can advance the recovery checkpoint while the TV's
+                    // latest display tick remains stale. Use the real tracker acceptance rules.
+                    f.resumeTracker.noteEstimate(ProgressEstimate(
+                        savedRecoveryPosition + 5, anchorPositionSeconds = 200,
+                        anchorAgeMillis = 65_000, uncertaintySeconds = 5, confidence = ProgressConfidence.DELIVERY,
+                    ))
+                    assertEquals(savedRecoveryPosition, f.resumeTracker.recoveryPositionSeconds())
+                    assertEquals(200L, f.engine.status.value?.positionSeconds)
+                }
+                val expectedPosition = savedRecoveryPosition ?: 200L
                 f.freshPlaying = freshPlaying
                 val previousLoads = f.loads.size
                 val reconnectReader = assertNotNull(oldSource.openProgressive())
@@ -134,9 +159,9 @@ class PlaybackEngineDlnaReconnectTest {
                 coVerify(exactly = 1) { f.target.readIsPlaying() }
                 assertEquals(freshPlaying ?: cachedPlaying, f.loads.last().playing)
                 assertEquals(0L, f.loads.last().position)
-                assertEquals(3400L, f.loads.last().duration)
-                assertEquals(200_000L, f.encoderStarts.last())
-                assertEquals(200L, f.engine.status.value?.positionSeconds)
+                assertEquals(3600L - expectedPosition, f.loads.last().duration)
+                assertEquals(expectedPosition * 1000, f.encoderStarts.last())
+                assertEquals(expectedPosition, f.engine.status.value?.positionSeconds)
                 // The old HTTP request is retired by replacing the stream, so it cannot hang a TV.
                 assertEquals(-1, reconnectReader.read())
                 reconnectReader.close()
@@ -165,7 +190,8 @@ class PlaybackEngineDlnaReconnectTest {
         assertFalse(job.isCancelled, "engine operation failed or was cancelled")
     }
 
-    private inner class Fixture(scope: TestScope) {
+    private inner class Fixture(scope: TestScope, private val trackResume: Boolean = false) {
+        val resumeTracker = SmartResumeSessionTracker(NoOpSmartResumeRecordStore, { scope.testScheduler.currentTime })
         val events = MutableSharedFlow<PlaybackTargetEvent>(extraBufferCapacity = 16)
         val target = mockk<PlaybackTargetController>(relaxed = true)
         val sources = CopyOnWriteArrayList<ClientTranscodeSource>()
@@ -238,15 +264,19 @@ class PlaybackEngineDlnaReconnectTest {
                 provider, coordinator, proxy, network, service, mockk(relaxed = true),
                 RuntimeEnvironment.getApplication(), transcoder,
                 { DeviceEncodeCapabilities(ResolutionTier.FHD_1080P, ResolutionTier.HD_720P) },
-                mockk(relaxed = true), clock = { scope.testScheduler.currentTime },
+                mockk(relaxed = true), smartResume = resumeTracker, clock = { scope.testScheduler.currentTime },
                 dispatcher = StandardTestDispatcher(scope.testScheduler), elapsedRealtime = { scope.testScheduler.currentTime },
             )
         }
 
         suspend fun start(providerSource: Boolean) {
-            if (providerSource) engine.play(movie, target, selected, StreamPreferences(maxVideoHeight = 720))
+            val seed = if (trackResume) SmartResumeSeed(
+                if (providerSource) SmartResumeSourceType.REMOTE else SmartResumeSourceType.DOWNLOADED,
+                "movie", "Movie", durationSeconds = 3600, serverId = "server", userId = "user",
+            ) else null
+            if (providerSource) engine.play(movie, target, selected, StreamPreferences(maxVideoHeight = 720), smartResumeSeed = seed)
             else engine.playLocal("/download/movie.mp4", "video/mp4", "Movie", 3600,
-                resumePositionSeconds = 123, allowClientTranscode = false, target = target, selectedTarget = selected)
+                resumePositionSeconds = 123, allowClientTranscode = false, target = target, selectedTarget = selected, smartResumeSeed = seed)
         }
     }
 }

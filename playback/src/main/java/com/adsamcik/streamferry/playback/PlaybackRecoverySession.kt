@@ -97,7 +97,7 @@ data class RecoveryBudget(
     val maxAutomaticAttempts: Int = 9,
     /** Each protocol receives its own finite connect-handshake allowance. */
     val maxEndpointConnectionRetriesPerProtocol: Int = 2,
-    /** An established stream still retries a transient network failure only once. */
+    /** One transient-network retry per continuously healthy playback window. */
     val maxSameStreamNetworkRetries: Int = 1,
     /** Format and resolution variants share a conservative cap; protocol handoff is reserved separately. */
     val maxCompatibilityOrQualityVariants: Int = 3,
@@ -346,6 +346,15 @@ data class PlaybackRecoverySession(
     )
 
     fun transition(next: PlaybackPhase): PlaybackRecoverySession = copy(phase = next)
+
+    /** Restore only network capacity; format, endpoint and protocol recovery remain finite. */
+    fun rearmNetworkRetry(): PlaybackRecoverySession {
+        if (phase != PlaybackPhase.PLAYING || usage.sameStreamNetworkRetries == 0) return this
+        return copy(usage = usage.copy(
+            automaticAttempts = (usage.automaticAttempts - usage.sameStreamNetworkRetries).coerceAtLeast(0),
+            sameStreamNetworkRetries = 0,
+        ))
+    }
 
     /** A stopped session invalidates queued watchdog/recovery work as well as renderer callbacks. */
     fun stop(): PlaybackRecoverySession = copy(phase = PlaybackPhase.STOPPED, generation = generation + 1)

@@ -38,13 +38,21 @@ import com.adsamcik.streamferry.source.api.TrackRef
 import com.adsamcik.streamferry.source.api.UserStateProvider
 import java.util.UUID
 import java.util.Base64
-import java.util.concurrent.ConcurrentHashMap
+import java.io.IOException
+import java.io.InterruptedIOException
+import java.net.SocketTimeoutException
+import java.security.MessageDigest
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
 import okhttp3.HttpUrl
+import okhttp3.Call
+import okhttp3.Callback
+import okhttp3.Response
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
@@ -429,9 +437,10 @@ class JellyfinPlaybackProvider(
 }
 
 /** Keeps every private locator and authorization value inside the source module. */
-private class JellyfinStreamLease(
+internal class JellyfinStreamLease(
     upstream: JellyfinUpstreamSource,
     httpClient: OkHttpClient,
+    private val resourceCapacity: Int = 16_384,
 ) : StreamLease {
 
     private val initialUrl = upstream.url
@@ -439,7 +448,14 @@ private class JellyfinStreamLease(
     private val origin = requireNotNull(TrustedMediaOriginPolicy.fromBaseUrl(initialUrl)) {
         "Playback origin is not a valid HTTP(S) authority"
     }
-    private val resources = ConcurrentHashMap<String, HttpUrl>()
+    private val resourceLock = Any()
+    private val resourceSalt = UUID.randomUUID().toString()
+    private val resources = LinkedHashMap<String, HttpUrl>(16, 0.75f, true)
+    private var retainedResources = emptySet<String>()
+
+    init {
+        require(resourceCapacity > 0) { "Stream resource capacity must be positive" }
+    }
     private val streamClient = httpClient.newBuilder()
         .followRedirects(false)
         .followSslRedirects(false)
@@ -465,12 +481,27 @@ private class JellyfinStreamLease(
         playlistReference: String,
         fromPlaylist: StreamResourceRef?,
     ): Result<StreamResourceRef?> = runCatching {
-        val base = fromPlaylist?.let { resources[it.opaqueId] }
-            ?: requireNotNull(origin.trustedAbsolute(initialUrl))
-        val resolved = origin.resolve(playlistReference, base)
+        val base = if (fromPlaylist == null) requireNotNull(origin.trustedAbsolute(initialUrl))
+        else synchronized(resourceLock) {
+            requireNotNull(resources[fromPlaylist.opaqueId]) { "Unknown stream playlist" }
+        }
+        val resolved = origin.resolve(playlistReference, base)?.newBuilder()?.fragment(null)?.build()
             ?: return@runCatching null
-        val opaqueId = UUID.randomUUID().toString()
-        resources[opaqueId] = resolved
+        // Salted lease-local identities deduplicate equivalent references without exposing private
+        // locators or requiring a second unbounded reverse-lookup map.
+        val opaqueId = Base64.getUrlEncoder().withoutPadding().encodeToString(
+            MessageDigest.getInstance("SHA-256").digest("$resourceSalt:$resolved".toByteArray(Charsets.UTF_8)),
+        )
+        synchronized(resourceLock) {
+            if (opaqueId !in resources) {
+                while (resources.size >= resourceCapacity) {
+                    val evictable = resources.keys.firstOrNull { it !in retainedResources }
+                        ?: error("Stream resource capacity is retained by active playlists")
+                    resources.remove(evictable)
+                }
+            }
+            resources[opaqueId] = resolved
+        }
         StreamResourceRef(
             opaqueId = opaqueId,
             kind = if (resolved.encodedPath.endsWith(".m3u8", ignoreCase = true)) {
@@ -485,16 +516,24 @@ private class JellyfinStreamLease(
         resource: StreamResourceRef,
         range: com.adsamcik.streamferry.core.http.ByteRange?,
     ): Result<StreamResponse> {
-        val url = resources[resource.opaqueId]
+        val url = synchronized(resourceLock) { resources[resource.opaqueId] }
             ?: return Result.failure(IllegalArgumentException("Unknown stream resource"))
         return openTrusted(url, range)
+    }
+
+    override fun retainResources(resources: Set<StreamResourceRef>) = synchronized(resourceLock) {
+        val ids = resources.mapTo(HashSet()) { it.opaqueId }
+        require(ids.size <= resourceCapacity && ids.all { it in this.resources }) {
+            "Cannot retain unknown stream resources"
+        }
+        retainedResources = ids
     }
 
     private suspend fun openTrusted(
         url: HttpUrl,
         range: com.adsamcik.streamferry.core.http.ByteRange?,
-    ): Result<StreamResponse> = withContext(Dispatchers.IO) {
-        runCatching {
+    ): Result<StreamResponse> {
+        return try {
             var target = url
             repeat(MAX_REDIRECTS + 1) {
                 require(origin.isTrusted(target)) { "Cross-origin stream request rejected" }
@@ -505,33 +544,65 @@ private class JellyfinStreamLease(
                         header("Range", "bytes=${it.start}-$end")
                     }
                 }.build()
-                val response = streamClient.newCall(request).execute()
+                val response = streamClient.newCall(request).awaitHeaders()
                 if (!response.isRedirect) {
-                    return@runCatching StreamResponse(
-                        statusCode = response.code,
-                        headers = SAFE_RESPONSE_HEADERS.mapNotNull { name ->
-                            response.header(name)?.let { value -> name to value }
-                        }.toMap(),
-                        body = response.body.byteStream(),
-                    )
+                    try {
+                        return Result.success(StreamResponse(
+                            statusCode = response.code,
+                            headers = SAFE_RESPONSE_HEADERS.mapNotNull { name ->
+                                response.header(name)?.let { value -> name to value }
+                            }.toMap(),
+                            body = response.body.byteStream(),
+                        ))
+                    } catch (error: Throwable) {
+                        response.close()
+                        throw error
+                    }
                 }
                 val next = response.header("Location")?.let { location -> origin.resolve(location, target) }
                 response.close()
                 target = next ?: error("Cross-origin stream redirect rejected")
             }
             error("Too many stream redirects")
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            Result.failure(sanitizedStreamFailure(error))
         }
+    }
+
+    /** Preserve retry-relevant timeout classification without forwarding private HTTP diagnostics. */
+    private fun sanitizedStreamFailure(error: Exception): IOException = when (error) {
+        is SocketTimeoutException -> SocketTimeoutException("Source stream request timed out")
+        is InterruptedIOException -> InterruptedIOException("Source stream request interrupted")
+        else -> IOException("Source stream request failed")
+    }
+
+    /** Cancel header waits immediately, and close a response cancelled before ownership is delivered. */
+    private suspend fun Call.awaitHeaders(): Response = suspendCancellableCoroutine { continuation ->
+        continuation.invokeOnCancellation { cancel() }
+        enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                continuation.resumeWith(Result.failure(sanitizedStreamFailure(e)))
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                continuation.resume(response) { _, undelivered, _ -> undelivered.close() }
+            }
+        })
     }
 
     companion object {
         private const val MAX_REDIRECTS = 3
         private val SAFE_RESPONSE_HEADERS = listOf(
             "Content-Type",
+            "Content-Encoding",
             "Content-Length",
             "Content-Range",
             "Accept-Ranges",
             "ETag",
             "Last-Modified",
+            "Date",
         )
     }
 }

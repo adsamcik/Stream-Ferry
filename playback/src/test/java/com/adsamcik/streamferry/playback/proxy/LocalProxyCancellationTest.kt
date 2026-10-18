@@ -135,6 +135,7 @@ class LocalProxyCancellationTest {
         proxy.mediaDeliveryListener = { deliveries += it }
         val session = sessions.create("application/vnd.apple.mpegurl", isHls = true)
         val source = mockk<StreamLease>()
+        every { source.retainResources(any()) } just Runs
         val segment = StreamResourceRef("segment", StreamResourceKind.MEDIA)
         val playlist = "#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:10,\nsegment.ts\n#EXT-X-ENDLIST\n"
         coEvery { source.open(range = any()) } returns Result.success(StreamResponse(
@@ -160,6 +161,7 @@ class LocalProxyCancellationTest {
         val proxy = LocalProxyServer(sessions, Log())
         val session = sessions.create("application/vnd.apple.mpegurl", isHls = true)
         val source = mockk<StreamLease>()
+        every { source.retainResources(any()) } just Runs
         val segment = StreamResourceRef("segment", StreamResourceKind.MEDIA)
         val playlist = "#EXTM3U\n#EXTINF:10,\nsegment.ts\n#EXT-X-ENDLIST\n"
         coEvery { source.open(range = any()) } answers { Result.success(StreamResponse(

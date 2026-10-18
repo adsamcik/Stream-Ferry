@@ -258,6 +258,13 @@ interface StreamLease {
         fromPlaylist: StreamResourceRef? = null,
     ): Result<StreamResourceRef?>
     suspend fun open(resource: StreamResourceRef, range: ByteRange? = null): Result<StreamResponse>
+
+    /**
+     * Protect resources still advertised by the gateway, including its previous playlist windows.
+     * Providers may evict other historical mappings within a bounded lease-local cache. The set is
+     * authoritative for this lease and must contain only resources returned by [resolve].
+     */
+    fun retainResources(resources: Set<StreamResourceRef>) {}
 }
 
 enum class StreamResourceKind { PLAYLIST, MEDIA, UNKNOWN }

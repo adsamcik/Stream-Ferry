@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Network
+import android.net.LinkProperties
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -434,7 +435,7 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
     // ----- playback engine -----
     val rendererCapabilityStore: RendererCapabilityStore by lazy { PersistentRendererCapabilityStore(appContext) }
 
-    val playbackEngine: PlaybackEngine by lazy {
+    private val playbackEngineDelegate = lazy {
         PlaybackEngine(
             playbackProvider = registeredPlaybackProvider,
             coordinator = coordinator,
@@ -451,6 +452,8 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
             requireLocalNetworkAccess = localNetworkGate::requireAccess,
         )
     }
+
+    val playbackEngine: PlaybackEngine by playbackEngineDelegate
 
     // ----- optional: offline downloads -----
     private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -568,6 +571,14 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
             .onFailure { logger.w("resume", "Couldn't persist lifecycle playback checkpoint", it) }
     }
 
+    private fun checkPlaybackNetwork() {
+        if (!playbackEngineDelegate.isInitialized()) return
+        ioScope.launch {
+            runCatching { playbackEngine.onLanAddressChanged() }
+                .onFailure { logger.w("Network", "Playback network check failed", it) }
+        }
+    }
+
     /**
      * Auto-recover downloads when connectivity returns. If a download exhausted its in-flight retries
      * while offline, re-enqueue it (resuming from its `.part` file) the moment a usable default network
@@ -578,7 +589,11 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
         runCatching {
             val cm = appContext.getSystemService(ConnectivityManager::class.java) ?: return
             cm.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
+                override fun onLinkPropertiesChanged(network: Network, properties: LinkProperties) = checkPlaybackNetwork()
+                override fun onLost(network: Network) = checkPlaybackNetwork()
+
                 override fun onAvailable(network: Network) {
+                    checkPlaybackNetwork()
                     ioScope.launch {
                         runCatching {
                             // A single Jellyfin client is configured for the active verified account.

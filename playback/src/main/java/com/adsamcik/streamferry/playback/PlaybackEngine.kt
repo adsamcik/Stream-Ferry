@@ -369,6 +369,9 @@ class PlaybackEngine(
     // ViewModel can auto-reconnect + resume. Cleared on each new play() and on teardown.
     @Volatile private var connectionLost = false
     private val disconnectRevision = AtomicLong()
+    private val playbackHealth = PlaybackHealthTracker()
+    @Volatile private var streamLanAddress: String? = null
+    private var gatewayWasUnavailable = false
     @Volatile private var controlErrorMessage: String? = null
     @Volatile private var lastThroughputBps = 0L
     @Volatile private var lastNote = "Measuring link speedâ€¦"
@@ -420,6 +423,49 @@ class PlaybackEngine(
 
     private val absolutePositionSeconds: Long get() = streamStartSeconds + reportedPositionSeconds
     private fun recoveryPositionSeconds(): Long = smartResume.recoveryPositionSeconds() ?: absolutePositionSeconds
+
+    /** Repair the phone media URL even when the TV control channel remains connected. */
+    suspend fun onLanAddressChanged() = withContext(dispatcher) {
+        mutex.withLock { checkLanAddressLocked() }
+    }
+
+    private fun checkLanAddressLocked() {
+        if (target == null || completedGeneration == playGeneration ||
+            recoverySession.phase in setOf(PlaybackPhase.STOPPED, PlaybackPhase.FAILED) || connectionLost
+        ) return
+        val address = runCatching { networkInfo.lanIpv4() }.getOrNull()
+        if (address == null) {
+            gatewayWasUnavailable = true
+            playbackHealth.reset()
+            return
+        }
+        val loadedAddress = streamLanAddress ?: return
+        if ((gatewayWasUnavailable || address != loadedAddress) && !isReloadingStream) {
+            handlePlaybackFailure(PlaybackFailureKind.NETWORK,
+                "The phone's local network changed. Reconnecting the stream…",
+                failureStage = PlaybackFailureStage.PROXY)
+        }
+    }
+
+    private fun canObservePlaybackHealth(): Boolean = playbackStarted && localPlayWhenReady && isPlaying &&
+        !isBuffering && !isReloadingStream && transcodePreparationJob == null && !connectionLost &&
+        seekSettleTargetSeconds == null && pendingRendererResumePosition == null &&
+        completedGeneration != playGeneration && recoverySession.phase == PlaybackPhase.PLAYING
+
+    private fun observePlaybackHealth(confirmed: Boolean) {
+        if (!canObservePlaybackHealth()) { playbackHealth.reset(); return }
+        if (!confirmed) return
+        if (playbackHealth.observe(recoverySession.generation, absolutePositionSeconds, elapsedRealtime())) {
+            synchronized(recoveryLock) {
+                val healthy = recoverySession.rearmNetworkRetry()
+                if (healthy !== recoverySession) {
+                    recoverySession = healthy
+                    retriedOnce = false
+                    logger.event("playback", "Healthy playback restored the network retry allowance")
+                }
+            }
+        }
+    }
 
     /** Persist the latest renderer-confirmed position when the app leaves the foreground. */
     fun checkpointSmartResumeLifecycle() {
@@ -1020,7 +1066,7 @@ class PlaybackEngine(
         ) {
             // A DLNA renderer can close the unseekable TS response while paused. Give it a fresh
             // stream at the retained source position instead of asking it to reopen expired bytes.
-            reloadOutput(absolutePositionSeconds, "resume phone stream", playWhenReady = true)
+            reloadOutput(recoveryPositionSeconds(), "resume phone stream", playWhenReady = true)
         } else t.play()
         isPlaying = true
         localPlayWhenReady = true
@@ -1042,6 +1088,7 @@ class PlaybackEngine(
         t.pause()
         isPlaying = false
         localPlayWhenReady = false
+        playbackHealth.reset()
         startupWatchdogJob?.cancel()
         holdProgressEstimate()
         controlErrorMessage = null
@@ -1410,6 +1457,8 @@ class PlaybackEngine(
         // Arm before load as well as after it: Cast can synchronously deliver an initial position callback
         // while the load result is being awaited, and that pre-position status must not snap resume to zero.
         val rendererStart = if (transcodeTarget != null) 0L else boundedStartPos
+        streamLanAddress = phoneIp
+        gatewayWasUnavailable = false
         armRendererResumeVerification(rendererStart)
         armRendererStartSettle(rendererStart)
         val loadIntent = localPlayWhenReady
@@ -1471,7 +1520,7 @@ class PlaybackEngine(
                                 } ?: localPlayWhenReady
                                 // Stop can release the source before obtaining the command lock.
                                 if (generation != playGeneration || streamingTranscode !== session) return@withLock
-                                reloadOutput(absolutePositionSeconds, "reconnect phone stream", playing)
+                                reloadOutput(recoveryPositionSeconds(), "reconnect phone stream", playing)
                             } catch (cancelled: CancellationException) {
                                 throw cancelled
                             } catch (error: Exception) {
@@ -1565,6 +1614,7 @@ class PlaybackEngine(
 
     private suspend fun seekToLocked(absoluteSeconds: Long) {
         requireLocalNetworkAccess()
+        playbackHealth.reset()
         val t = target ?: return
         // A user/media-session seek is newer than any load-time resume correction still waiting for a
         // renderer status. Clear it before issuing the command so recovery can never fight the user.
@@ -2520,6 +2570,8 @@ class PlaybackEngine(
         )
         val attemptGeneration = recoverySession.generation
         pendingRecoveryKind = null
+        streamLanAddress = phoneIp
+        gatewayWasUnavailable = false
         armRendererResumeVerification(loadStart)
         if (!serverSideStart) armRendererStartSettle(loadStart)
         val loadIntent = localPlayWhenReady
@@ -2693,11 +2745,11 @@ class PlaybackEngine(
         val expectedGeneration = recoverySession.generation
         fallbackJob = scope.launch {
             mutex.withLock {
-                if (!recoverySession.acceptsEvent(expectedGeneration)) {
-                    logger.trace(TAG, "Ignoring stale recovery reload for generation $expectedGeneration")
-                    return@withLock
-                }
                 try {
+                    if (!recoverySession.acceptsEvent(expectedGeneration)) {
+                        logger.trace(TAG, "Ignoring stale recovery reload for generation $expectedGeneration")
+                        return@withLock
+                    }
                     if (localPlayback != null) {
                         reloadLocalInPlace(resumeAt, reason, localPlayWhenReady)
                     } else {
@@ -3052,6 +3104,15 @@ class PlaybackEngine(
                 }
             }
             if (!protected) return
+            mutex.withLock {
+                checkLanAddressLocked()
+                if (!canObservePlaybackHealth()) playbackHealth.reset()
+                else if (playbackHealth.isStalled(recoverySession.generation, elapsedRealtime())) {
+                    handlePlaybackFailure(PlaybackFailureKind.NETWORK,
+                        "The TV stopped advancing playback. Reconnecting the stream…",
+                        failureStage = PlaybackFailureStage.ESTABLISHED_PLAYBACK)
+                }
+            }
             try {
                 mutex.withLock { evaluateNightVolumeLocked() }
             } catch (e: CancellationException) {
@@ -3292,6 +3353,7 @@ class PlaybackEngine(
                     }
                     maybeAutoSkip()
                 } else updateProgressEstimate()
+                observePlaybackHealth(event.isPositionConfirmed)
                 publishStatus()
             }
             is PlaybackTargetEvent.VolumeChanged -> {
@@ -3307,6 +3369,7 @@ class PlaybackEngine(
             is PlaybackTargetEvent.BufferingChanged -> {
                 if (isBuffering == event.isBuffering) return
                 isBuffering = event.isBuffering
+                playbackHealth.reset()
                 if (event.isBuffering) holdProgressEstimate()
                 recoverySession = recoverySession.transition(if (event.isBuffering) PlaybackPhase.BUFFERING else if (isPlaying) PlaybackPhase.PLAYING else PlaybackPhase.PAUSED)
                 if (event.isBuffering) adaptive?.recordRebuffer(clock())
@@ -3578,6 +3641,9 @@ class PlaybackEngine(
 
     private suspend fun stopInternalLocked(reason: String) {
         synchronized(recoveryLock) { cancelPendingUnknownFailure() }
+        playbackHealth.reset()
+        streamLanAddress = null
+        gatewayWasUnavailable = false
         failedPlaybackChoices = if (reason.endsWith("failed")) capturePlaybackChoices() else null
         updateProgressEstimate()
         synchronized(progressLock) {

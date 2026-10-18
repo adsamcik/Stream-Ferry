@@ -104,6 +104,7 @@ class PlaybackEngineLocalTranscodeTest {
         private val resumeStore = ResumeStore()
         private var deliveryListener: ((MediaDelivery) -> Unit)? = null
         private var deliveryEpoch = 0L
+        var phoneIp: String? = "127.0.0.1"
         var sleepMillis = 0L
         fun deliver(startMs: Long, endMs: Long) {
             assertNotNull(deliveryListener).invoke(MediaDelivery(session.id, deliveryEpoch, startMs, endMs))
@@ -156,7 +157,7 @@ class PlaybackEngineLocalTranscodeTest {
             coEvery { service.startAndAwaitForegrounded(any()) } returns
                 ForegroundServiceStartResult.Foregrounded(ProxyForegroundStartPath.START_SERVICE)
             val network = mockk<NetworkInfoProvider>()
-            every { network.lanIpv4() } returns "127.0.0.1"
+            every { network.lanIpv4() } answers { phoneIp }
             val context = mockk<Context>(relaxed = true)
             every { context.cacheDir } returns File(System.getProperty("java.io.tmpdir"), "local-transcode-test")
             engine = PlaybackEngine(
@@ -2312,6 +2313,160 @@ class PlaybackEngineLocalTranscodeTest {
             verify(exactly = 3) { LocalMediaProbe.probe(any(), any(), any()) }
             verify(exactly = 3) { LocalMediaProbe.probeDurationSecondsExact(any(), any()) }
         } finally { f.engine.stop(); runCurrent() }
+    }
+
+    @Test fun `DLNA phone Resume retains newer saved progress than stale renderer reports for every source`() = runTest {
+        for (source in SourceCase.entries) {
+            val f = Fixture(this, Protocol.DLNA, trackResume = true)
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(0, true)); runCurrent()
+                f.sleepMillis = 60_000
+                advanceTimeBy(5000); runCurrent()
+                f.deliver(0, 100_000)
+                f.events.emit(PlaybackTargetEvent.StatusChanged(1, true, isPositionConfirmed = false)); runCurrent()
+                f.engine.pause(); runCurrent()
+                val before = assertNotNull(f.engine.status.value)
+                assertTrue(before.recoveryPositionSeconds > before.positionSeconds + 30)
+                f.engine.resume(); runCurrent()
+                assertEquals(before.recoveryPositionSeconds, f.engine.status.value?.positionSeconds, source.name)
+                assertEquals(0L, f.loads.last().position)
+                assertTrue(f.loads.last().playWhenReady)
+            } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `LAN changes retain position pause audio captions and phone output for every source and protocol`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) for (paused in listOf(false, true)) {
+            coEvery { LocalSubtitleReader.discoverAudio(any(), any(), any()) } returns audioTracks
+            val f = Fixture(this, protocol)
+            f.providerMediaVersion = "version"
+            f.providerAudioTracks = audioTracks.map { com.adsamcik.streamferry.source.api.MediaTrack(TrackRef("version:${it.extractorTrackId}"), it.language, it.label, it.isDefault) }
+            every { LocalSubtitleReader.external(any(), any()) } returns LocalSubtitleTrack(
+                0, "ces", "Czech captions", source = LocalSubtitleSource.External("content://subtitles/42", "text/vtt"),
+            )
+            every { LocalSubtitleReader.open(any(), any(), any(), any()) } returns mockk(relaxed = true)
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectAudioTrack(1); runCurrent()
+                f.engine.attachSubtitle("content://subtitles/42"); runCurrent()
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE)
+                f.engine.selectPreferredCodec("hevc")
+                f.engine.selectMaxVideoHeight(480); runCurrent()
+                f.engine.seekTo(200); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(0, true)); runCurrent()
+                if (paused) { f.engine.pause(); runCurrent() }
+                val before = assertNotNull(f.engine.status.value)
+                val count = f.loads.size
+                f.phoneIp = "127.0.0.2"
+                f.engine.onLanAddressChanged(); runCurrent()
+                assertEquals(count + 1, f.loads.size, "$source/$protocol/$paused")
+                val after = assertNotNull(f.engine.status.value)
+                assertEquals(before.recoveryPositionSeconds, after.positionSeconds)
+                assertEquals(!paused, f.loads.last().playWhenReady)
+                assertEquals(before.currentAudioIndex, after.currentAudioIndex)
+                assertEquals(before.currentSubtitleIndex, after.currentSubtitleIndex)
+                assertEquals(before.localTranscodeMode, after.localTranscodeMode)
+                assertEquals(before.preferredVideoCodec, after.preferredVideoCodec)
+                assertEquals(before.maxVideoHeight, after.maxVideoHeight)
+                assertEquals(1, f.engine.recoverySnapshot().usage.sameStreamNetworkRetries)
+                assertEquals(0, f.engine.recoverySnapshot().usage.compatibilityOrQualityVariants)
+                repeat(3) { f.engine.onLanAddressChanged(); runCurrent() }
+                assertEquals(count + 1, f.loads.size, "Duplicate network callbacks consumed another attempt")
+                coVerify { f.coordinator.startClientTranscodeAndBuildUrl(any(), "127.0.0.2") }
+            } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `LAN outage returning to same address and missed callbacks recover without control disconnect`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) for (outage in listOf(false, true)) {
+            val f = Fixture(this, protocol)
+            try {
+                f.startSource(source); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(123, true)); runCurrent()
+                val count = f.loads.size
+                if (outage) {
+                    f.phoneIp = null
+                    f.engine.onLanAddressChanged(); runCurrent()
+                    assertEquals(count, f.loads.size)
+                    f.phoneIp = "127.0.0.1"
+                } else f.phoneIp = "127.0.0.2"
+                // No callback: the monitor repairs a stale gateway even if renderer controls stay alive.
+                advanceTimeBy(5000); runCurrent()
+                assertEquals(count + 1, f.loads.size, "$source/$protocol/$outage")
+                assertEquals(0, f.engine.recoverySnapshot().usage.compatibilityOrQualityVariants)
+            } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `fresh frozen PLAYING reports recover once and healthy progress rearms only network retries for every source`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) {
+            val f = Fixture(this, protocol)
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE); runCurrent()
+                val count = f.loads.size
+                f.events.emit(PlaybackTargetEvent.StatusChanged(0, true)); runCurrent()
+                repeat(10) {
+                    advanceTimeBy(5000)
+                    f.events.emit(PlaybackTargetEvent.StatusChanged(0, true)); runCurrent()
+                }
+                assertEquals(count + 1, f.loads.size, "$source/$protocol did not repair frozen playback")
+                assertEquals(1, f.engine.recoverySnapshot().usage.sameStreamNetworkRetries)
+                assertEquals(0, f.engine.recoverySnapshot().usage.compatibilityOrQualityVariants)
+                f.events.emit(PlaybackTargetEvent.StatusChanged(0, true)); runCurrent()
+                repeat(13) { index ->
+                    advanceTimeBy(5000)
+                    f.events.emit(PlaybackTargetEvent.StatusChanged((index + 1) * 5L, true)); runCurrent()
+                }
+                assertEquals(0, f.engine.recoverySnapshot().usage.sameStreamNetworkRetries, "$source/$protocol failed to rearm")
+                assertEquals(count + 1, f.loads.size, "Progressing renderer must tolerate encoder backpressure")
+                f.events.emit(PlaybackTargetEvent.Error(PlaybackFailureKind.NETWORK, "Later independent hiccup")); runCurrent()
+                assertEquals(count + 2, f.loads.size)
+                assertEquals(0, f.engine.recoverySnapshot().usage.compatibilityOrQualityVariants)
+            } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `pause buffering and heartbeat estimates never trigger established stall recovery or rearm`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) for (mode in listOf("pause", "buffer", "heartbeat")) {
+            val f = Fixture(this, protocol)
+            try {
+                f.startSource(source); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(123, true)); runCurrent()
+                f.events.emit(PlaybackTargetEvent.Error(PlaybackFailureKind.NETWORK, "First hiccup")); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(123, true)); runCurrent()
+                if (mode == "pause") { f.engine.pause(); runCurrent() }
+                if (mode == "buffer") { f.events.emit(PlaybackTargetEvent.BufferingChanged(true)); runCurrent() }
+                val count = f.loads.size
+                repeat(15) { index ->
+                    advanceTimeBy(5000)
+                    if (mode == "heartbeat") f.events.emit(PlaybackTargetEvent.StatusChanged(123 + index * 5L, true, isPositionConfirmed = false))
+                    runCurrent()
+                }
+                assertEquals(count, f.loads.size, "$source/$protocol/$mode recovered unexpectedly")
+                assertEquals(1, f.engine.recoverySnapshot().usage.sameStreamNetworkRetries, "$source/$protocol/$mode rearmed unexpectedly")
+            } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `a seek superseding queued recovery releases the reload guard for every source and protocol`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) {
+            val f = Fixture(this, protocol)
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE); runCurrent()
+                val gate = CompletableDeferred<Unit>()
+                coEvery { f.target.setVolume(any()) } coAnswers { gate.await() }
+                val volume = launch { f.engine.setVolume(.2f) }; runCurrent()
+                val seek = launch { f.engine.seekTo(300) }; runCurrent()
+                f.events.emit(PlaybackTargetEvent.Error(PlaybackFailureKind.NETWORK, "Queued failure")); runCurrent()
+                gate.complete(Unit); runCurrent(); volume.join(); seek.join()
+                f.events.emit(PlaybackTargetEvent.Ended); runCurrent()
+                assertNull(f.engine.status.value, "$source/$protocol retained a stale reload guard")
+            } finally { f.engine.stop(); runCurrent() }
+        }
     }
 
     private companion object {

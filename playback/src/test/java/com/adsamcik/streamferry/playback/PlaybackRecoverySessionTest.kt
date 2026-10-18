@@ -270,6 +270,52 @@ class PlaybackRecoverySessionTest {
         assertNull(continued.fail().manualProtocolSwitchContinuation())
     }
 
+    @Test fun healthyPlaybackRearmsOnlyNetworkCapacityAndPreservesOtherSessionState() {
+        var state = session()
+        for (protocol in Protocol.entries) repeat(2) {
+            val retry = assertNotNull(state.reserveEndpointConnectionRetry(protocol))
+            state = state.stop().continueFrom(retry)
+        }
+        repeat(3) {
+            state = assertNotNull(state.reserveRecovery(RecoveryAttemptKind.FORMAT_COMPATIBILITY, PlaybackPhase.CHANGING_STREAM))
+        }
+        val alternate = assertNotNull(state.reserveAlternateProtocol(protocolSwitchInput(state)))
+        state = state.stop().continueFrom(alternate)
+        state = assertNotNull(state.reserveRecovery(RecoveryAttemptKind.SAME_STREAM_NETWORK, PlaybackPhase.RECONNECTING))
+            .transition(PlaybackPhase.PLAYING)
+        val before = state
+        assertEquals(0, before.budgetStatus.automaticAttemptsRemaining)
+
+        val rearmed = before.rearmNetworkRetry()
+
+        assertEquals(before.copy(usage = before.usage.copy(
+            automaticAttempts = before.usage.automaticAttempts - 1,
+            sameStreamNetworkRetries = 0,
+        )), rearmed)
+        assertEquals(before.attempts, rearmed.attempts)
+        assertEquals(before.generation, rearmed.generation)
+        assertEquals(before.usage.endpointConnectionRetries, rearmed.usage.endpointConnectionRetries)
+        assertEquals(3, rearmed.usage.compatibilityOrQualityVariants)
+        assertTrue(rearmed.alternateProtocolReserved)
+        assertEquals(1, rearmed.budgetStatus.sameStreamNetworkRetriesRemaining)
+        assertNotNull(rearmed.reserveRecovery(RecoveryAttemptKind.SAME_STREAM_NETWORK, PlaybackPhase.RECONNECTING))
+        assertNull(rearmed.reserveRecovery(RecoveryAttemptKind.FORMAT_COMPATIBILITY, PlaybackPhase.CHANGING_STREAM))
+        assertNull(rearmed.reserveRecovery(RecoveryAttemptKind.LOWER_RESOLUTION, PlaybackPhase.CHANGING_STREAM))
+        Protocol.entries.forEach { assertNull(rearmed.reserveEndpointConnectionRetry(it)) }
+        assertNull(rearmed.reserveAlternateProtocol(protocolSwitchInput(rearmed)))
+        assertEquals(rearmed, rearmed.rearmNetworkRetry())
+    }
+
+    @Test fun networkRetryCannotRearmOutsideConfirmedPlayingState() {
+        val used = assertNotNull(session().reserveRecovery(
+            RecoveryAttemptKind.SAME_STREAM_NETWORK, PlaybackPhase.RECONNECTING,
+        ))
+        for (phase in PlaybackPhase.entries.filter { it != PlaybackPhase.PLAYING }) {
+            val state = used.transition(phase)
+            assertEquals(state, state.rearmNetworkRetry(), "phase=$phase")
+        }
+    }
+
     private fun protocolSwitchInput(state: PlaybackRecoverySession) = ProtocolSwitchInput(
         isLocalSession = false,
         isOnlineSession = true,

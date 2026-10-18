@@ -33,6 +33,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileInputStream
@@ -47,6 +49,8 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ThreadLocalRandom
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
 
 /**
  * In-RAM, session-scoped HTTP proxy (§6). Binds to the phone LAN IP on an ephemeral port ONLY while
@@ -135,8 +139,65 @@ class LocalProxyServer(
     var onDownstreamClosed: ((bytesServed: Long, durationMs: Long, completedNormally: Boolean) -> Unit)? = null
 
     /** Per-session opaque resource maps for HLS playlist rewriting (cleared on stop). */
-    private val hlsRegistries = ConcurrentHashMap<String, HlsSegmentRegistry>()
-    private val hlsResources = ConcurrentHashMap<String, ConcurrentHashMap<String, StreamResourceRef>>()
+    private val hlsStates = ConcurrentHashMap<String, HlsState>()
+
+    private data class PlaylistWindow(
+        val current: Set<StreamResourceRef>,
+        val previous: Set<StreamResourceRef> = emptySet(),
+    ) {
+        val references: Set<StreamResourceRef> get() = current + previous
+    }
+
+    private class HlsState {
+        val registry = HlsSegmentRegistry()
+        val resources = ConcurrentHashMap<String, StreamResourceRef>()
+        val windows = HashMap<String, PlaylistWindow>()
+        private val active = HashMap<StreamResourceRef, Int>()
+        // Resolving a full playlist is one transaction: concurrent variant refreshes must not evict
+        // each other's provisional provider references before their advertised tokens are retained.
+        val rewriteMutex = Mutex()
+
+        @Synchronized
+        fun pin(token: String): StreamResourceRef? = registry.resolve(token)?.let(resources::get)?.also {
+            active[it] = (active[it] ?: 0) + 1
+        }
+
+        @Synchronized
+        fun unpin(resource: StreamResourceRef) {
+            val count = active[resource] ?: return
+            if (count == 1) active.remove(resource) else active[resource] = count - 1
+        }
+
+        @Synchronized
+        fun retainPlaylist(parent: String?, references: Set<StreamResourceRef>, lease: StreamLease): Map<String, String> {
+            val key = parent.orEmpty()
+            val candidates = HashMap(windows)
+            val existing = windows[key]
+            candidates[key] = if (existing?.current == references) existing
+                else PlaylistWindow(references, existing?.current.orEmpty())
+            val reachable = LinkedHashSet<String>()
+            val pending = ArrayDeque<String>().apply { add("") }
+            val retained = LinkedHashSet<StreamResourceRef>().apply { addAll(active.keys) }
+            while (pending.isNotEmpty()) {
+                val next = pending.removeFirst()
+                if (!reachable.add(next)) continue
+                candidates[next]?.references?.forEach { reference ->
+                    retained += reference
+                    if (reference.opaqueId in candidates) pending.add(reference.opaqueId)
+                }
+            }
+            // Reject over-capacity playlists before changing any mapping. Preserve the latest and
+            // previous windows of every reachable rendition, rather than expiring an advertised
+            // audio/subtitle/video URL when a sibling playlist refreshes.
+            val encoded = registry.encodeBatch(references.map { it.opaqueId }, retained.map { it.opaqueId })
+            references.forEach { resources[it.opaqueId] = it }
+            resources.keys.retainAll(registry.resources())
+            lease.retainResources(resources.values.toSet())
+            windows.clear()
+            candidates.filterKeys { it in reachable }.forEach { (id, window) -> windows[id] = window }
+            return encoded
+        }
+    }
 
     /** Per-session on-device transcode origins (cleared/released on stop). */
     private val clientTranscoders = ConcurrentHashMap<String, ClientTranscodeSource>()
@@ -161,8 +222,7 @@ class LocalProxyServer(
         deliveryTrackers.remove(sessionId)
         remoteLeases.remove(sessionId)
         activeResponses.remove(sessionId)?.forEach { response -> runCatching { response.close() } }
-        hlsRegistries.remove(sessionId)
-        hlsResources.remove(sessionId)
+        hlsStates.remove(sessionId)
     }
 
     val isRunning: Boolean get() = serverSocket != null
@@ -218,8 +278,7 @@ class LocalProxyServer(
         clients.forEach { client -> runCatching { client.close() } }
         runCatching { listener?.close() }
         oldScope?.cancel()
-        hlsRegistries.clear()
-        hlsResources.clear()
+        hlsStates.clear()
         deliveryTrackers.clear()
         clientTranscoders.values.forEach { runCatching { it.release() } }
         clientTranscoders.clear()
@@ -450,124 +509,130 @@ class LocalProxyServer(
             writeStatus(out, 404, "Not Found")
             return
         }
-        val registry = hlsRegistries.computeIfAbsent(session.id) { HlsSegmentRegistry() }
-        val resourceMap = hlsResources.computeIfAbsent(session.id) { ConcurrentHashMap() }
-        val resource = if (segParam == null) null else registry.resolve(segParam)?.let(resourceMap::get)
+        val state = hlsStates.computeIfAbsent(session.id) { HlsState() }
+        val registry = state.registry
+        val resource = segParam?.let(state::pin)
         if (segParam != null && resource == null) {
             writeStatus(out, 404, "Not Found")
             return
         }
-        val range = if (resource == null || resource.kind == StreamResourceKind.PLAYLIST) {
-            null
-        } else {
-            (HttpRange.parse(req.rangeHeader, -1L) as? RangeParseResult.Satisfiable)?.range
-        }
-        val requestRangeHeader = range?.let(::rangeHeader)
-        logger.trace(TAG, "TV fetched HLS ${if (resource == null) "playlist" else "resource"}${requestRangeHeader?.let { " range=$it" } ?: ""}")
-        val response = openHlsUpstream(session, lease, resource, range)
-        if (response == null) {
-            writeStatus(out, 502, "Bad Gateway")
-            logger.w(TAG, "HLS source open failed or returned non-success")
-            return
-        }
         try {
-            val contentType = response.header("Content-Type")
-            if (response.statusCode == 416) {
-                val totalLength = requestRangeHeader?.let {
-                    UpstreamRangeVerifier.unsatisfiedTotal(response.statusCode, response.headers("Content-Range"))
-                }
-                if (totalLength == null) {
-                    writeStatus(out, 502, "Bad Gateway")
-                    logger.w(TAG, "HLS source returned an invalid unsatisfied range")
-                    return
-                }
-                writeHeaders(
-                    out,
-                    HttpResponsePlan.plan(
-                        RangeParseResult.Unsatisfiable(totalLength),
-                        totalLength,
-                        contentType ?: "application/octet-stream",
-                        head,
-                    ),
-                )
-                return
-            }
-            val playlist = resource == null ||
-                resource.kind == StreamResourceKind.PLAYLIST ||
-                looksLikePlaylist(contentType)
-            val responseValid = when {
-                playlist -> range == null && response.statusCode == 200
-                range == null -> response.statusCode == 200 && response.hasValidContentLength()
-                else -> response.hasValidContentLength() && UpstreamRangeVerifier.matchesRequestHeader(
-                    statusCode = response.statusCode,
-                    contentRanges = response.headers("Content-Range"),
-                    contentLength = response.declaredContentLength(),
-                    requestHeader = requireNotNull(requestRangeHeader),
-                )
-            }
-            if (!responseValid) {
-                writeStatus(out, 502, "Bad Gateway")
-                logger.w(TAG, "HLS source did not prove the requested response range")
-                return
-            }
-            if (playlist) {
-                val bodyBytes = BoundedBody.readAtMost(response.body, MAX_PLAYLIST_BYTES)
-                if (bodyBytes == null) {
-                    writeStatus(out, 502, "Bad Gateway")
-                    logger.w(TAG, "HLS playlist exceeded the size cap")
-                    return
-                }
-                val body = bodyBytes.toString(Charsets.UTF_8)
-                val proxyBase = "http://$boundAddress:$boundPort/session/${session.id}"
-                val rewritten = try {
-                    val rewriter = HlsRewriter(proxyBase)
-                    val rawReferences = rewriter.uriReferences(body, registry.capacity)
-                    val resolvedByRaw = LinkedHashMap<String, StreamResourceRef>()
-                    for (uri in rawReferences) {
-                        ensureSessionActive(session)
-                        val nested = lease.resolve(uri, resource).getOrThrow()
-                            ?: throw IllegalArgumentException("Untrusted HLS URI")
-                        resolvedByRaw[uri] = nested
-                        resourceMap[nested.opaqueId] = nested
-                    }
-                    val encodedById = registry.encodeBatch(resolvedByRaw.values.map { it.opaqueId })
-                    delivery.playlist(resource?.opaqueId, body, resolvedByRaw.mapValues { it.value.opaqueId })
-                    rewriter.rewrite(body) { uri ->
-                        encodedById.getValue(resolvedByRaw.getValue(uri).opaqueId)
-                    }
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (error: Exception) {
-                    writeStatus(out, 502, "Bad Gateway")
-                    logger.w(TAG, "Source rejected an HLS resource reference", error)
-                    return
-                }
-                val bytes = rewritten.toByteArray(Charsets.UTF_8)
-                writeSimpleHeaders(out, 200, "OK", "application/vnd.apple.mpegurl", bytes.size.toLong(), false, null)
-                if (!head) {
-                    out.write(bytes)
-                    out.flush()
-                }
+            val range = if (resource == null || resource.kind == StreamResourceKind.PLAYLIST) {
+                null
             } else {
-                val length = response.declaredContentLength()
-                val code = if (range != null) 206 else 200
-                val reason = if (code == 206) "Partial Content" else "OK"
-                writeSimpleHeaders(
-                    out,
-                    code,
-                    reason,
-                    contentType ?: "application/octet-stream",
-                    length,
-                    acceptRanges = true,
-                    extra = response.header("Content-Range")?.let { "Content-Range" to it },
-                )
-                if (!head && copyTo(session, response.body, out, length)) {
-                    ensureSessionActive(session)
-                    noteMediaDelivered(session, resource.opaqueId, range, deliveryEpoch)
+                (HttpRange.parse(req.rangeHeader, -1L) as? RangeParseResult.Satisfiable)?.range
+            }
+            val requestRangeHeader = range?.let(::rangeHeader)
+            logger.trace(TAG, "TV fetched HLS ${if (resource == null) "playlist" else "resource"}${requestRangeHeader?.let { " range=$it" } ?: ""}")
+            val response = openHlsUpstream(session, lease, resource, range)
+            if (response == null) {
+                writeStatus(out, 502, "Bad Gateway")
+                logger.w(TAG, "HLS source open failed or returned non-success")
+                return
+            }
+            try {
+                val contentType = response.header("Content-Type")
+                if (response.statusCode == 416) {
+                    val totalLength = requestRangeHeader?.let {
+                        UpstreamRangeVerifier.unsatisfiedTotal(response.statusCode, response.headers("Content-Range"))
+                    }
+                    if (totalLength == null) {
+                        writeStatus(out, 502, "Bad Gateway")
+                        logger.w(TAG, "HLS source returned an invalid unsatisfied range")
+                        return
+                    }
+                    writeHeaders(
+                        out,
+                        HttpResponsePlan.plan(
+                            RangeParseResult.Unsatisfiable(totalLength),
+                            totalLength,
+                            contentType ?: "application/octet-stream",
+                            head,
+                        ),
+                    )
+                    return
                 }
+                val playlist = resource == null ||
+                    resource.kind == StreamResourceKind.PLAYLIST ||
+                    looksLikePlaylist(contentType)
+                val responseValid = when {
+                    playlist -> range == null && response.statusCode == 200
+                    range == null -> response.statusCode == 200 && response.hasValidContentLength()
+                    else -> response.hasValidContentLength() && UpstreamRangeVerifier.matchesRequestHeader(
+                        statusCode = response.statusCode,
+                        contentRanges = response.headers("Content-Range"),
+                        contentLength = response.declaredContentLength(),
+                        requestHeader = requireNotNull(requestRangeHeader),
+                    )
+                }
+                if (!responseValid) {
+                    writeStatus(out, 502, "Bad Gateway")
+                    logger.w(TAG, "HLS source did not prove the requested response range")
+                    return
+                }
+                if (playlist) {
+                    val bodyBytes = BoundedBody.readAtMost(response.body, MAX_PLAYLIST_BYTES)
+                    if (bodyBytes == null) {
+                        writeStatus(out, 502, "Bad Gateway")
+                        logger.w(TAG, "HLS playlist exceeded the size cap")
+                        return
+                    }
+                    val body = bodyBytes.toString(Charsets.UTF_8)
+                    val proxyBase = "http://$boundAddress:$boundPort/session/${session.id}"
+                    val rewritten = try {
+                        state.rewriteMutex.withLock {
+                            val rewriter = HlsRewriter(proxyBase)
+                            val rawReferences = rewriter.uriReferences(body, registry.capacity)
+                            val resolvedByRaw = LinkedHashMap<String, StreamResourceRef>()
+                            for (uri in rawReferences) {
+                                ensureSessionActive(session)
+                                val nested = lease.resolve(uri, resource).getOrThrow()
+                                    ?: throw IllegalArgumentException("Untrusted HLS URI")
+                                resolvedByRaw[uri] = nested
+                            }
+                            ensureSessionActive(session)
+                            val encodedById = state.retainPlaylist(resource?.opaqueId, resolvedByRaw.values.toSet(), lease)
+                            delivery.playlist(resource?.opaqueId, body, resolvedByRaw.mapValues { it.value.opaqueId })
+                            rewriter.rewrite(body) { uri ->
+                                encodedById.getValue(resolvedByRaw.getValue(uri).opaqueId)
+                            }
+                        }
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (error: Exception) {
+                        writeStatus(out, 502, "Bad Gateway")
+                        logger.w(TAG, "Source rejected an HLS resource reference", error)
+                        return
+                    }
+                    val bytes = rewritten.toByteArray(Charsets.UTF_8)
+                    writeSimpleHeaders(out, 200, "OK", "application/vnd.apple.mpegurl", bytes.size.toLong(), false, null)
+                    if (!head) {
+                        out.write(bytes)
+                        out.flush()
+                    }
+                } else {
+                    val length = response.declaredContentLength()
+                    val code = if (range != null) 206 else 200
+                    val reason = if (code == 206) "Partial Content" else "OK"
+                    writeSimpleHeaders(
+                        out,
+                        code,
+                        reason,
+                        contentType ?: "application/octet-stream",
+                        length,
+                        acceptRanges = true,
+                        extra = response.header("Content-Range")?.let { "Content-Range" to it },
+                    )
+                    if (!head && copyHlsResource(session, lease, requireNotNull(resource), response, out)) {
+                        ensureSessionActive(session)
+                        noteMediaDelivered(session, resource.opaqueId, range, deliveryEpoch)
+                    }
+                }
+            } finally {
+                closeUpstream(session.id, response)
             }
         } finally {
-            closeUpstream(session.id, response)
+            resource?.let(state::unpin)
         }
     }
 
@@ -617,7 +682,7 @@ class LocalProxyServer(
     private fun StreamResponse.headers(name: String): List<String> = listOfNotNull(header(name))
 
     private fun StreamResponse.hasValidContentLength(): Boolean =
-        header("Content-Length")?.toLongOrNull()?.let { it >= 0 } ?: true
+        header("Content-Length")?.let { it.toLongOrNull()?.let { length -> length >= 0 } ?: false } ?: true
 
     private fun StreamResponse.declaredContentLength(): Long? =
         header("Content-Length")?.toLongOrNull()?.takeIf { it >= 0 }
@@ -715,6 +780,104 @@ class LocalProxyServer(
             attempt++
             delay(HLS_OPEN_RETRY_BACKOFF_MS * attempt)
         }
+    }
+
+    /**
+     * Continue a truncated HLS entity only when both its representation identity and exact byte
+     * window can be re-established. Never splice a newly generated segment (or an ignored Range)
+     * onto bytes already sent to the TV. A missing validator/length fails the existing response
+     * honestly; the renderer can then retry the resource as a new response.
+     */
+    private suspend fun copyHlsResource(
+        session: ProxySession,
+        lease: StreamLease,
+        resource: StreamResourceRef,
+        initial: StreamResponse,
+        out: OutputStream,
+    ): Boolean {
+        val initialRange = UpstreamRangeVerifier.verifiedContentRange(
+            initial.statusCode, initial.headers("Content-Range"), initial.declaredContentLength(),
+        )
+        val length = initial.declaredContentLength() ?: initialRange?.let { it.endInclusive - it.start + 1 }
+        val start = initialRange?.start ?: 0L
+        val total = initialRange?.totalLength ?: length
+        val end = length?.let { start + it - 1 }
+        val validator = representationValidator(initial)
+        val buffer = ByteArray(MemoryBufferPolicy.COPY_CHUNK_BYTES)
+        var copied = 0L
+        var attempts = 0
+        var response = initial
+        try {
+            while (true) {
+                ensureSessionActive(session)
+                var failure: IOException? = null
+                try {
+                    while (length == null || copied < length) {
+                        ensureSessionActive(session)
+                        val remaining = length?.minus(copied) ?: Long.MAX_VALUE
+                        val count = response.body.read(buffer, 0, minOf(buffer.size.toLong(), remaining).toInt())
+                        if (count < 0) {
+                            if (length != null && copied < length) throw IOException("HLS body ended before declared length")
+                            break
+                        }
+                        if (count == 0) continue
+                        try {
+                            out.write(buffer, 0, count)
+                            copied += count
+                            // Forward each bounded chunk immediately. Do not hold startup bytes while
+                            // waiting for an upstream retry or for a whole segment to finish.
+                            out.flush()
+                            if (session.id !in transcodeInputs) byteListener?.invoke(count.toLong())
+                        } catch (_: IOException) {
+                            return false // A downstream disconnect must never reconnect upstream.
+                        }
+                    }
+                    return copied > 0
+                } catch (error: IOException) {
+                    failure = error
+                }
+                closeUpstream(session.id, response)
+                ensureSessionActive(session)
+                if (validator == null || total == null || end == null || attempts >= HLS_BODY_MAX_RETRIES) {
+                    throw requireNotNull(failure)
+                }
+                attempts++
+                delay(HLS_OPEN_RETRY_BACKOFF_MS * attempts)
+                ensureSessionActive(session)
+                val requested = ByteRange(start + copied, end)
+                val replacement = openHlsUpstream(session, lease, resource, requested)
+                    ?: throw IOException("HLS body resume open failed", failure)
+                response = replacement
+                val valid = representationValidator(replacement) == validator &&
+                    replacement.header("Content-Encoding").orEmpty().equals(initial.header("Content-Encoding").orEmpty(), true) &&
+                    replacement.hasValidContentLength() &&
+                    UpstreamRangeVerifier.isExact(
+                        replacement.statusCode, replacement.headers("Content-Range"),
+                        replacement.declaredContentLength(), requested, total,
+                    )
+                if (!valid) throw IOException("HLS source changed representation or did not honour resume range")
+            }
+        } finally {
+            if (response !== initial) closeUpstream(session.id, response)
+        }
+    }
+
+    private data class RepresentationValidator(val header: String, val value: String)
+
+    private fun representationValidator(response: StreamResponse): RepresentationValidator? {
+        val etag = response.header("ETag")?.trim()
+        if (etag != null && etag.length >= 2 && etag.first() == '"' && etag.last() == '"' &&
+            etag.substring(1, etag.lastIndex).all { it.code == 0x21 || it.code in 0x23..0x7e || it.code in 0x80..0xff }) {
+            return RepresentationValidator("ETag", etag)
+        }
+        // Use a conservative one-minute Date/Last-Modified margin when inferring a strong timestamp
+        // validator, allowing for clock differences (RFC 9110 section 8.8.2.2).
+        fun date(name: String): Long? = response.header(name)?.let { value ->
+            runCatching { ZonedDateTime.parse(value, DateTimeFormatter.RFC_1123_DATE_TIME).toEpochSecond() }.getOrNull()
+        }
+        val modified = date("Last-Modified") ?: return null
+        val observed = date("Date") ?: return null
+        return if (observed - modified >= 60) RepresentationValidator("Last-Modified", modified.toString()) else null
     }
 
     /** Copy a (segment/key/subtitle) body downstream through the bounded buffer; abort if the TV leaves. */
@@ -1197,6 +1360,7 @@ class LocalProxyServer(
         // HLS segment/playlist upstream open: a couple of quick retries for a fast transient failure (a
         // live transcode segment briefly not ready). Small + short so the TV isn't held waiting; a slow
         // read timeout is not retried (see openHlsUpstream / UpstreamRetry.shouldRetryOpen).
+        private const val HLS_BODY_MAX_RETRIES = 2
         private const val HLS_OPEN_MAX_RETRIES = 2
         private const val HLS_OPEN_RETRY_BACKOFF_MS = 250L
         /** Hard cap on a source HLS playlist read into memory. */

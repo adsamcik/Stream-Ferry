@@ -93,4 +93,27 @@ class HlsSegmentRegistryTest {
         assertEquals(1, batch.size)
         assertEquals("same", r.resolve(batch.getValue("same")))
     }
+    @Test fun siblingPlaylistPinsSurviveBatchEviction() {
+        val registry = HlsSegmentRegistry(maxEntries = 4)
+        val audio = registry.encode("audio")
+        registry.encode("expired")
+        registry.encode("other-expired")
+        val current = registry.encodeBatch(listOf("video-a", "video-b"), setOf("audio"))
+        registry.encodeBatch(listOf("video-c"), setOf("audio", "video-a", "video-b"))
+        assertEquals("audio", registry.resolve(audio))
+        current.forEach { (id, token) -> assertEquals(id, registry.resolve(token)) }
+        assertEquals(setOf("audio", "video-a", "video-b", "video-c"), registry.resources())
+    }
+
+    @Test fun overCapacityPinnedWindowRejectsWithoutExpiringAdvertisedTokens() {
+        val registry = HlsSegmentRegistry(maxEntries = 2)
+        val audio = registry.encode("audio")
+        val video = registry.encode("video")
+        kotlin.test.assertFailsWith<IllegalArgumentException> {
+            registry.encodeBatch(listOf("new"), setOf("audio", "video"))
+        }
+        assertEquals("audio", registry.resolve(audio))
+        assertEquals("video", registry.resolve(video))
+        assertEquals(setOf("audio", "video"), registry.resources())
+    }
 }

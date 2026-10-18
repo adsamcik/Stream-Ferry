@@ -27,6 +27,7 @@ class TranscodeInputProxyTest {
         val proxy = LocalProxyServer(sessions, object : DiagnosticSink {})
         val input = sessions.create("video/mp4", totalLength = 8)
         val source = mockk<StreamLease>()
+        every { source.retainResources(any()) } just Runs
         every { source.descriptor } returns StreamDescriptor("video/mp4", "mp4", isTranscoding = false, isByteSeekable = true, totalLength = 8)
         coEvery { source.open(ByteRange(2, 4)) } answers {
             Result.success(StreamResponse(206, mapOf("Content-Length" to "3", "Content-Range" to "bytes 2-4/8"), ByteArrayInputStream("cde".toByteArray())))
@@ -62,6 +63,7 @@ class TranscodeInputProxyTest {
         val proxy = LocalProxyServer(sessions, object : DiagnosticSink {})
         val input = sessions.create("application/vnd.apple.mpegurl", isHls = true)
         val source = mockk<StreamLease>()
+        every { source.retainResources(any()) } just Runs
         val segment = StreamResourceRef("opaque-resource", StreamResourceKind.MEDIA)
         val sourceReference = "https://private.example/segment.ts?token=secret"
         val playlist = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\n$sourceReference\n#EXT-X-ENDLIST\n"
