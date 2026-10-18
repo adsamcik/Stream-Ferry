@@ -589,7 +589,7 @@ class LocalProxyServer(
                             val resolvedByRaw = LinkedHashMap<String, StreamResourceRef>()
                             for (uri in rawReferences) {
                                 ensureSessionActive(session)
-                                val nested = lease.resolve(uri, resource).getOrThrow()
+                                val nested = (response.playlistResolver?.invoke(uri) ?: lease.resolve(uri, resource)).getOrThrow()
                                     ?: throw IllegalArgumentException("Untrusted HLS URI")
                                 resolvedByRaw[uri] = nested
                             }
@@ -1198,13 +1198,14 @@ class LocalProxyServer(
         val policy = ResilientStreamPolicy(rangeStart, rangeEndInclusive)
         val watchdog = ThroughputWatchdog()
         val buf = ByteArray(MemoryBufferPolicy.COPY_CHUNK_BYTES)
+        val validator = representationValidator(initialResp)
         var response: StreamResponse? = initialResp
         try {
             while (true) {
                 ensureSessionActive(session)
                 if (response == null) {
                     val rangeEnd = policy.rangeEndInclusive
-                    if (!canResume || rangeEnd == null) throw IOException("Upstream transfer ended before completion")
+                    if (!canResume || rangeEnd == null || validator == null) throw IOException("Upstream transfer ended before completion")
                     val requested = ByteRange(policy.nextOffset, rangeEnd)
                     response = try {
                         openVerifiedRangeUpstream(session, lease, requested, expectedTotalLength)
@@ -1219,6 +1220,10 @@ class LocalProxyServer(
                     if (response == null) {
                         logger.w(TAG, "Upstream did not honour the resume range; ending transfer")
                         throw IOException("Upstream did not honour the resume range")
+                    }
+                    if (representationValidator(response) != validator ||
+                        !response.header("Content-Encoding").orEmpty().equals(initialResp.header("Content-Encoding").orEmpty(), true)) {
+                        throw IOException("Upstream changed representation during resume")
                     }
                 }
                 val resp = response
@@ -1240,7 +1245,7 @@ class LocalProxyServer(
                         throw IOException("Upstream throughput stalled")
                     }
                     StreamResult.UPSTREAM_FAILED -> {
-                        if (!canResume || !retryOrGiveUp(policy)) throw IOException("Upstream transfer failed")
+                        if (!canResume || validator == null || !retryOrGiveUp(policy)) throw IOException("Upstream transfer failed")
                     }
                 }
             }

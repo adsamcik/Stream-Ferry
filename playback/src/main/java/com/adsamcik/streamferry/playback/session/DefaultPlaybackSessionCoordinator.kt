@@ -123,22 +123,29 @@ class DefaultPlaybackSessionCoordinator(
         initialPositionSeconds: Long = 0L,
         shouldReport: () -> Boolean = { true },
     ): Pair<ProxySession, String> = mutex.withLock {
-        val hostPort = proxy.start(phoneLanIp)
-        val stream = providerSession.descriptor.stream
-        val session = sessions.create(
-            contentType = stream.contentType,
-            isHls = stream.isHls,
-            totalLength = stream.totalLength,
-        )
-        proxy.registerStreamLease(session.id, providerSession.upstream)
         val reporting = beginReporting(providerSession, initialPositionSeconds, shouldReport)
-        _active.value = session
-        // Server reporting must not delay the renderer load (a slow first request used to add
-        // several seconds here). Preserve Started -> Progress -> Stopped ordering for this token.
-        reportStarted(reporting)
-        val url = "http://$hostPort/session/${session.id}/stream"
-        logger.event("session", "Session started (online); proxy URL issued to TV (redacted)")
-        session to url
+        try {
+            val hostPort = proxy.start(phoneLanIp)
+            val stream = providerSession.descriptor.stream
+            val session = sessions.create(
+                contentType = stream.contentType,
+                isHls = stream.isHls,
+                totalLength = stream.totalLength,
+            )
+            _active.value = session
+            proxy.registerStreamLease(session.id, providerSession.upstream)
+            // Server reporting must not delay the renderer load (a slow first request used to add
+            // several seconds here). Preserve Started -> Progress -> Stopped ordering for this token.
+            reportStarted(reporting)
+            val url = "http://$hostPort/session/${session.id}/stream"
+            logger.event("session", "Session started (online); proxy URL issued to TV (redacted)")
+            session to url
+        } catch (error: Throwable) {
+            // Retain source cleanup ownership even if a disappearing LAN address prevents binding.
+            // No Started job exists on this path, so release the normal stop/report barrier here.
+            reporting.startReported.complete(Unit)
+            throw error
+        }
     }
 
     /**

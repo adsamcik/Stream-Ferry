@@ -279,6 +279,12 @@ class StreamResponse(
     val statusCode: Int,
     val headers: Map<String, String>,
     val body: InputStream,
+    /**
+     * Resolve relative playlist references against this response's final location. Providers with
+     * redirects supply this closure so overlapping playlist responses never share a mutable base;
+     * private upstream locations remain inside the provider. Other sources use [StreamLease.resolve].
+     */
+    val playlistResolver: (suspend (String) -> Result<StreamResourceRef?>)? = null,
 ) : Closeable {
     override fun close() = body.close()
 }

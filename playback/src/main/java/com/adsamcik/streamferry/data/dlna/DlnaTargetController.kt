@@ -122,6 +122,8 @@ class DlnaTargetController(
     @Volatile private var pendingResumeSeek: PendingDlnaResumeSeek? = null
     /** Orders the deferred load-time seek against explicit user/media-session seeks; the newest intent wins. */
     private val seekMutex = Mutex()
+    /** Reject position samples whose request preceded an accepted explicit or deferred seek. */
+    @Volatile private var positionRevision = 0L
     /** Duration of the stream whose URI was most recently accepted by the renderer. */
     @Volatile private var loadedDurationSeconds: Long? = null
     /** Last AVTransport state seen by the poll loop (PLAYING/TRANSITIONING/STOPPED/…), for diagnostics. */
@@ -609,6 +611,7 @@ class DlnaTargetController(
             seekRendererToUnlocked(bounded)
             retainedPositionSeconds = bounded
         }
+        positionRevision++
         Unit
     }
 
@@ -755,6 +758,7 @@ class DlnaTargetController(
                         "The TV did not start the stream. Check its connection and try again."))
                     break
                 }
+                val sampledPositionRevision = positionRevision
                 val position = runCatching { positionSeconds(r) }
                     .onFailure { logger.trace(TAG, "GetPositionInfo failed: ${it.javaClass.simpleName}") }
                     .getOrNull()
@@ -788,6 +792,7 @@ class DlnaTargetController(
                                         if (pendingResumeSeek === pendingResume) {
                                             pendingResumeSeek = null
                                             retainedPositionSeconds = target
+                                            positionRevision++
                                             // The position read above predates this seek. Do not emit it and make the
                                             // phone briefly claim resume restarted at zero; the next poll confirms it.
                                             suppressPreSeekPosition = true
@@ -822,20 +827,25 @@ class DlnaTargetController(
                     emitPollEvent(pollToken, PlaybackTargetEvent.BufferingChanged(state == "TRANSITIONING"))
                 }
                 if (state != null && !suppressPreSeekPosition) {
-                    val pendingPosition = pendingResumeSeek?.positionSeconds
-                    val confirmed = position != null && pendingPosition == null
-                    if (position != null && pendingPosition == null) {
-                        furthestPositionSeconds = maxOf(furthestPositionSeconds, position)
-                        pollSessionGate.commit(pollToken) { retainedPositionSeconds = position }
+                    seekMutex.withLock {
+                        val pendingPosition = pendingResumeSeek?.positionSeconds
+                        val currentPosition = position.takeIf { sampledPositionRevision == positionRevision }
+                        val confirmed = currentPosition != null && pendingPosition == null
+                        if (currentPosition != null && pendingPosition == null) {
+                            pollSessionGate.commit(pollToken) {
+                                furthestPositionSeconds = maxOf(furthestPositionSeconds, currentPosition)
+                                retainedPositionSeconds = currentPosition
+                            }
+                        }
+                        emitPollEvent(
+                            pollToken,
+                            PlaybackTargetEvent.StatusChanged(
+                                pendingPosition ?: currentPosition ?: retainedPositionSeconds,
+                                isPlaying = state == "PLAYING",
+                                isPositionConfirmed = confirmed,
+                            ),
+                        )
                     }
-                    emitPollEvent(
-                        pollToken,
-                        PlaybackTargetEvent.StatusChanged(
-                            pendingPosition ?: position ?: retainedPositionSeconds,
-                            isPlaying = state == "PLAYING",
-                            isPositionConfirmed = confirmed,
-                        ),
-                    )
                 }
                 if (state == "PLAYING" || state == "TRANSITIONING") everPlayed = true
                 val terminalOutcome = DlnaTerminalStatePolicy.classify(

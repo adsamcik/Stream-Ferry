@@ -234,6 +234,8 @@ sealed interface PlaybackTargetEvent {
     data object Ended : PlaybackTargetEvent
     /** The renderer stopped before a credible natural completion; close without watched/autoplay effects. */
     data object Stopped : PlaybackTargetEvent
+    /** The active receiver explicitly cancelled playback; terminal even before playback first starts. */
+    data object Cancelled : PlaybackTargetEvent
     data object Disconnected : PlaybackTargetEvent
 }
 

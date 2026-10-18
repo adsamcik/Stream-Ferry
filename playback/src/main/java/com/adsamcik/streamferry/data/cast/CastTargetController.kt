@@ -814,7 +814,7 @@ class CastTargetController(
                     MediaStatus.IDLE_REASON_FINISHED -> _events.tryEmit(PlaybackTargetEvent.Ended)
                     // A STOP from the TV or another sender ends the current media too. App-owned
                     // reloads invalidate this load's callbacks before stopping the previous stream.
-                    MediaStatus.IDLE_REASON_CANCELED -> _events.tryEmit(PlaybackTargetEvent.Stopped)
+                    MediaStatus.IDLE_REASON_CANCELED -> _events.tryEmit(PlaybackTargetEvent.Cancelled)
                     // There is no detailed error code in an IDLE/ERROR status. It could be an unsupported
                     // source, but it could just as easily be a proxy/network/receiver failure; only an
                     // explicit SDK decode/source-not-supported error is qualified format evidence.

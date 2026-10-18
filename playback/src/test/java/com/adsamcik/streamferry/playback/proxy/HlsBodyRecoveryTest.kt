@@ -18,11 +18,13 @@ class HlsBodyRecoveryTest {
     private class Source : StreamLease {
         override val descriptor = StreamDescriptor("application/vnd.apple.mpegurl", "hls", isTranscoding = false, isByteSeekable = false, totalLength = null)
         @Volatile var playlist = "#EXTM3U\n#EXTINF:10,\nsegment.ts\n#EXT-X-ENDLIST\n"
+        @Volatile var playlistResolver: (suspend (String) -> Result<StreamResourceRef?>)? = null
         @Volatile var body: suspend (StreamResourceRef, ByteRange?) -> StreamResponse = { _, _ -> response("allmedia") }
         val ranges = CopyOnWriteArrayList<ByteRange?>()
         val retained = CopyOnWriteArrayList<Set<StreamResourceRef>>()
         override suspend fun open(range: ByteRange?) = Result.success(StreamResponse(
             200, mapOf("Content-Type" to "application/vnd.apple.mpegurl"), ByteArrayInputStream(playlist.toByteArray()),
+            playlistResolver = playlistResolver,
         ))
         override suspend fun resolve(playlistReference: String, fromPlaylist: StreamResourceRef?) = Result.success(
             StreamResourceRef(playlistReference, if (playlistReference.endsWith(".m3u8")) StreamResourceKind.PLAYLIST else StreamResourceKind.MEDIA),
@@ -58,6 +60,35 @@ class HlsBodyRecoveryTest {
         fun fetch(query: String = "", range: String? = null): String = socket(query, range).use { it.getInputStream().readBytes().decodeToString() }
         fun segment(): String = token(fetch())
         override fun close() { proxy.stop() }
+    }
+
+    @Test fun `gateway uses response bound root and nested playlist resolution`() {
+        Fixture().use { fixture ->
+            val variant = StreamResourceRef("root/variant.m3u8", StreamResourceKind.PLAYLIST)
+            val segment = StreamResourceRef("nested/segment.ts", StreamResourceKind.MEDIA)
+            fixture.source.playlist = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\nvariant.m3u8\n"
+            fixture.source.playlistResolver = { reference ->
+                assertEquals("variant.m3u8", reference)
+                Result.success(variant)
+            }
+            fixture.source.body = { resource, _ ->
+                when (resource) {
+                    variant -> StreamResponse(
+                        200, mapOf("Content-Type" to "application/vnd.apple.mpegurl"),
+                        ByteArrayInputStream("#EXTM3U\n#EXTINF:10,\nsegment.ts\n#EXT-X-ENDLIST\n".toByteArray()),
+                        playlistResolver = { reference ->
+                            assertEquals("segment.ts", reference)
+                            Result.success(segment)
+                        },
+                    )
+                    segment -> response("allmedia")
+                    else -> error("Used the shared playlist base instead of the response: $resource")
+                }
+            }
+            val nested = fixture.fetch("?seg=${token(fixture.fetch())}")
+            assertTrue(fixture.fetch("?seg=${token(nested)}").endsWith("allmedia"))
+            assertTrue(fixture.source.retained.last().containsAll(setOf(variant, segment)))
+        }
     }
 
     @Test fun `truncated segment key and subtitle bodies resume with stable strong validators`() {

@@ -39,7 +39,7 @@ class LocalProxyCancellationTest {
 
     private fun lease(body: InputStream): StreamLease = mockk<StreamLease>().also { lease ->
         every { lease.descriptor } returns StreamDescriptor("video/mp4", "mp4", isTranscoding = false, isByteSeekable = true, totalLength = 8)
-        coEvery { lease.open(range = any()) } returns Result.success(StreamResponse(200, mapOf("Content-Length" to "8"), body))
+        coEvery { lease.open(range = any()) } returns Result.success(StreamResponse(200, mapOf("Content-Length" to "8", "ETag" to "\"same\""), body))
     }
 
     private fun request(address: String, id: String, query: String = "", method: String = "GET"): Socket = Socket("127.0.0.1", address.substringAfter(':').toInt()).apply {
@@ -100,7 +100,7 @@ class LocalProxyCancellationTest {
         val session = sessions.create("video/mp4", totalLength = 8)
         val source = lease(ByteArrayInputStream("part".toByteArray()))
         coEvery { source.open(range = match { it.start == 4L && it.endInclusive == 7L }) } returns
-            Result.success(StreamResponse(206, mapOf("Content-Length" to "4", "Content-Range" to "bytes 4-7/8"), ByteArrayInputStream("rest".toByteArray())))
+            Result.success(StreamResponse(206, mapOf("Content-Length" to "4", "Content-Range" to "bytes 4-7/8", "ETag" to "\"same\""), ByteArrayInputStream("rest".toByteArray())))
         proxy.registerStreamLease(session.id, source)
         try {
             request(proxy.start("127.0.0.1"), session.id).use {
@@ -124,6 +124,69 @@ class LocalProxyCancellationTest {
             assertTrue(log.finished.await(2, TimeUnit.SECONDS))
             assertTrue(log.outcomes.single().contains("clean=false outcome=upstream_failed"))
             coVerify(exactly = 1) { source.open(range = any()) }
+        } finally { proxy.stop() }
+    }
+
+    @Test fun `progressive resume never splices a changed or unproven representation`() {
+        val stable = mapOf("ETag" to "\"same\"")
+        val modified = mapOf("Last-Modified" to "Wed, 21 Oct 2015 07:28:00 GMT", "Date" to "Wed, 21 Oct 2015 07:30:00 GMT")
+        val cases = listOf(
+            stable to mapOf("ETag" to "\"changed\""),
+            stable to emptyMap(),
+            stable to (stable + ("Content-Encoding" to "gzip")),
+            emptyMap<String, String>() to emptyMap(),
+            mapOf("ETag" to "W/\"same\"") to mapOf("ETag" to "W/\"same\""),
+            modified to (modified + ("Last-Modified" to "Wed, 21 Oct 2015 07:29:00 GMT")),
+        )
+        for ((initial, replacement) in cases) {
+            val sessions = SessionRegistry()
+            val log = Log()
+            val proxy = LocalProxyServer(sessions, log)
+            val session = sessions.create("video/mp4", totalLength = 8)
+            val source = lease(ByteArrayInputStream(byteArrayOf()))
+            coEvery { source.open(range = any()) } answers { Result.success(StreamResponse(
+                200, mapOf("Content-Length" to "8") + initial, ByteArrayInputStream("part".toByteArray()),
+            )) }
+            coEvery { source.open(range = match { it.start == 4L && it.endInclusive == 7L }) } answers {
+                Result.success(StreamResponse(206,
+                    mapOf("Content-Length" to "4", "Content-Range" to "bytes 4-7/8") + replacement,
+                    ByteArrayInputStream("WRNG".toByteArray()),
+                ))
+            }
+            val callbacks = CopyOnWriteArrayList<Boolean>()
+            proxy.onDownstreamClosed = { _, _, clean -> callbacks += clean }
+            proxy.registerStreamLease(session.id, source)
+            try {
+                val body = request(proxy.start("127.0.0.1"), session.id).use {
+                    it.getInputStream().readBytes().decodeToString().substringAfter("\r\n\r\n")
+                }
+                assertEquals("part", body, "$initial -> $replacement")
+                assertTrue(log.finished.await(2, TimeUnit.SECONDS))
+                assertTrue(log.outcomes.single().contains("clean=false outcome=upstream_failed"))
+                assertTrue(callbacks.isEmpty(), "An upstream identity failure must not become a codec rejection")
+            } finally { proxy.stop() }
+        }
+    }
+
+    @Test fun `progressive resume accepts a stable strong last modified validator`() {
+        val sessions = SessionRegistry()
+        val proxy = LocalProxyServer(sessions, Log())
+        val session = sessions.create("video/mp4", totalLength = 8)
+        val validator = mapOf("Last-Modified" to "Wed, 21 Oct 2015 07:28:00 GMT", "Date" to "Wed, 21 Oct 2015 07:30:00 GMT")
+        val source = lease(ByteArrayInputStream(byteArrayOf()))
+        coEvery { source.open(range = any()) } answers { Result.success(StreamResponse(
+            200, mapOf("Content-Length" to "8") + validator, ByteArrayInputStream("part".toByteArray()),
+        )) }
+        coEvery { source.open(range = match { it.start == 4L && it.endInclusive == 7L }) } answers {
+            Result.success(StreamResponse(206,
+                mapOf("Content-Length" to "4", "Content-Range" to "bytes 4-7/8") + validator,
+                ByteArrayInputStream("rest".toByteArray()),
+            ))
+        }
+        proxy.registerStreamLease(session.id, source)
+        try {
+            val result = request(proxy.start("127.0.0.1"), session.id).use { it.getInputStream().readBytes().decodeToString() }
+            assertEquals("partrest", result.substringAfter("\r\n\r\n"))
         } finally { proxy.stop() }
     }
 

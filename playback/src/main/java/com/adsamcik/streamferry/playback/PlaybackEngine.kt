@@ -301,6 +301,8 @@ class PlaybackEngine(
     // Only changed while holding the command mutex. Ingress advances the sequence before waiting.
     private var streamPreparationRequest = 0L
     @Volatile private var startupWasInterrupted = false
+    private var preparationLanAddress: String? = null
+    private class PreparationLanChanged : CancellationException("The phone LAN address changed during preparation")
     private class StreamStartupSuperseded : CancellationException("A newer playback command replaced startup")
     // The probed source format of a LOCAL file (online sources use the provider descriptor), for the same UI.
     @Volatile private var localSourceProfile: MediaProfile? = null
@@ -426,7 +428,24 @@ class PlaybackEngine(
 
     /** Repair the phone media URL even when the TV control channel remains connected. */
     suspend fun onLanAddressChanged() = withContext(dispatcher) {
+        // Startup owns the command lock. Retire work using the old address before waiting;
+        // prepareStream restarts it with the same selections and latest playback intent.
+        val address = runCatching { networkInfo.lanIpv4() }.getOrNull()
+        synchronized(preparationLock) {
+            if (preparationLanAddress != null && address != preparationLanAddress) {
+                transcodePreparationJob?.cancel(PreparationLanChanged())
+            }
+        }
         mutex.withLock { checkLanAddressLocked() }
+    }
+
+    private fun requireCurrentPreparationAddress(address: String) {
+        if (networkInfo.lanIpv4() != address) throw PreparationLanChanged()
+    }
+
+    private fun recheckPreparationAddressAfterFailure() {
+        val address = synchronized(preparationLock) { preparationLanAddress }
+        if (address != null) requireCurrentPreparationAddress(address)
     }
 
     private fun checkLanAddressLocked() {
@@ -1000,29 +1019,57 @@ class PlaybackEngine(
             synchronized(preparationLock) { preparationReceiverLoaded = false }
             return block()
         }
-        return coroutineScope {
-            val request = streamPreparationRequest
-            val preparation = async(dispatcher, start = CoroutineStart.LAZY) { block() }
-            synchronized(preparationLock) {
-                transcodePreparationJob = preparation
-                preparationReceiverLoaded = false
-                if (request != streamChangeSequence.get()) preparation.cancel(StreamStartupSuperseded())
-            }
+        val request = streamPreparationRequest
+        var lanRestarts = 0
+        while (true) {
             try {
-                preparation.await().also {
-                    if (request == streamChangeSequence.get()) startupWasInterrupted = false
-                }
-            } catch (error: Throwable) {
-                releaseStreamingTranscode()
-                throw error
-            } finally {
-                synchronized(preparationLock) {
-                    if (transcodePreparationJob === preparation) {
-                        transcodePreparationJob = null
-                        preparationReceiverLoaded = false
+                return coroutineScope {
+                    val preparation = synchronized(preparationLock) {
+                        // Preserve selections applied by superseded queued commands. Their successor
+                        // must load them even when it requests an equal value.
+                        if (request != streamChangeSequence.get()) {
+                            startupWasInterrupted = true
+                            throw StreamStartupSuperseded()
+                        }
+                        async(dispatcher, start = CoroutineStart.LAZY) { block() }.also {
+                            preparationLanAddress = networkInfo.lanIpv4()
+                            transcodePreparationJob = it
+                            preparationReceiverLoaded = false
+                        }
+                    }
+                    try {
+                        preparation.await().also {
+                            synchronized(preparationLock) {
+                                if (request == streamChangeSequence.get()) startupWasInterrupted = false
+                            }
+                        }
+                    } catch (error: Throwable) {
+                        releaseStreamingTranscode()
+                        throw error
+                    } finally {
+                        synchronized(preparationLock) {
+                            if (transcodePreparationJob === preparation) {
+                                transcodePreparationJob = null
+                                preparationLanAddress = null
+                                preparationReceiverLoaded = false
+                            }
+                        }
+                        preparation.cancel()
                     }
                 }
-                preparation.cancel()
+            } catch (changed: PreparationLanChanged) {
+                currentCoroutineContext().ensureActive()
+                if (request != streamChangeSequence.get()) throw StreamStartupSuperseded()
+                // A moving network must not loop indefinitely or consume format attempts.
+                if (lanRestarts++ >= 1 || networkInfo.lanIpv4() == null) {
+                    throw PlaybackTargetException(PlaybackFailureKind.NETWORK,
+                        "The phone's network changed during playback startup. Check Wi-Fi and try again.")
+                }
+                startupWatchdogJob?.cancel()
+                runCatching { target?.prepareReload() }
+                coordinator.stop("LAN changed during preparation")
+                streamLanAddress = null
+                logger.event("playback", "Restarting stream preparation on the phone's new LAN address")
             }
         }
     }
@@ -1418,6 +1465,7 @@ class PlaybackEngine(
             lastNote = "Transcoding on device"
         } else {
             url = preparePlaybackSource("Couldn't start the local media gateway.") {
+                requireCurrentPreparationAddress(phoneIp)
                 coordinator.startLocalAndBuildUrl(params.filePath, params.contentType, phoneIp).second
             }
             // Advertise DLNA byte seeking for plain files and for SAF/MediaStore descriptors only after
@@ -1457,6 +1505,7 @@ class PlaybackEngine(
         // Arm before load as well as after it: Cast can synchronously deliver an initial position callback
         // while the load result is being awaited, and that pre-position status must not snap resume to zero.
         val rendererStart = if (transcodeTarget != null) 0L else boundedStartPos
+        requireCurrentPreparationAddress(phoneIp)
         streamLanAddress = phoneIp
         gatewayWasUnavailable = false
         armRendererResumeVerification(rendererStart)
@@ -1551,11 +1600,14 @@ class PlaybackEngine(
             streamingTranscode = session
             // Readiness means the first short fragment/packets, never completion of the source.
             session.awaitReady()
+            requireCurrentPreparationAddress(phoneIp)
             return coordinator.startClientTranscodeAndBuildUrl(session, phoneIp).second to
                 if (hls) RendererStream("application/vnd.apple.mpegurl", HlsSegmentFormat.FMP4)
                 else RendererStream("video/mp2t", isByteSeekable = false)
         } catch (error: Throwable) {
             releaseStreamingTranscode()
+            // A bind can race the last address check before the network callback arrives.
+            if (error !is CancellationException) recheckPreparationAddressAfterFailure()
             throw error
         }
     }
@@ -1733,7 +1785,7 @@ class PlaybackEngine(
             localAudioTracks.firstOrNull { it.index == selected }?.unsupportedReason?.let { throw PlaybackPreparationException(it) }
             if (audioSelection == selected && !startupWasInterrupted) return@withStreamChange
             reloadSelectionTransaction(audioSelection, selected, { audioSelection = it }) {
-                reloadOutput(absolutePositionSeconds, "audio track change", localPlayWhenReady)
+                reloadOutput(recoveryPositionSeconds(), "audio track change", localPlayWhenReady)
             }
         }
     }
@@ -1747,15 +1799,15 @@ class PlaybackEngine(
         require(index == null || mediaSubtitleTracks.any { it.index == index }) { "That subtitle track is no longer available." }
         localSubtitleTracks.firstOrNull { it.index == index }?.unsupportedReason?.let { throw PlaybackPreparationException(it) }
         subtitleSelectionExplicit = true
-        if (subtitleSelection == index) return
+        if (subtitleSelection == index && !startupWasInterrupted) return
         withStreamChange {
             if (localPlayback == null && currentProviderSession == null) return@withStreamChange
             require(index == null || mediaSubtitleTracks.any { it.index == index }) { "That subtitle track is no longer available." }
             localSubtitleTracks.firstOrNull { it.index == index }?.unsupportedReason?.let { throw PlaybackPreparationException(it) }
-            if (subtitleSelection == index) return@withStreamChange
+            if (subtitleSelection == index && !startupWasInterrupted) return@withStreamChange
             logger.event("playback", "Subtitle -> ${index?.let { "track $it (burned in)" } ?: "off"}; re-resolving")
             reloadSelectionTransaction(subtitleSelection, index, { subtitleSelection = it }) {
-                reloadOutput(absolutePositionSeconds, "subtitle change", localPlayWhenReady)
+                reloadOutput(recoveryPositionSeconds(), "subtitle change", localPlayWhenReady)
             }
         }
     }
@@ -1778,7 +1830,7 @@ class PlaybackEngine(
             mediaSubtitleTracks = mediaSubtitleTracks + MediaTrack(track.index, track.language, track.label)
             subtitleSelectionExplicit = true
             reloadSelectionTransaction(subtitleSelection, track.index, { subtitleSelection = it }) {
-                reloadOutput(absolutePositionSeconds, "subtitle file", localPlayWhenReady)
+                reloadOutput(recoveryPositionSeconds(), "subtitle file", localPlayWhenReady)
             }
         }
     }
@@ -1815,7 +1867,7 @@ class PlaybackEngine(
             // An override must re-resolve even when the selected rung matches the current displayed rate:
             // direct play can have that rate without the source having applied the requested output cap.
             try {
-                reloadStream(absolutePositionSeconds, requestedBitrate = target, reason = "manual quality override")
+                reloadStream(recoveryPositionSeconds(), requestedBitrate = target, reason = "manual quality override")
             } catch (failure: Throwable) {
                 manualQuality = wasManual
                 manualQualityBitrateBps = previousManualBitrate
@@ -1860,7 +1912,7 @@ class PlaybackEngine(
         val previousCodec = forcedLocalCodec
         val previousHeight = manualMaxVideoHeight
         val previousFallbacks = localCodecFallbacksTried.toSet()
-        val pos = absolutePositionSeconds
+        val pos = recoveryPositionSeconds()
         val playWhenReady = localPlayWhenReady
         localTranscodeMode = mode
         automaticPhoneTranscode = false
@@ -1923,7 +1975,7 @@ class PlaybackEngine(
             val label = height?.let { "${it}p" } ?: "Auto"
             lastNote = "Resolution -> $label; reloading stream…"
             logger.event("quality", "Resolution override -> $label; forcing server transcode=${height != null}")
-            val pos = absolutePositionSeconds
+            val pos = recoveryPositionSeconds()
             streamStartSeconds = pos
             reportedPositionSeconds = 0
             publishStatus()
@@ -1992,7 +2044,7 @@ class PlaybackEngine(
 
     /** Re-resolve the current online stream at the current absolute position (used by track changes). */
     private suspend fun reloadStreamPreservingPosition(reason: String) {
-        val pos = absolutePositionSeconds
+        val pos = recoveryPositionSeconds()
         // Optimistically hold the position so a transient status from the torn-down stream can't flash it
         // back to 0 while the new (likely transcoded) stream loads.
         streamStartSeconds = pos
@@ -2156,9 +2208,9 @@ class PlaybackEngine(
         block()
     } catch (e: CancellationException) {
         throw e
-    } catch (e: PlaybackPreparationException) {
-        throw e
     } catch (e: Exception) {
+        recheckPreparationAddressAfterFailure()
+        if (e is PlaybackPreparationException) throw e
         throw PlaybackPreparationException(message, e)
     }
 
@@ -2521,6 +2573,14 @@ class PlaybackEngine(
             isByteSeekable = stream.isByteSeekable,
         )
         val url = preparePlaybackSource("Couldn't establish the phone-hosted media gateway.") {
+            try {
+                currentCoroutineContext().ensureActive()
+                requireCurrentPreparationAddress(phoneIp)
+            } catch (cancelled: CancellationException) {
+                // The coordinator has not taken ownership of this freshly prepared source yet.
+                withContext(NonCancellable) { runCatching { providerSession.close(PlaybackStopReason.REPLACED) } }
+                throw cancelled
+            }
             if (phoneTarget != null) {
                 val input = coordinator.prepareTranscodeInput(providerSession, phoneIp, positionSeconds,
                     shouldReport = watchStatePolicy.current.let { session -> { session?.automatic != false } })
@@ -2570,6 +2630,7 @@ class PlaybackEngine(
         )
         val attemptGeneration = recoverySession.generation
         pendingRecoveryKind = null
+        requireCurrentPreparationAddress(phoneIp)
         streamLanAddress = phoneIp
         gatewayWasUnavailable = false
         armRendererResumeVerification(loadStart)
@@ -2905,7 +2966,8 @@ class PlaybackEngine(
         val localFallbackTo: VideoCodec? = synchronized(recoveryLock) {
             if (kind != PlaybackFailureKind.FORMAT || terminalFailureSurfaced || isReloadingStream || playbackStarted)
                 return@synchronized null
-            if (localTranscodeMode == LocalTranscodeMode.ON_DEVICE && forcedLocalCodec != null) return@synchronized null
+            if (forcedLocalCodec != null && (localTranscodeMode == LocalTranscodeMode.ON_DEVICE || preferredCodec != null))
+                return@synchronized null
             // Snapshot the volatile once: stopInternalLocked (under mutex, not recoveryLock) can null it out
             // between a separate check and a !! deref, which — on the unjoined watchdog path — would NPE.
             val odt = onDeviceTranscodeTarget ?: return@synchronized null
@@ -3071,7 +3133,7 @@ class PlaybackEngine(
 
     private suspend fun switchBitrate(decision: AdaptiveBitrateController.Decision.ChangeBitrate) {
         if (item == null || target == null) return
-        val position = absolutePositionSeconds
+        val position = recoveryPositionSeconds()
         logger.event("adaptive", "Bitrate ${decision.direction} -> ${decision.newBitrateBps / 1000} kbps: ${decision.reason}")
         reloadStream(position, requestedBitrate = decision.newBitrateBps, reason = "bitrate switch")
         adaptive?.noteApplied(decision.newIndex, clock())
@@ -3301,7 +3363,7 @@ class PlaybackEngine(
             logger.w(TAG, "Ignoring event from a replaced playback controller")
             return
         }
-        if (recoverySession.phase == PlaybackPhase.FAILED) {
+        if (recoverySession.phase == PlaybackPhase.FAILED && event !is PlaybackTargetEvent.Cancelled) {
             logger.trace(TAG, "Ignoring renderer event after terminal playback failure")
             return
         }
@@ -3360,7 +3422,11 @@ class PlaybackEngine(
                         )
                     }
                     maybeAutoSkip()
-                } else updateProgressEstimate()
+                } else {
+                    updateProgressEstimate()
+                    // A transport pause is authoritative even when the TV cannot report RelTime.
+                    if (!event.isPlaying) holdProgressEstimate()
+                }
                 observePlaybackHealth(event.isPositionConfirmed)
                 publishStatus()
             }
@@ -3464,6 +3530,26 @@ class PlaybackEngine(
                         scope.launch { stopIfCurrent(gen, "end of media") }
                     }
                 }
+            }
+            is PlaybackTargetEvent.Cancelled -> {
+                // Cast identifies explicit cancellation separately from startup STOPPED ambiguity.
+                // Latch before asynchronous teardown so queued status/recovery cannot revive it.
+                completedGeneration = playGeneration
+                startupWatchdogJob?.cancel()
+                cancelPendingUnknownFailure()
+                fallbackJob?.cancel()
+                transcodePreparationJob?.cancel(CancellationException("The TV stopped playback"))
+                releaseStreamingTranscode()
+                updateProgressEstimate()
+                holdProgressEstimate()
+                isPlaying = false
+                localPlayWhenReady = false
+                isBuffering = false
+                recoverySession = recoverySession.transition(PlaybackPhase.STOPPED)
+                rendererPlaybackRevision.incrementAndGet()
+                publishStatus()
+                val gen = playGeneration
+                scope.launch { stopIfCurrent(gen, "renderer cancelled playback") }
             }
             is PlaybackTargetEvent.Stopped -> {
                 if (isReloadingStream) return

@@ -169,7 +169,7 @@ class CastProgressTest {
         cachedIdleReason = MediaStatus.IDLE_REASON_CANCELED
         previousCallback.onStatusUpdated()
         runCurrent()
-        assertEquals(1, events.count { it is PlaybackTargetEvent.Stopped })
+        assertEquals(1, events.count { it is PlaybackTargetEvent.Cancelled })
 
         controller.prepareReload()
         events.clear()
@@ -184,12 +184,27 @@ class CastProgressTest {
         cachedState = MediaStatus.PLAYER_STATE_PAUSED
         currentCallback.onStatusUpdated()
         assertFalse(latestPosition().isPlaying)
-        assertTrue(events.none { it is PlaybackTargetEvent.Stopped })
+        assertTrue(events.none { it is PlaybackTargetEvent.Cancelled })
         previousCallback.onStatusUpdated()
-        assertTrue(events.none { it is PlaybackTargetEvent.Stopped })
+        assertTrue(events.none { it is PlaybackTargetEvent.Cancelled })
         cachedState = MediaStatus.PLAYER_STATE_IDLE
         currentCallback.onStatusUpdated()
-        assertEquals(1, events.count { it is PlaybackTargetEvent.Stopped })
+        assertEquals(1, events.count { it is PlaybackTargetEvent.Cancelled })
+    }
+
+    @Test fun `TV cancellation is authoritative before either playing or paused replacement starts`() = progressTest {
+        startPlaying()
+        for (playWhenReady in listOf(true, false)) {
+            controller.prepareReload()
+            val url = "http://phone/new/$playWhenReady/video"
+            controller.load(url, RendererStream("video/mp4"), "Movie", 400, 100, playWhenReady)
+            events.clear()
+            cachedMediaUrl = url
+            cachedState = MediaStatus.PLAYER_STATE_IDLE
+            cachedIdleReason = MediaStatus.IDLE_REASON_CANCELED
+            mediaCallback.captured.onStatusUpdated()
+            assertEquals(listOf<PlaybackTargetEvent>(PlaybackTargetEvent.Cancelled), events)
+        }
     }
 
     @Test fun `first heartbeat after deep sleep reconciles a stale estimate with TV progress`() = progressTest {

@@ -11,6 +11,7 @@ import com.adsamcik.streamferry.source.api.DiagnosticSink
 import io.mockk.every
 import io.mockk.mockk
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
@@ -28,10 +29,13 @@ import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import okio.Buffer
 import java.io.IOException
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertIs
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -144,10 +148,12 @@ class DlnaTargetControllerControlTest {
             assertTrue(fixture.events.isNotEmpty())
             // The IO control can finish after a scheduled poll; repeated authoritative polls are valid.
             fixture.events.chunked(2).forEach { events ->
-                assertEquals(
-                    listOf(PlaybackTargetEvent.BufferingChanged(false), PlaybackTargetEvent.StatusChanged(42, true)),
-                    events,
-                )
+                assertEquals(2, events.size)
+                assertEquals(PlaybackTargetEvent.BufferingChanged(false), events[0])
+                // A pre-seek position sample can be unconfirmed while its transport state stays valid.
+                val status = assertIs<PlaybackTargetEvent.StatusChanged>(events[1])
+                assertEquals(42L, status.positionSeconds)
+                assertTrue(status.isPlaying)
             }
         } finally {
             fixture.controller.disconnect()
@@ -408,11 +414,51 @@ class DlnaTargetControllerControlTest {
         } finally { fixture.controller.disconnect() }
     }
 
+    @Test
+    fun `delayed position poll cannot overwrite a newer seek when later positions are unavailable`() = runTest {
+        val fixture = pollingFixture()
+        val responseReady = CompletableDeferred<Unit>()
+        val releaseResponse = CountDownLatch(1)
+        try {
+            fixture.beforePositionResponse = {
+                responseReady.complete(Unit)
+                check(releaseResponse.await(10, TimeUnit.SECONDS)) { "Timed out releasing position response" }
+            }
+            fixture.controller.seekTo(42)
+            advanceTimeBy(351)
+            runCurrent()
+            responseReady.await()
+            fixture.controller.seekTo(47)
+            fixture.positionReply = "<RelTime>NOT_IMPLEMENTED</RelTime>"
+            val retainedStatus = async(UnconfinedTestDispatcher(testScheduler)) {
+                fixture.controller.events.first {
+                    it is PlaybackTargetEvent.StatusChanged && !it.isPositionConfirmed
+                } as PlaybackTargetEvent.StatusChanged
+            }
+            releaseResponse.countDown()
+            assertEquals(47L, retainedStatus.await().positionSeconds)
+            // Missing position support on later polls must retain the accepted scrub too.
+            val subsequentStatus = async(UnconfinedTestDispatcher(testScheduler)) {
+                fixture.controller.events.first { it is PlaybackTargetEvent.StatusChanged } as PlaybackTargetEvent.StatusChanged
+            }
+            advanceTimeBy(2_001)
+            runCurrent()
+            val status = subsequentStatus.await()
+            assertEquals(47L, status.positionSeconds)
+            assertFalse(status.isPositionConfirmed)
+            assertTrue(status.isPlaying)
+        } finally {
+            releaseResponse.countDown()
+            fixture.controller.disconnect()
+        }
+    }
+
     private class PollingFixture(val controller: DlnaTargetController) {
         var transportState: String? = "PLAYING"
         var transportStatus = "OK"
         var positionSeconds = 42L
         var positionReply: String? = null
+        @Volatile var beforePositionResponse: (() -> Unit)? = null
         var failedSeeksRemaining = 0
         var playCommands = 0
         var playStartsPlayback = true
@@ -445,7 +491,11 @@ class DlnaTargetControllerControlTest {
                 action == "GetTransportInfo" -> fixture.transportState?.let {
                     "<CurrentTransportState>$it</CurrentTransportState><CurrentTransportStatus>${fixture.transportStatus}</CurrentTransportStatus>"
                 } ?: "<CurrentTransportStatus>${fixture.transportStatus}</CurrentTransportStatus>"
-                action == "GetPositionInfo" -> fixture.positionReply ?: "<RelTime>${DidlLite.formatDuration(fixture.positionSeconds)}</RelTime>"
+                action == "GetPositionInfo" -> {
+                    val reply = fixture.positionReply ?: "<RelTime>${DidlLite.formatDuration(fixture.positionSeconds)}</RelTime>"
+                    fixture.beforePositionResponse?.also { fixture.beforePositionResponse = null }?.invoke()
+                    reply
+                }
                 action == "SetAVTransportURI" && fixture.setUriFaultCode != null ->
                     "<upnp:errorCode>${fixture.setUriFaultCode}</upnp:errorCode>"
                 action == "Play" -> {

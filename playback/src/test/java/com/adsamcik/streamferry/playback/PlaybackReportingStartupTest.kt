@@ -14,6 +14,32 @@ import kotlin.test.*
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class PlaybackReportingStartupTest {
+    @Test fun `direct file and HLS bind failures close source exactly once without reporting started or blocking stop`() = runTest {
+        val streams = listOf(
+            StreamDescriptor("video/mp4", "mp4", isTranscoding = false, isByteSeekable = true, totalLength = 8),
+            StreamDescriptor("application/vnd.apple.mpegurl", "hls", HlsSegmentFormat.FMP4,
+                isTranscoding = false, isByteSeekable = false, totalLength = null),
+        )
+        for (stream in streams) {
+            val proxy = mockk<LocalProxyServer>(relaxed = true)
+            every { proxy.start(any()) } throws java.net.BindException("LAN address disappeared")
+            val source = mockk<ProviderPlaybackSession>(relaxed = true)
+            every { source.descriptor.stream } returns stream
+            val coordinator = DefaultPlaybackSessionCoordinator(
+                SessionRegistry(), proxy, mockk(relaxed = true), StandardTestDispatcher(testScheduler),
+            )
+            assertFailsWith<java.net.BindException> { coordinator.startAndBuildUrl(source, "10.0.1.81", 123) }
+            withTimeout(1_000) { coordinator.stop("network startup failed") }
+            coordinator.stop("already stopped")
+            runCurrent()
+            coVerify(exactly = 0) { source.report(any<PlaybackEvent.Started>()) }
+            coVerify(exactly = 1) { source.close(PlaybackStopReason.ERROR) }
+            verify(exactly = 0) { proxy.registerStreamLease(any(), any(), any()) }
+            assertNull(coordinator.active.value)
+            assertNull(coordinator.activeReportToken())
+        }
+    }
+
     @Test fun `remote transcode keeps source reports and revokes both input and progressive output`() = runTest {
         val sessions = SessionRegistry()
         val proxy = mockk<LocalProxyServer>(relaxed = true)

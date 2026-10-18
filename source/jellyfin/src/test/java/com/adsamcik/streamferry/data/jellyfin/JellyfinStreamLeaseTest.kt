@@ -27,6 +27,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -119,6 +120,41 @@ class JellyfinStreamLeaseTest {
         fixture.lease.retainResources(emptySet())
         repeat(3) { fixture.lease.resolve("replacement$it.ts").getOrThrow() }
         assertTrue(fixture.lease.resolve("segment.ts", playlist).isFailure)
+    }
+
+    @Test fun `overlapping root and nested playlist responses keep their own redirect bases`() = runTest {
+        for (nested in listOf(false, true)) {
+            val fixture = Fixture()
+            val playlist = if (nested) fixture.lease.resolve("variant.m3u8").getOrThrow()!! else null
+            val responses = listOf("a", "b").map { directory ->
+                val opening = async {
+                    if (playlist == null) fixture.lease.open() else fixture.lease.open(playlist)
+                }
+                runCurrent()
+                fixture.calls.last().respond(ClosingBody(), 302, "/$directory/playlist.m3u8")
+                runCurrent()
+                fixture.calls.last().respond(ClosingBody())
+                opening.await().getOrThrow()
+            }
+            try {
+                // Both responses remain open. Resolve the older one only after the newer open has
+                // completed, exactly as concurrent gateway requests reading/re-writing bodies can do.
+                for ((index, directory) in listOf("a", "b").withIndex()) {
+                    val resolver = assertNotNull(responses[index].playlistResolver)
+                    val segment = resolver("segment.ts").getOrThrow()!!
+                    assertEquals(fixture.lease.resolve("https://example.test/$directory/segment.ts").getOrThrow(), segment)
+                    assertEquals(segment, resolver("./segment.ts").getOrThrow())
+                    assertEquals(null, resolver("https://other.test/segment.ts").getOrThrow())
+                    val opening = async { fixture.lease.open(segment) }
+                    runCurrent()
+                    assertEquals("https://example.test/$directory/segment.ts", fixture.calls.last().request.url.toString())
+                    fixture.calls.last().respond(ClosingBody())
+                    opening.await().getOrThrow().close()
+                }
+            } finally {
+                responses.forEach { it.close() }
+            }
+        }
     }
 
     @Test fun `cancelling a header wait cancels the upstream call promptly`() = runTest {

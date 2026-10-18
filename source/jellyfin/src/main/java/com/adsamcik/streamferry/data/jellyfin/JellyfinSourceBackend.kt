@@ -487,6 +487,10 @@ internal class JellyfinStreamLease(
             if (fromPlaylist == null) rootPlaylistBase
             else requireNotNull(resources[fromPlaylist.opaqueId]) { "Unknown stream playlist" }.playlistBase
         }
+        resolveAt(playlistReference, base).getOrThrow()
+    }
+
+    private fun resolveAt(playlistReference: String, base: HttpUrl): Result<StreamResourceRef?> = runCatching {
         val resolved = origin.resolve(playlistReference, base)?.newBuilder()?.fragment(null)?.build()
             ?: return@runCatching null
         // Salted lease-local identities deduplicate equivalent references without exposing private
@@ -551,6 +555,7 @@ internal class JellyfinStreamLease(
                 val response = streamClient.newCall(request).awaitHeaders()
                 if (!response.isRedirect) {
                     try {
+                        val responseBase = target
                         if (response.isSuccessful) synchronized(resourceLock) {
                             // Relative HLS references belong to the final response URL. Keep aliases
                             // inside their bounded resource entry rather than accumulating redirect URLs.
@@ -565,6 +570,7 @@ internal class JellyfinStreamLease(
                                 response.header(name)?.let { value -> name to value }
                             }.toMap(),
                             body = response.body.byteStream(),
+                            playlistResolver = { reference -> resolveAt(reference, responseBase) },
                         ))
                     } catch (error: Throwable) {
                         response.close()

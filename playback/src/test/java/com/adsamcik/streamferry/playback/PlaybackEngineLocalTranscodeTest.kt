@@ -2670,6 +2670,255 @@ class PlaybackEngineLocalTranscodeTest {
         }
     }
 
+
+    @Test fun `manual output audio and subtitle changes retain newer delivery checkpoint for every source and protocol`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) for (choice in listOf("resolution", "audio", "subtitle")) {
+            val f = Fixture(this, protocol, trackResume = true)
+            f.enableLanguageChoices()
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectAudioTrack(1); runCurrent()
+                f.engine.attachSubtitle("content://subtitles/42"); runCurrent()
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE)
+                f.engine.selectPreferredCodec("hevc")
+                f.engine.selectMaxVideoHeight(480); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(0, true)); runCurrent()
+                f.sleepMillis = 60_000
+                advanceTimeBy(5000); runCurrent()
+                f.deliver(0, 100_000)
+                f.events.emit(PlaybackTargetEvent.StatusChanged(1, true, isPositionConfirmed = false)); runCurrent()
+                f.engine.pause(); runCurrent()
+                val before = assertNotNull(f.engine.status.value)
+                assertTrue(before.recoveryPositionSeconds > before.positionSeconds + 30)
+                when (choice) {
+                    "resolution" -> f.engine.selectMaxVideoHeight(720)
+                    "audio" -> f.engine.selectAudioTrack(2)
+                    else -> f.engine.selectSubtitleTrack(null)
+                }
+                runCurrent()
+                val after = assertNotNull(f.engine.status.value)
+                assertEquals(before.recoveryPositionSeconds, after.positionSeconds, "$source/$protocol/$choice")
+                assertFalse(f.loads.last().playWhenReady)
+                assertEquals(if (choice == "audio") 2 else before.currentAudioIndex, after.currentAudioIndex)
+                assertEquals(if (choice == "subtitle") null else before.currentSubtitleIndex, after.currentSubtitleIndex)
+                assertEquals(if (choice == "resolution") 720 else 480, after.maxVideoHeight)
+                assertEquals(before.preferredVideoCodec, after.preferredVideoCodec)
+                assertEquals(before.localTranscodeMode, after.localTranscodeMode)
+            } finally { f.engine.stop(); runCurrent(); clearAllMocks(answers = false) }
+        }
+    }
+
+    @Test fun `duplicate selections queued behind another command load the selected media for every source and protocol`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) for (choice in listOf("resolution", "audio", "subtitle")) {
+            val f = Fixture(this, protocol)
+            f.enableLanguageChoices()
+            val gate = CompletableDeferred<Unit>()
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectAudioTrack(1); runCurrent()
+                f.engine.attachSubtitle("content://subtitles/42"); runCurrent()
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE)
+                f.engine.selectPreferredCodec("hevc")
+                f.engine.selectMaxVideoHeight(480); runCurrent()
+                f.engine.seekTo(200); runCurrent()
+                f.engine.pause(); runCurrent()
+                val before = assertNotNull(f.engine.status.value)
+                val count = f.loads.size
+                coEvery { f.target.setVolume(any()) } coAnswers { gate.await() }
+                val volume = launch { f.engine.setVolume(.2f) }; runCurrent()
+                suspend fun choose() {
+                    when (choice) {
+                        "resolution" -> f.engine.selectMaxVideoHeight(720)
+                        "audio" -> f.engine.selectAudioTrack(2)
+                        else -> f.engine.selectSubtitleTrack(null)
+                    }
+                }
+                val first = launch { choose() }
+                val second = launch { choose() }
+                runCurrent()
+                gate.complete(Unit); runCurrent()
+                volume.join(); first.join(); second.join()
+                assertEquals(count + 1, f.loads.size, "$source/$protocol/$choice must load one replacement")
+                val after = assertNotNull(f.engine.status.value)
+                assertEquals(200L, after.positionSeconds)
+                assertFalse(f.loads.last().playWhenReady)
+                assertEquals(if (choice == "audio") 2 else before.currentAudioIndex, after.currentAudioIndex)
+                assertEquals(if (choice == "subtitle") null else before.currentSubtitleIndex, after.currentSubtitleIndex)
+                assertEquals(if (choice == "resolution") 720 else 480, after.maxVideoHeight)
+                assertEquals(before.preferredVideoCodec, after.preferredVideoCodec)
+            } finally { gate.complete(Unit); runCurrent(); f.engine.stop(); runCurrent(); clearAllMocks(answers = false) }
+        }
+    }
+
+    @Test fun `automatic phone fallback keeps explicit provider codec after receiver rejection on both protocols`() = runTest {
+        for (protocol in Protocol.entries) for (source in listOf(SourceCase.PROVIDER_FILE, SourceCase.PROVIDER_HLS)) {
+            val f = Fixture(this, protocol)
+            f.enableLanguageChoices()
+            f.providerSubtitleTracks = listOf(com.adsamcik.streamferry.source.api.MediaTrack(TrackRef("version:sub"), "ces", "Czech captions"))
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectAudioTrack(1); runCurrent()
+                f.engine.selectSubtitleTrack(0); runCurrent()
+                f.engine.selectPreferredCodec("hevc")
+                f.engine.selectMaxVideoHeight(480); runCurrent()
+                f.engine.seekTo(200); runCurrent()
+                f.engine.pause(); runCurrent()
+                var rejected = false
+                coEvery { f.provider.prepare(any()) } answers {
+                    f.requests += firstArg<PlaybackRequest>()
+                    if (!rejected) { rejected = true; Result.failure(IllegalArgumentException("Server cannot convert")) }
+                    else Result.success(f.providerSession)
+                }
+                f.engine.selectMaxVideoHeight(720); runCurrent()
+                val before = assertNotNull(f.engine.status.value)
+                assertEquals("On-device transcode", before.streamMode)
+                assertEquals(LocalTranscodeMode.AUTOMATIC, before.localTranscodeMode)
+                f.events.emit(PlaybackTargetEvent.Error(PlaybackFailureKind.FORMAT, "Receiver rejected HEVC", true)); runCurrent()
+                val after = assertNotNull(f.engine.status.value)
+                assertEquals("hevc", after.preferredVideoCodec, "$source/$protocol changed the explicit codec")
+                assertEquals(before.currentAudioIndex, after.currentAudioIndex)
+                assertEquals(before.currentSubtitleIndex, after.currentSubtitleIndex)
+                assertEquals(before.recoveryPositionSeconds, after.recoveryPositionSeconds)
+                assertFalse(after.playWhenReady)
+                assertEquals(before.localTranscodeMode, after.localTranscodeMode)
+            } finally { f.engine.stop(); runCurrent(); clearAllMocks(answers = false) }
+        }
+    }
+
+    @Test fun `unconfirmed DLNA remote pause freezes retained progress for every source`() = runTest {
+        for (source in SourceCase.entries) {
+            val f = Fixture(this, Protocol.DLNA, trackResume = true)
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(0, true)); runCurrent()
+                advanceTimeBy(5000); runCurrent()
+                f.deliver(0, 100_000)
+                f.events.emit(PlaybackTargetEvent.StatusChanged(0, false, isPositionConfirmed = false)); runCurrent()
+                val paused = assertNotNull(f.engine.status.value)
+                assertFalse(paused.playWhenReady)
+                advanceTimeBy(25_000); runCurrent()
+                val after = assertNotNull(f.engine.status.value)
+                assertEquals(paused.recoveryPositionSeconds, after.recoveryPositionSeconds, source.name)
+                assertFalse(after.playWhenReady)
+            } finally { f.engine.stop(); runCurrent(); clearAllMocks(answers = false) }
+        }
+    }
+
+    @Test fun `authoritative Cast cancellation before playing ends autoplay and paused startup for every source`() = runTest {
+        for (source in SourceCase.entries) for (paused in listOf(false, true)) {
+            val f = Fixture(this, Protocol.CAST)
+            try {
+                f.startSource(source); runCurrent()
+                if (paused) { f.engine.pause(); runCurrent() }
+                val count = f.loads.size
+                f.events.emit(PlaybackTargetEvent.Cancelled); runCurrent()
+                assertNull(f.engine.status.value, "$source/$paused kept a cancelled Cast session")
+                advanceTimeBy(15_000); runCurrent()
+                assertEquals(count, f.loads.size, "$source/$paused restarted cancelled playback")
+                assertEquals(0, f.engine.recoverySnapshot().usage.automaticAttempts)
+            } finally { f.engine.stop(); runCurrent(); clearAllMocks(answers = false) }
+        }
+    }
+
+    @Test fun `LAN change during encoder startup retries current address and preserves requested choices for every source and protocol`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) for (paused in listOf(false, true)) {
+            val f = Fixture(this, protocol)
+            f.enableLanguageChoices()
+            val ready = CompletableDeferred<Unit>()
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectAudioTrack(1); runCurrent()
+                f.engine.attachSubtitle("content://subtitles/42"); runCurrent()
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE)
+                f.engine.selectPreferredCodec("hevc")
+                f.engine.selectMaxVideoHeight(480); runCurrent()
+                f.engine.seekTo(200); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(0, true)); runCurrent()
+                if (paused) { f.engine.pause(); runCurrent() }
+                val before = assertNotNull(f.engine.status.value)
+                coEvery { f.coordinator.startClientTranscodeAndBuildUrl(any(), any()) } coAnswers {
+                    if (secondArg<String>() != f.phoneIp) throw java.net.BindException("Address no longer assigned")
+                    assertNotNull(f.coordinator.active.value) to TRANSCODE_URL
+                }
+                coEvery { anyConstructed<StreamingTranscodeSession>().awaitReady() } coAnswers { ready.await() }
+                val output = async { f.engine.selectMaxVideoHeight(720) }; runCurrent()
+                assertFalse(output.isCompleted)
+                f.phoneIp = "127.0.0.2"
+                val changed = launch { f.engine.onLanAddressChanged() }; runCurrent()
+                ready.complete(Unit); runCurrent(); output.await(); changed.join()
+                val after = assertNotNull(f.engine.status.value)
+                assertEquals(720, after.maxVideoHeight, "$source/$protocol/$paused rolled back requested output")
+                assertEquals(before.recoveryPositionSeconds, after.positionSeconds)
+                assertEquals(before.currentAudioIndex, after.currentAudioIndex)
+                assertEquals(before.currentSubtitleIndex, after.currentSubtitleIndex)
+                assertEquals(before.preferredVideoCodec, after.preferredVideoCodec)
+                assertEquals(before.localTranscodeMode, after.localTranscodeMode)
+                assertEquals(!paused, f.loads.last().playWhenReady)
+                assertEquals(0, f.engine.recoverySnapshot().usage.compatibilityOrQualityVariants)
+                assertFalse(after.isTerminal)
+                coVerify { f.coordinator.startClientTranscodeAndBuildUrl(any(), "127.0.0.2") }
+            } finally {
+                ready.complete(Unit); runCurrent(); f.engine.stop(); runCurrent()
+                coEvery { anyConstructed<StreamingTranscodeSession>().awaitReady() } returns Unit
+                clearAllMocks(answers = false)
+            }
+        }
+    }
+
+
+    @Test fun `LAN bind race retries current address without callback and preserves choices for every source and protocol`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) {
+            val f = Fixture(this, protocol)
+            f.enableLanguageChoices()
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectAudioTrack(1); runCurrent()
+                f.engine.attachSubtitle("content://subtitles/42"); runCurrent()
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE)
+                f.engine.selectPreferredCodec("hevc")
+                f.engine.selectMaxVideoHeight(480); runCurrent()
+                f.engine.seekTo(200); runCurrent()
+                f.engine.pause(); runCurrent()
+                val before = assertNotNull(f.engine.status.value)
+                var raced = false
+                val bindAddresses = mutableListOf<String>()
+                fun bind(address: String) {
+                    bindAddresses += address
+                    if (!raced) {
+                        raced = true
+                        f.phoneIp = "127.0.0.2"
+                        throw java.net.BindException("Address disappeared between validation and bind")
+                    }
+                    if (address != f.phoneIp) throw java.net.BindException("Address no longer assigned")
+                }
+                if (source in listOf(SourceCase.PROVIDER_FILE, SourceCase.PROVIDER_HLS)) {
+                    coEvery { f.coordinator.prepareTranscodeInput(any(), any(), any(), any()) } coAnswers {
+                        bind(secondArg())
+                        INPUT_URL
+                    }
+                } else {
+                    coEvery { f.coordinator.startClientTranscodeAndBuildUrl(any(), any()) } coAnswers {
+                        bind(secondArg())
+                        assertNotNull(f.coordinator.active.value) to TRANSCODE_URL
+                    }
+                }
+                f.engine.selectMaxVideoHeight(720); runCurrent()
+                val after = assertNotNull(f.engine.status.value)
+                assertEquals(listOf("127.0.0.1", "127.0.0.2"), bindAddresses, "$source/$protocol must retry the bind on the new address")
+                assertEquals(720, after.maxVideoHeight)
+                assertEquals(before.recoveryPositionSeconds, after.positionSeconds)
+                assertFalse(f.loads.last().playWhenReady)
+                assertEquals(before.currentAudioIndex, after.currentAudioIndex)
+                assertEquals(before.currentSubtitleIndex, after.currentSubtitleIndex)
+                assertEquals(before.preferredVideoCodec, after.preferredVideoCodec)
+                assertEquals(before.localTranscodeMode, after.localTranscodeMode)
+                assertEquals(0, f.engine.recoverySnapshot().usage.compatibilityOrQualityVariants)
+                assertFalse(after.isTerminal)
+            } finally { f.engine.stop(); runCurrent(); clearAllMocks(answers = false) }
+        }
+    }
+
     private companion object {
         const val ORIGINAL_URL = "http://127.0.0.1/session/test/stream"
         const val TRANSCODE_URL = "http://127.0.0.1/session/test/transcode.m3u8"
