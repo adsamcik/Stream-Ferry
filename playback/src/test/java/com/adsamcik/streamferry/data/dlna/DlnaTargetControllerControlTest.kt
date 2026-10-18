@@ -511,6 +511,67 @@ class DlnaTargetControllerControlTest {
         }
     }
 
+    @Test
+    fun `confirmed TV remote backward seek resets completion evidence during playing and pause`() = runTest {
+        // All DLNA sources share this renderer timeline; no local Seek command is issued here.
+        for (state in listOf("PLAYING", "PAUSED_PLAYBACK")) {
+            val fixture = pollingFixture(initialPosition = 119)
+            try {
+                if (state == "PAUSED_PLAYBACK") {
+                    // A receiver may briefly reset its clock while applying a remote seek.
+                    fixture.transportState = "TRANSITIONING"
+                    fixture.positionSeconds = 0
+                    val transition = async(UnconfinedTestDispatcher(testScheduler)) {
+                        fixture.controller.events.first {
+                            it is PlaybackTargetEvent.StatusChanged && it.isPositionConfirmed && it.positionSeconds == 0L
+                        }
+                    }
+                    transition.await()
+                }
+                fixture.transportState = state
+                fixture.positionSeconds = 10
+                val remoteSeekStatus = async(UnconfinedTestDispatcher(testScheduler)) {
+                    fixture.controller.events.first {
+                        it is PlaybackTargetEvent.StatusChanged && it.isPositionConfirmed &&
+                            it.positionSeconds == 10L && it.isPlaying == (state == "PLAYING")
+                    }
+                }
+                remoteSeekStatus.await()
+                assertTrue(fixture.seekTargets.isEmpty(), "The TV remote seek must not use the app's local revision")
+                fixture.transportState = "STOPPED"
+                fixture.positionSeconds = 0
+                val terminal = async(UnconfinedTestDispatcher(testScheduler)) {
+                    fixture.controller.events.first { it is PlaybackTargetEvent.Ended || it is PlaybackTargetEvent.Stopped }
+                }
+                assertIs<PlaybackTargetEvent.Stopped>(terminal.await())
+            } finally { fixture.controller.disconnect() }
+        }
+    }
+
+    @Test
+    fun `stopped and transitioning position resets preserve genuine near-end completion`() = runTest {
+        for (intermediateTransition in listOf(false, true)) {
+            val fixture = pollingFixture(initialPosition = 119)
+            try {
+                fixture.positionSeconds = 0
+                if (intermediateTransition) {
+                    fixture.transportState = "TRANSITIONING"
+                    val buffering = async(UnconfinedTestDispatcher(testScheduler)) {
+                        fixture.controller.events.first {
+                            it is PlaybackTargetEvent.StatusChanged && it.isPositionConfirmed && it.positionSeconds == 0L
+                        }
+                    }
+                    buffering.await()
+                }
+                fixture.transportState = "STOPPED"
+                val terminal = async(UnconfinedTestDispatcher(testScheduler)) {
+                    fixture.controller.events.first { it is PlaybackTargetEvent.Ended || it is PlaybackTargetEvent.Stopped }
+                }
+                assertIs<PlaybackTargetEvent.Ended>(terminal.await())
+            } finally { fixture.controller.disconnect() }
+        }
+    }
+
     private class PollingFixture(val controller: DlnaTargetController) {
         var transportState: String? = "PLAYING"
         var transportStatus = "OK"

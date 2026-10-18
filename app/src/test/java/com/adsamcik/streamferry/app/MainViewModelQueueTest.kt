@@ -279,6 +279,67 @@ class MainViewModelQueueTest {
         assertNull(vm.state.value.playbackStartingTargetId)
     }
 
+    @Test fun `same endpoint recovery resumes its own retry after phone LAN returns without another status event`() = runTest {
+        val engine = container.playbackEngine
+        val statuses = MutableStateFlow<PlaybackStatus?>(null)
+        every { engine.status } returns statuses
+        every { container.permissions.hasLocalNetworkAccess() } returns true
+        every { container.localMediaSource.mimeTypeFor(any()) } returns "video/mp4"
+        coEvery { container.jellyfinMediaSource.item(any()) } returns Result.failure(IllegalStateException("No details"))
+        every { engine.recoverySnapshot() } returns PlaybackRecoverySession(phase = PlaybackPhase.BUFFERING)
+        var phoneIp: String? = "10.0.1.2"
+        every { container.networkInfo.lanIpv4() } answers { phoneIp }
+        val paused = statusesForRetry(Protocol.DLNA).copy(currentAudioIndex = 1, currentSubtitleIndex = 4)
+        coEvery { engine.playLocal(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()) } coAnswers {
+            arg<() -> Unit>(10).invoke()
+            statuses.value = paused
+        }
+        var retryCalls = 0
+        coEvery { engine.retrySameEndpointAfterDisconnect(any()) } coAnswers {
+            retryCalls++
+            if (retryCalls == 1) {
+                phoneIp = null
+                statuses.value = paused.copy(
+                    connectionLost = true, networkRecoveryDeferred = true,
+                    phase = PlaybackPhase.BUFFERING, isBuffering = true,
+                )
+                false
+            } else {
+                statuses.value = paused
+                true
+            }
+        }
+        val vm = create()
+        vm.onItemClicked(local)
+        val dlna = DiscoveredTarget("tv", "TV", Protocol.DLNA, TargetCapabilities(Protocol.DLNA), null)
+        vm.selectPhysicalTv(PhysicalTv("tv", "TV", dlnaEndpoint = dlna))
+        assertEquals(PlaybackPhase.PAUSED, vm.state.value.playback?.phase)
+        statuses.value = paused.copy(connectionLost = true)
+        advanceTimeBy(2_000); runCurrent()
+        assertEquals(1, retryCalls)
+        advanceTimeBy(2_000); runCurrent()
+        assertEquals(1, retryCalls, "A phone-offline reconnect must wait without another endpoint attempt")
+        verify(exactly = 0) { engine.reserveAlternateProtocolContinuation(any(), any(), any(), any(), any(), any()) }
+
+        // Only connectivity changes. The deferred engine status remains identical until retry succeeds.
+        phoneIp = "10.0.1.3"
+        advanceTimeBy(500); runCurrent()
+
+        assertEquals(2, retryCalls, "The active recovery owner must retry without a fresh disconnected status")
+        coVerify(exactly = 2) { engine.retrySameEndpointAfterDisconnect(dlna) }
+        coVerify(exactly = 1) { engine.playLocal(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()) }
+        verify(exactly = 0) { engine.reserveAlternateProtocolContinuation(any(), any(), any(), any(), any(), any()) }
+        val recovered = assertNotNull(vm.state.value.playback)
+        assertEquals(PlaybackPhase.PAUSED, recovered.phase)
+        assertFalse(recovered.reconnecting)
+        assertFalse(recovered.playWhenReady)
+        assertEquals(125L, recovered.positionSeconds)
+        assertEquals(1, recovered.currentAudioIndex)
+        assertEquals(4, recovered.currentSubtitleIndex)
+        assertEquals("hevc", recovered.preferredVideoCodec)
+        assertEquals(480, recovered.maxVideoHeight)
+    }
+
     @Test fun `cancelling the playback caller during discovery clears the picker without starting a stream`() = runTest {
         val playbackEngine = container.playbackEngine
         every { container.permissions.hasLocalNetworkAccess() } returns true

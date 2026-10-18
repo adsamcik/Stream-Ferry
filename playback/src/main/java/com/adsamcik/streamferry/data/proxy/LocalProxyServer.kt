@@ -325,7 +325,7 @@ class LocalProxyServer(
                     if (s.isActive && !stopping) logger.w(TAG, "Relay socket unavailable", error)
                 } finally {
                     runCatching { client.close() }
-                    activeClients.remove(client)
+                    synchronized(lifecycleLock) { activeClients.remove(client) }
                     connectionLimiter.release(ip)
                 }
             }

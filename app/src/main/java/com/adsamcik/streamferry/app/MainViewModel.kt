@@ -3674,6 +3674,15 @@ class MainViewModel(
         initialCause = status.attemptHistory.lastOrNull()?.failureCause,
     )
 
+    /** Keep discovery and protocol budgets dormant while the phone cannot reach its LAN. */
+    private suspend fun awaitPlaybackLan(generation: Long): Boolean {
+        while (container.networkInfo.lanIpv4() == null) {
+            if (generation != reconnectGeneration || !container.permissions.hasLocalNetworkAccess()) return false
+            delay(500)
+        }
+        return generation == reconnectGeneration
+    }
+
     private fun startBoundedDeviceRecovery(
         retrySameEndpoint: Boolean,
         initialStage: PlaybackFailureStage? = null,
@@ -3702,50 +3711,58 @@ class MainViewModel(
                     )
                 }
                 if (retrySameEndpoint) {
-                    container.logger.event("playback", "Connection lost; waiting for the TV to reappear")
-                    delay(RECONNECT_DELAY_MS)
-                    if (generation != reconnectGeneration) return@launch
-                    val rediscovered = if (PhysicalTvReconnectPolicy.hasStableIdentity(
-                            originalContext.physicalTv,
-                            originalContext.endpoint,
-                        )
-                    ) {
-                        rediscoverPhysicalTvAfterRestart(originalContext, generation)
-                    } else {
-                        container.logger.w(
-                            "playback",
-                            "TV endpoint has no stable identity; restart rediscovery cannot safely auto-select it",
-                        )
-                        null
-                    }
-                    if (generation != reconnectGeneration) return@launch
-                    val sameProtocolEndpoint = if (rediscovered != null) {
-                        recoveryContext = originalContext.withPhysicalTv(rediscovered.physicalTv)
-                        reconnectContext = recoveryContext
-                        rediscovered.sameProtocolEndpoint
-                    } else {
-                        // Preserve the old one-shot behavior when identity is unavailable or discovery
-                        // timed out. It can still work when the reboot retained its route/address.
-                        originalContext.endpoint
-                    }
-                    if (sameProtocolEndpoint != null) {
-                        recoveryContext = recoveryContext.withEndpoint(sameProtocolEndpoint)
-                        reconnectContext = recoveryContext
-                        _state.update { current ->
-                            current.copy(
-                                selectedPhysicalTv = recoveryContext.physicalTv,
-                                selectedTarget = sameProtocolEndpoint,
+                    while (true) {
+                        container.logger.event("playback", "Connection lost; waiting for the TV to reappear")
+                        delay(RECONNECT_DELAY_MS)
+                        if (generation != reconnectGeneration || !awaitPlaybackLan(generation)) return@launch
+                        val rediscovered = if (PhysicalTvReconnectPolicy.hasStableIdentity(
+                                originalContext.physicalTv,
+                                originalContext.endpoint,
                             )
+                        ) {
+                            rediscoverPhysicalTvAfterRestart(originalContext, generation)
+                        } else {
+                            container.logger.w(
+                                "playback",
+                                "TV endpoint has no stable identity; restart rediscovery cannot safely auto-select it",
+                            )
+                            null
                         }
-                    }
-                    if (sameProtocolEndpoint != null &&
-                        container.playbackEngine.retrySameEndpointAfterDisconnect(sameProtocolEndpoint)
-                    ) {
-                        container.logger.event("playback", "Reconnected and resumed on the same endpoint")
-                        return@launch
+                        if (generation != reconnectGeneration) return@launch
+                        val sameProtocolEndpoint = if (rediscovered != null) {
+                            recoveryContext = originalContext.withPhysicalTv(rediscovered.physicalTv)
+                            reconnectContext = recoveryContext
+                            rediscovered.sameProtocolEndpoint
+                        } else {
+                            // Preserve the old one-shot behavior when identity is unavailable or discovery
+                            // timed out. It can still work when the reboot retained its route/address.
+                            originalContext.endpoint
+                        }
+                        if (sameProtocolEndpoint != null) {
+                            recoveryContext = recoveryContext.withEndpoint(sameProtocolEndpoint)
+                            reconnectContext = recoveryContext
+                            _state.update { current ->
+                                current.copy(
+                                    selectedPhysicalTv = recoveryContext.physicalTv,
+                                    selectedTarget = sameProtocolEndpoint,
+                                )
+                            }
+                        }
+                        if (sameProtocolEndpoint != null &&
+                            container.playbackEngine.retrySameEndpointAfterDisconnect(sameProtocolEndpoint)
+                        ) {
+                            container.logger.event("playback", "Reconnected and resumed on the same endpoint")
+                            return@launch
+                        }
+                        // Keep this owner alive across phone-offline work. Rediscover afresh once LAN
+                        // returns, rather than falling back or waiting for another disconnected event.
+                        if (container.playbackEngine.status.value?.networkRecoveryDeferred == true &&
+                            container.playbackEngine.recoverySnapshot().phase != PlaybackPhase.FAILED
+                        ) continue
+                        break
                     }
                 }
-                if (generation != reconnectGeneration) return@launch
+                if (generation != reconnectGeneration || !awaitPlaybackLan(generation)) return@launch
                 val latest = container.playbackEngine.recoverySnapshot().attempts.lastOrNull()
                 val switched = tryAlternateProtocol(
                     recoveryContext,

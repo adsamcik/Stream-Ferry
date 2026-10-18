@@ -871,7 +871,13 @@ class DlnaTargetController(
                             val confirmed = currentPosition != null && pendingPosition == null
                             if (currentPosition != null && pendingPosition == null) {
                                 pollSessionGate.commit(pollToken) {
-                                    furthestPositionSeconds = maxOf(furthestPositionSeconds, currentPosition)
+                                    // TV remotes and other control points can seek without a local revision.
+                                    // Only a confirmed active/paused sample proves a new timeline: STOPPED
+                                    // commonly resets RelTime to zero even after normal end-of-media.
+                                    val remoteBackwardSeek = currentPosition < furthestPositionSeconds &&
+                                        (state == "PLAYING" || state == "PAUSED_PLAYBACK")
+                                    furthestPositionSeconds = if (remoteBackwardSeek) currentPosition
+                                        else maxOf(furthestPositionSeconds, currentPosition)
                                     retainedPositionSeconds = currentPosition
                                 }
                             }

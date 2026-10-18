@@ -139,6 +139,7 @@ data class PlaybackStatus(
     val isTerminal: Boolean = false,
     /** True when an active session's renderer connection dropped unexpectedly (drives auto-reconnect). */
     val connectionLost: Boolean = false,
+    val networkRecoveryDeferred: Boolean = false,
     /** Selectable audio tracks for the current media (empty for local/offline or single-track sources). */
     val audioTracks: List<MediaTrack> = emptyList(),
     /** Selectable subtitle tracks for the current media. */
@@ -302,6 +303,7 @@ class PlaybackEngine(
     private var streamPreparationRequest = 0L
     @Volatile private var startupWasInterrupted = false
     private var preparationLanAddress: String? = null
+    private var preparationLanNetwork: android.net.Network? = null
     private class PreparationLanChanged : CancellationException("The phone LAN address changed during preparation")
     private class StreamStartupSuperseded : CancellationException("A newer playback command replaced startup")
     // The probed source format of a LOCAL file (online sources use the provider descriptor), for the same UI.
@@ -335,6 +337,7 @@ class PlaybackEngine(
     @Volatile private var isPlaying = false
     @Volatile private var isBuffering = false
     private val rendererPlaybackRevision = java.util.concurrent.atomic.AtomicLong(0L)
+    private val confirmedPositionRevision = AtomicLong()
     private val rendererVolumeRevision = java.util.concurrent.atomic.AtomicLong(0L)
     // After a seek we optimistically show the target position; a status poll that was already in flight when
     // the seek was issued (esp. DLNA, which polls the renderer) can report the OLD position and snap the
@@ -373,7 +376,9 @@ class PlaybackEngine(
     private val disconnectRevision = AtomicLong()
     private val playbackHealth = PlaybackHealthTracker()
     @Volatile private var streamLanAddress: String? = null
+    private var streamLanNetwork: android.net.Network? = null
     private var gatewayWasUnavailable = false
+    private var endpointReconnectAfterLanReturn = false
     @Volatile private var controlErrorMessage: String? = null
     @Volatile private var lastThroughputBps = 0L
     @Volatile private var lastNote = "Measuring link speed…"
@@ -433,15 +438,43 @@ class PlaybackEngine(
         // prepareStream restarts it with the same selections and latest playback intent.
         val address = runCatching { networkInfo.lanIpv4() }.getOrNull()
         synchronized(preparationLock) {
-            if (preparationLanAddress != null && address != preparationLanAddress) {
+            if (preparationLanAddress != null &&
+                (address != preparationLanAddress || dlnaNetworkChanged(preparationLanNetwork))
+            ) {
                 transcodePreparationJob?.cancel(PreparationLanChanged())
             }
         }
         mutex.withLock { checkLanAddressLocked() }
     }
 
+    private fun currentLanNetwork(): android.net.Network? = runCatching { networkInfo.lanNetwork() }.getOrNull()
+
+    private fun dlnaNetworkChanged(previous: android.net.Network?): Boolean =
+        selectedTarget?.protocol == Protocol.DLNA && previous != null && previous != currentLanNetwork()
+
     private fun requireCurrentPreparationAddress(address: String) {
-        if (networkInfo.lanIpv4() != address) throw PreparationLanChanged()
+        if (networkInfo.lanIpv4() != address || dlnaNetworkChanged(preparationLanNetwork)) throw PreparationLanChanged()
+    }
+
+    /** Phone connectivity is not a decoder or source failure. Keep live intent until its LAN returns. */
+    private fun deferForUnavailableLan(reconnectEndpoint: Boolean = false): Boolean {
+        if (target == null || completedGeneration == playGeneration ||
+            recoverySession.phase in setOf(PlaybackPhase.STOPPED, PlaybackPhase.FAILED) || networkInfo.lanIpv4() != null
+        ) return false
+        endpointReconnectAfterLanReturn = endpointReconnectAfterLanReturn || reconnectEndpoint
+        if (!gatewayWasUnavailable) updateProgressEstimate()
+        gatewayWasUnavailable = true
+        startupWatchdogJob?.cancel()
+        startupWatchdogJob = null
+        cancelPendingUnknownFailure()
+        holdProgressEstimate()
+        playbackHealth.reset()
+        isPlaying = false
+        isBuffering = true
+        recoverySession = recoverySession.transition(PlaybackPhase.BUFFERING)
+        lastNote = "Waiting for Wi-Fi…"
+        publishStatus()
+        return true
     }
 
     private fun recheckPreparationAddressAfterFailure() {
@@ -451,16 +484,18 @@ class PlaybackEngine(
 
     private fun checkLanAddressLocked() {
         if (target == null || completedGeneration == playGeneration ||
-            recoverySession.phase in setOf(PlaybackPhase.STOPPED, PlaybackPhase.FAILED) || connectionLost
+            recoverySession.phase in setOf(PlaybackPhase.STOPPED, PlaybackPhase.FAILED)
         ) return
-        val address = runCatching { networkInfo.lanIpv4() }.getOrNull()
-        if (address == null) {
-            gatewayWasUnavailable = true
-            playbackHealth.reset()
+        if (deferForUnavailableLan()) return
+        if (connectionLost) return // The coordinator already owns endpoint rediscovery.
+        if (endpointReconnectAfterLanReturn || dlnaNetworkChanged(streamLanNetwork)) {
+            endpointReconnectAfterLanReturn = false
+            onTargetEvent(requireNotNull(target), PlaybackTargetEvent.Disconnected)
             return
         }
-        val loadedAddress = streamLanAddress ?: return
-        if ((gatewayWasUnavailable || address != loadedAddress) && !isReloadingStream) {
+        val address = networkInfo.lanIpv4() ?: return
+        val loadedAddress = streamLanAddress
+        if ((gatewayWasUnavailable || (loadedAddress != null && address != loadedAddress)) && !isReloadingStream) {
             handlePlaybackFailure(PlaybackFailureKind.NETWORK,
                 "The phone's local network changed. Reconnecting the stream�",
                 failureStage = PlaybackFailureStage.PROXY)
@@ -656,13 +691,14 @@ class PlaybackEngine(
         mutex.withLock {
             requireLocalNetworkAccess()
             if (!connectionLost) return@withLock false
+            if (deferForUnavailableLan(reconnectEndpoint = true)) return@withLock false
             val activeTarget = target ?: return@withLock false
             val endpoint = refreshedEndpoint ?: selectedTarget ?: return@withLock false
             if (endpoint.protocol != activeTarget.protocol) {
                 logger.w(TAG, "Ignoring same-endpoint retry with a different protocol")
                 return@withLock false
             }
-            if (currentProviderSession == null && localPlayback == null) return@withLock false
+            if (currentProviderSession == null && localPlayback == null && item == null) return@withLock false
             val reserved = synchronized(recoveryLock) {
                 recoverySession.reserveRecovery(
                     RecoveryAttemptKind.SAME_STREAM_NETWORK,
@@ -712,8 +748,21 @@ class PlaybackEngine(
                 publishStatus()
                 true
             } catch (e: CancellationException) {
+                if (e is StreamStartupSuperseded && (gatewayWasUnavailable || connectionLost)) {
+                    gatewayWasUnavailable = true
+                    connectionLost = true
+                    releaseOfflineNetworkAttempt(RecoveryAction.RETRY_SAME_STREAM)
+                    publishStatus()
+                    return@withLock false
+                }
                 throw e
             } catch (e: Exception) {
+                if (deferForUnavailableLan(reconnectEndpoint = true)) {
+                    connectionLost = true
+                    releaseOfflineNetworkAttempt(RecoveryAction.RETRY_SAME_STREAM)
+                    publishStatus()
+                    return@withLock false
+                }
                 smartResume.checkpoint(SmartResumeCheckpointKind.FAILURE, smartResumeDeviceContext)
                 val disconnectedAgain = disconnectRevision.get() != reconnectRevision
                 if (disconnectedAgain) connectionLost = true
@@ -1023,6 +1072,7 @@ class PlaybackEngine(
         val request = streamPreparationRequest
         var lanRestarts = 0
         while (true) {
+            var attemptNetwork: android.net.Network? = null
             try {
                 return coroutineScope {
                     val preparation = synchronized(preparationLock) {
@@ -1034,6 +1084,8 @@ class PlaybackEngine(
                         }
                         async(dispatcher, start = CoroutineStart.LAZY) { block() }.also {
                             preparationLanAddress = networkInfo.lanIpv4()
+                            attemptNetwork = currentLanNetwork()
+                            preparationLanNetwork = attemptNetwork
                             transcodePreparationJob = it
                             preparationReceiverLoaded = false
                         }
@@ -1052,6 +1104,7 @@ class PlaybackEngine(
                             if (transcodePreparationJob === preparation) {
                                 transcodePreparationJob = null
                                 preparationLanAddress = null
+                                preparationLanNetwork = null
                                 preparationReceiverLoaded = false
                             }
                         }
@@ -1061,8 +1114,17 @@ class PlaybackEngine(
             } catch (changed: PreparationLanChanged) {
                 currentCoroutineContext().ensureActive()
                 if (request != streamChangeSequence.get()) throw StreamStartupSuperseded()
+                if (deferForUnavailableLan()) {
+                    startupWasInterrupted = true
+                    throw StreamStartupSuperseded()
+                }
+                if (dlnaNetworkChanged(attemptNetwork)) {
+                    startupWasInterrupted = true
+                    onTargetEvent(requireNotNull(target), PlaybackTargetEvent.Disconnected)
+                    throw StreamStartupSuperseded()
+                }
                 // A moving network must not loop indefinitely or consume format attempts.
-                if (lanRestarts++ >= 1 || networkInfo.lanIpv4() == null) {
+                if (lanRestarts++ >= 1) {
                     throw PlaybackTargetException(PlaybackFailureKind.NETWORK,
                         "The phone's network changed during playback startup. Check Wi-Fi and try again.")
                 }
@@ -1071,13 +1133,21 @@ class PlaybackEngine(
                 coordinator.stop("LAN changed during preparation")
                 streamLanAddress = null
                 logger.event("playback", "Restarting stream preparation on the phone's new LAN address")
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                if (deferForUnavailableLan()) {
+                    startupWasInterrupted = true
+                    throw StreamStartupSuperseded()
+                }
+                throw error
             }
         }
     }
 
     /** No renderer RPC is needed while its replacement is still being prepared. */
     private fun setPreparingPlaybackIntent(requested: Boolean?): Boolean = synchronized(preparationLock) {
-        if (transcodePreparationJob == null || preparationReceiverLoaded) return@synchronized false
+        val waitingForLan = connectionLost || (gatewayWasUnavailable && networkInfo.lanIpv4() == null)
+        if (!waitingForLan && (transcodePreparationJob == null || preparationReceiverLoaded)) return@synchronized false
         val playing = requested ?: !localPlayWhenReady
         localPlayWhenReady = playing
         isPlaying = false
@@ -1508,7 +1578,9 @@ class PlaybackEngine(
         val rendererStart = if (transcodeTarget != null) 0L else boundedStartPos
         requireCurrentPreparationAddress(phoneIp)
         streamLanAddress = phoneIp
+        streamLanNetwork = currentLanNetwork()
         gatewayWasUnavailable = false
+        endpointReconnectAfterLanReturn = false
         armRendererResumeVerification(rendererStart)
         armRendererStartSettle(rendererStart)
         val loadIntent = localPlayWhenReady
@@ -1674,10 +1746,9 @@ class PlaybackEngine(
         pendingRendererResumePosition = null
         val duration = currentProviderSession?.descriptor?.runtimeSeconds ?: item?.runtimeSeconds ?: localPlayback?.runtimeSeconds
         val pos = PlaybackPositionPolicy.clamp(absoluteSeconds, duration)
-        val previousPendingSeek = smartResume.pendingSeekPositionSeconds()
-        smartResume.noteSeekRequested(pos)
-        holdProgressEstimate(resetDelivery = true)
         if (duration != null && duration > 0 && pos == duration) {
+            smartResume.noteSeekRequested(pos)
+            holdProgressEstimate(resetDelivery = true)
             // EOF is a normal completion, not a new clip with no samples to encode.
             startupWatchdogJob?.cancel()
             proxy.stop()
@@ -1691,7 +1762,11 @@ class PlaybackEngine(
         }
         // Phone streams restart their encoder at the requested source position. Server output uses
         // its existing seek policy; direct files and full-timeline HLS can seek in the renderer.
-        if (onDeviceTranscodeTarget != null || startupWasInterrupted) {
+        if (onDeviceTranscodeTarget != null || startupWasInterrupted ||
+            (gatewayWasUnavailable && networkInfo.lanIpv4() == null)
+        ) {
+            smartResume.noteSeekRequested(pos)
+            holdProgressEstimate(resetDelivery = true)
             // Record intent before a queued superseded startup can be cancelled without doing work.
             streamStartSeconds = pos
             reportedPositionSeconds = 0L
@@ -1703,6 +1778,8 @@ class PlaybackEngine(
             PlaybackPositionPolicy.requiresServerReload(currentIsTranscoding, currentIsHls)
         logger.event("playback", "Seek -> ${pos}s (${if (serverSideSeek) "server-side re-resolve" else "renderer seek"})")
         if (serverSideSeek) {
+            smartResume.noteSeekRequested(pos)
+            holdProgressEstimate(resetDelivery = true)
             // Optimistically reflect the seek target so a transient status from the torn-down old stream
             // can't flash the reported position back to 0 during the reload.
             streamStartSeconds = pos
@@ -1725,23 +1802,24 @@ class PlaybackEngine(
             // seek's guard before dispatch so that the new confirmation is not discarded.
             val previousTarget = seekSettleTargetSeconds
             val previousDeadline = seekSettleUntilMs
+            val confirmationBeforeSeek = confirmedPositionRevision.get()
             seekSettleTargetSeconds = pos
             seekSettleUntilMs = clock() + SEEK_SETTLE_WINDOW_MS
             try {
                 t.seekTo(pos)
             } catch (error: Exception) {
-                if (smartResume.pendingSeekPositionSeconds() == pos) {
-                    if (previousPendingSeek != null) smartResume.noteSeekRequested(previousPendingSeek)
-                    else smartResume.cancelPendingSeek(pos)
-                }
                 if (seekSettleTargetSeconds == pos) {
                     seekSettleTargetSeconds = previousTarget
                     seekSettleUntilMs = previousDeadline
                 }
                 throw error
             }
-            reportedPositionSeconds = pos
-            noteSourcePosition(pos)
+            if (confirmedPositionRevision.get() == confirmationBeforeSeek) {
+                smartResume.noteSeekRequested(pos)
+                holdProgressEstimate(resetDelivery = true)
+                reportedPositionSeconds = pos
+                noteSourcePosition(pos)
+            }
             controlErrorMessage = null
             reportSourceProgressSoon()
             publishStatus()
@@ -1797,7 +1875,7 @@ class PlaybackEngine(
             val selected = index ?: defaultAudioIndex()
             localAudioTracks.firstOrNull { it.index == selected }?.unsupportedReason?.let { throw PlaybackPreparationException(it) }
             if (audioSelection == selected && !startupWasInterrupted) return@withStreamChange
-            reloadSelectionTransaction(audioSelection, selected, { audioSelection = it }) {
+            reloadSelectionTransaction({ audioSelection = selected }) {
                 reloadOutput(recoveryPositionSeconds(), "audio track change", localPlayWhenReady)
             }
         }
@@ -1819,7 +1897,7 @@ class PlaybackEngine(
             localSubtitleTracks.firstOrNull { it.index == index }?.unsupportedReason?.let { throw PlaybackPreparationException(it) }
             if (subtitleSelection == index && !startupWasInterrupted) return@withStreamChange
             logger.event("playback", "Subtitle -> ${index?.let { "track $it (burned in)" } ?: "off"}; re-resolving")
-            reloadSelectionTransaction(subtitleSelection, index, { subtitleSelection = it }) {
+            reloadSelectionTransaction({ subtitleSelection = index }) {
                 reloadOutput(recoveryPositionSeconds(), "subtitle change", localPlayWhenReady)
             }
         }
@@ -1842,7 +1920,7 @@ class PlaybackEngine(
             localSubtitleTracks = localSubtitleTracks + track
             mediaSubtitleTracks = mediaSubtitleTracks + MediaTrack(track.index, track.language, track.label)
             subtitleSelectionExplicit = true
-            reloadSelectionTransaction(subtitleSelection, track.index, { subtitleSelection = it }) {
+            reloadSelectionTransaction({ subtitleSelection = track.index }) {
                 reloadOutput(recoveryPositionSeconds(), "subtitle file", localPlayWhenReady)
             }
         }
@@ -1868,29 +1946,15 @@ class PlaybackEngine(
         }
         val index = BitrateLadder.indexAtOrBelow(a.ladder, bitrateBps)
         val target = a.ladder[index]
-        val wasManual = manualQuality
-        val previousManualBitrate = manualQualityBitrateBps
-        val previousNote = lastNote
-        val previousStreamStart = streamStartSeconds
-        val previousReportedPosition = reportedPositionSeconds
-        manualQuality = true
-        manualQualityBitrateBps = target
-        if (!wasManual || target != a.currentBitrateBps) {
+        if (!manualQuality || target != a.currentBitrateBps) {
             logger.event("quality", "Quality cap -> ${target / 1000} kbps (manual source override)")
-            // An override must re-resolve even when the selected rung matches the current displayed rate:
-            // direct play can have that rate without the source having applied the requested output cap.
-            try {
+            reloadSelectionTransaction({ manualQuality = true; manualQualityBitrateBps = target }) {
                 reloadStream(recoveryPositionSeconds(), requestedBitrate = target, reason = "manual quality override")
-            } catch (failure: Throwable) {
-                manualQuality = wasManual
-                manualQualityBitrateBps = previousManualBitrate
-                lastNote = previousNote
-                streamStartSeconds = previousStreamStart
-                reportedPositionSeconds = previousReportedPosition
-                publishStatus()
-                throw failure
             }
             a.noteApplied(index, clock())
+        } else {
+            manualQuality = true
+            manualQualityBitrateBps = target
         }
         lastNote = "Manual quality selected — adaptation paused"
         publishStatus()
@@ -1951,8 +2015,7 @@ class PlaybackEngine(
             localCodecFallbacksTried.clear()
             localCodecFallbacksTried.addAll(previousFallbacks)
             if (reloadStarted && failure !is CancellationException) {
-                runCatching { reloadOutput(pos, "restore output", playWhenReady) }
-                    .onFailure { failure.addSuppressed(it) }
+                restoreOutputAfterFailedChange(failure, pos, playWhenReady)
             }
             publishStatus()
             throw failure
@@ -1980,28 +2043,12 @@ class PlaybackEngine(
             }
             if (item == null || height !in setOf(null, 2160, 1080, 720, 480)) return@withStreamChange
             if (manualMaxVideoHeight == height && !startupWasInterrupted) return@withStreamChange
-            val previousHeight = manualMaxVideoHeight
-            val previousStreamStart = streamStartSeconds
-            val previousReportedPosition = reportedPositionSeconds
-            val previousNote = lastNote
-            manualMaxVideoHeight = height
-            val label = height?.let { "${it}p" } ?: "Auto"
-            lastNote = "Resolution -> $label; reloading stream…"
-            logger.event("quality", "Resolution override -> $label; forcing server transcode=${height != null}")
-            val pos = recoveryPositionSeconds()
-            streamStartSeconds = pos
-            reportedPositionSeconds = 0
-            publishStatus()
-            try {
-                reloadStream(pos, requestedBitrate = adaptive?.currentBitrateBps, reason = "manual resolution", armWatchdog = true)
-            } catch (failure: Throwable) {
-                if (failure is StreamStartupSuperseded) throw failure
-                manualMaxVideoHeight = previousHeight
-                streamStartSeconds = previousStreamStart
-                reportedPositionSeconds = previousReportedPosition
-                lastNote = previousNote
-                publishStatus()
-                throw failure
+            reloadSelectionTransaction({ manualMaxVideoHeight = height }) {
+                val label = height?.let { "${it}p" } ?: "Auto"
+                lastNote = "Resolution -> $label; reloading stream…"
+                logger.event("quality", "Resolution override -> $label; forcing server transcode=${height != null}")
+                reloadStream(recoveryPositionSeconds(), requestedBitrate = adaptive?.currentBitrateBps,
+                    reason = "manual resolution", armWatchdog = true)
             }
         }
     }
@@ -2041,7 +2088,7 @@ class PlaybackEngine(
             }
             if (preferredCodec == requested && !startupWasInterrupted) return@withStreamChange
             logger.event("quality", "Preferred codec -> ${requested ?: "auto"}; re-resolving")
-            reloadSelectionTransaction(preferredCodec, requested, { preferredCodec = it }) {
+            reloadSelectionTransaction({ preferredCodec = requested }) {
                 reloadStreamPreservingPosition("codec change")
             }
         }
@@ -2066,27 +2113,49 @@ class PlaybackEngine(
         reloadStream(pos, requestedBitrate = adaptive?.currentBitrateBps, reason = reason)
     }
 
-    /** Apply a UI selection only if its replacement stream loads; restore it on failure/cancellation. */
-    private suspend fun <T> reloadSelectionTransaction(
-        previous: T,
-        requested: T,
-        apply: (T) -> Unit,
-        reload: suspend () -> Unit,
-    ) {
+    /** Apply a UI choice transactionally, including restoring the playable stream on failure. */
+    private suspend fun reloadSelectionTransaction(apply: () -> Unit, reload: suspend () -> Unit) {
+        val previousChoices = capturePlaybackChoices()
+        val previousAutomaticPhoneTranscode = automaticPhoneTranscode
+        val previousForceTranscode = forceTranscodeFallback
         val previousStreamStart = streamStartSeconds
         val previousReportedPosition = reportedPositionSeconds
         val previousNote = lastNote
-        apply(requested)
+        apply()
         try {
             reload()
         } catch (failure: Throwable) {
             if (failure is StreamStartupSuperseded) throw failure
-            apply(previous)
+            restorePlaybackChoices(previousChoices)
+            automaticPhoneTranscode = previousAutomaticPhoneTranscode
+            forceTranscodeFallback = previousForceTranscode
             streamStartSeconds = previousStreamStart
             reportedPositionSeconds = previousReportedPosition
             lastNote = previousNote
+            if (failure !is CancellationException) {
+                restoreOutputAfterFailedChange(failure, previousChoices.positionSeconds, previousChoices.playWhenReady)
+            }
             publishStatus()
             throw failure
+        }
+    }
+
+    private suspend fun restoreOutputAfterFailedChange(failure: Throwable, position: Long, playWhenReady: Boolean) {
+        if (connectionLost || deferForUnavailableLan()) return
+        try {
+            reloadOutput(position, "restore output", playWhenReady)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (restoreFailure: Exception) {
+            failure.addSuppressed(restoreFailure)
+            // Retain an honest retryable checkpoint rather than advertising the revoked old URL.
+            failedPlaybackChoices = capturePlaybackChoices()
+            recoverySession = recoverySession.fail()
+            terminalFailureSurfaced = true
+            startupWatchdogJob?.cancel()
+            isPlaying = false
+            holdProgressEstimate()
+            publishStatus(error = "Couldn't restore the previous output. Try playback again.")
         }
     }
 
@@ -2645,7 +2714,9 @@ class PlaybackEngine(
         pendingRecoveryKind = null
         requireCurrentPreparationAddress(phoneIp)
         streamLanAddress = phoneIp
+        streamLanNetwork = currentLanNetwork()
         gatewayWasUnavailable = false
+        endpointReconnectAfterLanReturn = false
         armRendererResumeVerification(loadStart)
         if (!serverSideStart) armRendererStartSettle(loadStart)
         val loadIntent = localPlayWhenReady
@@ -2833,6 +2904,7 @@ class PlaybackEngine(
         fallbackJob = scope.launch {
             mutex.withLock {
                 try {
+                    if (action == RecoveryAction.RETRY_SAME_STREAM && deferForUnavailableLan()) return@withLock
                     val admitted = synchronized(recoveryLock) {
                         if (!recoverySession.acceptsEvent(expectedGeneration) || connectionLost ||
                             disconnectRevision.get() != expectedDisconnect || streamChangeSequence.get() != expectedRequest
@@ -2866,8 +2938,18 @@ class PlaybackEngine(
                         reloadStream(resumeAt, requestedBitrate, reason, armWatchdog = true, playWhenReady = localPlayWhenReady)
                     }
                 } catch (cancelled: CancellationException) {
+                    if (cancelled is StreamStartupSuperseded && gatewayWasUnavailable &&
+                        expectedRequest == streamChangeSequence.get()
+                    ) {
+                        releaseOfflineNetworkAttempt(action)
+                        return@withLock
+                    }
                     throw cancelled
                 } catch (error: Exception) {
+                    if (deferForUnavailableLan()) {
+                        releaseOfflineNetworkAttempt(action)
+                        return@withLock
+                    }
                     logger.e("playback", "Recovery reload failed ($reason); giving up", error)
                     recoverySession = if (error.isPreparationFailure()) {
                         recoverySession.recordFailure(
@@ -2887,6 +2969,19 @@ class PlaybackEngine(
                     isReloadingStream = false
                 }
             }
+        }
+    }
+
+    /** Do not charge a phone-offline attempt to the receiver's bounded retry allowance. */
+    private fun releaseOfflineNetworkAttempt(action: RecoveryAction) {
+        if (action != RecoveryAction.RETRY_SAME_STREAM) return
+        synchronized(recoveryLock) {
+            val usage = recoverySession.usage
+            recoverySession = recoverySession.copy(usage = usage.copy(
+                automaticAttempts = (usage.automaticAttempts - 1).coerceAtLeast(0),
+                sameStreamNetworkRetries = (usage.sameStreamNetworkRetries - 1).coerceAtLeast(0),
+            ))
+            retriedOnce = recoverySession.usage.sameStreamNetworkRetries > 0
         }
     }
 
@@ -2946,6 +3041,7 @@ class PlaybackEngine(
             logger.trace(TAG, "Ignoring stale playback failure for generation $expectedGeneration")
             return
         }
+        if (kind == PlaybackFailureKind.NETWORK && deferForUnavailableLan()) return
         synchronized(recoveryLock) {
             // Endpoint recovery owns a disconnected session; media errors cannot change its encoding.
             if (connectionLost) return
@@ -3390,6 +3486,10 @@ class PlaybackEngine(
             logger.trace(TAG, "Ignoring renderer status while replacing its stream")
             return
         }
+        if (gatewayWasUnavailable &&
+            (event is PlaybackTargetEvent.StatusChanged || event is PlaybackTargetEvent.BufferingChanged ||
+                event is PlaybackTargetEvent.Stopped)
+        ) return
         when (event) {
             is PlaybackTargetEvent.Connected -> {
                 recoverySession = recoverySession.transition(PlaybackPhase.PREPARING)
@@ -3423,6 +3523,7 @@ class PlaybackEngine(
                 }
                 if (event.isPositionConfirmed) {
                     synchronized(progressLock) {
+                        confirmedPositionRevision.incrementAndGet()
                         progressEstimator.confirm(absolutePositionSeconds, event.isPlaying && !isBuffering,
                             elapsedRealtime(), event.playbackRate)
                         noteSourcePosition(absolutePositionSeconds)
@@ -3586,6 +3687,7 @@ class PlaybackEngine(
                 scope.launch { stopIfCurrent(gen, "renderer stopped") }
             }
             is PlaybackTargetEvent.Disconnected -> {
+                if (deferForUnavailableLan(reconnectEndpoint = true)) return
                 synchronized(recoveryLock) {
                     disconnectRevision.incrementAndGet()
                     connectionLost = true
@@ -3602,7 +3704,7 @@ class PlaybackEngine(
                 // BEFORE disconnecting the target (stopInternalLocked), so this handler never runs for a
                 // user stop — only for a real, unexpected drop. Flag it so the ViewModel can auto-reconnect
                 // and resume from the last reported position.
-                if (currentProviderSession != null || localPlayback != null) {
+                if (currentProviderSession != null || localPlayback != null || item != null) {
                     connectionLost = true
                     recoverySession = recoverySession
                         .recordFailure(PlaybackFailureStage.ENDPOINT_DISCONNECT, PlaybackFailureCause.ENDPOINT_UNAVAILABLE)
@@ -3750,7 +3852,9 @@ class PlaybackEngine(
         synchronized(recoveryLock) { cancelPendingUnknownFailure() }
         playbackHealth.reset()
         streamLanAddress = null
+        streamLanNetwork = null
         gatewayWasUnavailable = false
+        endpointReconnectAfterLanReturn = false
         failedPlaybackChoices = if (reason.endsWith("failed")) capturePlaybackChoices() else null
         updateProgressEstimate()
         synchronized(progressLock) {
@@ -3942,6 +4046,7 @@ class PlaybackEngine(
             recoveryBudget = recovery.budgetStatus,
             isTerminal = recovery.phase == PlaybackPhase.FAILED,
             connectionLost = connectionLost,
+            networkRecoveryDeferred = gatewayWasUnavailable,
             audioTracks = mediaAudioTracks,
             subtitleTracks = mediaSubtitleTracks,
             // When the user hasn't explicitly chosen audio, reflect the server default so the picker shows
