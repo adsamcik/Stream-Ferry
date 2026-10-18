@@ -12,6 +12,7 @@ import androidx.media3.muxer.Muxer
 import com.adsamcik.streamferry.core.hls.MediaPlaylistPlanner
 import com.adsamcik.streamferry.core.stream.MediaProfile
 import com.adsamcik.streamferry.core.transcode.Fmp4Splitter
+import com.adsamcik.streamferry.core.transcode.StreamingTsMuxer
 import com.adsamcik.streamferry.core.transcode.TranscodeTarget
 import com.adsamcik.streamferry.core.transcode.VideoCodec
 import com.adsamcik.streamferry.data.proxy.ClientTranscodeSource
@@ -191,8 +192,11 @@ class StreamingTranscodeSession(
         checkOpen()
         packets.addLast(bytes)
         bufferedBytes += bytes.size
-        val pid = if (bytes.size >= 4) ((bytes[1].toInt() and 0x1f) shl 8) or (bytes[2].toInt() and 0xff) else -1
-        if (pid == 0x100 || pid == 0x101) ready.complete(Unit)
+        val hasMedia = (0 until bytes.size step StreamingTsMuxer.PACKET_SIZE).any { offset ->
+            val pid = ((bytes[offset + 1].toInt() and 0x1f) shl 8) or (bytes[offset + 2].toInt() and 0xff)
+            pid == StreamingTsMuxer.VIDEO_PID || pid == StreamingTsMuxer.AUDIO_PID
+        }
+        if (hasMedia) ready.complete(Unit)
         lock.notifyAll()
     }
 

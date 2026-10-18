@@ -54,6 +54,7 @@ class MainViewModelVolumeTest {
         every { container.jellyfinConnectionMonitor.status } returns MutableStateFlow(SourceAvailability.UNKNOWN)
         every { container.smartResumeStore.history } returns MutableStateFlow(emptyList())
         every { container.downloader.states } returns MutableStateFlow(emptyMap())
+        every { container.downloadStore.metadataRevision } returns MutableStateFlow(0L)
         coEvery { container.authRepository.restoreCachedSession() } returns null
         coEvery { container.authRepository.ensureOnlineSession() } returns Result.failure(IllegalStateException("Offline"))
         viewModel = MainViewModel(container)

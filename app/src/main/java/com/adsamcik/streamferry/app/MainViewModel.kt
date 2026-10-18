@@ -364,6 +364,7 @@ class MainViewModel(
                     }
                 }
                 val sessionChanged = observedJellyfinSession != user
+                if (sessionChanged) container.clearArtworkMemoryCache()
                 observedJellyfinSession = user
                 // A prior account's overlays and revisions are never valid for a newly materialized scope.
                 if (sessionChanged) {
@@ -473,10 +474,11 @@ class MainViewModel(
             }
         }
         // Offline downloads: completed set (persistent) + live progress.
-        viewModelScope.launch { refreshDownloadEntries() }
+        viewModelScope.launch {
+            container.downloadStore.metadataRevision.collect { refreshDownloadEntries() }
+        }
         viewModelScope.launch {
             container.downloader.states.collect { states ->
-                if (states.values.any { it is DownloadState.Completed }) refreshDownloadEntries()
                 _state.update { it.copy(downloads = mergeDownloads(states)) }
             }
         }
@@ -815,6 +817,7 @@ class MainViewModel(
                 // teardown above (the second stop is idempotent when the active session was online).
                 runCatching { container.playbackEngine.stop() }
                 pauseDownloadsForAuthTransition()
+                container.clearArtworkMemoryCache()
                 container.authRepository.logout()
                 container.jellyfinConnectionMonitor.reset()
                 _state.value = AppUiState(queues = _state.value.queues)

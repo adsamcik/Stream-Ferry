@@ -123,19 +123,11 @@ import com.adsamcik.streamferry.ui.state.SourceItemAvailability
 import com.adsamcik.streamferry.ui.state.Route
 import com.adsamcik.streamferry.ui.theme.StreamFerryTheme
 import kotlinx.coroutines.launch
-import android.graphics.Bitmap
-import android.net.Uri
-import android.util.Size
-import androidx.compose.foundation.Image
-import androidx.compose.runtime.produceState
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.input.ImeAction
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 
 @Composable
 fun GalleryScreen(state: AppUiState, viewModel: UiController, compact: Boolean = false) {
@@ -1163,38 +1155,6 @@ private fun sectionKey(title: String): String {
     return when {
         c in 'A'..'Z' -> c.toString()
         else -> "#"
-    }
-}
-
-private const val THUMB_SIZE_PX = 512
-
-/** Bounded, access-ordered LRU of decoded on-device video thumbnails, keyed by content URI. */
-private object LocalThumbnailCache {
-    private const val MAX_ENTRIES = 64
-    private val lru = object : LinkedHashMap<String, Bitmap>(16, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Bitmap>): Boolean = size > MAX_ENTRIES
-    }
-    @Synchronized fun get(key: String): Bitmap? = lru[key]
-    @Synchronized fun put(key: String, value: Bitmap) { lru[key] = value }
-}
-
-/**
- * A thumbnail frame for an on-device video, loaded off-thread via `ContentResolver.loadThumbnail` and
- * cached. Renders nothing while loading / on failure, leaving the tonal initials slot visible behind it.
- */
-@Composable
-private fun LocalThumbnail(uriString: String, modifier: Modifier = Modifier) {
-    val context = LocalContext.current
-    val bitmap by produceState<Bitmap?>(LocalThumbnailCache.get(uriString), uriString) {
-        if (value != null) return@produceState
-        value = withContext(Dispatchers.IO) {
-            runCatching {
-                context.contentResolver.loadThumbnail(Uri.parse(uriString), Size(THUMB_SIZE_PX, THUMB_SIZE_PX), null)
-            }.getOrNull()?.also { LocalThumbnailCache.put(uriString, it) }
-        }
-    }
-    bitmap?.let {
-        Image(bitmap = it.asImageBitmap(), contentDescription = null, contentScale = ContentScale.Crop, modifier = modifier)
     }
 }
 

@@ -2,6 +2,9 @@ package com.adsamcik.streamferry.app
 
 import android.app.Application
 import com.adsamcik.streamferry.domain.MediaItem
+import com.adsamcik.streamferry.data.download.DownloadOwner
+import com.adsamcik.streamferry.data.download.DownloadIdentity
+import com.adsamcik.streamferry.data.download.MediaDownloader.DownloadState
 import com.adsamcik.streamferry.domain.SourceAvailability
 import com.adsamcik.streamferry.domain.UserSession
 import com.adsamcik.streamferry.domain.DiscoveredTarget
@@ -52,9 +55,12 @@ class MainViewModelQueueTest {
         every { container.jellyfinConnectionMonitor.status } returns MutableStateFlow(SourceAvailability.UNKNOWN)
         every { container.smartResumeStore.history } returns MutableStateFlow(emptyList())
         every { container.downloader.states } returns MutableStateFlow(emptyMap())
+        every { container.downloadStore.metadataRevision } returns MutableStateFlow(0L)
         every { container.resumeStore.resumePosition(any()) } returns null
         coEvery { container.authRepository.restoreCachedSession() } returns null
         coEvery { container.authRepository.ensureOnlineSession() } returns Result.failure(IllegalStateException("Offline"))
+        coEvery { container.jellyfinMediaSource.roots() } returns Result.success(emptyList())
+        coEvery { container.jellyfinMediaSource.continueWatching() } returns Result.success(emptyList())
     }
 
     @After fun tearDown() {
@@ -63,6 +69,31 @@ class MainViewModelQueueTest {
     }
 
     private fun create() = MainViewModel(container).also { viewModel = it }
+
+    @Test fun `download byte progress does not rescan completed entries but metadata changes do`() = runTest {
+        val owner = DownloadOwner("server", "user")
+        val identity = DownloadIdentity(owner, "completed")
+        val progress = MutableStateFlow<Map<DownloadIdentity,
+            DownloadState>>(emptyMap())
+        val revision = MutableStateFlow(0L)
+        val store = container.downloadStore
+        every { container.authRepository.currentUser } returns MutableStateFlow(UserSession(owner.userId, owner.serverId))
+        every { container.downloader.states } returns progress
+        every { store.metadataRevision } returns revision
+        coEvery { store.list(owner) } returns emptyList()
+        create(); runCurrent()
+        clearMocks(store, answers = false)
+        val running = identity.copy(itemId = "running")
+        repeat(5) {
+            progress.value = mapOf(identity to DownloadState.Completed,
+                running to DownloadState.Running(it.toLong(), 10))
+            runCurrent()
+        }
+        coVerify(exactly = 0) { store.list(any<DownloadOwner>()) }
+        revision.value++
+        runCurrent()
+        coVerify(exactly = 1) { store.list(owner) }
+    }
 
     @Test fun `opening a video from search preserves the gallery query and results`() = runTest {
         val movie = local.copy(id = "movie-1", title = "Movie", sourceId = "remote")

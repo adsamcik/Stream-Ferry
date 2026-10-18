@@ -304,6 +304,14 @@ class PlaybackEngine(
     private class StreamStartupSuperseded : CancellationException("A newer playback command replaced startup")
     // The probed source format of a LOCAL file (online sources use the provider descriptor), for the same UI.
     @Volatile private var localSourceProfile: MediaProfile? = null
+    private data class LocalProbeCache(
+        val uri: String,
+        val contentType: String,
+        val version: LocalMediaProbe.InputVersion?,
+        var profile: MediaProfile? = null,
+        var exactRuntimeSeconds: Double? = null,
+    )
+    private var localProbeCache: LocalProbeCache? = null
     // Parameters of the current LOCAL playback, kept so the on-device stream can be reloaded in place (a
     // manual codec change or an auto codec fallback) while reusing the live TV connection. Null = online.
     @Volatile private var localPlayback: LocalPlaybackParams? = null
@@ -1229,15 +1237,41 @@ class PlaybackEngine(
         val params = localPlayback ?: error("No local media selected")
         val sel = selectedTarget ?: error("No target")
         val tgt = target ?: error("No target")
-        if (!localAudioDiscovered) {
-            localAudioTracks = try {
-                LocalSubtitleReader.discoverAudio(appContext, params.filePath, params.contentType)
+        val version = LocalMediaProbe.inputVersion(appContext, params.filePath)
+        val previousProbe = localProbeCache
+        if (previousProbe == null || previousProbe.uri != params.filePath ||
+            previousProbe.contentType != params.contentType || version == null || previousProbe.version != version
+        ) {
+            if (previousProbe != null && (previousProbe.version != version ||
+                    previousProbe.uri != params.filePath || previousProbe.contentType != params.contentType)) {
+                // A replaced file can have different track identities. Preserve only an explicitly added sidecar.
+                val retained = selectedLocalSubtitle()?.takeIf {
+                    subtitleSelectionExplicit && it.source is LocalSubtitleSource.External
+                }
+                localAudioTracks = emptyList()
+                localAudioDiscovered = false
+                audioSelection = null
+                audioSelectionExplicit = false
+                localSubtitleTracks = listOfNotNull(retained)
+                localSubtitlesDiscovered = false
+                subtitleSelection = retained?.index
+                subtitleSelectionExplicit = retained != null
+                languagePreferenceApplied = false
+            }
+            localProbeCache = LocalProbeCache(params.filePath, params.contentType, version)
+        }
+        val initialTracks = if (!localAudioDiscovered || !localSubtitlesDiscovered) {
+            try {
+                LocalSubtitleReader.discoverTracks(appContext, params.filePath, params.contentType)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
-                logger.w("audio", "Couldn't discover local audio tracks", error)
-                emptyList()
+                logger.w("playback", "Couldn't discover local audio and subtitles; external files remain available", error)
+                LocalSubtitleReader.DiscoveredTracks(emptyList(), emptyList())
             }
+        } else null
+        if (!localAudioDiscovered) {
+            localAudioTracks = initialTracks?.audio.orEmpty()
             localAudioDiscovered = true
             mediaAudioTracks = distinguishAudioTracks(localAudioTracks.map { MediaTrack(it.index, it.language, it.label, it.isDefault) })
             if (!audioSelectionExplicit) {
@@ -1257,14 +1291,7 @@ class PlaybackEngine(
         }
         if (!localSubtitlesDiscovered) {
             val retained = localSubtitleTracks
-            val discovered = try {
-                LocalSubtitleReader.discover(appContext, params.filePath, params.contentType)
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: Exception) {
-                logger.w("subtitles", "Couldn't discover embedded subtitles; external files remain available", error)
-                emptyList()
-            }
+            val discovered = initialTracks?.subtitles.orEmpty()
             val used = retained.mapTo(mutableSetOf()) { it.index }
             var next = ((retained + discovered).maxOfOrNull { it.index } ?: -1) + 1
             localSubtitleTracks = discovered.filter { candidate -> retained.none { it.source == candidate.source } }.map { track ->
@@ -1298,7 +1325,10 @@ class PlaybackEngine(
                 }
                 .getOrNull()
         }
-        val exactRuntimeSeconds = LocalMediaProbe.probeDurationSecondsExact(appContext, params.filePath)
+        val exactRuntimeSeconds = localProbeCache?.exactRuntimeSeconds
+            ?: LocalMediaProbe.probeDurationSecondsExact(appContext, params.filePath).also {
+                localProbeCache?.exactRuntimeSeconds = it
+            }
         val effectiveRuntimeSeconds = exactRuntimeSeconds?.let { kotlin.math.ceil(it).toLong() }
             ?: params.runtimeSeconds?.takeIf { it > 0 }
         val boundedStartPos = PlaybackPositionPolicy.clamp(startPos, effectiveRuntimeSeconds)
@@ -3421,7 +3451,8 @@ class PlaybackEngine(
      */
     private fun chooseClientTranscodeTarget(uri: String, contentType: String, target: DiscoveredTarget): TranscodeTarget? {
         val container = containerForMime(contentType)
-        val originalProfile = LocalMediaProbe.probe(appContext, uri, container)
+        val originalProfile = localProbeCache?.profile
+            ?: LocalMediaProbe.probe(appContext, uri, container).also { localProbeCache?.profile = it }
         val audio = selectedLocalAudio()
         val profile = if (originalProfile != null && audio != null) originalProfile.copy(
             audioCodec = audio.codecName ?: originalProfile.audioCodec,
@@ -3611,6 +3642,7 @@ class PlaybackEngine(
         currentIsTranscoding = false
         onDeviceTranscodeTarget = null
         localSourceProfile = null
+        localProbeCache = null
         localPlayback = null
         forcedLocalCodec = null
         localTranscodeCodecOptions = emptyList()

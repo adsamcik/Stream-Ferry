@@ -71,10 +71,17 @@ class PlaybackEngineLocalTranscodeTest {
         every { LocalMediaProbe.probe(any(), any(), any()) } returns compatibleProfile
         every { LocalMediaProbe.isByteSeekable(any(), any()) } returns true
         every { LocalMediaProbe.probeDurationSecondsExact(any(), any()) } returns 3600.0
+        coEvery { LocalMediaProbe.inputVersion(any(), any()) } returns null
         mockkConstructor(StreamingTranscodeSession::class)
         mockkObject(LocalSubtitleReader)
         coEvery { LocalSubtitleReader.discover(any(), any(), any()) } returns emptyList()
         coEvery { LocalSubtitleReader.discoverAudio(any(), any(), any()) } returns emptyList()
+        coEvery { LocalSubtitleReader.discoverTracks(any(), any(), any()) } coAnswers {
+            LocalSubtitleReader.DiscoveredTracks(
+                LocalSubtitleReader.discoverAudio(firstArg(), arg(1), arg(2)),
+                LocalSubtitleReader.discover(firstArg(), arg(1), arg(2)),
+            )
+        }
         // Only first-media readiness is signalled. No source-EOF or export-completion event is sent.
         coEvery { anyConstructed<StreamingTranscodeSession>().awaitReady() } returns Unit
         every { anyConstructed<StreamingTranscodeSession>().release() } just Runs
@@ -2252,6 +2259,59 @@ class PlaybackEngineLocalTranscodeTest {
                 assertEquals(before.recoveryPositionSeconds, f.engine.status.value?.positionSeconds)
             } finally { f.engine.stop(); runCurrent() }
         }
+    }
+
+    @Test fun `unchanged local metadata is reused through seeks output and audio changes but not a new session`() = runTest {
+        for (protocol in Protocol.entries) for (source in listOf(SourceCase.FILE, SourceCase.CONTENT_URI)) {
+            clearMocks(LocalMediaProbe, LocalSubtitleReader, answers = false)
+            coEvery { LocalMediaProbe.inputVersion(any(), any()) } returns LocalMediaProbe.InputVersion(1000, 10)
+            coEvery { LocalSubtitleReader.discoverAudio(any(), any(), any()) } returns audioTracks
+            val f = Fixture(this, protocol)
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectAudioTrack(1); runCurrent()
+                f.engine.pause(); runCurrent()
+                f.engine.seekTo(250); runCurrent()
+                f.engine.selectMaxVideoHeight(480); runCurrent()
+                assertEquals(1, f.engine.status.value?.currentAudioIndex)
+                assertFalse(f.loads.last().playWhenReady)
+                verify(exactly = 1) { LocalMediaProbe.probe(any(), any(), any()) }
+                verify(exactly = 1) { LocalMediaProbe.probeDurationSecondsExact(any(), any()) }
+                coVerify(exactly = 1) { LocalSubtitleReader.discoverTracks(any(), any(), any()) }
+                f.engine.stop(); runCurrent()
+                f.startSource(source); runCurrent()
+                verify(exactly = 2) { LocalMediaProbe.probe(any(), any(), any()) }
+                verify(exactly = 2) { LocalMediaProbe.probeDurationSecondsExact(any(), any()) }
+                coVerify(exactly = 2) { LocalSubtitleReader.discoverTracks(any(), any(), any()) }
+            } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `changed and unavailable input versions invalidate local metadata without retaining stale tracks`() = runTest {
+        val f = Fixture(this)
+        var version: LocalMediaProbe.InputVersion? = LocalMediaProbe.InputVersion(1000, 10)
+        coEvery { LocalMediaProbe.inputVersion(any(), any()) } coAnswers { version }
+        coEvery { LocalSubtitleReader.discoverAudio(any(), any(), any()) } returns audioTracks
+        try {
+            f.start(); runCurrent()
+            f.engine.selectAudioTrack(1); runCurrent()
+            clearMocks(LocalMediaProbe, LocalSubtitleReader, answers = false)
+            version = LocalMediaProbe.InputVersion(2000, 20)
+            every { LocalMediaProbe.probeDurationSecondsExact(any(), any()) } returns 2400.0
+            coEvery { LocalSubtitleReader.discoverAudio(any(), any(), any()) } returns audioTracks.take(1)
+            f.engine.selectMaxVideoHeight(480); runCurrent()
+            assertEquals(2400L, f.engine.status.value?.durationSeconds)
+            assertEquals(0, f.engine.status.value?.currentAudioIndex)
+            assertEquals(1, f.engine.status.value?.audioTracks?.size)
+            verify(exactly = 1) { LocalMediaProbe.probe(any(), any(), any()) }
+            verify(exactly = 1) { LocalMediaProbe.probeDurationSecondsExact(any(), any()) }
+            coVerify(exactly = 1) { LocalSubtitleReader.discoverTracks(any(), any(), any()) }
+            version = null
+            f.engine.selectMaxVideoHeight(720); runCurrent()
+            f.engine.selectMaxVideoHeight(480); runCurrent()
+            verify(exactly = 3) { LocalMediaProbe.probe(any(), any(), any()) }
+            verify(exactly = 3) { LocalMediaProbe.probeDurationSecondsExact(any(), any()) }
+        } finally { f.engine.stop(); runCurrent() }
     }
 
     private companion object {

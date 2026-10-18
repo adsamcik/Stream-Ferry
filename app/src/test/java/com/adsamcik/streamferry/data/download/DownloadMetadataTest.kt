@@ -28,6 +28,30 @@ class DownloadMetadataTest {
     )
     private val owner = DownloadOwner(serverId = "server-a", userId = "user-a")
 
+    @Test fun metadataRevisionChangesOnlyWhenTheCompletedIndexChanges() = runBlocking {
+        val root = Files.createTempDirectory("download-revisions").toFile()
+        try {
+            val store = DownloadStore.forFilesDir(root)
+            val entry = DownloadEntry(media.id, media.title, "movie.mp4", "video/mp4", sizeBytes = 1,
+                owner = owner, mediaItem = media)
+            store.fileFor(entry).apply { parentFile?.mkdirs(); writeBytes(byteArrayOf(1)) }
+            assertEquals(0L, store.metadataRevision.value)
+            store.upsert(entry)
+            val completed = store.metadataRevision.value
+            store.upsert(entry)
+            store.list(owner)
+            assertEquals(completed, store.metadataRevision.value)
+            store.syncLibraryMetadata(AccountLibraryScope(owner.serverId, owner.userId).cacheKey,
+                listOf(media.copy(title = "Updated")))
+            assertEquals(completed + 1, store.metadataRevision.value)
+            store.fileFor(entry).delete()
+            assertTrue(store.list(owner).isEmpty())
+            assertEquals(completed + 2, store.metadataRevision.value)
+            store.clear()
+            assertEquals(completed + 3, store.metadataRevision.value)
+        } finally { root.deleteRecursively() }
+    }
+
     @Test
     fun libraryRefreshUpdatesOnlyExistingCopiesInTheExactAccount() = runBlocking {
         val root = Files.createTempDirectory("download-metadata-sync").toFile()

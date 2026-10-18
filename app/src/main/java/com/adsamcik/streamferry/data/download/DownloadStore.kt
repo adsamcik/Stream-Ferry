@@ -5,6 +5,9 @@ import com.adsamcik.streamferry.core.download.DownloadPaths
 import com.adsamcik.streamferry.domain.AccountLibraryScope
 import com.adsamcik.streamferry.domain.MediaItem
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -53,6 +56,9 @@ class DownloadStore private constructor(filesDir: File) {
     private val json = Json { ignoreUnknownKeys = true; prettyPrint = false }
     private val serializer = ListSerializer(DownloadEntry.serializer())
     private val mutex = Mutex()
+    private val _metadataRevision = MutableStateFlow(0L)
+    /** Index writes, rather than byte-progress updates, invalidate the completed-download gallery. */
+    val metadataRevision = _metadataRevision.asStateFlow()
 
     fun fileFor(entry: DownloadEntry): File = File(dir, entry.fileName)
 
@@ -84,9 +90,10 @@ class DownloadStore private constructor(filesDir: File) {
     suspend fun upsert(entry: DownloadEntry) = mutex.withLock {
         withContext(Dispatchers.IO) {
             dir.mkdirs()
-            val updated = (loadPlayableUnlocked().filterNot { it.identity == entry.identity } + entry)
+            val current = loadPlayableUnlocked()
+            val updated = (current.filterNot { it.identity == entry.identity } + entry)
                 .sortedBy { it.title.lowercase() }
-            writeIndex(updated)
+            if (updated != current) writeIndex(updated)
         }
     }
 
@@ -114,7 +121,8 @@ class DownloadStore private constructor(filesDir: File) {
             current.firstOrNull { it.identity == identity }?.let { runCatching { fileFor(it).delete() } }
             runCatching { partFileFor(itemId, owner).delete() }
             runCatching { partMetaFileFor(itemId, owner).delete() }
-            writeIndex(current.filterNot { it.identity == identity })
+            val updated = current.filterNot { it.identity == identity }
+            if (updated != current) writeIndex(updated)
         }
     }
 
@@ -122,7 +130,10 @@ class DownloadStore private constructor(filesDir: File) {
     suspend fun remove(owner: DownloadOwner, itemId: String) = remove(itemId, owner)
 
     suspend fun clear() = mutex.withLock {
-        withContext(Dispatchers.IO) { runCatching { dir.deleteRecursively() }; Unit }
+        withContext(Dispatchers.IO) {
+            runCatching { dir.deleteRecursively() }
+            _metadataRevision.update { it + 1 }
+        }
     }
 
     private suspend fun listInternal(owner: DownloadOwner?, filterByOwner: Boolean): List<DownloadEntry> = mutex.withLock {
@@ -155,6 +166,7 @@ class DownloadStore private constructor(filesDir: File) {
     private fun writeIndex(entries: List<DownloadEntry>) {
         dir.mkdirs()
         CrashSafeTextFile.write(indexFile, json.encodeToString(serializer, entries))
+        _metadataRevision.update { it + 1 }
     }
 
     private fun hasPlayableFile(entry: DownloadEntry): Boolean {

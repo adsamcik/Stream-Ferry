@@ -5,6 +5,7 @@ import android.content.ContentResolver
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.SystemClock
 import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.provider.OpenableColumns
@@ -38,9 +39,27 @@ class LocalMediaSource(
     private val hasAllMediaAccess: () -> Boolean,
     private val hasSelectedMediaAccess: () -> Boolean,
     private val resolver: ContentResolver = context.applicationContext.contentResolver,
+    private val elapsedRealtime: () -> Long = SystemClock::elapsedRealtime,
 ) : MediaSource {
 
-    private val appContext = context.applicationContext
+    private val searchCacheLock = Any()
+    private var searchAccess: SearchAccess? = null
+    private var searchCacheGeneration = 0L
+    private val searchCache = LinkedHashMap<Pair<String, Boolean>, CachedSearchItems>()
+
+    private data class SearchAccess(
+        val folders: Set<String>,
+        val files: Set<String>,
+        val readGrants: Set<String>?,
+    )
+
+    private data class CachedSearchItems(val items: List<MediaItem>, val capturedAt: Long)
+
+    private fun invalidateSearchCache() = synchronized(searchCacheLock) {
+        searchAccess = null
+        searchCache.clear()
+        searchCacheGeneration++
+    }
 
     override val id: String = MediaSourceIds.LOCAL
     override val displayName: String = "On this device"
@@ -60,12 +79,14 @@ class LocalMediaSource(
     fun addFolder(treeUri: Uri) {
         persist(treeUri)
         store.addFolder(treeUri.toString())
+        invalidateSearchCache()
         logger.event("local", "Added a local folder")
     }
 
     /** Persist individual file grants from the SAF `OpenDocument` picker. */
     fun addFiles(uris: List<Uri>) {
         uris.forEach { persist(it); store.addFile(it.toString()) }
+        invalidateSearchCache()
         logger.event("local", "Added ${uris.size} local file(s)")
     }
 
@@ -73,6 +94,7 @@ class LocalMediaSource(
         val tracked = rootId in store.folders() || rootId in store.files()
         store.removeFolder(rootId)
         store.removeFile(rootId)
+        invalidateSearchCache()
         if (!tracked) return
 
         runCatching {
@@ -107,6 +129,7 @@ class LocalMediaSource(
             }.onFailure { incomplete = true }
         }
         runCatching { store.clear() }.onFailure { incomplete = true }
+        invalidateSearchCache()
         if (incomplete) {
             logger.warn("local", "Could not fully clear local-media permissions")
             throw IllegalStateException("Could not fully clear local-media permissions")
@@ -153,14 +176,61 @@ class LocalMediaSource(
         withContext(Dispatchers.IO) {
             val needle = query.trim().lowercase()
             if (needle.isEmpty()) return@withContext emptyList<MediaItem>()
-            val all = ArrayList<MediaItem>()
-            if (hasMediaAccess()) all.addAll(mediaStoreVideos())
-            for (folder in store.folders()) {
-                runCatching { all.addAll(enumerateRecursive(treeDocumentUri(Uri.parse(folder)), depth = 3)) }
+            val access = SearchAccess(
+                folders = store.folders(),
+                files = store.files(),
+                readGrants = runCatching {
+                    resolver.persistedUriPermissions.filter { it.isReadPermission }.map { it.uri.toString() }.toSet()
+                }.getOrNull(),
+            )
+            val generation = synchronized(searchCacheLock) {
+                if (searchAccess != access || access.readGrants == null) {
+                    searchCache.clear()
+                    searchCacheGeneration++
+                    searchAccess = access
+                }
+                searchCacheGeneration
             }
-            for (file in store.files()) videoItemForUri(Uri.parse(file))?.let { all.add(it) }
+            val all = ArrayList<MediaItem>()
+            // Re-query MediaStore, including Android's selected-video scope, on every search. Its
+            // selection can change while the permission booleans remain granted.
+            if (hasMediaAccess()) runCatching { all.addAll(mediaStoreVideos(needle)) }
+            for (folder in access.folders) all.addAll(safSearchItems(folder, true, access, generation))
+            for (file in access.files) all.addAll(safSearchItems(file, false, access, generation))
             all.filter { !it.isFolder && it.title.lowercase().contains(needle) }.distinctBy { it.id }
         }
+    }
+
+    /** Reuse only metadata backed by a still-persisted read grant; temporary grants remain live. */
+    private fun safSearchItems(
+        root: String,
+        folder: Boolean,
+        access: SearchAccess,
+        generation: Long,
+    ): List<MediaItem> {
+        val key = root to folder
+        val cacheable = access.readGrants?.contains(root) == true
+        val now = elapsedRealtime()
+        if (cacheable) synchronized(searchCacheLock) {
+            searchCache[key]?.takeIf {
+                searchCacheGeneration == generation && now - it.capturedAt in 0L until SEARCH_CACHE_TTL_MS
+            }?.let { return it.items }
+        }
+        // A revoked or broken root must not hide independently readable sibling roots.
+        val items = runCatching {
+            if (folder) enumerateRecursive(treeDocumentUri(Uri.parse(root)), depth = 3)
+            else listOfNotNull(videoItemForUri(Uri.parse(root)))
+        }.getOrElse { return emptyList() }
+        if (cacheable && items.size <= MAX_SEARCH_CACHE_ITEMS) synchronized(searchCacheLock) {
+            // Do not repopulate metadata after a concurrent picker, removal, or permission change.
+            if (generation == searchCacheGeneration) {
+                searchCache[key] = CachedSearchItems(items, now)
+                while (searchCache.size > MAX_SEARCH_CACHE_ROOTS ||
+                    searchCache.values.sumOf { it.items.size } > MAX_SEARCH_CACHE_ITEMS
+                ) searchCache.remove(searchCache.keys.first())
+            }
+        }
+        return items
     }
 
     // ----- SAF tree enumeration -----
@@ -225,16 +295,27 @@ class LocalMediaSource(
     private fun mediaStoreRootTitle(): String =
         if (hasAllMediaAccess()) "All device videos" else "Selected device videos"
 
-    private fun mediaStoreVideos(): List<MediaItem> {
+    private fun mediaStoreVideos(needle: String? = null): List<MediaItem> {
         val out = ArrayList<MediaItem>()
         val projection = arrayOf(
             MediaStore.Video.Media._ID,
             MediaStore.Video.Media.DISPLAY_NAME,
             MediaStore.Video.Media.DURATION,
         )
+        // Friendly titles replace dots/underscores and collapse whitespace. Match filename tokens
+        // conservatively in SQL, then apply the exact friendly-title predicate in search(). SQLite
+        // LIKE only folds ASCII case. Keep non-ASCII filenames in its candidate set, and use
+        // only the Unicode-aware postfilter for non-ASCII queries.
+        val pattern = needle?.takeIf { query -> query.all { it.code < 128 } }?.let { query ->
+            query.split(Regex("\\s+")).joinToString("%", prefix = "%", postfix = "%") { token ->
+                token.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            }
+        }
         resolver.query(
             MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
-            projection, null, null,
+            projection,
+            pattern?.let { "(${MediaStore.Video.Media.DISPLAY_NAME} LIKE ? ESCAPE '\\' OR ${MediaStore.Video.Media.DISPLAY_NAME} GLOB '*[^ -~]*' OR ${MediaStore.Video.Media.DISPLAY_NAME} IS NULL)" },
+            pattern?.let { arrayOf(it) },
             "${MediaStore.Video.Media.DATE_ADDED} DESC",
         )?.use { c ->
             val idCol = c.getColumnIndexOrThrow(MediaStore.Video.Media._ID)
@@ -283,6 +364,9 @@ class LocalMediaSource(
     )
 
     private companion object {
+        const val SEARCH_CACHE_TTL_MS = 30_000L
+        const val MAX_SEARCH_CACHE_ITEMS = 2_000
+        const val MAX_SEARCH_CACHE_ROOTS = 64
         const val MEDIASTORE_ALL = "streamferry://local/all-videos"
         val LOCAL_INSTANCE_ID = SourceInstanceId(LocalSourceBackend.PROVIDER_ID, LocalSourceBackend.DEFAULT_INSTANCE)
     }

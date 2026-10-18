@@ -5,10 +5,14 @@ import android.media.MediaCodecInfo.CodecProfileLevel
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.net.Uri
+import android.os.CancellationSignal
+import android.provider.OpenableColumns
 import android.system.Os
 import android.system.OsConstants
 import com.adsamcik.streamferry.core.stream.MediaProfile
 import java.io.File
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
 
 /**
  * Probes a local video's first video+audio tracks into a [MediaProfile] (via [MediaExtractor]) so the
@@ -17,6 +21,38 @@ import java.io.File
  * extractor doesn't expose it reliably).
  */
 object LocalMediaProbe {
+
+    data class InputVersion(val size: Long, val modified: Long)
+
+    /** Unknown provider versions are deliberately not reusable; access is still checked on every open. */
+    suspend fun inputVersion(context: Context, uriString: String): InputVersion? {
+        val uri = Uri.parse(uriString).normalizeScheme()
+        if (uri.scheme != "content") return runCatching {
+            val file = File(if (uri.scheme == "file") requireNotNull(uri.path) else uriString)
+            file.takeIf { it.isFile && it.canRead() }?.let { InputVersion(it.length(), it.lastModified()) }
+        }.getOrNull()
+        // A cloud provider may block even its metadata query. Keep Stop/seek cancellation responsive.
+        return suspendCancellableCoroutine { continuation ->
+            val signal = CancellationSignal()
+            val worker = Thread({
+                if (!continuation.isActive || signal.isCanceled) return@Thread
+                val version = runCatching {
+                    context.contentResolver.query(uri, null, null, null, null, signal)?.use { cursor ->
+                        if (!cursor.moveToFirst()) return@use null
+                        fun value(name: String): Long? = cursor.getColumnIndex(name).takeIf { it >= 0 }
+                            ?.takeUnless(cursor::isNull)?.let(cursor::getLong)
+                        val size = value(OpenableColumns.SIZE)?.takeIf { it >= 0 } ?: return@use null
+                        val modified = (value("last_modified") ?: value("date_modified"))?.takeIf { it > 0 }
+                            ?: return@use null
+                        InputVersion(size, modified)
+                    }
+                }.getOrNull()
+                if (continuation.isActive) continuation.resume(version)
+            }, "local-media-version").apply { isDaemon = true }
+            continuation.invokeOnCancellation { signal.cancel(); worker.interrupt() }
+            worker.start()
+        }
+    }
 
     fun probe(context: Context, uriString: String, container: String): MediaProfile? {
         val extractor = MediaExtractor()
@@ -127,28 +163,30 @@ object LocalMediaProbe {
      * Plain files are random-access by definition. A content provider must expose a known-size descriptor
      * that accepts `lseek`; pipes/cloud streams remain conservatively non-seekable.
      */
-    fun isByteSeekable(context: Context, uriString: String): Boolean = when {
-        uriString.startsWith("content://") -> runCatching {
-            context.contentResolver.openFileDescriptor(Uri.parse(uriString), "r")?.use { descriptor ->
-                if (descriptor.statSize <= 0L) return@use false
-                val original = Os.lseek(descriptor.fileDescriptor, 0L, OsConstants.SEEK_CUR)
-                val probe = (descriptor.statSize - 1L).coerceAtLeast(0L)
-                Os.lseek(descriptor.fileDescriptor, probe, OsConstants.SEEK_SET)
-                Os.lseek(descriptor.fileDescriptor, original, OsConstants.SEEK_SET)
-                true
-            } ?: false
-        }.getOrDefault(false)
+    fun isByteSeekable(context: Context, uriString: String): Boolean {
+        val uri = Uri.parse(uriString).normalizeScheme()
+        return when (uri.scheme) {
+            "content" -> runCatching {
+                context.contentResolver.openFileDescriptor(uri, "r")?.use { descriptor ->
+                    if (descriptor.statSize <= 0L) return@use false
+                    val original = Os.lseek(descriptor.fileDescriptor, 0L, OsConstants.SEEK_CUR)
+                    val probe = (descriptor.statSize - 1L).coerceAtLeast(0L)
+                    Os.lseek(descriptor.fileDescriptor, probe, OsConstants.SEEK_SET)
+                    Os.lseek(descriptor.fileDescriptor, original, OsConstants.SEEK_SET)
+                    true
+                } ?: false
+            }.getOrDefault(false)
 
-        uriString.startsWith("file://") ->
-            Uri.parse(uriString).path?.let(::File)?.isFile == true
-
-        else -> File(uriString).isFile
+            "file" -> uri.path?.let(::File)?.isFile == true
+            else -> File(uriString).isFile
+        }
     }
 
     /** Open [uriString] on [extractor], handling both a `content://`/`file://` URI and a bare filesystem path. */
     private fun setDataSource(extractor: MediaExtractor, context: Context, uriString: String) {
-        if (uriString.startsWith("content://") || uriString.startsWith("file://")) {
-            extractor.setDataSource(context, Uri.parse(uriString), null)
+        val uri = Uri.parse(uriString).normalizeScheme()
+        if (uri.scheme == "content" || uri.scheme == "file") {
+            extractor.setDataSource(context, uri, null)
         } else {
             extractor.setDataSource(uriString)
         }

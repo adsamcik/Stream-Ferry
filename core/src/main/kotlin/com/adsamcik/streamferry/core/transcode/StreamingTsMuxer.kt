@@ -3,8 +3,9 @@ package com.adsamcik.streamferry.core.transcode
 import java.io.ByteArrayOutputStream
 
 /**
- * Single-program MPEG-TS for an ongoing hardware encode. Each callback owns one 188-byte packet;
- * callbacks run synchronously, so the consumer can apply backpressure without retaining the video.
+ * Single-program MPEG-TS for an ongoing hardware encode. Each callback owns a bounded, packet-aligned
+ * chunk. Callbacks run synchronously, so the consumer can apply backpressure without retaining video.
+ * Every sample is delivered before its write returns; no output waits for another sample or close.
  * Video samples must be in presentation/decode order (the encoder must disable B frames).
  */
 class StreamingTsMuxer(
@@ -166,24 +167,30 @@ class StreamingTsMuxer(
     private fun writePackets(pid: Int, payload: ByteArray, randomAccess: Boolean) {
         var position = 0
         while (position < payload.size) {
-            val first = position == 0
-            val capacity = if (first && randomAccess) 182 else 184
-            val count = minOf(capacity, payload.size - position)
-            val adaptation = count < 184
-            val packet = ByteArray(PACKET_SIZE) { 0xff.toByte() }
-            packet[0] = 0x47
-            packet[1] = ((pid ushr 8) or if (first) 0x40 else 0).toByte()
-            packet[2] = pid.toByte()
-            packet[3] = ((if (adaptation) 0x30 else 0x10) or (continuity[pid]++ and 15)).toByte()
-            val offset = if (adaptation) {
-                val length = 183 - count
-                packet[4] = length.toByte()
-                if (length > 0) packet[5] = if (first && randomAccess) 0x40 else 0
-                5 + length
-            } else 4
-            payload.copyInto(packet, offset, position, position + count)
-            output(packet)
-            position += count
+            val remainingPackets = (payload.size.toLong() - position + 183 +
+                (if (position == 0 && randomAccess) 2 else 0)) / 184
+            val packetCount = minOf(MAX_PACKETS_PER_CHUNK.toLong(), remainingPackets).toInt()
+            val chunk = ByteArray(packetCount * PACKET_SIZE) { 0xff.toByte() }
+            repeat(packetCount) { packetIndex ->
+                val packetStart = packetIndex * PACKET_SIZE
+                val first = position == 0
+                val capacity = if (first && randomAccess) 182 else 184
+                val count = minOf(capacity, payload.size - position)
+                val adaptation = count < 184
+                chunk[packetStart] = 0x47
+                chunk[packetStart + 1] = ((pid ushr 8) or if (first) 0x40 else 0).toByte()
+                chunk[packetStart + 2] = pid.toByte()
+                chunk[packetStart + 3] = ((if (adaptation) 0x30 else 0x10) or (continuity[pid]++ and 15)).toByte()
+                val offset = if (adaptation) {
+                    val length = 183 - count
+                    chunk[packetStart + 4] = length.toByte()
+                    if (length > 0) chunk[packetStart + 5] = if (first && randomAccess) 0x40 else 0
+                    5 + length
+                } else 4
+                payload.copyInto(chunk, packetStart + offset, position, position + count)
+                position += count
+            }
+            output(chunk)
         }
     }
 
@@ -249,6 +256,7 @@ class StreamingTsMuxer(
 
     companion object {
         const val PACKET_SIZE = 188
+        private const val MAX_PACKETS_PER_CHUNK = 32
         const val VIDEO_PID = 0x100
         const val AUDIO_PID = 0x101
         const val PMT_PID = 0x1000

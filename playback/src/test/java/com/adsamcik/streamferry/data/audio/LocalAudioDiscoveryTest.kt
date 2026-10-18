@@ -104,8 +104,24 @@ class LocalAudioDiscoveryTest {
         } finally { release.countDown(); discovery.cancelAndJoin() }
     }
 
+    @Test
+    fun `one header discovery retains ordered audio identities and local subtitle siblings`() = runBlocking {
+        val directory = kotlin.io.path.createTempDirectory("combined-tracks-").toFile()
+        try {
+            val video = File(directory, "movie.mkv").apply { writeBytes(audioMatroska(withSubtitles = true)) }
+            File(directory, "movie.en.srt").writeText("1\n00:00:00,000 --> 00:00:01,000\nCaption\n")
+            val result = LocalSubtitleReader.discoverTracks(RuntimeEnvironment.getApplication(), video.toURI().toString(), "video/x-matroska")
+            assertEquals(listOf(2, 5, 7), result.audio.map { it.extractorTrackId })
+            assertEquals(listOf("Czech", "English commentary", "English"), result.audio.map { it.label })
+            assertEquals(2, result.subtitles.size)
+            assertTrue(result.subtitles.first().source is com.adsamcik.streamferry.data.subtitle.LocalSubtitleSource.Embedded)
+            assertTrue(result.subtitles.last().source is com.adsamcik.streamferry.data.subtitle.LocalSubtitleSource.External)
+            assertEquals("eng", result.subtitles.last().language)
+        } finally { directory.deleteRecursively() }
+    }
+
     /** A first packet precedes malformed later data: discovery must not scan the movie payload. */
-    private fun audioMatroska(audioOnly: Boolean = false): ByteArray {
+    private fun audioMatroska(audioOnly: Boolean = false, withSubtitles: Boolean = false): ByteArray {
         fun bytes(vararg values: Int) = values.map { it.toByte() }.toByteArray()
         fun id(value: Int): ByteArray {
             val full = ByteBuffer.allocate(4).putInt(value).array()
@@ -132,10 +148,12 @@ class LocalAudioDiscoveryTest {
             video + audio(7, "eng", "English", true, 6) + audio(2, "ces", "Czech", false, 2) +
                 audio(5, "eng", "English commentary", false, 2)
         }
+        val text = if (withSubtitles) el(0xae, uint(0xd7, 9) + uint(0x73c5, 9) + uint(0x83, 17) +
+            el(0x86, "S_TEXT/UTF8".toByteArray()) + el(0x22b59c, "eng".toByteArray())) else ByteArray(0)
         // MatroskaExtractor.read returns after its first sample, even when endTracks fired earlier
         // in the same call. Supply that valid packet before the unreadable tail.
         val firstPacket = el(0xa3, bytes(if (audioOnly) 0x83 else 0x81, 0, 0, 0x80, 0, 0))
-        return header + el(0x18538067, el(0x1549a966, ByteArray(0)) + el(0x1654ae6b, tracks) +
+        return header + el(0x18538067, el(0x1549a966, ByteArray(0)) + el(0x1654ae6b, tracks + text) +
             el(0x1f43b675, uint(0xe7, 0) + firstPacket + el(0xe7, ByteArray(9))))
     }
 }

@@ -10,6 +10,7 @@ import android.os.Handler
 import android.os.Looper
 import androidx.core.content.ContextCompat
 import coil.ImageLoader
+import coil.memory.MemoryCache
 import coil.request.CachePolicy
 import com.adsamcik.streamferry.BuildConfig
 import com.google.android.gms.cast.framework.CastContext
@@ -76,6 +77,7 @@ import com.adsamcik.streamferry.data.jellyfin.DefaultJellyfinPlaybackReporter
 import com.adsamcik.streamferry.playback.session.DefaultPlaybackSessionCoordinator
 import com.adsamcik.streamferry.ui.theme.AppearancePreferences
 import com.adsamcik.streamferry.ui.artwork.ArtworkRefFetcher
+import com.adsamcik.streamferry.ui.artwork.ArtworkRefKeyer
 import com.adsamcik.streamferry.source.api.MediaRef
 import com.adsamcik.streamferry.source.api.DownloadFormat
 import com.adsamcik.streamferry.source.api.DownloadProvider
@@ -164,13 +166,24 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
 
     // ----- in-app poster images (Coil) -----
     /** The UI carries only opaque artwork refs; the owning source performs every authenticated fetch. */
-    val imageLoader: ImageLoader by lazy {
+    private val artworkKeyer = ArtworkRefKeyer()
+    private val imageLoaderDelegate = lazy {
         ImageLoader.Builder(appContext)
-            .components { add(ArtworkRefFetcher.Factory(::sourceRegistry)) }
-            .memoryCachePolicy(CachePolicy.DISABLED)
+            .components {
+                add(artworkKeyer)
+                add(ArtworkRefFetcher.Factory(::sourceRegistry))
+            }
+            .memoryCache { MemoryCache.Builder(appContext).maxSizeBytes(24 * 1024 * 1024).build() }
+            .memoryCachePolicy(CachePolicy.ENABLED)
             .diskCachePolicy(CachePolicy.DISABLED)
             .crossfade(true)
             .build()
+    }
+    val imageLoader: ImageLoader by imageLoaderDelegate
+
+    fun clearArtworkMemoryCache() {
+        artworkKeyer.invalidate()
+        if (imageLoaderDelegate.isInitialized()) imageLoaderDelegate.value.memoryCache?.clear()
     }
     val mediaRepository: MediaLibraryRepository by lazy {
         DownloadedJellyfinMediaLibraryRepository(
@@ -608,6 +621,7 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
 
     /** Clears all secrets and app-owned state (Settings → Delete all app data). */
     suspend fun deleteAllData() {
+        clearArtworkMemoryCache()
         legacyMigration.cancel()
         legacyMigration.join()
         runCatching { playbackEngine.stop() }

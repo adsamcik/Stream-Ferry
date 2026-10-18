@@ -37,66 +37,69 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 object LocalSubtitleReader {
     private const val MAX_SIDECAR_BYTES = 16 * 1024 * 1024
 
-    fun tracks(context: Context, videoUri: String, sourceMimeType: String?): List<LocalSubtitleTrack> {
-        return tracks(context, videoUri, sourceMimeType, ReadCancellation())
-    }
+    data class DiscoveredTracks(val audio: List<LocalAudioTrack>, val subtitles: List<LocalSubtitleTrack>)
 
-    /** Cancellation can close a provider even while its initial open/sniff is still pending. */
+    fun tracks(context: Context, videoUri: String, sourceMimeType: String?): List<LocalSubtitleTrack> =
+        readTracks(context, videoUri, sourceMimeType, ReadCancellation()).subtitles
+
     suspend fun discover(context: Context, videoUri: String, sourceMimeType: String?): List<LocalSubtitleTrack> =
-        suspendCancellableCoroutine { continuation ->
-            val cancellation = ReadCancellation()
-            val worker = Thread({
-                val result = runCatching { tracks(context, videoUri, sourceMimeType, cancellation) }
-                if (continuation.isActive) continuation.resumeWith(result)
-            }, "subtitle-discovery").apply { isDaemon = true }
-            continuation.invokeOnCancellation { cancellation.cancel(); worker.interrupt() }
-            worker.start()
-        }
+        discoverTracks(context, videoUri, sourceMimeType).subtitles
 
-    /** Reads container headers only; cancellation also interrupts a blocked document-provider open. */
     suspend fun discoverAudio(context: Context, videoUri: String, sourceMimeType: String?): List<LocalAudioTrack> =
+        discoverTracks(context, videoUri, sourceMimeType).audio
+
+    /** One cancellable header read discovers both track kinds, including MKV text omitted by MediaExtractor. */
+    suspend fun discoverTracks(context: Context, videoUri: String, sourceMimeType: String?): DiscoveredTracks =
         suspendCancellableCoroutine { continuation ->
             val cancellation = ReadCancellation()
             val worker = Thread({
-                val result = runCatching { audioTracks(context, videoUri, sourceMimeType, cancellation) }
+                val result = runCatching { readTracks(context, videoUri, sourceMimeType, cancellation) }
                 if (continuation.isActive) continuation.resumeWith(result)
-            }, "audio-discovery").apply { isDaemon = true }
+            }, "local-track-discovery").apply { isDaemon = true }
             continuation.invokeOnCancellation { cancellation.cancel(); worker.interrupt() }
             worker.start()
         }
 
-    private fun audioTracks(
+    private fun readTracks(
         context: Context,
         videoUri: String,
         sourceMimeType: String?,
         cancellation: ReadCancellation,
-    ): List<LocalAudioTrack> {
-        val discovered = linkedMapOf<Int, LocalAudioTrack>()
+    ): DiscoveredTracks {
+        val audio = linkedMapOf<Int, LocalAudioTrack>()
+        val subtitles = ArrayList<LocalSubtitleTrack>()
         var ended = false
         val output = object : ExtractorOutput {
             override fun track(id: Int, type: Int): TrackOutput = object : TrackOutput by DiscardingTrackOutput() {
                 override fun format(format: Format) {
-                    if (type != C.TRACK_TYPE_AUDIO) return
-                    val index = discovered[id]?.index ?: discovered.size
-                    val language = format.language?.takeUnless { it.isBlank() || it == "und" }
-                    discovered[id] = LocalAudioTrack(
-                        index = index,
-                        extractorTrackId = id,
-                        formatId = format.id,
-                        language = language,
-                        label = format.label ?: Languages.nameFor(language) ?: "Audio ${index + 1}",
-                        isDefault = format.selectionFlags and C.SELECTION_FLAG_DEFAULT != 0,
-                        roleFlags = format.roleFlags,
-                        mimeType = format.sampleMimeType,
-                        codecs = format.codecs,
-                        channelCount = format.channelCount,
-                        sampleRate = format.sampleRate,
-                        unsupportedReason = when {
-                            format.drmInitData != null -> "Encrypted audio cannot be converted on this device"
-                            format.sampleMimeType == null -> "Unknown audio format"
-                            else -> null
-                        },
-                    )
+                    if (type == C.TRACK_TYPE_AUDIO) {
+                        val index = audio[id]?.index ?: audio.size
+                        val language = format.language?.takeUnless { it.isBlank() || it == "und" }
+                        audio[id] = LocalAudioTrack(
+                            index = index, extractorTrackId = id, formatId = format.id, language = language,
+                            label = format.label ?: Languages.nameFor(language) ?: "Audio ${index + 1}",
+                            isDefault = format.selectionFlags and C.SELECTION_FLAG_DEFAULT != 0,
+                            roleFlags = format.roleFlags, mimeType = format.sampleMimeType, codecs = format.codecs,
+                            channelCount = format.channelCount, sampleRate = format.sampleRate,
+                            unsupportedReason = when {
+                                format.drmInitData != null -> "Encrypted audio cannot be converted on this device"
+                                format.sampleMimeType == null -> "Unknown audio format"
+                                else -> null
+                            },
+                        )
+                    } else if (type == C.TRACK_TYPE_TEXT) {
+                        val supported = format.sampleMimeType == MimeTypes.APPLICATION_MEDIA3_CUES ||
+                            DefaultSubtitleParserFactory().supportsFormat(format)
+                        subtitles.removeAll { (it.source as? LocalSubtitleSource.Embedded)?.trackId == id }
+                        subtitles += LocalSubtitleTrack(
+                            index = subtitles.size, language = format.language,
+                            label = format.label ?: format.language ?: "Subtitle ${subtitles.size + 1}",
+                            isDefault = format.selectionFlags and C.SELECTION_FLAG_DEFAULT != 0,
+                            isForced = format.selectionFlags and C.SELECTION_FLAG_FORCED != 0,
+                            source = LocalSubtitleSource.Embedded(id),
+                            unsupportedReason = if (supported) null else "Unsupported subtitle format: ${format.sampleMimeType}",
+                        )
+                    }
                 }
             }
             override fun endTracks() { ended = true }
@@ -105,38 +108,7 @@ object LocalSubtitleReader {
         ExtractorSession(context, videoUri, sourceMimeType, output, cancellation).use { session ->
             while (!ended && session.read()) Unit
         }
-        // ProgressiveMediaPeriod groups extractor tracks by ID, independent of header encounter order.
-        return discovered.values.sortedBy { it.extractorTrackId }.mapIndexed { index, track -> track.copy(index = index) }
-    }
-
-    private fun tracks(context: Context, videoUri: String, sourceMimeType: String?, cancellation: ReadCancellation): List<LocalSubtitleTrack> {
-        val discovered = ArrayList<LocalSubtitleTrack>()
-        var ended = false
-        val output = object : ExtractorOutput {
-            override fun track(id: Int, type: Int): TrackOutput = object : TrackOutput by DiscardingTrackOutput() {
-                override fun format(format: Format) {
-                    if (type != C.TRACK_TYPE_TEXT) return
-                    val supported = format.sampleMimeType == MimeTypes.APPLICATION_MEDIA3_CUES ||
-                        DefaultSubtitleParserFactory().supportsFormat(format)
-                    discovered.removeAll { (it.source as? LocalSubtitleSource.Embedded)?.trackId == id }
-                    discovered += LocalSubtitleTrack(
-                        index = discovered.size,
-                        language = format.language,
-                        label = format.label ?: format.language ?: "Subtitle ${discovered.size + 1}",
-                        isDefault = format.selectionFlags and C.SELECTION_FLAG_DEFAULT != 0,
-                        isForced = format.selectionFlags and C.SELECTION_FLAG_FORCED != 0,
-                        source = LocalSubtitleSource.Embedded(id),
-                        unsupportedReason = if (supported) null else "Unsupported subtitle format: ${format.sampleMimeType}",
-                    )
-                }
-            }
-            override fun endTracks() { ended = true }
-            override fun seekMap(seekMap: SeekMap) = Unit
-        }
-        ExtractorSession(context, videoUri, sourceMimeType, output, cancellation).use { session ->
-            while (!ended && session.read()) Unit
-        }
-        // File siblings require no extra permission. A content URI never grants access to sibling documents.
+        // A content URI never grants access to sibling documents; only plain files have sidecars.
         val uri = sourceUri(videoUri)
         if (uri.scheme == "file") {
             val file = File(requireNotNull(uri.path))
@@ -146,11 +118,12 @@ object LocalSubtitleReader {
                         sibling.nameWithoutExtension.startsWith("${file.nameWithoutExtension}.", ignoreCase = true)) &&
                     mimeFromName(sibling.name) != null
             }?.sortedBy { it.name }?.forEach { sibling ->
-                discovered += external(Uri.fromFile(sibling).toString(), null, sibling.name)
-                    .copy(index = discovered.size)
+                subtitles += external(Uri.fromFile(sibling).toString(), null, sibling.name).copy(index = subtitles.size)
             }
         }
-        return discovered
+        // ProgressiveMediaPeriod groups extractor tracks by ID, independent of header encounter order.
+        val orderedAudio = audio.values.sortedBy { it.extractorTrackId }.mapIndexed { index, track -> track.copy(index = index) }
+        return DiscoveredTracks(orderedAudio, subtitles)
     }
 
     private class ReadCancellation {
