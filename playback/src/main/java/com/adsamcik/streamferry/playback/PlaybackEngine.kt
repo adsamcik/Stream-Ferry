@@ -360,6 +360,7 @@ class PlaybackEngine(
     // Set true when an active renderer connection drops unexpectedly; surfaced in the status so the
     // ViewModel can auto-reconnect + resume. Cleared on each new play() and on teardown.
     @Volatile private var connectionLost = false
+    private val disconnectRevision = AtomicLong()
     @Volatile private var controlErrorMessage: String? = null
     @Volatile private var lastThroughputBps = 0L
     @Volatile private var lastNote = "Measuring link speed…"
@@ -396,6 +397,7 @@ class PlaybackEngine(
     private val recoveryLock = Any()
     private class RendererLoadErrors(var pending: PlaybackTargetEvent.Error? = null)
     private var rendererLoadErrors: RendererLoadErrors? = null
+    private var pendingUnknownFailure: Job? = null
 
     // Monotonic id of the current live playback session, bumped on every new play()/playLocal(). An
     // end-of-media (Ended) handler captures the generation it belongs to and only tears the session down
@@ -409,6 +411,7 @@ class PlaybackEngine(
     @Volatile private var pendingRecoveryKind: RecoveryAttemptKind? = null
 
     private val absolutePositionSeconds: Long get() = streamStartSeconds + reportedPositionSeconds
+    private fun recoveryPositionSeconds(): Long = smartResume.recoveryPositionSeconds() ?: absolutePositionSeconds
 
     /** Persist the latest renderer-confirmed position when the app leaves the foreground. */
     fun checkpointSmartResumeLifecycle() {
@@ -530,7 +533,7 @@ class PlaybackEngine(
         if (manualQuality) manualQualityBitrateBps ?: adaptive?.currentBitrateBps else null,
         audioSelection, subtitleSelection, mediaAudioTracks.toList(), mediaSubtitleTracks.toList(),
         mediaAudioTrackRefs.toMap(), mediaSubtitleTrackRefs.toMap(),
-        smartResume.recoveryPositionSeconds() ?: absolutePositionSeconds,
+        recoveryPositionSeconds(),
         localSubtitleTracks.toList(),
         providerMediaVersion,
         subtitleSelectionExplicit,
@@ -601,14 +604,21 @@ class PlaybackEngine(
                 publishStatus(error = "Couldn't reconnect to the TV.")
                 return@withLock false
             }
-            val resumeAt = absolutePositionSeconds
+            val resumeAt = recoveryPositionSeconds()
             val wasReloading = isReloadingStream
             isReloadingStream = true
+            val reconnectRevision = disconnectRevision.get()
             var endpointConnected = false
             try {
                 selectedTarget = endpoint
                 activeTarget.connect(endpoint)
                 endpointConnected = true
+                synchronized(recoveryLock) {
+                    if (disconnectRevision.get() != reconnectRevision) {
+                        throw PlaybackTargetException(PlaybackFailureKind.NETWORK, "The TV disconnected again.")
+                    }
+                    connectionLost = false
+                }
                 if (localPlayback != null) {
                     reloadLocalInPlace(resumeAt, "endpoint reconnect")
                 } else {
@@ -619,7 +629,11 @@ class PlaybackEngine(
                         armWatchdog = true,
                     )
                 }
-                connectionLost = false
+                synchronized(recoveryLock) {
+                    if (disconnectRevision.get() != reconnectRevision || connectionLost) {
+                        throw PlaybackTargetException(PlaybackFailureKind.NETWORK, "The TV disconnected again.")
+                    }
+                }
                 lastNote = "Reconnected to the TV"
                 publishStatus()
                 true
@@ -627,12 +641,16 @@ class PlaybackEngine(
                 throw e
             } catch (e: Exception) {
                 smartResume.checkpoint(SmartResumeCheckpointKind.FAILURE, smartResumeDeviceContext)
+                val disconnectedAgain = disconnectRevision.get() != reconnectRevision
+                if (disconnectedAgain) connectionLost = true
                 val stage = when {
+                    disconnectedAgain -> PlaybackFailureStage.ENDPOINT_DISCONNECT
                     e.isPreparationFailure() -> PlaybackFailureStage.STREAM_RESOLUTION
                     !endpointConnected -> PlaybackFailureStage.ENDPOINT_CONNECTION
                     else -> PlaybackFailureStage.SEEK_OR_RELOAD
                 }
                 val cause = when {
+                    disconnectedAgain -> PlaybackFailureCause.ENDPOINT_UNAVAILABLE
                     e.isPreparationFailure() -> PlaybackFailureCause.UPSTREAM_OR_SERVER_UNAVAILABLE
                     !endpointConnected -> PlaybackFailureCause.ENDPOINT_UNAVAILABLE
                     else -> e.rendererFailureKind().toRecoveryCause()
@@ -1493,7 +1511,6 @@ class PlaybackEngine(
         completedGeneration = null // supersede the current stream (its stray end-of-media/watchdog is now stale)
         val wasReloading = isReloadingStream
         isReloadingStream = true
-        connectionLost = false
         playbackStarted = false
         startupBytesServed = 0
         terminalFailureSurfaced = false
@@ -2089,7 +2106,10 @@ class PlaybackEngine(
     /** One receiver load can fail through both a callback and its command result. Decide only once. */
     private suspend fun withRendererLoadErrors(generation: Long, load: suspend () -> Unit) {
         val errors = RendererLoadErrors()
-        synchronized(recoveryLock) { rendererLoadErrors = errors }
+        synchronized(recoveryLock) {
+            cancelPendingUnknownFailure()
+            rendererLoadErrors = errors
+        }
         try {
             load()
         } catch (cancelled: CancellationException) {
@@ -2116,7 +2136,7 @@ class PlaybackEngine(
         scope.launch {
             mutex.withLock {
                 handlePlaybackFailure(pending.kind, pending.redactedMessage,
-                    pending.qualifiedFormatEvidence, expectedGeneration = generation)
+                    pending.qualifiedFormatEvidence, expectedGeneration = generation, coalesceUnknown = true)
             }
         }
     }
@@ -2639,7 +2659,7 @@ class PlaybackEngine(
      */
     private fun launchRecoveryReload(requestedBitrate: Long?, reason: String) {
         if (fallbackJob?.isActive == true) return // one automatic recovery coroutine at a time
-        val resumeAt = absolutePositionSeconds
+        val resumeAt = recoveryPositionSeconds()
         val expectedGeneration = recoverySession.generation
         fallbackJob = scope.launch {
             mutex.withLock {
@@ -2678,7 +2698,7 @@ class PlaybackEngine(
         }
     }
 
-    /** Reserve automatic work after the duplicate-event guard has claimed the reload window. */
+    /** Reserve automatic work before committing output choices; caller holds recoveryLock. */
     private fun admitRecoveryDecision(action: RecoveryAction): RecoveryAction {
         val kind = when (action) {
             RecoveryAction.RETRY_SAME_STREAM -> RecoveryAttemptKind.SAME_STREAM_NETWORK
@@ -2702,14 +2722,18 @@ class PlaybackEngine(
             pendingRecoveryKind = kind
             return action
         }
-        // The existing failure handler set isReloadingStream before admission. Undo that claim when the
-        // finite budget rejects it so the terminal state is stable and no orphan reload can start.
+        // A rejected attempt must leave output choices intact and expose a stable terminal state.
         isReloadingStream = false
         terminalFailureSurfaced = true
         recoverySession = recoverySession.fail()
         logger.w(TAG, "Recovery budget exhausted; surfacing playback failure")
         return RecoveryAction.SURFACE
     }
+    private fun cancelPendingUnknownFailure() {
+        pendingUnknownFailure?.cancel()
+        pendingUnknownFailure = null
+    }
+
     /**
      * Central handler for a playback failure — whether a renderer-reported [PlaybackTargetEvent.Error] or
      * one synthesized by the startup watchdog. The decision + the flags that gate re-entry (so concurrent
@@ -2722,6 +2746,7 @@ class PlaybackEngine(
         qualifiedFormatEvidence: Boolean = false,
         expectedGeneration: Long? = null,
         failureStage: PlaybackFailureStage = PlaybackFailureStage.RENDERER_LOAD,
+        coalesceUnknown: Boolean = false,
     ) {
         if (expectedGeneration != null && !recoverySession.acceptsEvent(expectedGeneration)) {
             logger.trace(TAG, "Ignoring stale playback failure for generation $expectedGeneration")
@@ -2736,6 +2761,21 @@ class PlaybackEngine(
                 return
             }
             if (terminalFailureSurfaced || isReloadingStream) return
+            if (kind == PlaybackFailureKind.UNKNOWN && coalesceUnknown) {
+                // IDLE/ERROR can precede the receiver's detailed decoder/fetch callback. Keep the
+                // first deadline: repeated generic statuses must not postpone recovery indefinitely.
+                if (pendingUnknownFailure?.isActive == true) return
+                val generation = recoverySession.generation
+                pendingUnknownFailure = scope.launch {
+                    delay(UNKNOWN_FAILURE_GRACE_MS)
+                    mutex.withLock {
+                        handlePlaybackFailure(kind, message, qualifiedFormatEvidence,
+                            expectedGeneration = generation, failureStage = failureStage)
+                    }
+                }
+                return
+            }
+            cancelPendingUnknownFailure()
             recoverySession = recoverySession.recordFailure(failureStage, kind.toRecoveryCause())
         }
         // Local on-device transcode AUTO-FALLBACK: if the TV rejected this format before playback started,
@@ -2767,7 +2807,7 @@ class PlaybackEngine(
                 "playback",
                 "On-device transcode ($kind) rejected by the TV; auto-falling back to codec ${localFallbackTo.name.lowercase()}",
             )
-            val resumeAt = absolutePositionSeconds
+            val resumeAt = recoveryPositionSeconds()
             fallbackJob = scope.launch {
                 mutex.withLock {
                     try {
@@ -2795,13 +2835,14 @@ class PlaybackEngine(
         }
         val online = currentProviderSession != null
         val transcoding = currentIsTranscoding || effectiveForceTranscode()
-        val decidedAction = synchronized(recoveryLock) {
+        val action = synchronized(recoveryLock) {
             // A single failure often arrives as multiple events (Cast fires onMediaError twice plus an
             // IDLE/ERROR status); once we've surfaced a terminal failure for this stream, drop the extras.
             if (terminalFailureSurfaced) {
                 logger.trace(TAG, "Ignoring duplicate playback error (terminal failure already surfaced)")
                 return
             }
+            val lowerResolution = if (online && transcoding) nextLowerResolution() else null
             val decided = decideRecovery(
                 failure = kind,
                 isReloading = isReloadingStream,
@@ -2809,23 +2850,23 @@ class PlaybackEngine(
                 preferDirectPlay = prefs.preferDirectPlay,
                 alreadyTranscoding = transcoding,
                 alreadyRetried = retriedOnce,
-                hasLowerResolutionFallback = online && transcoding && nextLowerResolution() != null,
+                hasLowerResolutionFallback = lowerResolution != null,
             )
-            // Enter the reload window synchronously so further errors from the dying stream are ignored.
-            when (decided) {
+            val admitted = admitRecoveryDecision(decided)
+            // Commit output choices only after the finite budget accepts this recovery.
+            when (admitted) {
                 RecoveryAction.RETRY_SAME_STREAM -> { retriedOnce = true; isReloadingStream = true }
                 RecoveryAction.TRANSCODE_FALLBACK -> { forceTranscodeFallback = true; isReloadingStream = true }
                 RecoveryAction.LOWER_RESOLUTION_FALLBACK -> {
-                    manualMaxVideoHeight = nextLowerResolution()
+                    manualMaxVideoHeight = lowerResolution
                     forceTranscodeFallback = true
                     isReloadingStream = true
                 }
                 RecoveryAction.SURFACE -> terminalFailureSurfaced = true
                 else -> Unit
             }
-            decided
+            admitted
         }
-        val action = admitRecoveryDecision(decidedAction)
         // Always-on: attribute the recovery decision to its inputs so a shared report explains WHY a
         // failure was retried, transcoded, ignored, or surfaced (e.g. "kind=UNKNOWN ... -> SURFACE").
         logger.event(
@@ -2875,6 +2916,8 @@ class PlaybackEngine(
      */
     private fun armStartupWatchdog(generation: Long = recoverySession.generation) {
         startupWatchdogJob?.cancel()
+        startupWatchdogJob = null
+        if (connectionLost) return
         playbackStarted = false
         startupBytesServed = 0L
         startupWatchdogJob = scope.launch {
@@ -2906,6 +2949,7 @@ class PlaybackEngine(
         "The TV didn't start playing. Check the TV and phone connection, then try again."
 
     private fun markPlaybackStarted() {
+        synchronized(recoveryLock) { cancelPendingUnknownFailure() }
         if (!playbackStarted) {
             playbackStarted = true
             logger.event("playback", "Playback confirmed on the TV (~${startupBytesServed / 1024} KiB served)")
@@ -3248,6 +3292,7 @@ class PlaybackEngine(
                 event.kind,
                 event.redactedMessage,
                 event.qualifiedFormatEvidence,
+                coalesceUnknown = true,
             )
             is PlaybackTargetEvent.Ended -> {
                 // Ignore a "finished" that fires only because we are mid-reload (HLS seek / bitrate
@@ -3341,6 +3386,11 @@ class PlaybackEngine(
                 scope.launch { stopIfCurrent(gen, "renderer stopped") }
             }
             is PlaybackTargetEvent.Disconnected -> {
+                synchronized(recoveryLock) {
+                    disconnectRevision.incrementAndGet()
+                    connectionLost = true
+                    cancelPendingUnknownFailure()
+                }
                 startupWatchdogJob?.cancel()
                 startupWatchdogJob = null
                 updateProgressEstimate()
@@ -3496,6 +3546,7 @@ class PlaybackEngine(
     }
 
     private suspend fun stopInternalLocked(reason: String) {
+        synchronized(recoveryLock) { cancelPendingUnknownFailure() }
         failedPlaybackChoices = if (reason.endsWith("failed")) capturePlaybackChoices() else null
         updateProgressEstimate()
         synchronized(progressLock) {
@@ -3641,7 +3692,7 @@ class PlaybackEngine(
             playWhenReady = localPlayWhenReady,
             isBuffering = isBuffering,
             positionSeconds = absolutePositionSeconds,
-            recoveryPositionSeconds = smartResume.recoveryPositionSeconds() ?: absolutePositionSeconds,
+            recoveryPositionSeconds = recoveryPositionSeconds(),
             // For an online session the duration comes from the source descriptor; a local session
             // falls back to the item runtime (probed for on-device files).
             durationSeconds = descriptor?.runtimeSeconds ?: item?.runtimeSeconds,
@@ -3708,6 +3759,7 @@ class PlaybackEngine(
     }
 
     companion object {
+        private const val UNKNOWN_FAILURE_GRACE_MS = 300L
         private const val TAG = "PlaybackEngine"
         private const val MONITOR_INTERVAL_MS = 5_000L
         // How long end-of-media keeps the TV connection alive waiting for a seamless autoplay-next before

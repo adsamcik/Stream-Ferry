@@ -3,6 +3,8 @@ package com.adsamcik.streamferry.playback
 import android.content.Context
 import com.adsamcik.streamferry.core.adaptive.AdaptiveBitrateController
 import com.adsamcik.streamferry.core.session.SessionRegistry
+import com.adsamcik.streamferry.core.resume.*
+import com.adsamcik.streamferry.data.proxy.MediaDelivery
 import com.adsamcik.streamferry.core.stream.MediaProfile
 import com.adsamcik.streamferry.core.stream.Protocol
 import com.adsamcik.streamferry.core.stream.StreamPreferences
@@ -80,10 +82,25 @@ class PlaybackEngineLocalTranscodeTest {
 
     @AfterTest fun releaseLocalProbe() = unmockkAll()
 
+    private class ResumeStore : SmartResumeRecordStore {
+        override var current: SmartResumeRecord? = null
+        override fun apply(update: SmartResumeCheckpoint) = SmartResumeReducer.reduce(current, update).also { current = it }
+        override fun clear() { current = null }
+    }
+
     private class Fixture(scope: TestScope, protocol: Protocol = Protocol.CAST,
-        dispatcher: CoroutineDispatcher = StandardTestDispatcher(scope.testScheduler)) {
+        dispatcher: CoroutineDispatcher = StandardTestDispatcher(scope.testScheduler),
+        private val trackResume: Boolean = false) {
         val events = MutableSharedFlow<PlaybackTargetEvent>(extraBufferCapacity = 16)
         val target = mockk<PlaybackTargetController>(relaxed = true)
+        val proxy = mockk<LocalProxyServer>(relaxed = true)
+        private val resumeStore = ResumeStore()
+        private var deliveryListener: ((MediaDelivery) -> Unit)? = null
+        private var deliveryEpoch = 0L
+        var sleepMillis = 0L
+        fun deliver(startMs: Long, endMs: Long) {
+            assertNotNull(deliveryListener).invoke(MediaDelivery(session.id, deliveryEpoch, startMs, endMs))
+        }
         val coordinator = mockk<DefaultPlaybackSessionCoordinator>(relaxed = true)
         val provider = mockk<PlaybackProvider>(relaxed = true)
         val providerSession = mockk<ProviderPlaybackSession>(relaxed = true)
@@ -100,6 +117,8 @@ class PlaybackEngineLocalTranscodeTest {
         val engine: PlaybackEngine
 
         init {
+            every { proxy.mediaDeliveryListener = any() } answers { deliveryListener = firstArg() }
+            every { proxy.renewDeliveryEpoch(any()) } answers { ++deliveryEpoch }
             every { target.events } returns events
             every { target.protocol } returns protocol
             coEvery { target.readCurrentVolume() } returns 0.1f
@@ -134,13 +153,14 @@ class PlaybackEngineLocalTranscodeTest {
             val context = mockk<Context>(relaxed = true)
             every { context.cacheDir } returns File(System.getProperty("java.io.tmpdir"), "local-transcode-test")
             engine = PlaybackEngine(
-                provider, coordinator, mockk<LocalProxyServer>(relaxed = true), network, service,
+                provider, coordinator, proxy, network, service,
                 mockk<DiagnosticSink>(relaxed = true), context, mockk(relaxed = true),
                 { DeviceEncodeCapabilities(ResolutionTier.FHD_1080P, ResolutionTier.HD_720P) },
                 mockk(relaxed = true),
+                smartResume = SmartResumeSessionTracker(resumeStore, { scope.testScheduler.currentTime }),
                 clock = { scope.testScheduler.currentTime },
                 dispatcher = dispatcher,
-                elapsedRealtime = { scope.testScheduler.currentTime },
+                elapsedRealtime = { scope.testScheduler.currentTime + sleepMillis },
             )
         }
 
@@ -157,23 +177,31 @@ class PlaybackEngineLocalTranscodeTest {
             filePath = filePath, contentType = "video/mp4", title = "Movie",
             runtimeSeconds = 3600, allowClientTranscode = allowClientTranscode,
             resumePositionSeconds = 123, target = target, selectedTarget = selected,
+            smartResumeSeed = if (trackResume) SmartResumeSeed(
+                if (filePath.startsWith("content:")) SmartResumeSourceType.LOCAL else SmartResumeSourceType.DOWNLOADED,
+                filePath, "Movie", durationSeconds = 3600, serverId = "server", userId = "user", localContentUri = filePath,
+            ) else null,
             prefs = prefs,
         )
 
-        suspend fun startOnline(prefs: StreamPreferences = StreamPreferences(maxVideoHeight = 720, maxBitrateBps = 2_000_000)) = engine.play(movie, target, selected, prefs)
+        suspend fun startOnline(prefs: StreamPreferences = StreamPreferences(maxVideoHeight = 720, maxBitrateBps = 2_000_000)) = engine.play(
+            movie, target, selected, prefs,
+            smartResumeSeed = if (trackResume) SmartResumeSeed(SmartResumeSourceType.REMOTE, "movie", "Movie",
+                durationSeconds = 3600, serverId = "server", userId = "user") else null,
+        )
 
-        suspend fun startSource(source: SourceCase) {
+        suspend fun startSource(source: SourceCase, prefs: StreamPreferences? = null) {
             when (source) {
-                SourceCase.FILE -> start(allowClientTranscode = false)
-                SourceCase.CONTENT_URI -> start(allowClientTranscode = false, filePath = "content://media/external/video/42")
-                SourceCase.PROVIDER_FILE -> startOnline()
+                SourceCase.FILE -> start(allowClientTranscode = false, prefs = prefs ?: StreamPreferences())
+                SourceCase.CONTENT_URI -> start(allowClientTranscode = false, filePath = "content://media/external/video/42", prefs = prefs ?: StreamPreferences())
+                SourceCase.PROVIDER_FILE -> startOnline(prefs ?: StreamPreferences(maxVideoHeight = 720, maxBitrateBps = 2_000_000))
                 SourceCase.PROVIDER_HLS -> {
                     providerStream = StreamDescriptor(
                         "application/vnd.apple.mpegurl", "hls", isTranscoding = true, isByteSeekable = false,
                         hlsSegmentFormat = com.adsamcik.streamferry.source.api.HlsSegmentFormat.FMP4,
                         totalLength = null,
                     )
-                    startOnline()
+                    startOnline(prefs ?: StreamPreferences(maxVideoHeight = 720, maxBitrateBps = 2_000_000))
                 }
             }
         }
@@ -1854,6 +1882,7 @@ class PlaybackEngineLocalTranscodeTest {
                     val before = assertNotNull(f.engine.status.value)
                     val loads = f.loads.size
                     f.events.emit(PlaybackTargetEvent.Error(kind, "Connection interrupted")); runCurrent()
+                    if (kind == PlaybackFailureKind.UNKNOWN) { advanceTimeBy(500); runCurrent() }
                     val retried = assertNotNull(f.engine.status.value)
                     assertEquals(loads + 1, f.loads.size, "$source/$protocol/$kind must retry the same output")
                     assertEquals(before.outputFormat, retried.outputFormat)
@@ -1862,6 +1891,7 @@ class PlaybackEngineLocalTranscodeTest {
                     assertEquals(0, f.engine.recoverySnapshot().usage.compatibilityOrQualityVariants)
                     assertEquals(1, f.engine.recoverySnapshot().usage.sameStreamNetworkRetries)
                     f.events.emit(PlaybackTargetEvent.Error(kind, "Still disconnected")); runCurrent()
+                    if (kind == PlaybackFailureKind.UNKNOWN) { advanceTimeBy(500); runCurrent() }
                     assertTrue(f.engine.status.value?.isTerminal == true)
                     assertEquals(loads + 1, f.loads.size, "retry must be bounded")
                     assertEquals(0, f.engine.recoverySnapshot().usage.compatibilityOrQualityVariants)
@@ -2038,6 +2068,188 @@ class PlaybackEngineLocalTranscodeTest {
                 assertEquals(0, f.engine.recoverySnapshot().usage.compatibilityOrQualityVariants)
                 assertEquals(PlaybackFailureCause.ENDPOINT_UNAVAILABLE,
                     f.engine.recoverySnapshot().attempts.last().failureCause)
+            } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `detailed errors replace generic errors without spending network retries for every source and protocol`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) {
+            val f = Fixture(this, protocol)
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE); runCurrent()
+                f.engine.selectMaxVideoHeight(480); runCurrent()
+                f.engine.pause(); runCurrent()
+                val before = assertNotNull(f.engine.status.value)
+                val loads = f.loads.size
+                f.events.emit(PlaybackTargetEvent.Error(PlaybackFailureKind.UNKNOWN, "Generic receiver error")); runCurrent()
+                advanceTimeBy(100); runCurrent()
+                assertEquals(loads, f.loads.size)
+                f.events.emit(PlaybackTargetEvent.Error(PlaybackFailureKind.FORMAT, "Explicit decode failure", true)); runCurrent()
+                advanceTimeBy(500); runCurrent()
+                val recovered = assertNotNull(f.engine.status.value)
+                assertEquals(loads + 1, f.loads.size, "$source/$protocol duplicate recovery")
+                assertEquals(0, f.engine.recoverySnapshot().usage.sameStreamNetworkRetries)
+                assertEquals(1, f.engine.recoverySnapshot().usage.compatibilityOrQualityVariants)
+                assertEquals(before.recoveryPositionSeconds, recovered.recoveryPositionSeconds)
+                assertEquals(480, recovered.maxVideoHeight)
+                assertFalse(f.loads.last().playWhenReady)
+                assertNotEquals(before.outputFormat, recovered.outputFormat)
+            } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `generic errors have a fixed deadline and stale errors cannot outlive playback changes`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) {
+            val f = Fixture(this, protocol)
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE); runCurrent()
+                var loads = f.loads.size
+                f.events.emit(PlaybackTargetEvent.Error(PlaybackFailureKind.UNKNOWN, "Generic error")); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(0, true)); runCurrent()
+                advanceTimeBy(500); runCurrent()
+                assertEquals(loads, f.loads.size, "$source/$protocol recovered playback was restarted")
+                f.events.emit(PlaybackTargetEvent.Error(PlaybackFailureKind.UNKNOWN, "Generic error")); runCurrent()
+                f.engine.seekTo(300); runCurrent()
+                loads = f.loads.size
+                advanceTimeBy(500); runCurrent()
+                assertEquals(loads, f.loads.size, "$source/$protocol old error survived seek")
+                f.events.emit(PlaybackTargetEvent.Error(PlaybackFailureKind.UNKNOWN, "Generic error")); runCurrent()
+                f.events.emit(PlaybackTargetEvent.Disconnected); runCurrent()
+                advanceTimeBy(500); runCurrent()
+                assertEquals(loads, f.loads.size)
+                assertEquals(0, f.engine.recoverySnapshot().usage.sameStreamNetworkRetries)
+                assertTrue(f.engine.retrySameEndpointAfterDisconnect()); runCurrent()
+                f.events.emit(PlaybackTargetEvent.Error(PlaybackFailureKind.UNKNOWN, "Generic error")); runCurrent()
+                f.engine.stop(); runCurrent()
+                loads = f.loads.size
+                advanceTimeBy(500); runCurrent()
+                assertEquals(loads, f.loads.size)
+                assertNull(f.engine.status.value)
+            } finally { f.engine.stop(); runCurrent() }
+        }
+        val f = Fixture(this)
+        try {
+            f.start(); runCurrent()
+            val loads = f.loads.size
+            repeat(5) {
+                f.events.emit(PlaybackTargetEvent.Error(PlaybackFailureKind.UNKNOWN, "Repeated status")); runCurrent()
+                advanceTimeBy(100); runCurrent()
+            }
+            assertEquals(loads + 1, f.loads.size, "duplicate UNKNOWN events extended the first deadline")
+            assertEquals(1, f.engine.recoverySnapshot().usage.sameStreamNetworkRetries)
+        } finally { f.engine.stop(); runCurrent() }
+    }
+
+    @Test fun `a fresh disconnect during connect or load fails reconnect and preserves explicit retry choices for every source`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) for (duringConnect in listOf(true, false)) {
+            val f = Fixture(this, protocol)
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE)
+                f.engine.selectPreferredCodec("hevc")
+                f.engine.selectMaxVideoHeight(480); runCurrent()
+                f.engine.seekTo(200); runCurrent()
+                f.engine.pause(); runCurrent()
+                val before = assertNotNull(f.engine.status.value)
+                f.events.emit(PlaybackTargetEvent.Disconnected); runCurrent()
+                if (duringConnect) coEvery { f.target.connect(any()) } coAnswers {
+                    f.events.emit(PlaybackTargetEvent.Disconnected); yield()
+                } else coEvery { f.target.load(any(), any(), any(), any(), any(), any()) } coAnswers {
+                    f.loads += LoadedStream(firstArg(), arg(3), arg(4), arg(5))
+                    f.events.emit(PlaybackTargetEvent.Disconnected); yield()
+                }
+                assertFalse(f.engine.retrySameEndpointAfterDisconnect(), "$source/$protocol/$duringConnect falsely recovered")
+                runCurrent()
+                val failed = assertNotNull(f.engine.status.value)
+                assertTrue(failed.connectionLost)
+                assertTrue(failed.isTerminal)
+                assertFalse(failed.playWhenReady)
+                assertEquals(PlaybackFailureCause.ENDPOINT_UNAVAILABLE, failed.attemptHistory.last().failureCause)
+                val retry = assertNotNull(f.engine.continuationForExplicitRetry())
+                assertEquals(before.recoveryPositionSeconds, retry.positionSeconds)
+                assertEquals(480, retry.playbackChoices?.maxVideoHeight)
+                assertEquals(VideoCodec.HEVC, retry.playbackChoices?.localCodec)
+                coEvery { f.target.connect(any()) } returns Unit
+                coEvery { f.target.load(any(), any(), any(), any(), any(), any()) } coAnswers {
+                    f.loads += LoadedStream(firstArg(), arg(3), arg(4), arg(5))
+                }
+                f.continueSource(source, protocol, assertNotNull(retry.positionSeconds), retry); runCurrent()
+                assertFalse(f.loads.last().playWhenReady)
+                assertEquals(before.recoveryPositionSeconds, f.engine.status.value?.positionSeconds)
+                assertEquals("hevc", f.engine.status.value?.preferredVideoCodec)
+                assertEquals(480, f.engine.status.value?.maxVideoHeight)
+                assertEquals(0, f.engine.recoverySnapshot().usage.compatibilityOrQualityVariants)
+            } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `network reload and reconnect preserve saved progress pause and output for every source and protocol`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries)
+            for (reconnect in listOf(true, false)) for (paused in listOf(true, false)) {
+                val f = Fixture(this, protocol, trackResume = true)
+                try {
+                    f.startSource(source); runCurrent()
+                    f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE)
+                    f.engine.selectPreferredCodec("hevc")
+                    f.engine.selectMaxVideoHeight(480); runCurrent()
+                    f.events.emit(PlaybackTargetEvent.StatusChanged(0, true)); runCurrent()
+                    f.sleepMillis = 60_000
+                    advanceTimeBy(5000); runCurrent()
+                    f.deliver(0, 100_000)
+                    f.events.emit(PlaybackTargetEvent.StatusChanged(1, true, isPositionConfirmed = false)); runCurrent()
+                    if (paused) { f.engine.pause(); runCurrent() }
+                    val before = assertNotNull(f.engine.status.value)
+                    assertTrue(before.recoveryPositionSeconds > before.positionSeconds + 30, "$source/$protocol missing delivery progress")
+                    if (reconnect) {
+                        f.events.emit(PlaybackTargetEvent.Disconnected); runCurrent()
+                        assertTrue(f.engine.retrySameEndpointAfterDisconnect()); runCurrent()
+                    } else {
+                        f.events.emit(PlaybackTargetEvent.Error(PlaybackFailureKind.NETWORK, "Delivery failed")); runCurrent()
+                    }
+                    val recovered = assertNotNull(f.engine.status.value)
+                    assertEquals(before.recoveryPositionSeconds, recovered.positionSeconds, "$source/$protocol rewound recovery")
+                    assertEquals(!paused, f.loads.last().playWhenReady)
+                    assertEquals(before.preferredVideoCodec, recovered.preferredVideoCodec)
+                    assertEquals(before.maxVideoHeight, recovered.maxVideoHeight)
+                    assertEquals(before.localTranscodeMode, recovered.localTranscodeMode)
+                    assertEquals(0, f.engine.recoverySnapshot().usage.compatibilityOrQualityVariants)
+                } finally { f.engine.stop(); runCurrent() }
+            }
+    }
+
+    @Test fun `rejected recovery preserves the last admitted resolution pause and protocol handoff choices for every source`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) {
+            val f = Fixture(this, protocol)
+            try {
+                f.startSource(source, StreamPreferences(maxVideoHeight = 2160)); runCurrent()
+                if (source == SourceCase.FILE || source == SourceCase.CONTENT_URI) {
+                    f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE)
+                    f.engine.selectMaxVideoHeight(720); runCurrent()
+                }
+                f.events.emit(PlaybackTargetEvent.StatusChanged(200, true)); runCurrent()
+                f.engine.pause(); runCurrent()
+                repeat(3) {
+                    f.events.emit(PlaybackTargetEvent.Error(PlaybackFailureKind.FORMAT, "Decode failed", true)); runCurrent()
+                }
+                val before = assertNotNull(f.engine.status.value)
+                val loads = f.loads.size
+                f.events.emit(PlaybackTargetEvent.Error(PlaybackFailureKind.FORMAT, "Decode failed", true)); runCurrent()
+                val failed = assertNotNull(f.engine.status.value)
+                assertTrue(failed.isTerminal)
+                assertEquals(loads, f.loads.size)
+                assertEquals(before.maxVideoHeight, failed.maxVideoHeight, "$source/$protocol retained an unattempted resolution")
+                val explicitRetry = assertNotNull(f.engine.continuationForExplicitRetry())
+                assertEquals(before.maxVideoHeight, explicitRetry.playbackChoices?.maxVideoHeight)
+                val attempt = failed.attemptHistory.last()
+                val alternate = assertNotNull(f.engine.reserveAlternateProtocolContinuation(
+                    true, assertNotNull(attempt.failureStage), assertNotNull(attempt.failureCause), true,
+                ))
+                f.continueSource(source, Protocol.entries.single { it != protocol }, assertNotNull(alternate.positionSeconds), alternate); runCurrent()
+                assertEquals(before.maxVideoHeight, f.engine.status.value?.maxVideoHeight)
+                assertFalse(f.loads.last().playWhenReady)
+                assertEquals(before.recoveryPositionSeconds, f.engine.status.value?.positionSeconds)
             } finally { f.engine.stop(); runCurrent() }
         }
     }
