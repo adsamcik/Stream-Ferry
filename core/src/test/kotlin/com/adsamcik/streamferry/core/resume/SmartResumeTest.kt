@@ -132,6 +132,47 @@ class SmartResumeTest {
         assertEquals(105, store.current!!.confirmedPositionSeconds)
     }
 
+    @Test fun liveSeekIntentDoesNotAdvanceDurableCheckpointUntilConfirmed() {
+        val store = MemoryStore()
+        val tracker = SmartResumeSessionTracker(store, clock = { 1000 }, newSessionId = { "session" })
+        tracker.prepare(seed)
+        tracker.onRendererStatus(123, 1_000, isPlaying = true)
+        tracker.noteSeekRequested(300)
+        assertEquals(300, tracker.pendingSeekPositionSeconds())
+        assertEquals(123, tracker.recoveryPositionSeconds())
+        assertEquals(123, store.current!!.confirmedPositionSeconds)
+        tracker.cancelPendingSeek(299)
+        assertEquals(300, tracker.pendingSeekPositionSeconds())
+        tracker.cancelPendingSeek(300)
+        assertNull(tracker.pendingSeekPositionSeconds())
+        tracker.noteSeekRequested(50)
+        tracker.onRendererStatus(50, 1_000, isPlaying = false)
+        assertNull(tracker.pendingSeekPositionSeconds())
+        assertEquals(50, tracker.recoveryPositionSeconds())
+        assertEquals(50, store.current!!.confirmedPositionSeconds)
+    }
+
+    @Test fun firstConfirmedStatusRetiresSeekIntentDuringInitiallyPausedStartup() {
+        val tracker = SmartResumeSessionTracker(MemoryStore(), clock = { 1000 }, newSessionId = { "session" })
+        tracker.prepare(seed)
+        tracker.noteSeekRequested(300)
+        tracker.onRendererStatus(300, 1_000, isPlaying = false, allowRegression = true)
+        assertNull(tracker.pendingSeekPositionSeconds())
+        tracker.onRendererStatus(400, 1_000, isPlaying = true, allowRegression = true)
+        assertEquals(400, tracker.recoveryPositionSeconds())
+    }
+
+    @Test fun trustedPostSeekProgressBeyondTargetRetiresSeekIntent() {
+        val tracker = SmartResumeSessionTracker(MemoryStore(), clock = { 1000 }, newSessionId = { "session" })
+        tracker.prepare(seed)
+        tracker.onRendererStatus(123, 1_000, isPlaying = true)
+        tracker.noteSeekRequested(300)
+        tracker.onRendererStatus(306, 1_000, isPlaying = true, allowRegression = true)
+        assertNull(tracker.pendingSeekPositionSeconds())
+        tracker.onRendererStatus(400, 1_000, isPlaying = true, allowRegression = true)
+        assertEquals(400, tracker.recoveryPositionSeconds())
+    }
+
     @Test fun lateTeardownCannotResurrectCompletion() {
         val current = SmartResumeReducer.reduce(null, checkpoint(position = 900))!!
         val finished = SmartResumeReducer.reduce(current, checkpoint(sequence = 2, position = 995, kind = SmartResumeCheckpointKind.COMPLETED))!!

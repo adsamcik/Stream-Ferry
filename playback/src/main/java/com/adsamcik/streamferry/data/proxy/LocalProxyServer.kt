@@ -558,7 +558,7 @@ class LocalProxyServer(
                 val playlist = resource == null ||
                     resource.kind == StreamResourceKind.PLAYLIST ||
                     looksLikePlaylist(contentType)
-                val responseValid = when {
+                val responseValid = response.hasIdentityContentEncoding() && when {
                     playlist -> range == null && response.statusCode == 200
                     range == null -> response.statusCode == 200 && response.hasValidContentLength()
                     else -> response.hasValidContentLength() && UpstreamRangeVerifier.matchesRequestHeader(
@@ -570,7 +570,7 @@ class LocalProxyServer(
                 }
                 if (!responseValid) {
                     writeStatus(out, 502, "Bad Gateway")
-                    logger.w(TAG, "HLS source did not prove the requested response range")
+                    logger.w(TAG, "HLS source did not prove the requested range or identity encoding")
                     return
                 }
                 if (playlist) {
@@ -648,7 +648,7 @@ class LocalProxyServer(
         val response = openTracked(session, lease, null)
         val declaredLength = response.declaredContentLength()
         val valid = response.statusCode == 200 &&
-            response.hasValidContentLength() &&
+            response.hasIdentityContentEncoding() && response.hasValidContentLength() &&
             (expectedTotalLength == null || declaredLength == null || declaredLength == expectedTotalLength)
         if (valid) return response
         closeUpstream(session.id, response)
@@ -667,7 +667,7 @@ class LocalProxyServer(
         totalLength: Long,
     ): StreamResponse? {
         val response = openTracked(session, lease, requested)
-        val valid = response.hasValidContentLength() && UpstreamRangeVerifier.isExact(
+        val valid = response.hasIdentityContentEncoding() && response.hasValidContentLength() && UpstreamRangeVerifier.isExact(
             statusCode = response.statusCode,
             contentRanges = response.headers("Content-Range"),
             contentLength = response.declaredContentLength(),
@@ -683,6 +683,12 @@ class LocalProxyServer(
         headers.entries.firstOrNull { it.key.equals(name, ignoreCase = true) }?.value
 
     private fun StreamResponse.headers(name: String): List<String> = listOfNotNull(header(name))
+
+    // Downstream byte offsets and lengths describe raw media. A still-encoded representation cannot
+    // be relayed or resumed under those offsets; a partially received gzip entity cannot be decoded
+    // safely here either. Sources may transparently decode full responses before returning them.
+    private fun StreamResponse.hasIdentityContentEncoding(): Boolean =
+        header("Content-Encoding")?.trim()?.equals("identity", ignoreCase = true) ?: true
 
     private fun StreamResponse.hasValidContentLength(): Boolean =
         header("Content-Length")?.let { it.toLongOrNull()?.let { length -> length >= 0 } ?: false } ?: true
@@ -858,7 +864,7 @@ class LocalProxyServer(
                     ?: throw IOException("HLS body resume open failed", failure)
                 response = replacement
                 val valid = representationValidator(replacement) == validator &&
-                    replacement.header("Content-Encoding").orEmpty().equals(initial.header("Content-Encoding").orEmpty(), true) &&
+                    replacement.hasIdentityContentEncoding() &&
                     replacement.hasValidContentLength() &&
                     UpstreamRangeVerifier.isExact(
                         replacement.statusCode, replacement.headers("Content-Range"),
@@ -1222,7 +1228,7 @@ class LocalProxyServer(
                         throw IOException("Upstream did not honour the resume range")
                     }
                     if (representationValidator(response) != validator ||
-                        !response.header("Content-Encoding").orEmpty().equals(initialResp.header("Content-Encoding").orEmpty(), true)) {
+                        !response.hasIdentityContentEncoding()) {
                         throw IOException("Upstream changed representation during resume")
                     }
                 }

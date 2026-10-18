@@ -42,10 +42,60 @@ class LocalProxyCancellationTest {
         coEvery { lease.open(range = any()) } returns Result.success(StreamResponse(200, mapOf("Content-Length" to "8", "ETag" to "\"same\""), body))
     }
 
-    private fun request(address: String, id: String, query: String = "", method: String = "GET"): Socket = Socket("127.0.0.1", address.substringAfter(':').toInt()).apply {
+    private fun request(address: String, id: String, query: String = "", method: String = "GET", range: String? = null): Socket = Socket("127.0.0.1", address.substringAfter(':').toInt()).apply {
         soTimeout = 3000
-        getOutputStream().write("$method /session/$id/stream$query HTTP/1.1\r\nHost: localhost\r\n\r\n".toByteArray())
+        val rangeHeader = range?.let { "Range: $it\r\n" }.orEmpty()
+        getOutputStream().write("$method /session/$id/stream$query HTTP/1.1\r\nHost: localhost\r\n$rangeHeader\r\n".toByteArray())
         getOutputStream().flush()
+    }
+
+    @Test fun `progressive media rejects encoded bodies before success headers with and without known length`() {
+        for (totalLength in listOf(8L, null)) {
+            for (range in if (totalLength == null) listOf(null) else listOf(null, "bytes=2-5")) {
+                for (encoding in listOf(null, "identity", "gzip")) {
+                    val sessions = SessionRegistry()
+                    val proxy = LocalProxyServer(sessions, Log())
+                    val session = sessions.create("video/mp4", totalLength = totalLength)
+                    val source = lease(ByteArrayInputStream(byteArrayOf()))
+                    every { source.descriptor } returns StreamDescriptor(
+                        "video/mp4", "mp4", isTranscoding = false, isByteSeekable = totalLength != null,
+                        totalLength = totalLength,
+                    )
+                    val closed = CountDownLatch(1)
+                    val reads = java.util.concurrent.atomic.AtomicInteger()
+                    val bytes = if (range == null) "allmedia".toByteArray() else "lmed".toByteArray()
+                    coEvery { source.open(range = any()) } answers { Result.success(StreamResponse(
+                        if (range == null) 200 else 206,
+                        mapOf("Content-Length" to bytes.size.toString()) +
+                            range?.let { mapOf("Content-Range" to "bytes 2-5/8") }.orEmpty() +
+                            encoding?.let { mapOf("Content-Encoding" to it) }.orEmpty(),
+                        object : ByteArrayInputStream(bytes) {
+                            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                                reads.incrementAndGet()
+                                return super.read(buffer, offset, length)
+                            }
+                            override fun close() { closed.countDown(); super.close() }
+                        },
+                    )) }
+                    proxy.registerStreamLease(session.id, source)
+                    try {
+                        val result = request(proxy.start("127.0.0.1"), session.id, range = range).use {
+                            it.getInputStream().readBytes().decodeToString()
+                        }
+                        assertTrue(closed.await(2, TimeUnit.SECONDS))
+                        if (encoding == "gzip") {
+                            assertTrue(result.startsWith("HTTP/1.1 502"))
+                            assertEquals("", result.substringAfter("\r\n\r\n"))
+                            assertEquals(0, reads.get(), "Encoded bytes must never reach the media decoder")
+                        } else {
+                            assertTrue(result.startsWith(if (range == null) "HTTP/1.1 200" else "HTTP/1.1 206"))
+                            assertEquals(bytes.decodeToString(), result.substringAfter("\r\n\r\n"))
+                        }
+                        coVerify(exactly = 1) { source.open(range = any()) }
+                    } finally { proxy.stop() }
+                }
+            }
+        }
     }
 
     @Test fun `stop during blocked read cancels old transfer before replacement can retry`() {
@@ -100,7 +150,7 @@ class LocalProxyCancellationTest {
         val session = sessions.create("video/mp4", totalLength = 8)
         val source = lease(ByteArrayInputStream("part".toByteArray()))
         coEvery { source.open(range = match { it.start == 4L && it.endInclusive == 7L }) } returns
-            Result.success(StreamResponse(206, mapOf("Content-Length" to "4", "Content-Range" to "bytes 4-7/8", "ETag" to "\"same\""), ByteArrayInputStream("rest".toByteArray())))
+            Result.success(StreamResponse(206, mapOf("Content-Length" to "4", "Content-Range" to "bytes 4-7/8", "ETag" to "\"same\"", "Content-Encoding" to "identity"), ByteArrayInputStream("rest".toByteArray())))
         proxy.registerStreamLease(session.id, source)
         try {
             request(proxy.start("127.0.0.1"), session.id).use {

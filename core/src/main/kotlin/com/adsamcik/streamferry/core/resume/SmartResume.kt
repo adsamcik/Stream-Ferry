@@ -329,6 +329,13 @@ class SmartResumeSessionTracker(
         return maxOf(s.positionSeconds, estimate ?: 0)
     }
 
+    /** In-memory intent for a live continuation; durable checkpoints remain renderer-confirmed. */
+    @Synchronized fun pendingSeekPositionSeconds(): Long? = session?.pendingSeekSeconds
+
+    @Synchronized fun cancelPendingSeek(positionSeconds: Long) {
+        session?.takeIf { it.pendingSeekSeconds == positionSeconds }?.pendingSeekSeconds = null
+    }
+
     @Synchronized fun noteSeekRequested(positionSeconds: Long) {
         session?.let { s ->
             s.pendingSeekSeconds = positionSeconds.coerceAtLeast(0)
@@ -364,11 +371,14 @@ class SmartResumeSessionTracker(
         if (!s.active) {
             if (!isPlaying && position <= 0) return
             s.active = true
+            s.pendingSeekSeconds = null
             s.positionSeconds = position
             persist(s, SmartResumeCheckpointKind.STARTED)
             return
         }
-        val seekConfirmed = s.pendingSeekSeconds?.let { abs(it - position) <= POSITION_TOLERANCE_SECONDS } == true ||
+        // Callers allowing regression have already filtered stale renderer samples. Their first
+        // accepted confirmation may be beyond the target after a slow poll; retire live seek intent.
+        val seekConfirmed = s.pendingSeekSeconds?.let { allowRegression || abs(it - position) <= POSITION_TOLERANCE_SECONDS } == true ||
             (allowRegression && position < s.positionSeconds)
         if (seekConfirmed) {
             s.pendingSeekSeconds = null

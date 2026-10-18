@@ -124,6 +124,9 @@ class DlnaTargetController(
     private val seekMutex = Mutex()
     /** Reject position samples whose request preceded an accepted explicit or deferred seek. */
     @Volatile private var positionRevision = 0L
+    /** A transport reply sampled before an accepted Play/Pause/Stop cannot undo that command. */
+    private val transportMutex = Mutex()
+    @Volatile private var transportRevision = 0L
     /** Duration of the stream whose URI was most recently accepted by the renderer. */
     @Volatile private var loadedDurationSeconds: Long? = null
     /** Last AVTransport state seen by the poll loop (PLAYING/TRANSITIONING/STOPPED/…), for diagnostics. */
@@ -568,17 +571,25 @@ class DlnaTargetController(
             if (playWhenReady) play()
         }
 
-    override suspend fun play() {
+    override suspend fun play() = transportMutex.withLock {
         avAction("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
         playbackRequestedAtMillis = monotonicMillis()
+        transportRevision++
         pollWake.trySend(Unit)
+        Unit
     }
-    override suspend fun pause() {
+    override suspend fun pause() = transportMutex.withLock {
         avAction("Pause", "<InstanceID>0</InstanceID>")
         playbackRequestedAtMillis = null
+        transportRevision++
         pollWake.trySend(Unit)
+        Unit
     }
-    override suspend fun stop() = avAction("Stop", "<InstanceID>0</InstanceID>")
+    override suspend fun stop() = transportMutex.withLock {
+        avAction("Stop", "<InstanceID>0</InstanceID>")
+        transportRevision++
+        Unit
+    }
 
     override suspend fun diagnosticStatus(): String =
         "dlna transport=${lastTransportState ?: "?"} connected=${connected != null}"
@@ -699,6 +710,7 @@ class DlnaTargetController(
             var everPlayed = false
             var hasObservedPlaying = false
             var furthestPositionSeconds = 0L
+            var completionPositionRevision = positionRevision
             var consecutiveFailures = 0
             var transitionStartedAtMillis: Long? = null
             // Idea 8: poll fast while actively playing (need timely position + end/error detection), and
@@ -712,63 +724,77 @@ class DlnaTargetController(
                 val wokenByControl = withTimeoutOrNull(intervalMs) { pollWake.receive() } != null
                 if (wokenByControl) delay(POST_ACTION_SETTLE_MS)
                 val r = connected ?: break
+                val sampledTransportRevision = transportRevision
+                val sampledPositionRevision = positionRevision
                 val info = runCatching { transportInfo(r) }
                     .onFailure { logger.trace(TAG, "GetTransportInfo failed: ${it.javaClass.simpleName}") }
                     .getOrNull()
                 if (!isActive || !pollSessionGate.isCurrent(pollToken)) break
                 val state = info?.state
-                if (state == null && info?.status != "ERROR_OCCURRED") {
-                    // Position alone cannot establish a usable transport (some TVs still return zero
-                    // after dropping the stream). After a few missing transport replies,
-                    // consecutive failures treat it as an UNEXPECTED disconnect so the app auto-reconnects
-                    // (a single failure can be a transient SOAP timeout, hence the threshold). Guarded by
-                    // isActive so a teardown-cancelled poll doesn't emit a stale event.
-                    if (++consecutiveFailures >= MAX_POLL_FAILURES) {
-                        logger.w("dlna", "DLNA renderer unreachable after $consecutiveFailures polls — treating as a disconnect")
-                        emitPollEvent(pollToken, PlaybackTargetEvent.Disconnected)
-                        break
-                    }
-                    // A failed paused/idle read should retry promptly. Do not spend another SOAP
-                    // timeout reading position when the transport itself did not answer.
-                    intervalMs = POLL_INTERVAL_MS
-                    continue
-                }
-                consecutiveFailures = 0
-                // The status can remain ERROR_OCCURRED after a recovered server/network fault.
-                // A TV still reporting PLAYING must keep its stream rather than rotate formats.
-                if (info.status == "ERROR_OCCURRED" && state !in setOf("PLAYING", "PAUSED_PLAYBACK", "TRANSITIONING")) {
-                    emitPollEvent(pollToken, PlaybackTargetEvent.Error(PlaybackFailureKind.UNKNOWN,
-                        "The TV reported a playback error. Check its connection and try again."))
-                    break
-                }
-                val now = monotonicMillis()
-                if (state == "PLAYING") {
-                    hasObservedPlaying = true
-                    pollSessionGate.commit(pollToken) { awaitingInitialPlayback = false }
-                }
-                if (state == "PLAYING" || state == "PAUSED_PLAYBACK") {
-                    playbackRequestedAtMillis = null
-                }
-                transitionStartedAtMillis = if (state == "TRANSITIONING" &&
-                    (hasObservedPlaying || playbackRequestedAtMillis != null)
-                ) transitionStartedAtMillis ?: now else null
-                val waitingSince = transitionStartedAtMillis ?: playbackRequestedAtMillis
-                if (waitingSince != null && now - waitingSince >= TRANSPORT_READY_TIMEOUT_MS) {
-                    emitPollEvent(pollToken, PlaybackTargetEvent.Error(PlaybackFailureKind.NETWORK,
-                        "The TV did not start the stream. Check its connection and try again."))
-                    break
-                }
-                val sampledPositionRevision = positionRevision
-                val position = runCatching { positionSeconds(r) }
+                val position = if (state != null) runCatching { positionSeconds(r) }
                     .onFailure { logger.trace(TAG, "GetPositionInfo failed: ${it.javaClass.simpleName}") }
-                    .getOrNull()
+                    .getOrNull() else null
                 if (!isActive || !pollSessionGate.isCurrent(pollToken)) break
-                if (state != null && state != lastState) {
-                    logger.event("dlna", "DLNA transport state ${lastState ?: "?"} -> $state")
-                    lastState = state
-                    pollSessionGate.commit(pollToken) { lastTransportState = state }
+                var terminalReached = false
+                var currentTransportSample = false
+                transportMutex.withLock {
+                    if (!isActive || !pollSessionGate.isCurrent(pollToken) ||
+                        sampledTransportRevision != transportRevision
+                    ) return@withLock
+                    currentTransportSample = true
+                    if (state == null && info?.status != "ERROR_OCCURRED") {
+                        // Position alone cannot establish a usable transport (some TVs still return zero
+                        // after dropping the stream). After a few missing transport replies,
+                        // consecutive failures treat it as an UNEXPECTED disconnect so the app auto-reconnects
+                        // (a single failure can be a transient SOAP timeout, hence the threshold). Guarded by
+                        // isActive so a teardown-cancelled poll doesn't emit a stale event.
+                        if (++consecutiveFailures >= MAX_POLL_FAILURES) {
+                            logger.w("dlna", "DLNA renderer unreachable after $consecutiveFailures polls — treating as a disconnect")
+                            emitPollEvent(pollToken, PlaybackTargetEvent.Disconnected)
+                            terminalReached = true
+                            return@withLock
+                        }
+                        // A failed paused/idle read should retry promptly. Do not spend another SOAP
+                        // timeout reading position when the transport itself did not answer.
+                        intervalMs = POLL_INTERVAL_MS
+                        return@withLock
+                    }
+                    consecutiveFailures = 0
+                    // The status can remain ERROR_OCCURRED after a recovered server/network fault.
+                    // A TV still reporting PLAYING must keep its stream rather than rotate formats.
+                    if (info.status == "ERROR_OCCURRED" && state !in setOf("PLAYING", "PAUSED_PLAYBACK", "TRANSITIONING")) {
+                        emitPollEvent(pollToken, PlaybackTargetEvent.Error(PlaybackFailureKind.UNKNOWN,
+                            "The TV reported a playback error. Check its connection and try again."))
+                        terminalReached = true
+                        return@withLock
+                    }
+                    val now = monotonicMillis()
+                    if (state == "PLAYING") {
+                        hasObservedPlaying = true
+                        pollSessionGate.commit(pollToken) { awaitingInitialPlayback = false }
+                    }
+                    if (state == "PLAYING" || state == "PAUSED_PLAYBACK") {
+                        playbackRequestedAtMillis = null
+                    }
+                    transitionStartedAtMillis = if (state == "TRANSITIONING" &&
+                        (hasObservedPlaying || playbackRequestedAtMillis != null)
+                    ) transitionStartedAtMillis ?: now else null
+                    val waitingSince = transitionStartedAtMillis ?: playbackRequestedAtMillis
+                    if (waitingSince != null && now - waitingSince >= TRANSPORT_READY_TIMEOUT_MS) {
+                        emitPollEvent(pollToken, PlaybackTargetEvent.Error(PlaybackFailureKind.NETWORK,
+                            "The TV did not start the stream. Check its connection and try again."))
+                        terminalReached = true
+                        return@withLock
+                    }
+                    if (state != null && state != lastState) {
+                        logger.event("dlna", "DLNA transport state ${lastState ?: "?"} -> $state")
+                        lastState = state
+                        pollSessionGate.commit(pollToken) { lastTransportState = state }
+                    }
+                    intervalMs = if (state == "PLAYING" || state == "TRANSITIONING") POLL_INTERVAL_MS else POLL_IDLE_INTERVAL_MS
                 }
-                intervalMs = if (state == "PLAYING" || state == "TRANSITIONING") POLL_INTERVAL_MS else POLL_IDLE_INTERVAL_MS
+                if (terminalReached) break
+                if (!currentTransportSample) continue
                 // A direct-play resume/reload asked to start at a position: now that the renderer is
                 // actually PLAYING (transport ready + the proxy advertises the entity length so a byte
                 // seek is honoured), issue the REL_TIME Seek exactly once.
@@ -782,7 +808,9 @@ class DlnaTargetController(
                             "(attempt ${pendingResume.failedAttempts + 1}/${DlnaResumeSeekPolicy.MAX_ATTEMPTS})",
                     )
                     seekMutex.withLock {
-                        if (!isActive || !pollSessionGate.isCurrent(pollToken)) return@withLock
+                        if (!isActive || !pollSessionGate.isCurrent(pollToken) ||
+                            sampledTransportRevision != transportRevision
+                        ) return@withLock
                         // The user may have issued a newer seek while this poll was reading transport state.
                         // In that case the explicit seek cleared/replaced this exact object; do nothing.
                         if (pendingResumeSeek === pendingResume) {
@@ -820,60 +848,74 @@ class DlnaTargetController(
                         }
                     }
                 }
-                // TRANSITIONING is buffering, not a user pause. Send this before the status so the
-                // engine preserves the intended play/pause state until the renderer settles. A failed
-                // transport read cannot establish either state, even when position is available.
-                if (state != null) {
-                    emitPollEvent(pollToken, PlaybackTargetEvent.BufferingChanged(state == "TRANSITIONING"))
-                }
-                if (state != null && !suppressPreSeekPosition) {
-                    seekMutex.withLock {
-                        val pendingPosition = pendingResumeSeek?.positionSeconds
-                        val currentPosition = position.takeIf { sampledPositionRevision == positionRevision }
-                        val confirmed = currentPosition != null && pendingPosition == null
-                        if (currentPosition != null && pendingPosition == null) {
-                            pollSessionGate.commit(pollToken) {
-                                furthestPositionSeconds = maxOf(furthestPositionSeconds, currentPosition)
-                                retainedPositionSeconds = currentPosition
-                            }
+                seekMutex.withLock {
+                    transportMutex.withLock {
+                        if (!isActive || !pollSessionGate.isCurrent(pollToken) ||
+                            sampledTransportRevision != transportRevision
+                        ) return@withLock
+                        // TRANSITIONING is buffering, not a user pause. Send this before the status so the
+                        // engine preserves the intended play/pause state until the renderer settles. A failed
+                        // transport read cannot establish either state, even when position is available.
+                        if (state != null) {
+                            emitPollEvent(pollToken, PlaybackTargetEvent.BufferingChanged(state == "TRANSITIONING"))
                         }
-                        emitPollEvent(
-                            pollToken,
-                            PlaybackTargetEvent.StatusChanged(
-                                pendingPosition ?: currentPosition ?: retainedPositionSeconds,
-                                isPlaying = state == "PLAYING",
-                                isPositionConfirmed = confirmed,
-                            ),
+                        if (completionPositionRevision != positionRevision) {
+                            // A backward scrub starts a new completion window. Never carry a previous
+                            // near-end sample into terminal classification on the new timeline.
+                            furthestPositionSeconds = retainedPositionSeconds
+                            completionPositionRevision = positionRevision
+                        }
+                        if (state != null && !suppressPreSeekPosition) {
+                            val pendingPosition = pendingResumeSeek?.positionSeconds
+                            val currentPosition = position.takeIf { sampledPositionRevision == positionRevision }
+                            val confirmed = currentPosition != null && pendingPosition == null
+                            if (currentPosition != null && pendingPosition == null) {
+                                pollSessionGate.commit(pollToken) {
+                                    furthestPositionSeconds = maxOf(furthestPositionSeconds, currentPosition)
+                                    retainedPositionSeconds = currentPosition
+                                }
+                            }
+                            emitPollEvent(
+                                pollToken,
+                                PlaybackTargetEvent.StatusChanged(
+                                    pendingPosition ?: currentPosition ?: retainedPositionSeconds,
+                                    isPlaying = state == "PLAYING",
+                                    isPositionConfirmed = confirmed,
+                                ),
+                            )
+                        }
+                        if (state == "PLAYING" || state == "TRANSITIONING") everPlayed = true
+                        val terminalOutcome = if (sampledPositionRevision != positionRevision) {
+                            DlnaTerminalStatePolicy.Outcome.NONE
+                        } else DlnaTerminalStatePolicy.classify(
+                            everPlayed = everPlayed,
+                            transportState = state,
+                            furthestPositionSeconds = furthestPositionSeconds,
+                            durationSeconds = loadedDurationSeconds,
                         )
+                        if (terminalOutcome != DlnaTerminalStatePolicy.Outcome.NONE) {
+                            // Don't emit end-of-media if this poll has been cancelled (a reload is tearing the
+                            // old stream down) — the STOPPED is the teardown, not a real finish. tryEmit isn't a
+                            // suspension point, so without this guard a cancelled mid-iteration poll could still
+                            // emit a stale Ended that stops the freshly-reloaded stream.
+                            when (terminalOutcome) {
+                                DlnaTerminalStatePolicy.Outcome.COMPLETED -> {
+                                    if (emitPollEvent(pollToken, PlaybackTargetEvent.Ended)) {
+                                        logger.event("dlna", "DLNA end-of-media near ${loadedDurationSeconds}s")
+                                    }
+                                }
+                                DlnaTerminalStatePolicy.Outcome.STOPPED -> {
+                                    if (emitPollEvent(pollToken, PlaybackTargetEvent.Stopped)) {
+                                        logger.event("dlna", "DLNA renderer stopped at ${furthestPositionSeconds}s")
+                                    }
+                                }
+                                DlnaTerminalStatePolicy.Outcome.NONE -> Unit
+                            }
+                            terminalReached = true
+                        }
                     }
                 }
-                if (state == "PLAYING" || state == "TRANSITIONING") everPlayed = true
-                val terminalOutcome = DlnaTerminalStatePolicy.classify(
-                    everPlayed = everPlayed,
-                    transportState = state,
-                    furthestPositionSeconds = furthestPositionSeconds,
-                    durationSeconds = loadedDurationSeconds,
-                )
-                if (terminalOutcome != DlnaTerminalStatePolicy.Outcome.NONE) {
-                    // Don't emit end-of-media if this poll has been cancelled (a reload is tearing the
-                    // old stream down) — the STOPPED is the teardown, not a real finish. tryEmit isn't a
-                    // suspension point, so without this guard a cancelled mid-iteration poll could still
-                    // emit a stale Ended that stops the freshly-reloaded stream.
-                    when (terminalOutcome) {
-                        DlnaTerminalStatePolicy.Outcome.COMPLETED -> {
-                            if (emitPollEvent(pollToken, PlaybackTargetEvent.Ended)) {
-                                logger.event("dlna", "DLNA end-of-media near ${loadedDurationSeconds}s")
-                            }
-                        }
-                        DlnaTerminalStatePolicy.Outcome.STOPPED -> {
-                            if (emitPollEvent(pollToken, PlaybackTargetEvent.Stopped)) {
-                                logger.event("dlna", "DLNA renderer stopped at ${furthestPositionSeconds}s")
-                            }
-                        }
-                        DlnaTerminalStatePolicy.Outcome.NONE -> Unit
-                    }
-                    break
-                }
+                if (terminalReached) break
             }
         }
     }

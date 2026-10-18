@@ -424,7 +424,8 @@ class PlaybackEngine(
     @Volatile private var pendingRecoveryKind: RecoveryAttemptKind? = null
 
     private val absolutePositionSeconds: Long get() = streamStartSeconds + reportedPositionSeconds
-    private fun recoveryPositionSeconds(): Long = smartResume.recoveryPositionSeconds() ?: absolutePositionSeconds
+    private fun recoveryPositionSeconds(): Long =
+        smartResume.pendingSeekPositionSeconds() ?: smartResume.recoveryPositionSeconds() ?: absolutePositionSeconds
 
     /** Repair the phone media URL even when the TV control channel remains connected. */
     suspend fun onLanAddressChanged() = withContext(dispatcher) {
@@ -1673,6 +1674,7 @@ class PlaybackEngine(
         pendingRendererResumePosition = null
         val duration = currentProviderSession?.descriptor?.runtimeSeconds ?: item?.runtimeSeconds ?: localPlayback?.runtimeSeconds
         val pos = PlaybackPositionPolicy.clamp(absoluteSeconds, duration)
+        val previousPendingSeek = smartResume.pendingSeekPositionSeconds()
         smartResume.noteSeekRequested(pos)
         holdProgressEstimate(resetDelivery = true)
         if (duration != null && duration > 0 && pos == duration) {
@@ -1728,6 +1730,10 @@ class PlaybackEngine(
             try {
                 t.seekTo(pos)
             } catch (error: Exception) {
+                if (smartResume.pendingSeekPositionSeconds() == pos) {
+                    if (previousPendingSeek != null) smartResume.noteSeekRequested(previousPendingSeek)
+                    else smartResume.cancelPendingSeek(pos)
+                }
                 if (seekSettleTargetSeconds == pos) {
                     seekSettleTargetSeconds = previousTarget
                     seekSettleUntilMs = previousDeadline
@@ -1742,9 +1748,16 @@ class PlaybackEngine(
         }
     }
 
+    private fun cancelStreamPreparation(reason: String) = synchronized(preparationLock) {
+        // Cancellation retains its first cause. A newer Stop must also invalidate a previously
+        // signalled LAN retry, including the gap before that retry installs its next child job.
+        streamChangeSequence.incrementAndGet()
+        transcodePreparationJob?.cancel(CancellationException(reason))
+    }
+
     suspend fun stop() = withContext(dispatcher) {
         // Wake a producer blocked by receiver backpressure before waiting for the command lock.
-        transcodePreparationJob?.cancel(CancellationException("Playback stopped"))
+        cancelStreamPreparation("Playback stopped")
         releaseStreamingTranscode()
         mutex.withLock { stopInternalLocked("user stopped") }
     }
@@ -1756,7 +1769,7 @@ class PlaybackEngine(
     suspend fun onLocalNetworkPermissionRevoked() {
         val hadActivePlayback = target != null || proxy.isRunning
         if (!hadActivePlayback) return
-        transcodePreparationJob?.cancel(CancellationException("Local network permission revoked"))
+        cancelStreamPreparation("Local network permission revoked")
         proxy.stop()
         releaseStreamingTranscode()
         runCatching { serviceController.stop() }
@@ -3538,7 +3551,7 @@ class PlaybackEngine(
                 startupWatchdogJob?.cancel()
                 cancelPendingUnknownFailure()
                 fallbackJob?.cancel()
-                transcodePreparationJob?.cancel(CancellationException("The TV stopped playback"))
+                cancelStreamPreparation("The TV stopped playback")
                 releaseStreamingTranscode()
                 updateProgressEstimate()
                 holdProgressEstimate()

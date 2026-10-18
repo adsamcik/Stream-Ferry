@@ -2919,6 +2919,145 @@ class PlaybackEngineLocalTranscodeTest {
         }
     }
 
+    @Test fun `accepted native seeks survive immediate output and language changes for every source and protocol`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) for (choice in listOf("resolution", "audio", "subtitle")) {
+            // Multiple local audio tracks intentionally require phone output; native audio selection
+            // is a provider path. Phone audio/language preservation is covered separately below.
+            if (choice == "audio" && source in listOf(SourceCase.FILE, SourceCase.CONTENT_URI)) continue
+            val f = Fixture(this, protocol, trackResume = true)
+            f.enableLanguageChoices()
+            coEvery { LocalSubtitleReader.discoverAudio(any(), any(), any()) } returns emptyList()
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ORIGINAL); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(123, true)); runCurrent()
+                f.engine.pause(); runCurrent()
+                if (choice == "resolution") {
+                    coEvery { f.target.seekTo(600) } throws IllegalStateException("Seek rejected")
+                    assertFailsWith<IllegalStateException> { f.engine.seekTo(600) }
+                    assertEquals(123L, f.engine.status.value?.recoveryPositionSeconds)
+                }
+                f.engine.seekTo(300); runCurrent()
+                val before = assertNotNull(f.engine.status.value)
+                assertEquals(300L, before.positionSeconds)
+                when (choice) {
+                    "resolution" -> f.engine.selectMaxVideoHeight(480)
+                    "audio" -> f.engine.selectAudioTrack(1)
+                    else -> f.engine.attachSubtitle("content://subtitles/42")
+                }
+                runCurrent()
+                val after = assertNotNull(f.engine.status.value)
+                assertEquals(300L, after.positionSeconds, "$source/$protocol/$choice")
+                assertEquals(300L, after.recoveryPositionSeconds)
+                assertFalse(f.loads.last().playWhenReady)
+                assertEquals(if (choice == "audio") 1 else before.currentAudioIndex, after.currentAudioIndex)
+                if (choice == "subtitle") assertNotNull(after.currentSubtitleIndex)
+                else assertEquals(before.currentSubtitleIndex, after.currentSubtitleIndex)
+                assertEquals(if (choice == "resolution") 480 else before.maxVideoHeight, after.maxVideoHeight)
+                assertEquals(before.preferredVideoCodec, after.preferredVideoCodec)
+            } finally { f.engine.stop(); runCurrent(); clearAllMocks(answers = false) }
+        }
+    }
+
+    @Test fun `pending phone seek retains all choices through recovery and protocol handoff for every source and protocol`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) {
+            val f = Fixture(this, protocol, trackResume = true)
+            f.enableLanguageChoices()
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.selectAudioTrack(1); runCurrent()
+                f.engine.attachSubtitle("content://subtitles/42"); runCurrent()
+                f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE)
+                f.engine.selectPreferredCodec("hevc")
+                f.engine.selectMaxVideoHeight(480); runCurrent()
+                f.events.emit(PlaybackTargetEvent.StatusChanged(0, true)); runCurrent()
+                f.engine.pause(); runCurrent()
+                f.engine.seekTo(300); runCurrent()
+                val before = assertNotNull(f.engine.status.value)
+                f.events.emit(PlaybackTargetEvent.Error(PlaybackFailureKind.NETWORK, "Connection interrupted")); runCurrent()
+                val recovered = assertNotNull(f.engine.status.value)
+                assertEquals(300L, recovered.positionSeconds, "$source/$protocol")
+                assertFalse(f.loads.last().playWhenReady)
+                assertEquals(before.currentAudioIndex, recovered.currentAudioIndex)
+                assertEquals(before.currentSubtitleIndex, recovered.currentSubtitleIndex)
+                assertEquals(before.maxVideoHeight, recovered.maxVideoHeight)
+                assertEquals(before.preferredVideoCodec, recovered.preferredVideoCodec)
+                assertEquals(before.localTranscodeMode, recovered.localTranscodeMode)
+                // Transport pause can be acknowledged before the new numeric position is confirmed.
+                f.events.emit(PlaybackTargetEvent.StatusChanged(0, false, isPositionConfirmed = false)); runCurrent()
+                val continuation = assertNotNull(f.engine.beginManualProtocolSwitch())
+                assertEquals(300L, continuation.positionSeconds)
+                f.continueSource(source, Protocol.entries.first { it != protocol }, assertNotNull(continuation.positionSeconds), continuation); runCurrent()
+                val switched = assertNotNull(f.engine.status.value)
+                assertEquals(300L, switched.positionSeconds)
+                assertFalse(f.loads.last().playWhenReady)
+                assertEquals(before.currentAudioIndex, switched.currentAudioIndex)
+                assertEquals(before.currentSubtitleIndex, switched.currentSubtitleIndex)
+                assertEquals(before.maxVideoHeight, switched.maxVideoHeight)
+                assertEquals(before.preferredVideoCodec, switched.preferredVideoCodec)
+                assertEquals(before.localTranscodeMode, switched.localTranscodeMode)
+            } finally { f.engine.stop(); runCurrent(); clearAllMocks(answers = false) }
+        }
+    }
+
+    @Test fun `Stop supersedes already signalled LAN preparation retry for every source and protocol`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) {
+            val f = Fixture(this, protocol)
+            val ready = CompletableDeferred<Unit>()
+            var preparations = 0
+            try {
+                f.startSource(source); runCurrent()
+                coEvery { anyConstructed<StreamingTranscodeSession>().awaitReady() } coAnswers {
+                    preparations++
+                    ready.await()
+                }
+                val output = launch { f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE) }; runCurrent()
+                assertEquals(1, preparations)
+                f.phoneIp = "127.0.0.2"
+                val changed = launch { f.engine.onLanAddressChanged() }
+                val stopped = launch { f.engine.stop() }
+                runCurrent()
+                assertTrue(stopped.isCompleted, "$source/$protocol Stop waited for another encoder")
+                assertEquals(1, preparations, "$source/$protocol restarted after Stop")
+                assertNull(f.engine.status.value)
+                ready.complete(Unit); runCurrent()
+                output.join(); changed.join(); stopped.join()
+            } finally {
+                ready.complete(Unit); runCurrent(); f.engine.stop(); runCurrent()
+                coEvery { anyConstructed<StreamingTranscodeSession>().awaitReady() } returns Unit
+                clearAllMocks(answers = false)
+            }
+        }
+    }
+
+    @Test fun `Cast cancellation supersedes already signalled LAN preparation retry for every source`() = runTest {
+        for (source in SourceCase.entries) {
+            val f = Fixture(this, Protocol.CAST)
+            val ready = CompletableDeferred<Unit>()
+            var preparations = 0
+            try {
+                f.startSource(source); runCurrent()
+                coEvery { anyConstructed<StreamingTranscodeSession>().awaitReady() } coAnswers {
+                    preparations++
+                    ready.await()
+                }
+                val output = launch { f.engine.selectLocalTranscodeMode(LocalTranscodeMode.ON_DEVICE) }; runCurrent()
+                f.phoneIp = "127.0.0.2"
+                val changed = launch { f.engine.onLanAddressChanged() }
+                val cancelled = launch { f.events.emit(PlaybackTargetEvent.Cancelled) }
+                runCurrent()
+                assertEquals(1, preparations, "$source restarted after TV cancellation")
+                assertNull(f.engine.status.value)
+                ready.complete(Unit); runCurrent()
+                output.join(); changed.join(); cancelled.join()
+            } finally {
+                ready.complete(Unit); runCurrent(); f.engine.stop(); runCurrent()
+                coEvery { anyConstructed<StreamingTranscodeSession>().awaitReady() } returns Unit
+                clearAllMocks(answers = false)
+            }
+        }
+    }
+
     private companion object {
         const val ORIGINAL_URL = "http://127.0.0.1/session/test/stream"
         const val TRANSCODE_URL = "http://127.0.0.1/session/test/transcode.m3u8"

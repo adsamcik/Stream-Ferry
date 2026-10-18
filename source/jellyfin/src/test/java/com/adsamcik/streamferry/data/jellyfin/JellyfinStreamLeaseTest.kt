@@ -1,5 +1,6 @@
 package com.adsamcik.streamferry.data.jellyfin
 
+import com.adsamcik.streamferry.core.http.ByteRange
 import com.adsamcik.streamferry.domain.HlsSegmentFormat
 import io.mockk.every
 import io.mockk.mockk
@@ -174,6 +175,31 @@ class JellyfinStreamLeaseTest {
         fixture.calls.single().respond(body)
         waiting.cancelAndJoin()
         assertEquals(1, body.closes)
+    }
+
+    @Test fun `root and resolved resource ranges request identity encoding across trusted redirects`() = runTest {
+        for (resolvedResource in listOf(false, true)) {
+            val fixture = Fixture()
+            val resource = if (resolvedResource) fixture.lease.resolve("segment.ts").getOrThrow()!! else null
+            val waiting = async {
+                if (resource == null) fixture.lease.open(ByteRange(2, 5))
+                else fixture.lease.open(resource, ByteRange(2, 5))
+            }
+            runCurrent()
+            val initial = fixture.calls.single()
+            assertEquals("bytes=2-5", initial.request.header("Range"))
+            assertEquals("identity", initial.request.header("Accept-Encoding"))
+            initial.respond(ClosingBody(), 302, "/redirected/media")
+            runCurrent()
+            val redirected = fixture.calls.last()
+            assertEquals(2, fixture.calls.size)
+            assertEquals("bytes=2-5", redirected.request.header("Range"))
+            assertEquals("identity", redirected.request.header("Accept-Encoding"))
+            val body = ClosingBody()
+            redirected.respond(body, 206)
+            waiting.await().getOrThrow().close()
+            assertEquals(1, body.closes)
+        }
     }
 
     @Test fun `successful response passes safe validation headers and ownership to the stream consumer`() = runTest {

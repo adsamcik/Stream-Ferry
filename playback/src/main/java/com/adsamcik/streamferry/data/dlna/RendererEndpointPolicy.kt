@@ -5,6 +5,7 @@ import com.adsamcik.streamferry.core.net.ServerUrlValidator
 import com.adsamcik.streamferry.diagnostics.NetworkInfoProvider
 import okhttp3.Dns
 import okhttp3.OkHttpClient
+import java.io.IOException
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
@@ -52,20 +53,39 @@ class RendererEndpointPolicy(private val networkInfo: NetworkInfoProvider) {
      * vendor kernels that reject `Network.socketFactory` with EPERM while a VPN is active; it still keeps
      * renderer traffic off the VPN because the socket's source is the verified Wi-Fi/Ethernet address.
      */
-    fun client(base: OkHttpClient, endpoint: Endpoint, timeoutMillis: Long): OkHttpClient = base.newBuilder()
-        .followRedirects(false)
-        .followSslRedirects(false)
-        .callTimeout(timeoutMillis.coerceAtLeast(1), TimeUnit.MILLISECONDS)
-        .socketFactory(LocalAddressSocketFactory(endpoint.localAddress))
-        .dns(object : Dns {
-            override fun lookup(hostname: String): List<InetAddress> {
-                if (!hostname.equals(endpoint.host, ignoreCase = true)) {
-                    throw UnknownHostException("Renderer endpoint host mismatch")
+    fun client(base: OkHttpClient, endpoint: Endpoint, timeoutMillis: Long): OkHttpClient {
+        // Addresses belong to an Android Network, not to the descriptor's discovery-time DHCP lease.
+        // A new Network must rediscover the peer; a new address on the same LAN can reuse its pin.
+        val localAddress = currentLocalAddress(endpoint.network)
+        return base.newBuilder()
+            .followRedirects(false)
+            .followSslRedirects(false)
+            .callTimeout(timeoutMillis.coerceAtLeast(1), TimeUnit.MILLISECONDS)
+            .socketFactory(LocalAddressSocketFactory(localAddress, endpoint.network, networkInfo))
+            .dns(object : Dns {
+                override fun lookup(hostname: String): List<InetAddress> {
+                    if (!hostname.equals(endpoint.host, ignoreCase = true)) {
+                        throw UnknownHostException("Renderer endpoint host mismatch")
+                    }
+                    return endpoint.addresses
                 }
-                return endpoint.addresses
-            }
-        })
-        .build()
+            })
+            .build()
+    }
+
+    private fun currentLocalAddress(expectedNetwork: Network): InetAddress {
+        if (networkInfo.lanNetwork() != expectedNetwork) {
+            throw IOException("Renderer LAN changed; rediscover the TV")
+        }
+        val address = networkInfo.lanIpv4()
+            ?.let { runCatching { InetAddress.getByName(it) }.getOrNull() as? Inet4Address }
+            ?.takeIf { it.isSiteLocalAddress }
+            ?: throw IOException("Renderer LAN address is unavailable")
+        if (networkInfo.lanNetwork() != expectedNetwork) {
+            throw IOException("Renderer LAN changed; rediscover the TV")
+        }
+        return address
+    }
 
     private fun resolve(
         rawUrl: String,
@@ -137,10 +157,25 @@ class RendererEndpointPolicy(private val networkInfo: NetworkInfoProvider) {
         runCatching { InetAddress.getByName(host) }.getOrNull() as? Inet4Address
 
     /** SocketFactory equivalent of binding a UDP socket to the physical LAN interface/address. */
-    private class LocalAddressSocketFactory(private val localAddress: InetAddress) : SocketFactory() {
-        private fun unconnected(): Socket = Socket().apply {
-            reuseAddress = true
-            bind(InetSocketAddress(localAddress, 0))
+    private class LocalAddressSocketFactory(
+        private val localAddress: InetAddress,
+        private val network: Network,
+        private val networkInfo: NetworkInfoProvider,
+    ) : SocketFactory() {
+        private fun unconnected(): Socket {
+            // Recheck immediately before opening, including calls delayed behind connection-pool work.
+            if (networkInfo.lanNetwork() != network || networkInfo.lanIpv4() != localAddress.hostAddress) {
+                throw IOException("Renderer LAN route changed before connecting")
+            }
+            return Socket().apply {
+                try {
+                    reuseAddress = true
+                    bind(InetSocketAddress(localAddress, 0))
+                } catch (error: Exception) {
+                    close()
+                    throw error
+                }
+            }
         }
 
         override fun createSocket(): Socket = unconnected()
@@ -162,8 +197,8 @@ class RendererEndpointPolicy(private val networkInfo: NetworkInfoProvider) {
         ): Socket = unconnected().apply { connect(InetSocketAddress(address, port)) }
 
         override fun equals(other: Any?): Boolean =
-            other is LocalAddressSocketFactory && other.localAddress == localAddress
+            other is LocalAddressSocketFactory && other.localAddress == localAddress && other.network == network
 
-        override fun hashCode(): Int = localAddress.hashCode()
+        override fun hashCode(): Int = 31 * localAddress.hashCode() + network.hashCode()
     }
 }

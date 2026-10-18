@@ -453,6 +453,64 @@ class DlnaTargetControllerControlTest {
         }
     }
 
+    @Test
+    fun `accepted transport commands discard older playing paused and terminal poll snapshots`() = runTest {
+        // The controller is shared by every local/download/provider stream; URI and output format
+        // do not participate in transport ordering.
+        for ((sampledState, resume) in listOf("PLAYING" to false, "PAUSED_PLAYBACK" to true, "STOPPED" to false)) {
+            val fixture = pollingFixture(pollingDispatcher = kotlinx.coroutines.Dispatchers.IO)
+            val responseReady = CompletableDeferred<Unit>()
+            val releaseResponse = CountDownLatch(1)
+            try {
+                fixture.transportState = sampledState
+                fixture.beforePositionResponse = {
+                    responseReady.complete(Unit)
+                    check(releaseResponse.await(10, TimeUnit.SECONDS)) { "Timed out releasing position response" }
+                }
+                fixture.controller.seekTo(42)
+                responseReady.await()
+                if (resume) fixture.controller.play() else fixture.controller.pause()
+                fixture.events.clear()
+                val nextStatus = async(UnconfinedTestDispatcher(testScheduler)) {
+                    fixture.controller.events.first { it is PlaybackTargetEvent.StatusChanged } as PlaybackTargetEvent.StatusChanged
+                }
+                releaseResponse.countDown()
+                val status = nextStatus.await()
+                assertEquals(resume, status.isPlaying, "The delayed $sampledState sample must not undo the accepted command")
+                assertEquals(42L, status.positionSeconds)
+                assertTrue(fixture.events.none { it is PlaybackTargetEvent.Ended || it is PlaybackTargetEvent.Stopped })
+            } finally {
+                releaseResponse.countDown()
+                fixture.controller.disconnect()
+            }
+        }
+    }
+
+    @Test
+    fun `backward seek resets completion evidence while an accepted seek to end still completes`() = runTest {
+        for ((target, expectedCompleted) in listOf(10L to false, 120L to true)) {
+            val fixture = pollingFixture(initialPosition = 119)
+            try {
+                val seekStatus = async(UnconfinedTestDispatcher(testScheduler)) {
+                    fixture.controller.events.first {
+                        it is PlaybackTargetEvent.StatusChanged && it.isPositionConfirmed && it.positionSeconds == target
+                    }
+                }
+                fixture.controller.seekTo(target)
+                seekStatus.await()
+                fixture.transportState = "STOPPED"
+                // Some renderers reset RelTime when stopped; completion uses the accepted seek window.
+                fixture.positionSeconds = 0
+                val terminal = async(UnconfinedTestDispatcher(testScheduler)) {
+                    fixture.controller.events.first { it is PlaybackTargetEvent.Ended || it is PlaybackTargetEvent.Stopped }
+                }
+                val event = terminal.await()
+                if (expectedCompleted) assertIs<PlaybackTargetEvent.Ended>(event)
+                else assertIs<PlaybackTargetEvent.Stopped>(event)
+            } finally { fixture.controller.disconnect() }
+        }
+    }
+
     private class PollingFixture(val controller: DlnaTargetController) {
         var transportState: String? = "PLAYING"
         var transportStatus = "OK"
@@ -473,6 +531,7 @@ class DlnaTargetControllerControlTest {
         startPosition: Long = 0,
         initialState: String = "PLAYING",
         initialPosition: Long = 42,
+        pollingDispatcher: kotlinx.coroutines.CoroutineDispatcher = StandardTestDispatcher(testScheduler),
     ): PollingFixture {
         val network = mockk<NetworkInfoProvider>(relaxed = true)
         every { network.lanNetwork() } returns mockk<Network>(relaxed = true)
@@ -510,6 +569,10 @@ class DlnaTargetControllerControlTest {
                         "<Response/>"
                     }
                 }
+                action == "Pause" -> {
+                    fixture.transportState = "PAUSED_PLAYBACK"
+                    "<Response/>"
+                }
                 action == "Seek" -> {
                     val buffer = Buffer()
                     request.body!!.writeTo(buffer)
@@ -531,7 +594,7 @@ class DlnaTargetControllerControlTest {
         val controller = DlnaTargetController(
             mockk<DiagnosticSink>(relaxed = true), network, http,
             configuredRenderers = listOf(ConfiguredDlnaRenderer("http://10.0.1.44/description.xml", "uuid:test-tv", "10.0.1.44")),
-            pollingDispatcher = StandardTestDispatcher(testScheduler),
+            pollingDispatcher = pollingDispatcher,
             monotonicMillis = { testScheduler.currentTime },
         )
         fixture = PollingFixture(controller)

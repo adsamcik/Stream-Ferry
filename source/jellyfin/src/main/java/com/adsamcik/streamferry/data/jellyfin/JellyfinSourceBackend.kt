@@ -550,6 +550,8 @@ internal class JellyfinStreamLease(
                     range?.let {
                         val end = if (it.endInclusive == Long.MAX_VALUE) "" else it.endInclusive.toString()
                         header("Range", "bytes=${it.start}-$end")
+                        // Range offsets must refer to the raw media representation.
+                        header("Accept-Encoding", "identity")
                     }
                 }.build()
                 val response = streamClient.newCall(request).awaitHeaders()

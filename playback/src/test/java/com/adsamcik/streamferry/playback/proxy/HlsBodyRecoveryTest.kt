@@ -91,6 +91,46 @@ class HlsBodyRecoveryTest {
         }
     }
 
+    @Test fun `HLS media accepts identity bytes and rejects encoded full or ranged bodies before success headers`() {
+        for (range in listOf(null, "bytes=2-5")) {
+            for (encoding in listOf(null, " identity ", "GZip")) {
+                Fixture().use { fixture ->
+                    val closed = CountDownLatch(1)
+                    val reads = AtomicInteger()
+                    val payload = "allmedia".toByteArray()
+                    val bytes = if (range == null) payload else payload.copyOfRange(2, 6)
+                    fixture.source.body = { _, requested ->
+                        assertEquals(if (range == null) null else ByteRange(2, 5), requested)
+                        StreamResponse(
+                            if (range == null) 200 else 206,
+                            mapOf("Content-Type" to "video/mp2t", "Content-Length" to bytes.size.toString()) +
+                                range?.let { mapOf("Content-Range" to "bytes 2-5/8") }.orEmpty() +
+                                encoding?.let { mapOf("Content-Encoding" to it) }.orEmpty(),
+                            object : ByteArrayInputStream(bytes) {
+                                override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                                    reads.incrementAndGet()
+                                    return super.read(buffer, offset, length)
+                                }
+                                override fun close() { closed.countDown(); super.close() }
+                            },
+                        )
+                    }
+                    val result = fixture.fetch("?seg=${fixture.segment()}", range)
+                    assertTrue(closed.await(2, TimeUnit.SECONDS))
+                    if (encoding == "GZip") {
+                        assertTrue(result.startsWith("HTTP/1.1 502"))
+                        assertEquals("", result.substringAfter("\r\n\r\n"))
+                        assertEquals(0, reads.get(), "Encoded bytes must never reach the media decoder")
+                    } else {
+                        assertTrue(result.startsWith(if (range == null) "HTTP/1.1 200" else "HTTP/1.1 206"))
+                        assertEquals(bytes.decodeToString(), result.substringAfter("\r\n\r\n"))
+                    }
+                    assertEquals(1, fixture.source.ranges.size, "An encoding mismatch is not a transient open failure")
+                }
+            }
+        }
+    }
+
     @Test fun `truncated segment key and subtitle bodies resume with stable strong validators`() {
         val etag = mapOf("ETag" to "\"same\"")
         val modified = mapOf("Last-Modified" to "Wed, 21 Oct 2015 07:28:00 GMT", "Date" to "Wed, 21 Oct 2015 07:30:00 GMT")
@@ -102,7 +142,7 @@ class HlsBodyRecoveryTest {
                         if (range == null) response("part", length = 8, extra = validator)
                         else {
                             assertEquals(ByteRange(4, 7), range)
-                            response("rest", range = "bytes 4-7/8", extra = validator)
+                            response("rest", range = "bytes 4-7/8", extra = validator + ("Content-Encoding" to "identity"))
                         }
                     }
                     val result = fixture.fetch("?seg=${fixture.segment()}")
@@ -139,6 +179,7 @@ class HlsBodyRecoveryTest {
             response("WRONG", length = 8, extra = mapOf("ETag" to "\"same\"")),
             response("WRONG", range = "bytes 0-3/8", length = 4, extra = mapOf("ETag" to "\"same\"")),
             response("WRONG", range = "bytes 4-7/9", length = 4, extra = mapOf("ETag" to "\"same\"")),
+            response("WRONG", range = "bytes 4-7/8", length = 4, extra = mapOf("ETag" to "\"same\"", "Content-Encoding" to "gzip")),
         )
         for (replacement in replacements) {
             Fixture().use { fixture ->
