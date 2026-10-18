@@ -188,4 +188,78 @@ class LocalProxyCancellationTest {
             assertEquals(listOf(MediaDelivery(session.id, epoch, 0, 10_000)), deliveries)
         } finally { proxy.stop() }
     }
+
+    @Test fun `Stop closes a body registered while the previous response is removed and closed`() {
+        val sessions = SessionRegistry()
+        val session = sessions.create("video/mp4", totalLength = 8)
+        val proxy = LocalProxyServer(sessions, Log())
+        val cleanupObservedEmpty = CountDownLatch(1)
+        val registrationFinished = CountDownLatch(1)
+        val oldBodyClosing = CountDownLatch(1)
+        val allowOldBodyClose = CountDownLatch(1)
+        val replacementClosed = CountDownLatch(1)
+        val failures = CopyOnWriteArrayList<Throwable>()
+        val old = StreamResponse(200, emptyMap(), object : ByteArrayInputStream(byteArrayOf()) {
+            override fun close() {
+                oldBodyClosing.countDown()
+                check(allowOldBodyClose.await(5, TimeUnit.SECONDS))
+                super.close()
+            }
+        })
+        val replacement = StreamResponse(200, emptyMap(), object : ByteArrayInputStream(byteArrayOf()) {
+            override fun close() { replacementClosed.countDown(); super.close() }
+        })
+        val track = proxy.javaClass.getDeclaredMethod("trackResponse", String::class.java, StreamResponse::class.java)
+            .apply { isAccessible = true }
+        val close = proxy.javaClass.getDeclaredMethod("closeUpstream", String::class.java, StreamResponse::class.java)
+            .apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST")
+        val responses = proxy.javaClass.getDeclaredField("activeResponses").apply { isAccessible = true }
+            .get(proxy) as MutableMap<String, MutableSet<StreamResponse>>
+        track.invoke(proxy, session.id, old)
+        val backing = responses.getValue(session.id)
+        val registration = Thread {
+            try {
+                check(cleanupObservedEmpty.await(2, TimeUnit.SECONDS))
+                track.invoke(proxy, session.id, replacement)
+            } catch (error: Throwable) { failures += error }
+            finally { registrationFinished.countDown() }
+        }.apply { isDaemon = true }
+        responses[session.id] = object : MutableSet<StreamResponse> by backing {
+            override fun isEmpty(): Boolean {
+                val observedEmpty = backing.isEmpty()
+                if (observedEmpty) {
+                    cleanupObservedEmpty.countDown()
+                    // Let the real competing registration either complete (the broken case), or
+                    // reach the held lifecycle monitor. Avoid a timing-dependent race/sleep.
+                    val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+                    while (registrationFinished.count != 0L && registration.state != Thread.State.BLOCKED &&
+                        System.nanoTime() < deadline) Thread.yield()
+                    check(registrationFinished.count == 0L || registration.state == Thread.State.BLOCKED)
+                }
+                return observedEmpty
+            }
+        }
+        val cleanup = Thread {
+            try { close.invoke(proxy, session.id, old) }
+            catch (error: Throwable) { failures += error }
+        }.apply { isDaemon = true }
+        try {
+            registration.start()
+            cleanup.start()
+            assertTrue(oldBodyClosing.await(2, TimeUnit.SECONDS))
+            assertTrue(registrationFinished.await(2, TimeUnit.SECONDS),
+                "A blocking provider close must not hold the registration/Stop ownership lock")
+            assertTrue(failures.isEmpty(), failures.joinToString())
+            proxy.stop()
+            assertTrue(replacementClosed.await(1, TimeUnit.SECONDS),
+                "Stop must retain ownership of the new upstream body during response cleanup")
+        } finally {
+            allowOldBodyClose.countDown()
+            cleanup.join(2000)
+            registration.join(2000)
+            proxy.stop()
+            replacement.close()
+        }
+    }
 }

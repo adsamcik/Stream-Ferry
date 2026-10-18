@@ -221,7 +221,10 @@ class LocalProxyServer(
         transcodeInputs.remove(sessionId)
         deliveryTrackers.remove(sessionId)
         remoteLeases.remove(sessionId)
-        activeResponses.remove(sessionId)?.forEach { response -> runCatching { response.close() } }
+        val responses = synchronized(lifecycleLock) {
+            activeResponses.remove(sessionId)?.toList().orEmpty()
+        }
+        responses.forEach { response -> runCatching { response.close() } }
         hlsStates.remove(sessionId)
     }
 
@@ -743,10 +746,16 @@ class LocalProxyServer(
     }
 
     private fun closeUpstream(sessionId: String, response: StreamResponse) {
-        activeResponses[sessionId]?.let { responses ->
-            responses.remove(response)
-            if (responses.isEmpty()) activeResponses.remove(sessionId, responses)
+        synchronized(lifecycleLock) {
+            // Registration and empty-set removal must be one ownership transaction. Otherwise a
+            // concurrently opened body can enter this set just before its map entry is discarded,
+            // leaving Stop unable to find and close that body.
+            activeResponses[sessionId]?.let { responses ->
+                responses.remove(response)
+                if (responses.isEmpty()) activeResponses.remove(sessionId, responses)
+            }
         }
+        // Closing a provider body can block; keep it outside the registration/teardown lock.
         runCatching { response.close() }
     }
 

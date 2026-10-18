@@ -126,6 +126,10 @@ class DlnaTargetController(
     @Volatile private var loadedDurationSeconds: Long? = null
     /** Last AVTransport state seen by the poll loop (PLAYING/TRANSITIONING/STOPPED/…), for diagnostics. */
     @Volatile private var lastTransportState: String? = null
+    /** A newly accepted URI can remain STOPPED until Play, including an intentionally paused load at zero. */
+    @Volatile private var awaitingInitialPlayback = false
+    /** Transport-only reports retain the last known/requested position without confirming a new timeline sample. */
+    @Volatile private var retainedPositionSeconds = 0L
     /** Null for an intentionally paused load; set only after a successful Play command. */
     @Volatile private var playbackRequestedAtMillis: Long? = null
 
@@ -517,6 +521,8 @@ class DlnaTargetController(
                 durationSeconds?.takeIf { it > 0 }?.let(requested::coerceAtMost) ?: requested
             }
             pendingResumeSeek = boundedStart.takeIf { it > 0 }?.let(::PendingDlnaResumeSeek)
+            awaitingInitialPlayback = true
+            retainedPositionSeconds = boundedStart
             lastTransportState = null
             playbackRequestedAtMillis = null
             val setUri = {
@@ -589,17 +595,19 @@ class DlnaTargetController(
     override suspend fun seekTo(positionSeconds: Long) = seekMutex.withLock {
         // An explicit user/media-session seek supersedes a still-pending load-time resume. Serializing this
         // update with the deferred command guarantees an older resume can never execute after this seek.
-        if (pendingResumeSeek != null && lastTransportState != "PLAYING") {
+        val bounded = positionSeconds.coerceAtLeast(0).let { requested ->
+            loadedDurationSeconds?.let(requested::coerceAtMost) ?: requested
+        }
+        if ((pendingResumeSeek != null || awaitingInitialPlayback) && lastTransportState != "PLAYING") {
             // A paused handoff has not started the new URI yet. Many TVs reject Seek in STOPPED;
             // retain the newest scrub for the same deferred application without starting playback.
-            val bounded = positionSeconds.coerceAtLeast(0).let { requested ->
-                loadedDurationSeconds?.let(requested::coerceAtMost) ?: requested
-            }
             pendingResumeSeek = PendingDlnaResumeSeek(bounded)
+            retainedPositionSeconds = bounded
             pollWake.trySend(Unit)
         } else {
             pendingResumeSeek = null
-            seekRendererToUnlocked(positionSeconds)
+            seekRendererToUnlocked(bounded)
+            retainedPositionSeconds = bounded
         }
         Unit
     }
@@ -650,6 +658,8 @@ class DlnaTargetController(
     override suspend fun disconnect() {
         stopPolling()
         pendingResumeSeek = null
+        awaitingInitialPlayback = false
+        retainedPositionSeconds = 0L
         loadedDurationSeconds = null
         playbackRequestedAtMillis = null
         connected = null
@@ -670,6 +680,7 @@ class DlnaTargetController(
     override suspend fun prepareReload() {
         stopPolling()
         pendingResumeSeek = null
+        awaitingInitialPlayback = false
         avAction("Stop", "<InstanceID>0</InstanceID>")
     }
 
@@ -728,7 +739,10 @@ class DlnaTargetController(
                     break
                 }
                 val now = monotonicMillis()
-                if (state == "PLAYING") hasObservedPlaying = true
+                if (state == "PLAYING") {
+                    hasObservedPlaying = true
+                    pollSessionGate.commit(pollToken) { awaitingInitialPlayback = false }
+                }
                 if (state == "PLAYING" || state == "PAUSED_PLAYBACK") {
                     playbackRequestedAtMillis = null
                 }
@@ -773,6 +787,7 @@ class DlnaTargetController(
                                     pollSessionGate.commit(pollToken) {
                                         if (pendingResumeSeek === pendingResume) {
                                             pendingResumeSeek = null
+                                            retainedPositionSeconds = target
                                             // The position read above predates this seek. Do not emit it and make the
                                             // phone briefly claim resume restarted at zero; the next poll confirms it.
                                             suppressPreSeekPosition = true
@@ -806,15 +821,19 @@ class DlnaTargetController(
                 if (state != null) {
                     emitPollEvent(pollToken, PlaybackTargetEvent.BufferingChanged(state == "TRANSITIONING"))
                 }
-                if (position != null && state != null && !suppressPreSeekPosition) {
+                if (state != null && !suppressPreSeekPosition) {
                     val pendingPosition = pendingResumeSeek?.positionSeconds
-                    if (pendingPosition == null) furthestPositionSeconds = maxOf(furthestPositionSeconds, position)
+                    val confirmed = position != null && pendingPosition == null
+                    if (position != null && pendingPosition == null) {
+                        furthestPositionSeconds = maxOf(furthestPositionSeconds, position)
+                        pollSessionGate.commit(pollToken) { retainedPositionSeconds = position }
+                    }
                     emitPollEvent(
                         pollToken,
                         PlaybackTargetEvent.StatusChanged(
-                            pendingPosition ?: position,
+                            pendingPosition ?: position ?: retainedPositionSeconds,
                             isPlaying = state == "PLAYING",
-                            isPositionConfirmed = pendingPosition == null,
+                            isPositionConfirmed = confirmed,
                         ),
                     )
                 }

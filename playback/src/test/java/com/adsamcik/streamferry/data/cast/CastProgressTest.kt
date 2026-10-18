@@ -160,6 +160,38 @@ class CastProgressTest {
 
     private fun latestPosition() = events.filterIsInstance<PlaybackTargetEvent.StatusChanged>().last()
 
+    @Test fun `external Cast cancellation stops current playback while retired media cancellation is ignored`() = progressTest {
+        startPlaying()
+        val previousCallback = mediaCallback.captured
+        events.clear()
+        cachedState = MediaStatus.PLAYER_STATE_IDLE
+        receiverState = MediaStatus.PLAYER_STATE_IDLE
+        cachedIdleReason = MediaStatus.IDLE_REASON_CANCELED
+        previousCallback.onStatusUpdated()
+        runCurrent()
+        assertEquals(1, events.count { it is PlaybackTargetEvent.Stopped })
+
+        controller.prepareReload()
+        events.clear()
+        previousCallback.onStatusUpdated()
+        assertTrue(events.isEmpty(), "App-owned teardown must not stop replacement playback")
+        val nextUrl = "http://phone/new/video"
+        controller.load(nextUrl, RendererStream("video/mp4"), "Movie", 400, 0, false)
+        val currentCallback = mediaCallback.captured
+        currentCallback.onStatusUpdated()
+        assertTrue(events.isEmpty(), "A replacement callback must ignore the old media's canceled status")
+        cachedMediaUrl = nextUrl
+        cachedState = MediaStatus.PLAYER_STATE_PAUSED
+        currentCallback.onStatusUpdated()
+        assertFalse(latestPosition().isPlaying)
+        assertTrue(events.none { it is PlaybackTargetEvent.Stopped })
+        previousCallback.onStatusUpdated()
+        assertTrue(events.none { it is PlaybackTargetEvent.Stopped })
+        cachedState = MediaStatus.PLAYER_STATE_IDLE
+        currentCallback.onStatusUpdated()
+        assertEquals(1, events.count { it is PlaybackTargetEvent.Stopped })
+    }
+
     @Test fun `first heartbeat after deep sleep reconciles a stale estimate with TV progress`() = progressTest {
         startPlaying()
         // The phone's coroutine did not run for ten minutes, while the TV continued independently.

@@ -450,7 +450,9 @@ internal class JellyfinStreamLease(
     }
     private val resourceLock = Any()
     private val resourceSalt = UUID.randomUUID().toString()
-    private val resources = LinkedHashMap<String, HttpUrl>(16, 0.75f, true)
+    private data class StreamResource(val requestUrl: HttpUrl, val playlistBase: HttpUrl = requestUrl)
+    private val resources = LinkedHashMap<String, StreamResource>(16, 0.75f, true)
+    private var rootPlaylistBase = requireNotNull(origin.trustedAbsolute(initialUrl))
     private var retainedResources = emptySet<String>()
 
     init {
@@ -481,9 +483,9 @@ internal class JellyfinStreamLease(
         playlistReference: String,
         fromPlaylist: StreamResourceRef?,
     ): Result<StreamResourceRef?> = runCatching {
-        val base = if (fromPlaylist == null) requireNotNull(origin.trustedAbsolute(initialUrl))
-        else synchronized(resourceLock) {
-            requireNotNull(resources[fromPlaylist.opaqueId]) { "Unknown stream playlist" }
+        val base = synchronized(resourceLock) {
+            if (fromPlaylist == null) rootPlaylistBase
+            else requireNotNull(resources[fromPlaylist.opaqueId]) { "Unknown stream playlist" }.playlistBase
         }
         val resolved = origin.resolve(playlistReference, base)?.newBuilder()?.fragment(null)?.build()
             ?: return@runCatching null
@@ -500,7 +502,8 @@ internal class JellyfinStreamLease(
                     resources.remove(evictable)
                 }
             }
-            resources[opaqueId] = resolved
+            // Repeated references must not erase a previously learned redirect destination.
+            resources[opaqueId] = resources[opaqueId] ?: StreamResource(resolved)
         }
         StreamResourceRef(
             opaqueId = opaqueId,
@@ -516,9 +519,9 @@ internal class JellyfinStreamLease(
         resource: StreamResourceRef,
         range: com.adsamcik.streamferry.core.http.ByteRange?,
     ): Result<StreamResponse> {
-        val url = synchronized(resourceLock) { resources[resource.opaqueId] }
+        val url = synchronized(resourceLock) { resources[resource.opaqueId]?.requestUrl }
             ?: return Result.failure(IllegalArgumentException("Unknown stream resource"))
-        return openTrusted(url, range)
+        return openTrusted(url, range, resource.opaqueId)
     }
 
     override fun retainResources(resources: Set<StreamResourceRef>) = synchronized(resourceLock) {
@@ -532,6 +535,7 @@ internal class JellyfinStreamLease(
     private suspend fun openTrusted(
         url: HttpUrl,
         range: com.adsamcik.streamferry.core.http.ByteRange?,
+        resourceId: String? = null,
     ): Result<StreamResponse> {
         return try {
             var target = url
@@ -547,6 +551,14 @@ internal class JellyfinStreamLease(
                 val response = streamClient.newCall(request).awaitHeaders()
                 if (!response.isRedirect) {
                     try {
+                        if (response.isSuccessful) synchronized(resourceLock) {
+                            // Relative HLS references belong to the final response URL. Keep aliases
+                            // inside their bounded resource entry rather than accumulating redirect URLs.
+                            if (resourceId == null) rootPlaylistBase = target
+                            else resources[resourceId]?.takeIf { it.requestUrl == url }?.let {
+                                resources[resourceId] = it.copy(playlistBase = target)
+                            }
+                        }
                         return Result.success(StreamResponse(
                             statusCode = response.code,
                             headers = SAFE_RESPONSE_HEADERS.mapNotNull { name ->

@@ -81,6 +81,46 @@ class JellyfinStreamLeaseTest {
         }
     }
 
+    @Test fun `root playlist children resolve against the final redirect directory`() = runTest {
+        val fixture = Fixture()
+        val opening = async { fixture.lease.open() }
+        runCurrent()
+        val redirectBody = ClosingBody()
+        fixture.calls.last().respond(redirectBody, 302, "/new/master.m3u8?api_key=secret")
+        runCurrent()
+        fixture.calls.last().respond(ClosingBody())
+        opening.await().getOrThrow().close()
+        assertEquals(1, redirectBody.closes)
+
+        val segment = fixture.lease.resolve("segment.ts").getOrThrow()!!
+        val segmentOpen = async { fixture.lease.open(segment) }
+        runCurrent()
+        assertEquals("https://example.test/new/segment.ts", fixture.calls.last().request.url.toString())
+        assertEquals("Bearer private-token", fixture.calls.last().request.header("Authorization"))
+        fixture.calls.last().respond(ClosingBody())
+        segmentOpen.await().getOrThrow().close()
+    }
+
+    @Test fun `nested redirect bases survive repeated references and expire with bounded resource entries`() = runTest {
+        val fixture = Fixture(resourceCapacity = 2)
+        val playlist = fixture.lease.resolve("variant.m3u8").getOrThrow()!!
+        fixture.lease.retainResources(setOf(playlist))
+        val opening = async { fixture.lease.open(playlist) }
+        runCurrent()
+        fixture.calls.last().respond(ClosingBody(), 302, "/redirected/nested/variant.m3u8")
+        runCurrent()
+        fixture.calls.last().respond(ClosingBody())
+        opening.await().getOrThrow().close()
+        repeat(5) { fixture.lease.resolve("discard$it.ts").getOrThrow() }
+        assertEquals(playlist, fixture.lease.resolve("./variant.m3u8").getOrThrow())
+        val relative = fixture.lease.resolve("segment.ts", playlist).getOrThrow()!!
+        assertEquals(relative, fixture.lease.resolve("https://example.test/redirected/nested/segment.ts").getOrThrow())
+
+        fixture.lease.retainResources(emptySet())
+        repeat(3) { fixture.lease.resolve("replacement$it.ts").getOrThrow() }
+        assertTrue(fixture.lease.resolve("segment.ts", playlist).isFailure)
+    }
+
     @Test fun `cancelling a header wait cancels the upstream call promptly`() = runTest {
         val fixture = Fixture()
         val waiting = async { fixture.lease.open() }
@@ -173,7 +213,7 @@ class JellyfinStreamLeaseTest {
         }
     }
 
-    private inner class Fixture {
+    private inner class Fixture(resourceCapacity: Int = 16_384) {
         val calls = mutableListOf<PendingCall>()
         private val client = mockk<OkHttpClient>()
         private val builder = mockk<OkHttpClient.Builder>()
@@ -192,7 +232,7 @@ class JellyfinStreamLeaseTest {
             every { streamClient.newCall(any()) } answers {
                 PendingCall(firstArg()).also { calls += it }.call
             }
-            lease = JellyfinStreamLease(upstream, client)
+            lease = JellyfinStreamLease(upstream, client, resourceCapacity)
         }
     }
 

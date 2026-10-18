@@ -43,6 +43,7 @@ object UpstreamRangeVerifier {
      * Validate a renderer's single-byte-range request when the segment total is learned from the
      * upstream Content-Range. Multiple ranges are rejected because this proxy does not emit multipart
      * responses; suffix and open-ended forms are accepted only when the returned span proves them.
+     * A bounded request may end beyond EOF, in which case the proven entity length clamps its end.
      */
     fun matchesRequestHeader(
         statusCode: Int,
@@ -58,7 +59,8 @@ object UpstreamRangeVerifier {
         return when {
             requestedStart != null && requestedEnd != null ->
                 requestedEnd >= requestedStart &&
-                    actual.start == requestedStart && actual.endInclusive == requestedEnd
+                    actual.start == requestedStart &&
+                    actual.endInclusive == minOf(requestedEnd, actual.totalLength - 1)
             requestedStart != null ->
                 actual.start == requestedStart && actual.endInclusive == actual.totalLength - 1
             else -> {

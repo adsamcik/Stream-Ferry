@@ -2667,6 +2667,12 @@ class PlaybackEngine(
         val options = selectedTarget?.capabilities?.let(::localTranscodeCodecOptions).orEmpty()
         val requested = preferredCodec?.let(::parseVideoCodec)
         if (options.isEmpty() || (requested != null && requested !in options)) return false
+        synchronized(recoveryLock) {
+            recoverySession = recoverySession.reserveRecovery(
+                RecoveryAttemptKind.FORMAT_COMPATIBILITY, PlaybackPhase.CHANGING_STREAM,
+            ) ?: return false
+            pendingRecoveryKind = RecoveryAttemptKind.FORMAT_COMPATIBILITY
+        }
         automaticPhoneTranscode = true
         forcedLocalCodec = requested
         return true
@@ -2734,22 +2740,52 @@ class PlaybackEngine(
 
     /**
      * Launch the off-mutex reload used by both recovery paths (network retry / transcode fallback). The
-     * caller has already set the flags ([isReloadingStream] plus [retriedOnce] or [forceTranscodeFallback])
-     * synchronously; this only performs the reload from the current position and surfaces a terminal error
+     * caller has claimed [isReloadingStream] to coalesce duplicate errors. Admission, budget usage and
+     * encoding changes are committed under the command lock only if the request is still current. This
+     * reloads from the retained position and surfaces a terminal error
      * if even the reload fails. Tracked in [fallbackJob] so teardown cancels it (it can't orphan onto a
      * later session because it re-checks state under the mutex).
      */
-    private fun launchRecoveryReload(requestedBitrate: Long?, reason: String) {
-        if (fallbackJob?.isActive == true) return // one automatic recovery coroutine at a time
-        val resumeAt = recoveryPositionSeconds()
+    private fun launchRecoveryReload(
+        requestedBitrate: Long?,
+        reason: String,
+        action: RecoveryAction,
+        phoneCodec: VideoCodec? = null,
+        lowerResolution: Int? = null,
+    ) {
         val expectedGeneration = recoverySession.generation
+        val expectedDisconnect = disconnectRevision.get()
+        val expectedRequest = streamChangeSequence.get()
         fallbackJob = scope.launch {
             mutex.withLock {
                 try {
-                    if (!recoverySession.acceptsEvent(expectedGeneration)) {
-                        logger.trace(TAG, "Ignoring stale recovery reload for generation $expectedGeneration")
+                    val admitted = synchronized(recoveryLock) {
+                        if (!recoverySession.acceptsEvent(expectedGeneration) || connectionLost ||
+                            disconnectRevision.get() != expectedDisconnect || streamChangeSequence.get() != expectedRequest
+                        ) false else {
+                            val decision = admitRecoveryDecision(action, reserve = true)
+                            if (decision != action) false else {
+                                when (action) {
+                                    RecoveryAction.RETRY_SAME_STREAM -> retriedOnce = true
+                                    RecoveryAction.TRANSCODE_FALLBACK -> if (phoneCodec != null) {
+                                        onDeviceTranscodeTarget?.videoCodec?.let(localCodecFallbacksTried::add)
+                                        forcedLocalCodec = phoneCodec
+                                    } else forceTranscodeFallback = true
+                                    RecoveryAction.LOWER_RESOLUTION_FALLBACK -> {
+                                        manualMaxVideoHeight = requireNotNull(lowerResolution)
+                                        forceTranscodeFallback = true
+                                    }
+                                    else -> Unit
+                                }
+                                true
+                            }
+                        }
+                    }
+                    if (!admitted) {
+                        logger.trace(TAG, "Discarding superseded recovery reload for generation $expectedGeneration")
                         return@withLock
                     }
+                    val resumeAt = recoveryPositionSeconds()
                     if (localPlayback != null) {
                         reloadLocalInPlace(resumeAt, reason, localPlayWhenReady)
                     } else {
@@ -2780,8 +2816,8 @@ class PlaybackEngine(
         }
     }
 
-    /** Reserve automatic work before committing output choices; caller holds recoveryLock. */
-    private fun admitRecoveryDecision(action: RecoveryAction): RecoveryAction {
+    /** Check capacity when queued; spend it only when work starts. Caller holds recoveryLock. */
+    private fun admitRecoveryDecision(action: RecoveryAction, reserve: Boolean): RecoveryAction {
         val kind = when (action) {
             RecoveryAction.RETRY_SAME_STREAM -> RecoveryAttemptKind.SAME_STREAM_NETWORK
             RecoveryAction.TRANSCODE_FALLBACK -> RecoveryAttemptKind.FORMAT_COMPATIBILITY
@@ -2798,10 +2834,12 @@ class PlaybackEngine(
             RecoveryAttemptKind.LOWER_RESOLUTION -> PlaybackPhase.CHANGING_STREAM
             RecoveryAttemptKind.ALTERNATE_PROTOCOL -> PlaybackPhase.CHANGING_PROTOCOL
         }
-        val reserved = recoverySession.reserveRecovery(kind, phase)
-        if (reserved != null) {
-            recoverySession = reserved
-            pendingRecoveryKind = kind
+        if (recoverySession.budget.canSchedule(recoverySession.usage, kind)) {
+            if (reserve) {
+                val reserved = recoverySession.reserveRecovery(kind, phase) ?: return RecoveryAction.SURFACE
+                recoverySession = reserved
+                pendingRecoveryKind = kind
+            }
             return action
         }
         // A rejected attempt must leave output choices intact and expose a stable terminal state.
@@ -2871,15 +2909,10 @@ class PlaybackEngine(
             // Snapshot the volatile once: stopInternalLocked (under mutex, not recoveryLock) can null it out
             // between a separate check and a !! deref, which — on the unjoined watchdog path — would NPE.
             val odt = onDeviceTranscodeTarget ?: return@synchronized null
-            localCodecFallbacksTried.add(odt.videoCodec)
-            val next = localTranscodeCodecOptions.firstOrNull { it !in localCodecFallbacksTried }
+            val next = localTranscodeCodecOptions.firstOrNull { it != odt.videoCodec && it !in localCodecFallbacksTried }
                 ?: return@synchronized null
-            val reserved = recoverySession.reserveRecovery(
-                RecoveryAttemptKind.FORMAT_COMPATIBILITY, PlaybackPhase.CHANGING_STREAM,
-            ) ?: return@synchronized null
-            recoverySession = reserved
-            pendingRecoveryKind = RecoveryAttemptKind.FORMAT_COMPATIBILITY
-            forcedLocalCodec = next
+            if (!recoverySession.budget.canSchedule(recoverySession.usage, RecoveryAttemptKind.FORMAT_COMPATIBILITY))
+                return@synchronized null
             isReloadingStream = true // enter the reload window so the dying stream's further errors are ignored
             next
         }
@@ -2889,34 +2922,13 @@ class PlaybackEngine(
                 "playback",
                 "On-device transcode ($kind) rejected by the TV; auto-falling back to codec ${localFallbackTo.name.lowercase()}",
             )
-            val resumeAt = recoveryPositionSeconds()
-            fallbackJob = scope.launch {
-                mutex.withLock {
-                    try {
-                        reloadOutput(resumeAt, "on-device codec fallback", localPlayWhenReady)
-                    } catch (cancelled: CancellationException) {
-                        throw cancelled
-                    } catch (error: Exception) {
-                        logger.e("playback", "On-device codec fallback failed; giving up", error)
-                        terminalFailureSurfaced = true
-                        val cause = if (error.isPreparationFailure()) PlaybackFailureCause.UPSTREAM_OR_SERVER_UNAVAILABLE
-                            else error.rendererFailureKind().toRecoveryCause()
-                        recoverySession = recoverySession
-                            .recordFailure(PlaybackFailureStage.RENDERER_LOAD, cause)
-                            .fail()
-                        smartResume.checkpoint(SmartResumeCheckpointKind.FAILURE, smartResumeDeviceContext)
-                        publishStatus(error = if (cause == PlaybackFailureCause.TRANSIENT_NETWORK)
-                            "The connection to the TV was interrupted. Check its connection and try again."
-                            else "Couldn't play this video on your TV.")
-                    } finally {
-                        isReloadingStream = false
-                    }
-                }
-            }
+            launchRecoveryReload(adaptive?.currentBitrateBps, "on-device codec fallback",
+                RecoveryAction.TRANSCODE_FALLBACK, phoneCodec = localFallbackTo)
             return
         }
         val online = currentProviderSession != null
         val transcoding = currentIsTranscoding || effectiveForceTranscode()
+        var lowerResolution: Int? = null
         val action = synchronized(recoveryLock) {
             // A single failure often arrives as multiple events (Cast fires onMediaError twice plus an
             // IDLE/ERROR status); once we've surfaced a terminal failure for this stream, drop the extras.
@@ -2924,7 +2936,7 @@ class PlaybackEngine(
                 logger.trace(TAG, "Ignoring duplicate playback error (terminal failure already surfaced)")
                 return
             }
-            val lowerResolution = if (online && transcoding) nextLowerResolution() else null
+            lowerResolution = if (online && transcoding) nextLowerResolution() else null
             val decided = decideRecovery(
                 failure = kind,
                 isReloading = isReloadingStream,
@@ -2934,16 +2946,12 @@ class PlaybackEngine(
                 alreadyRetried = retriedOnce,
                 hasLowerResolutionFallback = lowerResolution != null,
             )
-            val admitted = admitRecoveryDecision(decided)
-            // Commit output choices only after the finite budget accepts this recovery.
+            val admitted = admitRecoveryDecision(decided, reserve = false)
+            // The reload claim coalesces errors, but a newer command can still supersede queued work.
             when (admitted) {
-                RecoveryAction.RETRY_SAME_STREAM -> { retriedOnce = true; isReloadingStream = true }
-                RecoveryAction.TRANSCODE_FALLBACK -> { forceTranscodeFallback = true; isReloadingStream = true }
-                RecoveryAction.LOWER_RESOLUTION_FALLBACK -> {
-                    manualMaxVideoHeight = lowerResolution
-                    forceTranscodeFallback = true
-                    isReloadingStream = true
-                }
+                RecoveryAction.RETRY_SAME_STREAM,
+                RecoveryAction.TRANSCODE_FALLBACK,
+                RecoveryAction.LOWER_RESOLUTION_FALLBACK -> isReloadingStream = true
                 RecoveryAction.SURFACE -> terminalFailureSurfaced = true
                 else -> Unit
             }
@@ -2963,7 +2971,7 @@ class PlaybackEngine(
             RecoveryAction.RETRY_SAME_STREAM -> {
                 lastNote = "Connection hiccup — retrying…"
                 logger.event("playback", "Renderer reported a network error; retrying the same stream")
-                launchRecoveryReload(requestedBitrate = adaptive?.currentBitrateBps, reason = "network retry")
+                launchRecoveryReload(adaptive?.currentBitrateBps, "network retry", action)
             }
             // The renderer couldn't decode the original: fall back once to a server transcode (Cast -> HLS,
             // DLNA -> progressive TS). Remember it so the next play to this renderer skips the doomed attempt.
@@ -2974,13 +2982,13 @@ class PlaybackEngine(
                 )
                 lastNote = "The TV couldn't play the original; switching to a server transcode…"
                 logger.event("playback", "Direct play failed on the receiver; falling back to server transcode")
-                launchRecoveryReload(requestedBitrate = adaptive?.currentBitrateBps, reason = "transcode fallback")
+                launchRecoveryReload(adaptive?.currentBitrateBps, "transcode fallback", action)
             }
             RecoveryAction.LOWER_RESOLUTION_FALLBACK -> {
-                val height = effectiveMaxVideoHeight()
+                val height = requireNotNull(lowerResolution)
                 lastNote = "That stream failed; trying a ${height}p server transcode…"
                 logger.event("playback", "Server transcode failed; falling back to ${height}p")
-                launchRecoveryReload(requestedBitrate = adaptive?.currentBitrateBps, reason = "resolution fallback")
+                launchRecoveryReload(adaptive?.currentBitrateBps, "resolution fallback", action, lowerResolution = lowerResolution)
             }
             RecoveryAction.SURFACE -> {
                 logger.e("playback", "Unrecoverable playback failure (kind=$kind); surfaced to user")

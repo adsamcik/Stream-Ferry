@@ -155,6 +155,71 @@ class DlnaTargetControllerControlTest {
     }
 
     @Test
+    fun `playing without relative time confirms transport but never confirms a fabricated position`() = runTest {
+        for (reply in listOf("<RelTime>NOT_IMPLEMENTED</RelTime>", "<Track>1</Track>")) {
+            val fixture = pollingFixture()
+            try {
+                fixture.positionReply = reply
+                fixture.events.clear()
+                val polled = async(UnconfinedTestDispatcher(testScheduler)) {
+                    // A poll already in flight may precede the accepted Seek. Await its retained
+                    // target rather than treating that older transport report as the seek result.
+                    fixture.controller.events.first {
+                        it is PlaybackTargetEvent.StatusChanged && it.positionSeconds == 47L
+                    }
+                        as PlaybackTargetEvent.StatusChanged
+                }
+                fixture.controller.seekTo(47)
+                val status = polled.await()
+                assertTrue(status.isPlaying)
+                assertFalse(status.isPositionConfirmed)
+                assertEquals(47L, status.positionSeconds)
+                assertTrue(fixture.events.none { it is PlaybackTargetEvent.Error || it is PlaybackTargetEvent.Disconnected })
+                fixture.positionReply = null
+                val confirmed = async(UnconfinedTestDispatcher(testScheduler)) {
+                    fixture.controller.events.first {
+                        it is PlaybackTargetEvent.StatusChanged && it.isPositionConfirmed && it.positionSeconds == 48L
+                    }
+                }
+                fixture.controller.seekTo(48)
+                confirmed.await()
+            } finally { fixture.controller.disconnect() }
+        }
+    }
+
+    @Test
+    fun `paused zero load retains the latest scrub until Play without an unnecessary initial zero seek`() = runTest {
+        val fixture = pollingFixture(startPosition = 0, initialState = "STOPPED", initialPosition = 0)
+        try {
+            fixture.controller.seekTo(60)
+            fixture.controller.seekTo(87)
+            assertTrue(fixture.seekTargets.isEmpty(), "The renderer must remain STOPPED until Resume")
+            assertEquals(0, fixture.playCommands)
+            fixture.failedSeeksRemaining = 1
+            val confirmed = async(UnconfinedTestDispatcher(testScheduler)) {
+                fixture.controller.events.first {
+                    it is PlaybackTargetEvent.StatusChanged && it.isPositionConfirmed && it.positionSeconds == 87L
+                }
+            }
+            fixture.controller.play()
+            confirmed.await()
+            assertEquals(listOf("0:01:27", "0:01:27"), fixture.seekTargets)
+            assertEquals(1, fixture.playCommands)
+            assertTrue(fixture.events.none { it is PlaybackTargetEvent.ControlError })
+        } finally { fixture.controller.disconnect() }
+
+        val zero = pollingFixture(startPosition = 0, initialState = "STOPPED", initialPosition = 0)
+        try {
+            val playing = async(UnconfinedTestDispatcher(testScheduler)) {
+                zero.controller.events.first { it is PlaybackTargetEvent.StatusChanged && it.isPlaying }
+            }
+            zero.controller.play()
+            playing.await()
+            assertTrue(zero.seekTargets.isEmpty(), "Loading at zero must not add an unsupported Seek command")
+        } finally { zero.controller.disconnect() }
+    }
+
+    @Test
     fun `paused handoff holds requested position through idle polls without starting the TV`() = runTest {
         val fixture = pollingFixture(startPosition = 63, initialState = "STOPPED", initialPosition = 0)
         try {
@@ -347,6 +412,7 @@ class DlnaTargetControllerControlTest {
         var transportState: String? = "PLAYING"
         var transportStatus = "OK"
         var positionSeconds = 42L
+        var positionReply: String? = null
         var failedSeeksRemaining = 0
         var playCommands = 0
         var playStartsPlayback = true
@@ -379,7 +445,7 @@ class DlnaTargetControllerControlTest {
                 action == "GetTransportInfo" -> fixture.transportState?.let {
                     "<CurrentTransportState>$it</CurrentTransportState><CurrentTransportStatus>${fixture.transportStatus}</CurrentTransportStatus>"
                 } ?: "<CurrentTransportStatus>${fixture.transportStatus}</CurrentTransportStatus>"
-                action == "GetPositionInfo" -> "<RelTime>${DidlLite.formatDuration(fixture.positionSeconds)}</RelTime>"
+                action == "GetPositionInfo" -> fixture.positionReply ?: "<RelTime>${DidlLite.formatDuration(fixture.positionSeconds)}</RelTime>"
                 action == "SetAVTransportURI" && fixture.setUriFaultCode != null ->
                     "<upnp:errorCode>${fixture.setUriFaultCode}</upnp:errorCode>"
                 action == "Play" -> {
@@ -423,7 +489,11 @@ class DlnaTargetControllerControlTest {
         fixture.positionSeconds = initialPosition
         controller.connect(controller.discover(500).single())
         backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { controller.events.collect { fixture.events += it } }
+        val initialStatus = async(UnconfinedTestDispatcher(testScheduler)) {
+            controller.events.first { it is PlaybackTargetEvent.StatusChanged }
+        }
         controller.load("http://10.0.1.81/video", RendererStream("video/mp2t"), "Video", 120, startPosition, false)
+        initialStatus.await()
         runCurrent()
         return fixture
     }

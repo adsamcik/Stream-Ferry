@@ -812,6 +812,9 @@ class CastTargetController(
             MediaStatus.PLAYER_STATE_IDLE ->
                 when (status.idleReason) {
                     MediaStatus.IDLE_REASON_FINISHED -> _events.tryEmit(PlaybackTargetEvent.Ended)
+                    // A STOP from the TV or another sender ends the current media too. App-owned
+                    // reloads invalidate this load's callbacks before stopping the previous stream.
+                    MediaStatus.IDLE_REASON_CANCELED -> _events.tryEmit(PlaybackTargetEvent.Stopped)
                     // There is no detailed error code in an IDLE/ERROR status. It could be an unsupported
                     // source, but it could just as easily be a proxy/network/receiver failure; only an
                     // explicit SDK decode/source-not-supported error is qualified format evidence.
@@ -819,7 +822,7 @@ class CastTargetController(
                         logger.w("cast", "Cast parked IDLE with error reason — classifying as UNKNOWN without detailed SDK evidence")
                         _events.tryEmit(PlaybackTargetEvent.Error(PlaybackFailureKind.UNKNOWN, "Cast playback error"))
                     }
-                    // NONE / CANCELED / INTERRUPTED are our own stop/reload transitions — ignore them.
+                    // NONE / INTERRUPTED can be intermediate load transitions.
                     else -> Unit
                 }
             else -> Unit
