@@ -12,6 +12,35 @@ there is **no telemetry** and nothing leaves the device unless you share a repor
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-18
+
+### Added
+- Added continuous on-device transcoding for Jellyfin, downloaded files and local media on both Google
+  Cast and DLNA. Choose Auto, Original or On device during playback, then configure the output codec
+  and resolution using the available phone and receiver capabilities. Playback starts while encoding.
+- Added audio-language selection and embedded or external subtitle controls across the supported
+  source and output paths. Selected tracks remain in effect during seeks, recovery and protocol changes.
+
+### Changed
+- Made the Cast or DLNA connection choice explicit during playback on TVs with confidently paired
+  endpoints, retaining the current position, paused state and output settings when switching.
+- Reduced repeated media probing, download-index scans and local-search enumeration, added bounded
+  poster and thumbnail caching, and batched DLNA transport output to reduce allocation overhead.
+
+### Fixed
+- Preserved the latest Pause or Resume issued during output preparation, including failed output
+  changes and DLNA stream restarts, without triggering recovery for intentionally paused playback.
+- Kept seek and recovery positions stable through stale receiver updates, rejected seeks, unseekable
+  inputs and end-of-video seeks. Failed output changes restore the previous playable output.
+- Separated connectivity failures from format attempts, deferred recovery while the phone is offline,
+  and refreshed DLNA endpoints after Android network changes. Reconnects and protocol fallback retain
+  position, audio, subtitles and output settings.
+- Stabilized HLS resource URLs and retention, recovered safely from interrupted segment transfers, and
+  cancelled pending upstream requests promptly when playback stops.
+- Improved Cast receiver cleanup on stop/disconnect and DLNA startup, resume and completion handling.
+- Restored gallery scroll position after playback, kept the search caret in place as results move,
+  and removed blank space that clipped gallery content while the keyboard was open.
+
 ## [0.7.1] - 2026-09-08
 
 ### Fixed
@@ -502,7 +531,8 @@ there is **no telemetry** and nothing leaves the device unless you share a repor
   policy, redaction), the Android app skeleton and Compose UI, CI + release pipelines, and
   documentation.
 
-[Unreleased]: https://github.com/adamnova/video-bridge/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/adsamcik/Stream-Ferry/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/adsamcik/Stream-Ferry/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/adamnova/video-bridge/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/adamnova/video-bridge/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/adamnova/video-bridge/compare/v0.5.0...v0.6.0

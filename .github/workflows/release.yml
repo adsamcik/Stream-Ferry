@@ -1,6 +1,6 @@
 name: Public release
 
-# A signed semantic-version tag creates a public GitHub Release with a directly installable APK,
+# An annotated semantic-version tag creates a public GitHub Release with a directly installable APK,
 # checksum, and signer report.
 on:
   push:
@@ -116,6 +116,8 @@ jobs:
         with:
           args: >-
             -PversionName=${{ steps.release.outputs.version }}
+            :core:test
+            checkSourceBoundaries
             testDebugUnitTest
             compileDebugAndroidTestKotlin
             lintRelease

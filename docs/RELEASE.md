@@ -1,6 +1,6 @@
 # Public releases
 
-Every release is built from a signed Git tag and published on GitHub with:
+Every release is built from an annotated Git tag and published on GitHub with:
 
 - a directly installable, R8-minified APK;
 - a SHA-256 checksum and signer-certificate report.

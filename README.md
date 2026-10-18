@@ -41,7 +41,8 @@ Implemented end-to-end:
   unfinished item's playback position are saved automatically on this device. See [docs/QUEUES.md](docs/QUEUES.md).
 - **Physical-TV picker** — live Cast (MediaRouter) + DLNA (SSDP) discoveries are conservatively
   aggregated into one TV row only when stable evidence is confident. Tapping the TV starts playback;
-  Cast versus DLNA is normally an internal choice.
+  the initial connection is selected automatically. Playback options lets you choose Cast or DLNA
+  when both endpoints are confidently paired to that TV.
 - **Adaptive bitrate** — during playback the proxy measures real throughput over a rolling **≥ 30 s**
   window and, with hysteresis, steps quality down/up intelligently (also reacting to renderer
   rebuffering). See [docs/ADAPTIVE_BITRATE.md](docs/ADAPTIVE_BITRATE.md).
@@ -53,6 +54,13 @@ Implemented end-to-end:
   network/proxy failures are not. DLNA uses its own profile and progressive MPEG-TS fallback. Every
   receiver URL remains phone-proxied, so the Jellyfin token never reaches the TV. See
   [docs/STREAM_SELECTION.md](docs/STREAM_SELECTION.md).
+- **On-device transcoding** — convert local, downloaded or Jellyfin media while streaming to Cast or
+  DLNA. Choose Auto, Original or On device and configure output codec and resolution during playback.
+  Phone encoding uses the available hardware and receiver capabilities; see
+  [docs/ONDEVICE_TRANSCODE.md](docs/ONDEVICE_TRANSCODE.md) for limits and verification boundaries.
+- **Audio and subtitles** — choose an audio language, an available embedded subtitle, or a supported
+  external subtitle file during playback. Track choices remain in effect through seeks, recovery and
+  protocol switches.
 - **Optional offline downloads + library cache** — download a title's original file to app-private
   storage and cast it to a TV later **without the server** (the proxy serves the local file); the
   library listing is cached so browsing works offline. Both are opt-in, app-private, and removed by
@@ -81,8 +89,8 @@ Implemented end-to-end:
 - Kotlin · Jetpack Compose · Material 3 · ViewModel/coroutines/Flow.
 - `minSdk 34` (Android 14) · `targetSdk 37` / `compileSdk 37` (Android 17 — SDK verified present).
 - Modes: phone-proxied **Cast** and **DLNA** (Samsung/LG and other renderers); when one confidently
-  identified TV exposes both, endpoint preference and fallback are internal. No direct Jellyfin-to-TV
-  path.
+  identified TV exposes both, you can select the connection during playback, with bounded automatic
+  fallback when needed. No direct Jellyfin-to-TV path.
 
 ## Documentation
 
