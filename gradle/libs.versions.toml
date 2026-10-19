@@ -1,24 +1,24 @@
 [versions]
 # Verified locally: Kotlin 2.4.0 (kotlinc on the build host), Android SDK Platform 37 / build-tools 37.0.0 present.
 # AGP 9.2.1 supports compileSdk 37 (developer.android.com AGP 9.2 release notes); requires Gradle >= 9.4.1 (wrapper pins 9.5.1).
-agp = "9.3.2"
-kotlin = "2.4.10"
+agp = "9.4.1"
+kotlin = "2.4.21"
 
 # AndroidX / Compose. Compose BOM + Cast versions must be re-verified at first online build
 # (this sandbox blocks dl.google.com, so they could not be resolved here — see docs/BUILD.md).
-coreKtx = "1.19.0"
+coreKtx = "1.19.1"
 lifecycle = "2.11.0"
 activityCompose = "1.13.0"
 # The alpha BOM is required for the official Material 3 Expressive theme, motion scheme, and
 # morphing loading indicator. Keep the whole Compose stack aligned instead of pinning Material 3
 # independently against an older Compose runtime.
-composeBom = "2026.08.01"
+composeBom = "2026.10.00"
 
 # Google Cast Sender SDK (Google Play services).
 castFramework = "22.3.1"
 
 # Jellyfin official Kotlin SDK — VERIFIED on Maven Central: org.jellyfin.sdk:jellyfin-core:1.8.12, LGPL-3.0.
-jellyfinSdk = "1.8.12"
+jellyfinSdk = "1.9.2"
 tracebox = "0.1.0-alpha.8"
 
 # Networking / serialization (Maven Central).
@@ -31,13 +31,13 @@ serialization = "1.11.0"
 coil = "2.7.0"
 
 # On-device hardware transcoding (AndroidX Media3 Transformer; resolves from google()).
-media3 = "1.11.0"
+media3 = "1.11.1"
 
 # Testing.
 junit = "4.13.2"
 androidxTestJunit = "1.3.0"
 espresso = "3.7.0"
-robolectric = "4.16.1"
+robolectric = "4.17"
 mockk = "1.14.11"
 
 [libraries]
