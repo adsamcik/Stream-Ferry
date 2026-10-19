@@ -1,6 +1,5 @@
 [versions]
-# Verified locally: Kotlin 2.4.0 (kotlinc on the build host), Android SDK Platform 37 / build-tools 37.0.0 present.
-# AGP 9.2.1 supports compileSdk 37 (developer.android.com AGP 9.2 release notes); requires Gradle >= 9.4.1 (wrapper pins 9.5.1).
+# Android modules compile against SDK Platform 37.1; targetSdk remains 37.
 agp = "9.4.1"
 kotlin = "2.4.21"
 

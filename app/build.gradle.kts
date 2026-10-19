@@ -41,8 +41,9 @@ val quotedDemoRendererUrl = "\"" + demoRendererUrl
 
 android {
     namespace = "com.adsamcik.streamferry"
-    // compileSdk 37 = Android 17. Platform + build-tools 37 are installed on the build host.
-    compileSdk = 37
+    compileSdk {
+        version = release(37) { minorApiLevel = 1 }
+    }
 
     defaultConfig {
         applicationId = "com.adsamcik.streamferry"

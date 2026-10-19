@@ -40,22 +40,18 @@ jobs:
           distribution: temurin
           java-version: "21"
 
-      # The project targets compileSdk/targetSdk 37 (Android 17) with build-tools 37.0.0. The
-      # GitHub-hosted runner image normally ships these already (the CI/release Gradle builds compile
-      # against android-37 fine on the same image), but a stale cmdline-tools manifest can report
-      # "Failed to find package 'platforms;android-37'" (e.g. if API 37 is only in the preview channel).
-      # So this install is BEST-EFFORT: try the stable channel, then preview, and never fail the
-      # pre-warm — the Gradle step below is the real gate and resolves the platform from the runner's
-      # pre-installed SDK (auto-downloading any missing pieces into the cache for offline reuse).
-      - name: Install Android SDK Platform 37 and build-tools 37.0.0 (best-effort)
+      # Compile against SDK 37.1 with build-tools 37.0.0; targetSdk remains 37.
+      # This install is best-effort; the Gradle build below is the required gate and can
+      # auto-download missing SDK packages after license acceptance.
+      - name: Install Android SDK Platform 37.1 and build-tools 37.0.0 (best-effort)
         run: |
           set -uxo pipefail
           SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
           yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
-          pkgs=("platforms;android-37" "build-tools;37.0.0" "platform-tools")
+          pkgs=("platforms;android-37.1" "build-tools;37.0.0" "platform-tools")
           "$SDKMANAGER" --install "${pkgs[@]}" \
             || "$SDKMANAGER" --channel=3 --install "${pkgs[@]}" \
-            || echo "::warning::sdkmanager could not install android-37 explicitly; relying on the runner's pre-installed SDK + Gradle."
+            || echo "::warning::sdkmanager could not install android-37.1 explicitly; relying on the runner's pre-installed SDK + Gradle."
 
       - name: Set up Gradle (with dependency cache)
         uses: gradle/actions/setup-gradle@v6

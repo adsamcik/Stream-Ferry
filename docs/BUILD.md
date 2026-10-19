@@ -3,7 +3,7 @@
 ## Requirements
 
 - JDK 21 (Java 17 application bytecode).
-- Android SDK Platform 37 + build-tools 37.0.0 (installed on the build host).
+- Android SDK Platform 37.1 (`platforms;android-37.1`) + build-tools 37.0.0.
 - Gradle wrapper and Android Gradle Plugin versions are pinned in the repository; use the wrapper.
 - **Network access to `google()` / `maven.google.com`**, or a complete warm dependency cache — see
   Android dependency availability below.
@@ -54,7 +54,7 @@ workflow never falls back to a debug key: a missing signing secret fails safely 
 
 ## Android dependency availability
 
-The full Android gates require SDK Platform 37 and resolved artifacts from `google()` / Maven Central.
+The full Android gates require SDK Platform 37.1 and resolved artifacts from `google()` / Maven Central.
 A host with a warm Gradle cache may run them offline; a cold host without repository access cannot.
 Report that situation as an environment limitation, not as a passing build. GitHub Actions remains the
 authoritative connected build described above.

@@ -4,7 +4,9 @@ plugins {
 
 android {
     namespace = "com.adsamcik.streamferry.playback"
-    compileSdk = 37
+    compileSdk {
+        version = release(37) { minorApiLevel = 1 }
+    }
 
     defaultConfig {
         minSdk = 34
@@ -23,6 +25,10 @@ android {
     testOptions {
         unitTests.isReturnDefaultValues = true
         unitTests.isIncludeAndroidResources = true
+        unitTests.all {
+            // Robolectric 4.17 needs SharedSecrets access on JDK 21.
+            it.jvmArgs("--add-opens=java.base/jdk.internal.access=ALL-UNNAMED")
+        }
     }
 }
 
