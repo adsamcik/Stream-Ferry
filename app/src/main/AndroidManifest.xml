@@ -82,6 +82,11 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".app.DiagnosticsActivity"
+            android:exported="false"
+            android:theme="@style/Theme.StreamFerry" />
+
         <!--
           The proxy + playback foreground service. Not exported. mediaPlayback type is the correct
           FGS type because the service exists to keep an active, user-initiated media stream alive

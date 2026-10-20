@@ -73,6 +73,9 @@ class MainActivity : FragmentActivity() {
                         nightVolumePolicy = policy
                         container.nightVolumeSettingsStore.save(policy)
                     },
+                    onOpenDiagnostics = {
+                        startActivity(Intent(this, DiagnosticsActivity::class.java))
+                    },
                     onScanDevices = {
                         if (container.permissions.hasLocalNetworkAccess()) viewModel.scanTargets()
                         else permissionLauncher.launch(AndroidNetworkPermissionManager.PLAYBACK_PERMISSIONS)

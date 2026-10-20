@@ -81,7 +81,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import com.adsamcik.streamferry.core.volume.NightVolumePolicy
-import dev.tracebox.ui.compose.TraceboxDiagnosticsActivity
 import com.adsamcik.streamferry.domain.SourceAvailability
 import com.adsamcik.streamferry.domain.MediaSourceIds
 import com.adsamcik.streamferry.playback.PlaybackPhase
@@ -149,6 +148,7 @@ fun AppRoot(
     appVersion: String,
     nightVolumePolicy: NightVolumePolicy,
     onNightVolumePolicyChange: (NightVolumePolicy) -> Unit,
+    onOpenDiagnostics: () -> Unit = {},
 ) {
     val back = backActionFor(state, viewModel)
     val context = LocalContext.current
@@ -253,6 +253,7 @@ fun AppRoot(
                                 appVersion = appVersion,
                                 nightVolumePolicy = nightVolumePolicy,
                                 onNightVolumePolicyChange = onNightVolumePolicyChange,
+                                onOpenDiagnostics = onOpenDiagnostics,
                                 expanded = useNavigationRail,
                                 reserveMiniPlayerSpace = useNavigationRail && showMiniPlayer,
                             )
@@ -281,7 +282,7 @@ fun AppRoot(
         state.crashAlertCount?.let { count ->
             CrashAlertDialog(
                 count = count,
-                onReview = { context.startActivity(TraceboxDiagnosticsActivity.intent(context)) },
+                onReview = onOpenDiagnostics,
                 onDismiss = { viewModel.dismissCrashAlert() },
             )
         }
@@ -297,6 +298,7 @@ private fun ScreenContent(
     appVersion: String,
     nightVolumePolicy: NightVolumePolicy,
     onNightVolumePolicyChange: (NightVolumePolicy) -> Unit,
+    onOpenDiagnostics: () -> Unit,
     expanded: Boolean,
     reserveMiniPlayerSpace: Boolean,
 ) {
@@ -337,7 +339,7 @@ private fun ScreenContent(
                         .weight(1f)
                         .fillMaxWidth(),
                 ) {
-                    RouteContent(state, viewModel, onScanDevices, context, appVersion, nightVolumePolicy, onNightVolumePolicyChange, compact = !expanded)
+                    RouteContent(state, viewModel, onScanDevices, context, appVersion, nightVolumePolicy, onNightVolumePolicyChange, onOpenDiagnostics, compact = !expanded)
                 }
             }
         } else {
@@ -350,7 +352,7 @@ private fun ScreenContent(
                     message = shellErrorMessage,
                     onDismiss = viewModel::dismissError,
                 )
-                RouteContent(state, viewModel, onScanDevices, context, appVersion, nightVolumePolicy, onNightVolumePolicyChange, compact = !expanded)
+                RouteContent(state, viewModel, onScanDevices, context, appVersion, nightVolumePolicy, onNightVolumePolicyChange, onOpenDiagnostics, compact = !expanded)
             }
         }
     }
@@ -365,6 +367,7 @@ private fun RouteContent(
     appVersion: String,
     nightVolumePolicy: NightVolumePolicy,
     onNightVolumePolicyChange: (NightVolumePolicy) -> Unit,
+    onOpenDiagnostics: () -> Unit,
     compact: Boolean,
 ) {
     val diagnosticsScope = rememberCoroutineScope()
@@ -395,7 +398,7 @@ private fun RouteContent(
             onReviewDiagnostics = {
                 diagnosticsScope.launch {
                     viewModel.prepareDiagnostics()
-                    context.startActivity(TraceboxDiagnosticsActivity.intent(context))
+                    onOpenDiagnostics()
                 }
             },
             onToggleTvTracing = { viewModel.setTvTracingEnabled(it) },

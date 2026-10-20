@@ -39,6 +39,20 @@ class StreamFerryApplication : Application(), ImageLoaderFactory, PlaybackServic
     lateinit var tracebox: TraceboxHandle
         private set
 
+    val diagnosticsUiConfiguration: TraceboxDiagnosticsUiConfiguration
+        get() = TraceboxDiagnosticsUiConfiguration(
+            showHeading = false,
+            showCasualStatus = false,
+            primaryAction = TraceboxPrimaryAction.REVIEW_ONLY,
+            packageActions = TraceboxPackageActions(upload = false, deleteAllData = false),
+            advancedControls = dev.tracebox.ui.compose.TraceboxAdvancedControls(
+                initiallyExpanded = true,
+                statusDetails = false,
+                captureKinds = diagnosticsPolicy().captures,
+            ),
+            defaultPolicy = diagnosticsPolicy(),
+        )
+
     override fun attachBaseContext(base: Context) {
         super.attachBaseContext(base)
         tracebox = Tracebox.install(this, TraceboxConfiguration.Builder()
@@ -49,14 +63,7 @@ class StreamFerryApplication : Application(), ImageLoaderFactory, PlaybackServic
 
     override fun onCreate() {
         super.onCreate()
-        TraceboxDiagnosticsUi.configure(TraceboxDiagnosticsUiConfiguration(
-            primaryAction = TraceboxPrimaryAction.REVIEW_ONLY,
-            packageActions = TraceboxPackageActions(upload = false, deleteAllData = false),
-            advancedControls = dev.tracebox.ui.compose.TraceboxAdvancedControls(
-                captureKinds = diagnosticsPolicy().captures,
-            ),
-            defaultPolicy = diagnosticsPolicy(),
-        ))
+        TraceboxDiagnosticsUi.configure(diagnosticsUiConfiguration)
         crashReporter = CrashReporter(tracebox, packageManager.getPackageInfo(packageName, 0).lastUpdateTime)
         logger = TraceboxDiagnosticsLogger(tracebox, BuildConfig.VERSION_CODE.toString())
         container = AppContainer(this, logger, crashReporter)
