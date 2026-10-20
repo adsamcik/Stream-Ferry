@@ -8,6 +8,9 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsSelected
+import androidx.compose.ui.test.SemanticsMatcher
+import androidx.compose.ui.test.hasText
+import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
@@ -65,8 +68,8 @@ class SubtitlePlaybackControlsTest {
         // The file entry must remain reachable even when this video has no embedded tracks.
         compose.onNodeWithContentDescription("Captions: Off").assertIsDisplayed().performClick()
         compose.onNodeWithText("Choose subtitle file…").assertIsDisplayed()
-        compose.onNodeWithText("Off").assertIsSelected()
-        compose.onNodeWithText("Off").performClick()
+        trackOption("Off").assertIsSelected()
+        trackOption("Off").performClick()
         compose.runOnIdle {
             state.value = state.value.copy(playback = state.value.playback!!.copy(
                 subtitleTracks = listOf(MediaTrack(4, "eng", "English"), MediaTrack(7, "ces", "Czech")),
@@ -77,19 +80,19 @@ class SubtitlePlaybackControlsTest {
         for (protocol in listOf("CAST", "DLNA")) {
             compose.runOnIdle { state.value = state.value.copy(playback = state.value.playback!!.copy(protocol = protocol)) }
             compose.onNodeWithContentDescription("Audio: English").assertIsDisplayed().performClick()
-            compose.onNodeWithText("English").assertIsSelected()
-            compose.onNodeWithText("Czech").performClick()
+            trackOption("English").assertIsSelected()
+            trackOption("Czech").performClick()
             compose.onNodeWithContentDescription("Audio: Czech").assertIsDisplayed().performClick()
-            compose.onNodeWithText("Czech").assertIsSelected()
+            trackOption("Czech").assertIsSelected()
             if (protocol == "DLNA") screenshot("playback-audio.png")
-            compose.onNodeWithText("English").performClick()
+            trackOption("English").performClick()
             compose.onNodeWithContentDescription("Captions: Off").performClick()
-            compose.onNodeWithText("Czech").performClick()
+            trackOption("Czech").performClick()
             compose.onNodeWithContentDescription("Captions: Czech").assertIsDisplayed().performClick()
-            compose.onNodeWithText("Czech").assertIsSelected()
+            trackOption("Czech").assertIsSelected()
             compose.onNodeWithText("Choose subtitle file…").assertIsDisplayed()
             if (protocol == "DLNA") screenshot()
-            compose.onNodeWithText("Off").performClick()
+            trackOption("Off").performClick()
         }
         compose.runOnIdle {
             assertEquals(listOf(null, 7, null, 7, null), choices)
@@ -97,6 +100,11 @@ class SubtitlePlaybackControlsTest {
             assertEquals(1325L, state.value.playback!!.positionSeconds)
         }
     }
+
+    // The selected value is also visible on the toolbar; choose the actual menu option.
+    private fun trackOption(label: String) = compose.onNode(
+        hasText(label) and SemanticsMatcher.keyIsDefined(SemanticsProperties.Selected),
+    )
 
     private fun screenshot(name: String = "playback-subtitles.png") {
         compose.waitForIdle()

@@ -21,6 +21,8 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -61,6 +63,7 @@ import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material.icons.rounded.Tv
 import androidx.compose.material.icons.rounded.VideoLibrary
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -71,6 +74,7 @@ import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.FilledTonalIconButton
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonDefaults
@@ -571,8 +575,13 @@ fun PlaybackScreen(state: AppUiState, viewModel: UiController) {
                 NowPlayingHero(p, mediaTitle = title, compact = compactHeight || !wide)
                 TerminalPlaybackCard(
                     message = p.errorMessage ?: "Stream Ferry ran out of safe automatic options.",
+                    retryAvailable = p.retryAvailable,
                     onRetry = viewModel::retryPlayback,
                     onChangeTv = viewModel::changeTv,
+                    onDiagnostics = {
+                        viewModel.navigate(com.adsamcik.streamferry.ui.state.Route.DIAGNOSTICS)
+                        viewModel.refreshDiagnostics()
+                    },
                     onStop = viewModel::stopPlayback,
                     compact = compactHeight || !wide,
                 )
@@ -715,8 +724,6 @@ private fun PlaybackIssueBanner(
                 message,
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onErrorContainer,
-                maxLines = if (compact) 1 else 2,
-                overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f),
             )
             onOpenOptions?.let { openOptions ->
@@ -736,11 +743,14 @@ private fun PlaybackIssueBanner(
 @Composable
 private fun TerminalPlaybackCard(
     message: String,
+    retryAvailable: Boolean,
     onRetry: () -> Unit,
     onChangeTv: () -> Unit,
+    onDiagnostics: () -> Unit,
     onStop: () -> Unit,
     compact: Boolean,
 ) {
+    val minActionWidth = 132.dp * LocalDensity.current.fontScale
     Card(
         modifier = Modifier.fillMaxWidth().semantics { liveRegion = LiveRegionMode.Assertive },
         shape = RoundedCornerShape(if (compact) 18.dp else 22.dp),
@@ -750,31 +760,40 @@ private fun TerminalPlaybackCard(
             modifier = Modifier.fillMaxWidth().padding(14.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
+            Text("Playback failed", style = MaterialTheme.typography.titleMedium)
             Text(
                 message,
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onErrorContainer,
             )
-            Button(
-                onClick = onRetry,
-                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+            FlowRow(
+                modifier = Modifier.fillMaxWidth(),
+                maxItemsInEachRow = 2,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                Icon(Icons.Rounded.Refresh, contentDescription = null)
-                Text("Retry")
+                Button(
+                    onClick = if (retryAvailable) onRetry else onStop,
+                    modifier = Modifier.weight(1f).widthIn(min = minActionWidth).heightIn(min = 48.dp),
+                ) {
+                    Icon(if (retryAvailable) Icons.Rounded.Refresh else Icons.Rounded.Stop, contentDescription = null,
+                        modifier = Modifier.size(18.dp))
+                    Text(if (retryAvailable) "Try again" else "Back to library", Modifier.padding(start = 8.dp))
+                }
+                if (retryAvailable) OutlinedButton(
+                    onClick = onChangeTv,
+                    modifier = Modifier.weight(1f).widthIn(min = minActionWidth).heightIn(min = 48.dp),
+                ) {
+                    Icon(Icons.Rounded.Tv, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Text("Change TV", Modifier.padding(start = 8.dp))
+                }
             }
-            OutlinedButton(
-                onClick = onChangeTv,
-                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+            FlowRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
             ) {
-                Icon(Icons.Rounded.Tv, contentDescription = null)
-                Text("Change TV")
-            }
-            OutlinedButton(
-                onClick = onStop,
-                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
-            ) {
-                Icon(Icons.Rounded.Stop, contentDescription = null)
-                Text("Stop")
+                TextButton(onClick = onDiagnostics) { Text("Diagnostics") }
+                if (retryAvailable) TextButton(onClick = onStop) { Text("Close playback") }
             }
         }
     }
@@ -789,6 +808,7 @@ private fun PlaybackQuickActions(
     onStop: () -> Unit,
 ) {
     val showAudio = p.audioTracks.size > 1
+    val minActionWidth = 140.dp * LocalDensity.current.fontScale
     val subtitlePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let { viewModel.attachSubtitle(it.toString()) }
     }
@@ -797,11 +817,16 @@ private fun PlaybackQuickActions(
         shape = RoundedCornerShape(24.dp),
         color = MaterialTheme.colorScheme.surfaceContainerHigh,
     ) {
-        Row(
+        Column(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 7.dp),
-            horizontalArrangement = Arrangement.SpaceEvenly,
-            verticalAlignment = Alignment.CenterVertically,
+            verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
+            FlowRow(
+                modifier = Modifier.fillMaxWidth(),
+                maxItemsInEachRow = 2,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
             if (showAudio) {
                 val current = p.audioTracks.firstOrNull { it.index == p.currentAudioIndex }
                 QuickTrackAction(
@@ -811,7 +836,7 @@ private fun PlaybackQuickActions(
                     selectedValue = p.currentAudioIndex,
                     options = p.audioTracks.map { it.index to it.label },
                     onSelect = viewModel::selectAudioTrack,
-                    modifier = Modifier.weight(1f),
+                    modifier = Modifier.weight(1f).widthIn(min = minActionWidth),
                 )
             }
             run {
@@ -824,7 +849,7 @@ private fun PlaybackQuickActions(
                     options = listOf<Pair<Int?, String>>(null to "Off") + p.subtitleTracks.map { it.index to it.label },
                     onSelect = viewModel::selectSubtitleTrack,
                     onAdd = { subtitlePicker.launch(arrayOf("*/*")) },
-                    modifier = Modifier.weight(1f),
+                    modifier = Modifier.weight(1f).widthIn(min = minActionWidth),
                 )
             }
             if (hasQueuedItem) {
@@ -833,24 +858,25 @@ private fun PlaybackQuickActions(
                     label = "Next",
                     contentDescription = "Skip to the next playlist item",
                     onClick = viewModel::skipToNextPlaylistItem,
-                    modifier = Modifier.weight(1f),
+                    modifier = Modifier.weight(1f).widthIn(min = minActionWidth),
                 )
             }
             QuickControlButton(
                 icon = Icons.Rounded.Tune,
-                label = "Options",
+                label = "Video output",
                 contentDescription = "Playback options and troubleshooting",
                 onClick = onOpenOptions,
-                modifier = Modifier.weight(1f),
+                modifier = Modifier.weight(1f).widthIn(min = minActionWidth),
             )
-            QuickControlButton(
-                icon = Icons.Rounded.Stop,
-                label = "Stop",
-                contentDescription = "Stop playing on TV",
+            }
+            TextButton(
                 onClick = onStop,
-                danger = true,
-                modifier = Modifier.weight(1f),
-            )
+                modifier = Modifier.align(Alignment.End).heightIn(min = 48.dp).semantics { contentDescription = "Stop playing on TV" },
+                colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
+            ) {
+                Icon(Icons.Rounded.Stop, contentDescription = null, modifier = Modifier.size(18.dp))
+                Text("Stop playback", Modifier.padding(start = 8.dp))
+            }
         }
     }
 }
@@ -971,6 +997,7 @@ private fun <T> QuickTrackAction(
             icon = icon,
             label = label,
             contentDescription = "$label: $selectedLabel",
+            supporting = selectedLabel,
             onClick = { expanded = true },
             modifier = Modifier.fillMaxWidth(),
         )
@@ -1003,28 +1030,21 @@ private fun QuickControlButton(
     contentDescription: String,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
-    danger: Boolean = false,
+    supporting: String? = null,
 ) {
-    Column(modifier = modifier, horizontalAlignment = Alignment.CenterHorizontally) {
-        FilledTonalIconButton(
-            onClick = onClick,
-            colors = if (danger) {
-                IconButtonDefaults.filledTonalIconButtonColors(
-                    containerColor = MaterialTheme.colorScheme.errorContainer,
-                    contentColor = MaterialTheme.colorScheme.onErrorContainer,
-                )
-            } else {
-                IconButtonDefaults.filledTonalIconButtonColors()
-            },
-        ) {
-            Icon(icon, contentDescription = contentDescription, modifier = Modifier.size(22.dp))
+    FilledTonalButton(
+        onClick = onClick,
+        modifier = modifier.heightIn(min = 56.dp).semantics { this.contentDescription = contentDescription },
+        shape = MaterialTheme.shapes.medium,
+        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+    ) {
+        Icon(icon, contentDescription = null, modifier = Modifier.size(22.dp))
+        Column(Modifier.weight(1f).padding(start = 8.dp)) {
+            Text(label, style = MaterialTheme.typography.labelLarge)
+            supporting?.let {
+                Text(it, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
         }
-        Text(
-            label,
-            style = MaterialTheme.typography.labelSmall,
-            fontWeight = FontWeight.SemiBold,
-            maxLines = 1,
-        )
     }
 }
 

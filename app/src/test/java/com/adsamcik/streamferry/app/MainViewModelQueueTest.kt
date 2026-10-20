@@ -412,7 +412,7 @@ class MainViewModelQueueTest {
                 failureCause = PlaybackFailureCause.TRANSIENT_NETWORK)
             val failed = assertNotNull(fixture.vm.state.value.playback)
             assertTrue(failed.isTerminal)
-            assertEquals("The connection to the TV couldn't be restored. Check the TV and phone connection, then try again.",
+            assertEquals("The phone couldn't reach the TV. Check both devices' network connections, then retry.",
                 failed.errorMessage)
             fixture.vm.viewModelScope.cancel()
         }

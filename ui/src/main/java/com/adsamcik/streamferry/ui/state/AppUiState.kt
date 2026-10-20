@@ -235,6 +235,8 @@ data class PlaybackUiState(
     val controls: PlaybackControlUiState = PlaybackControlUiState(),
     /** Intended playback state, retained while the renderer is buffering. */
     val playWhenReady: Boolean = isPlaying,
+    /** False when startup failed before a replayable source/TV context was established. */
+    val retryAvailable: Boolean = true,
 )
 
 /** Compact now-playing snapshot for the diagnostics page (no secrets). */

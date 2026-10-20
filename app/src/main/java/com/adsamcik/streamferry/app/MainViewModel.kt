@@ -1597,19 +1597,20 @@ class MainViewModel(
         playbackStarting = true
         var onlineOwnerForAttempt: UserSession? = null
         runCatching {
-            check(queueEntry == null || queueEntry.canPlayWith(activeJellyfinSession())) {
+            checkPlaybackRequest(queueEntry == null || queueEntry.canPlayWith(activeJellyfinSession())) {
                 "Sign in to the Jellyfin account that owns this queued video."
             }
             if (downloadId != null) {
-                val owner = activeDownloadOwner() ?: error("The Jellyfin account for this download is unavailable.")
-                check(!hasPendingJellyfinWatchStateMutation(owner.serverId, owner.userId, downloadId)) {
+                val owner = activeDownloadOwner() ?: throw PlaybackRequestException("Sign in to the Jellyfin account that owns this download.")
+                checkPlaybackRequest(!hasPendingJellyfinWatchStateMutation(owner.serverId, owner.userId, downloadId)) {
                     "This item's watch-state change is waiting to sync. Reconnect to Jellyfin before playing it."
                 }
-                val entry = container.downloadStore.get(owner, downloadId) ?: error("Download no longer available.")
+                val entry = container.downloadStore.get(owner, downloadId)
+                    ?: throw PlaybackRequestException("The downloaded copy is no longer available. Download this video again.")
                 val file = container.downloadStore.fileFor(entry)
-                check(file.isFile && file.canRead() && file.length() > 0L &&
+                checkPlaybackRequest(file.isFile && file.canRead() && file.length() > 0L &&
                     (entry.sizeBytes <= 0L || file.length() == entry.sizeBytes)) {
-                    "The downloaded copy is unavailable."
+                    "The downloaded copy is missing or incomplete. Download this video again."
                 }
                 val resumeKey = DownloadIdentity(owner, downloadId).resumeKey
                 val resumeAt = PlaybackPositionPolicy.clamp(
@@ -1640,7 +1641,7 @@ class MainViewModel(
                     onForegrounded = goToPlayback,
                 )
             } else {
-                val item = requestedItem ?: error("Nothing selected to play.")
+                val item = requestedItem ?: throw PlaybackRequestException("Choose a video before starting playback.")
                 if (item.sourceId == MediaSourceIds.LOCAL) {
                     // On-device file: served via the proxy from a content:// fd. Resumes where you left
                     // off and auto-reconnects, the same as an online session.
@@ -1671,15 +1672,15 @@ class MainViewModel(
                         onForegrounded = goToPlayback,
                     )
                 } else {
-                    check(s.availabilityFor(item) != SourceItemAvailability.UNAVAILABLE) {
+                    checkPlaybackRequest(s.availabilityFor(item) != SourceItemAvailability.UNAVAILABLE) {
                         "Jellyfin is unavailable. Download this item to play it offline."
                     }
                     // Keep an online connection alive only when episode autoplay or this session's playlist
                     // has a concrete next item ready for a seamless hand-off. Capture the verified owner
                     // before any stream request so an account rebind can invalidate this whole session.
                     val owner = container.authRepository.currentUser.value
-                        ?: error("Reconnect to Jellyfin before streaming this item.")
-                    check(!hasPendingJellyfinWatchStateMutation(owner.serverId, owner.userId, item.id)) {
+                        ?: throw PlaybackRequestException("Reconnect to Jellyfin before streaming this item.")
+                    checkPlaybackRequest(!hasPendingJellyfinWatchStateMutation(owner.serverId, owner.userId, item.id)) {
                         "This item's watch-state change is waiting to sync. Reconnect to Jellyfin before playing it."
                     }
                     onlineOwnerForAttempt = owner
@@ -1761,6 +1762,7 @@ class MainViewModel(
                     container.logger.w("Playback", "Couldn't start playback", failure)
                 }
                 var switched = false
+                var terminalFailure = failure
                 if (context != null && !upstreamFailure) {
                     val generation = ++reconnectGeneration
                     reconnecting = true
@@ -1776,12 +1778,14 @@ class MainViewModel(
                         )
                     }
                     val latest = container.playbackEngine.recoverySnapshot().attempts.lastOrNull()
-                    switched = tryAlternateProtocol(
+                    val alternateResult = tryAlternateProtocol(
                         context,
                         failureStage = latest?.failureStage ?: PlaybackFailureStage.UNKNOWN,
                         failureCause = latest?.failureCause ?: PlaybackFailureCause.UNKNOWN,
                         generation = generation,
                     )
+                    switched = alternateResult.getOrDefault(false)
+                    terminalFailure = alternateResult.exceptionOrNull() ?: failure
                     if (generation != reconnectGeneration) return@onFailure
                     reconnecting = false
                     _state.update { current ->
@@ -1796,7 +1800,7 @@ class MainViewModel(
                     if (onlinePlaybackOwner == onlineOwnerForAttempt) onlinePlaybackOwner = null
                     // Keep raw/redacted transport detail in diagnostics; the main UI stays concise.
                     container.logger.event("playback", "Initial playback exhausted: $reason")
-                    surfaceTerminalPlaybackFailure(context, "Couldn't start playback on this TV.")
+                    surfaceTerminalPlaybackFailure(context, "Couldn't start playback on this TV.", terminalFailure)
                 } else {
                     if (onlinePlaybackOwner == onlineOwnerForAttempt) onlinePlaybackOwner = null
                     _state.update { current ->
@@ -1805,7 +1809,8 @@ class MainViewModel(
                             playback = (current.playback ?: pendingPlayback).copy(
                                 phase = PlaybackPhase.FAILED,
                                 isTerminal = true,
-                                errorMessage = "Couldn't start playback on this TV.",
+                                errorMessage = playbackFailureMessage(failure, null),
+                                retryAvailable = false,
                             ),
                             errorMessage = null,
                         )
@@ -3460,11 +3465,11 @@ class MainViewModel(
                 )
             }
             try {
-                check(queueEntry == null || queueEntry.canPlayWith(activeJellyfinSession())) {
+                checkPlaybackRequest(queueEntry == null || queueEntry.canPlayWith(activeJellyfinSession())) {
                     "Sign in to the Jellyfin account that owns this queued video."
                 }
                 if (ctx is ReconnectContext.Online) {
-                    check(container.authRepository.currentUser.value == ctx.owner) {
+                    checkPlaybackRequest(container.authRepository.currentUser.value == ctx.owner) {
                         "Sign in to the Jellyfin account that owns this video."
                     }
                     onlinePlaybackOwner = ctx.owner
@@ -3475,9 +3480,8 @@ class MainViewModel(
             } catch (c: CancellationException) {
                 throw c
             } catch (error: Exception) {
-                val reason = LogRedactor.redact(bestFailureReason(error)).take(180)
                 container.logger.w("playback", "Explicit playback retry failed", error)
-                surfaceTerminalPlaybackFailure(ctx, "Couldn't start playback: $reason")
+                surfaceTerminalPlaybackFailure(ctx, "Couldn't start playback on this TV.", error)
             } finally {
                 playbackStarting = false
             }
@@ -3820,14 +3824,14 @@ class MainViewModel(
                 }
                 if (generation != reconnectGeneration || !awaitPlaybackLan(generation)) return@launch
                 val latest = container.playbackEngine.recoverySnapshot().attempts.lastOrNull()
-                val switched = tryAlternateProtocol(
+                val alternateResult = tryAlternateProtocol(
                     recoveryContext,
                     failureStage = latest?.failureStage ?: initialStage ?: PlaybackFailureStage.UNKNOWN,
                     failureCause = latest?.failureCause ?: initialCause ?: PlaybackFailureCause.UNKNOWN,
                     generation = generation,
                 )
                 if (generation != reconnectGeneration) return@launch
-                if (switched) {
+                if (alternateResult.getOrDefault(false)) {
                     container.logger.event("playback", "Playback resumed through the TV's alternate protocol")
                     return@launch
                 }
@@ -3845,13 +3849,14 @@ class MainViewModel(
                         else -> if (retrySameEndpoint) "The connection to the TV couldn't be restored automatically."
                             else "Playback couldn't be restored. Check the connection and try again."
                     },
+                    alternateResult.exceptionOrNull(),
                 )
             } catch (c: CancellationException) {
                 throw c
             } catch (error: Exception) {
                 if (generation != reconnectGeneration) return@launch
                 container.logger.w("playback", "Automatic playback recovery failed", error)
-                surfaceTerminalPlaybackFailure(recoveryContext, "Playback couldn't be restored automatically.")
+                surfaceTerminalPlaybackFailure(recoveryContext, "Playback couldn't be restored automatically.", error)
             } finally {
                 // A reboot scan keeps the Cast route callback alive until connect() can select the
                 // refreshed route. Release it only after the whole recovery attempt completes.
@@ -3988,11 +3993,11 @@ class MainViewModel(
         failureStage: PlaybackFailureStage,
         failureCause: PlaybackFailureCause,
         generation: Long,
-    ): Boolean {
-        if (failureCause == PlaybackFailureCause.UPSTREAM_OR_SERVER_UNAVAILABLE) return false
+    ): Result<Boolean> {
+        if (failureCause == PlaybackFailureCause.UPSTREAM_OR_SERVER_UNAVAILABLE) return Result.success(false)
         val resolvedContext = discoverDlnaAlternate(context, generation)
-        if (generation != reconnectGeneration) return false
-        val alternate = resolvedContext.physicalTv.alternateEndpoint(context.endpoint.protocol) ?: return false
+        if (generation != reconnectGeneration) return Result.success(false)
+        val alternate = resolvedContext.physicalTv.alternateEndpoint(context.endpoint.protocol) ?: return Result.success(false)
         val continuation = container.playbackEngine.reserveAlternateProtocolContinuation(
             hasAlternateProtocol = true,
             failureStage = failureStage,
@@ -4000,8 +4005,8 @@ class MainViewModel(
             sameEndpointRecoveryExhausted = true,
             isLocalSessionHint = context is ReconnectContext.Local,
             isOnlineSessionHint = context is ReconnectContext.Online,
-        ) ?: return false
-        if (generation != reconnectGeneration) return false
+        ) ?: return Result.success(false)
+        if (generation != reconnectGeneration) return Result.success(false)
         val alternateContext = resolvedContext.withEndpoint(alternate)
         reconnectContext = alternateContext
         _state.update { current ->
@@ -4023,7 +4028,7 @@ class MainViewModel(
             throw c
         } catch (error: Exception) {
             container.logger.w("playback", "Alternate TV protocol failed", error)
-            val pendingPlayback = _state.value.playback ?: return false
+            val pendingPlayback = _state.value.playback ?: return Result.failure(error)
             val retryResult = retryEndpointConnection(alternateContext, error, pendingPlayback)
             retryResult.exceptionOrNull()?.let {
                 container.logger.w(
@@ -4032,21 +4037,26 @@ class MainViewModel(
                     it,
                 )
             }
-            retryResult.isSuccess
+            retryResult.getOrElse { return Result.failure(it) }
+            true
         }
-        if (!recovered || generation != reconnectGeneration) return false
+        if (!recovered || generation != reconnectGeneration) return Result.success(false)
         _state.update {
             it.copy(
                 selectedPhysicalTv = alternateContext.physicalTv,
                 selectedTarget = alternate,
             )
         }
-        return true
+        return Result.success(true)
     }
 
     /** Release renderer/proxy resources while retaining a stable, actionable Now Playing error card. */
-    private suspend fun surfaceTerminalPlaybackFailure(context: ReconnectContext, message: String) {
+    private suspend fun surfaceTerminalPlaybackFailure(context: ReconnectContext, message: String, failure: Throwable? = null) {
         val snapshot = container.playbackEngine.recoverySnapshot()
+        val attempt = snapshot.attempts.lastOrNull()
+        val explanation = if (failure != null || attempt?.failureCause?.let { it != PlaybackFailureCause.UNKNOWN } == true) {
+            playbackFailureMessage(failure, attempt)
+        } else message
         failedPlaybackContinuation = container.playbackEngine.continuationForExplicitRetry()
             ?: failedPlaybackContinuation
         val checkpoint = failedPlaybackContinuation?.positionSeconds
@@ -4074,7 +4084,8 @@ class MainViewModel(
                     phase = PlaybackPhase.FAILED,
                     isTerminal = true,
                     reconnecting = false,
-                    errorMessage = message,
+                    errorMessage = explanation,
+                    retryAvailable = true,
                     attemptGeneration = snapshot.generation,
                     attemptHistory = snapshot.attempts,
                     recoveryBudget = snapshot.budgetStatus,
@@ -4472,12 +4483,15 @@ class MainViewModel(
         outputFormat = outputFormat,
         volume = confirmedVolume,
         volumeSupported = volumeSupported,
-        errorMessage = errorMessage,
+        errorMessage = if (isTerminal && attemptHistory.lastOrNull()?.failureCause?.let { it != PlaybackFailureCause.UNKNOWN } == true) {
+            playbackFailureMessage(null, attemptHistory.lastOrNull())
+        } else errorMessage,
         phase = phase,
         attemptGeneration = attemptGeneration,
         attemptHistory = attemptHistory,
         recoveryBudget = recoveryBudget,
         isTerminal = isTerminal,
+        retryAvailable = reconnectContext != null,
         audioTracks = audioTracks,
         subtitleTracks = subtitleTracks,
         currentAudioIndex = currentAudioIndex,
