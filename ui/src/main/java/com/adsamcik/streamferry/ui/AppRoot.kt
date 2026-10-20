@@ -59,6 +59,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -152,7 +153,10 @@ fun AppRoot(
 ) {
     val back = backActionFor(state, viewModel)
     val context = LocalContext.current
-    val galleryStateHolder = rememberSaveableStateHolder()
+    val screenStateHolder = rememberSaveableStateHolder()
+    LaunchedEffect(state.route) {
+        if (state.route == Route.WELCOME) screenStateHolder.removeState(Route.SETTINGS.name)
+    }
     val showUpNavigation = state.route in upNavigationRoutes
 
     BackHandler(enabled = back != null) { back?.invoke() }
@@ -259,9 +263,9 @@ fun AppRoot(
                                 reserveMiniPlayerSpace = useNavigationRail && showMiniPlayer,
                             )
                         }
-                        if (route == Route.GALLERY) {
-                            // Keep the gallery's lazy-layout anchors when playback removes its composition.
-                            galleryStateHolder.SaveableStateProvider(Route.GALLERY.name) { screen() }
+                        if (route == Route.GALLERY || route == Route.SETTINGS) {
+                            // Keep browsing anchors when playback or a linked settings page replaces the screen.
+                            screenStateHolder.SaveableStateProvider(route.name) { screen() }
                         } else {
                             screen()
                         }
@@ -435,6 +439,7 @@ private fun RouteContent(
             onResetTvCapabilities = { viewModel.resetLearnedTvCapabilities() },
             nightVolumePolicy = nightVolumePolicy,
             onNightVolumePolicyChange = onNightVolumePolicyChange,
+            canSignOut = state.canBrowseRemote,
         )
         Route.ABOUT -> AboutScreen(appVersion)
         Route.SERVERS -> ServersScreen(state, viewModel)

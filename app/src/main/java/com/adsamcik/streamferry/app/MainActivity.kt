@@ -8,6 +8,10 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.SideEffect
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.ui.graphics.luminance
+import androidx.core.view.WindowCompat
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -51,6 +55,13 @@ class MainActivity : FragmentActivity() {
             val uiController = remember(viewModel) { MainViewModelUiController(viewModel) }
             var nightVolumePolicy by remember { mutableStateOf(container.nightVolumeSettingsStore.load()) }
             StreamFerryTheme(themeMode = state.themeMode) {
+                val lightBars = MaterialTheme.colorScheme.surface.luminance() > 0.5f
+                SideEffect {
+                    WindowCompat.getInsetsController(window, window.decorView).apply {
+                        isAppearanceLightStatusBars = lightBars
+                        isAppearanceLightNavigationBars = lightBars
+                    }
+                }
                 // Request the local-network (+ notifications) permissions before scanning/playing, then
                 // scan. Browsing the library never needs these; only TV playback does, so it is deferred.
                 val permissionLauncher = rememberLauncherForActivityResult(
