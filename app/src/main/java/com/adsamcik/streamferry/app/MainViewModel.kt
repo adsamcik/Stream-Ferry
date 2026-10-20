@@ -81,6 +81,7 @@ import com.adsamcik.streamferry.ui.state.PlaybackUiState
 import com.adsamcik.streamferry.ui.state.QuickConnectUiState
 import com.adsamcik.streamferry.ui.state.RendererPlaybackSnapshot
 import com.adsamcik.streamferry.ui.state.Route
+import com.adsamcik.streamferry.ui.state.SourceRetryStatus
 import com.adsamcik.streamferry.ui.state.toPlaybackHistoryUiState
 import com.adsamcik.streamferry.ui.state.toUiState
 import com.adsamcik.streamferry.ui.theme.ThemeMode
@@ -192,6 +193,8 @@ class MainViewModel(
     // One current browse request owns gallery publication. Every folder/source transition supersedes
     // earlier work so a late Jellyfin response cannot replace the list currently on screen.
     private var galleryLoadJob: Job? = null
+    private var galleryRefreshJob: Job? = null
+    private var galleryRefreshGeneration = 0L
     private val galleryLoadGate = GalleryLoadRequestGate()
 
     // ----- auto-reconnect after an unexpected renderer disconnect -----
@@ -411,7 +414,12 @@ class MainViewModel(
         }
         viewModelScope.launch {
             container.jellyfinConnectionMonitor.status.collect { status ->
-                _state.update { it.copy(sourceAvailability = status) }
+                _state.update { current -> current.copy(
+                    sourceAvailability = status,
+                    sourceRetryStatus = if (status != SourceAvailability.UNAVAILABLE &&
+                        current.sourceRetryStatus == SourceRetryStatus.FAILED) SourceRetryStatus.IDLE
+                        else current.sourceRetryStatus,
+                ) }
                 // ONLINE is emitted only after a verified authenticated Jellyfin request succeeds. It is a
                 // safe recovery boundary for retrying durable actions that previously lost connectivity.
                 if (!deletingAllData && status == SourceAvailability.ONLINE) {
@@ -933,14 +941,22 @@ class MainViewModel(
         galleryLoadGate.invalidate()
     }
 
-    private fun launchGalleryLoad(target: GalleryBrowseTarget = _state.value.galleryTarget()) {
+    private fun cancelGalleryRefresh() {
+        galleryRefreshGeneration++
+        galleryRefreshJob?.cancel()
+        galleryRefreshJob = null
+        _state.update { it.copy(sourceRetryStatus = SourceRetryStatus.IDLE) }
+    }
+
+    private fun launchGalleryLoad(target: GalleryBrowseTarget = _state.value.galleryTarget()): Job? {
         // A delayed refresh may resume after navigation; it must not start a request for a stale folder.
-        if (_state.value.galleryTarget() != target) return
+        if (_state.value.galleryTarget() != target) return null
         galleryLoadJob?.cancel()
         val request = galleryLoadGate.begin(target)
         galleryLoadJob = viewModelScope.launch {
             if (target.folderId == null) loadRoots(request) else loadChildren(request)
         }
+        return galleryLoadJob
     }
 
     /** Sources for the gallery switcher, as (id, displayName) in display order. */
@@ -972,11 +988,13 @@ class MainViewModel(
     /** Switch the gallery to another source, resetting the browse stack and loading its roots. */
     fun selectSource(sourceId: String) {
         if (_state.value.activeSourceId == sourceId) return
+        cancelGalleryRefresh()
         searchJob?.cancel()
         _state.update {
             it.copy(
                 activeSourceId = sourceId, libraries = emptyList(), folderStack = emptyList(), items = emptyList(),
                 searchQuery = "", searchResults = emptyList(), searching = false, errorMessage = null, galleryLoading = true,
+                sourceRetryStatus = SourceRetryStatus.IDLE,
             )
         }
         launchGalleryLoad()
@@ -1067,6 +1085,7 @@ class MainViewModel(
     }
 
     private fun openFolder(folder: MediaItem) {
+        cancelGalleryRefresh()
         _state.update { it.copy(folderStack = it.folderStack + folder, galleryLoading = true, items = emptyList(), errorMessage = null) }
         launchGalleryLoad()
     }
@@ -1075,6 +1094,7 @@ class MainViewModel(
     fun popFolder() {
         val stack = _state.value.folderStack
         if (stack.isEmpty()) return
+        cancelGalleryRefresh()
         val newStack = stack.dropLast(1)
         _state.update { it.copy(folderStack = newStack, items = emptyList(), galleryLoading = newStack.isNotEmpty()) }
         if (newStack.isEmpty()) cancelGalleryLoad() else launchGalleryLoad()
@@ -1200,15 +1220,49 @@ class MainViewModel(
 
     /** Reload the current gallery view (libraries at the root, otherwise the current folder). */
     fun refreshGallery() {
+        if (galleryRefreshJob?.isActive == true) return
+        val generation = ++galleryRefreshGeneration
         val target = _state.value.galleryTarget()
-        viewModelScope.launch {
-            refreshOnlineJellyfinSessionIfNeeded()
-            container.authRepository.currentUser.value?.let(::schedulePendingJellyfinWatchStateReplay)
-            if (_state.value.galleryTarget() != target) return@launch
-            _state.update { current ->
-                if (current.galleryTarget() == target) current.copy(galleryLoading = true, errorMessage = null) else current
+        val query = _state.value.searchQuery
+        val owner = container.authRepository.currentUser.value ?: container.authRepository.cachedSession.value
+        val remote = target.sourceId == MediaSourceIds.REMOTE
+        _state.update { it.copy(
+            sourceRetryStatus = if (remote) SourceRetryStatus.RETRYING else SourceRetryStatus.IDLE,
+            errorMessage = null,
+        ) }
+        galleryRefreshJob = viewModelScope.launch {
+            var cancelled = false
+            try {
+                refreshOnlineJellyfinSessionIfNeeded()
+                val currentOwner = container.authRepository.currentUser.value ?: container.authRepository.cachedSession.value
+                if (_state.value.galleryTarget() != target || _state.value.searchQuery != query ||
+                    (remote && currentOwner != owner)) return@launch
+                container.authRepository.currentUser.value?.let(::schedulePendingJellyfinWatchStateReplay)
+                if (query.isNotBlank()) {
+                    onSearchQueryChanged(query)
+                    searchJob?.join()
+                } else {
+                    _state.update { it.copy(galleryLoading = true) }
+                    launchGalleryLoad(target)?.join()
+                }
+            } catch (error: CancellationException) {
+                cancelled = true
+                throw error
+            } catch (error: Exception) {
+                val currentOwner = container.authRepository.currentUser.value ?: container.authRepository.cachedSession.value
+                if (galleryRefreshGeneration == generation && _state.value.galleryTarget() == target &&
+                    (!remote || currentOwner == owner)) {
+                    _state.update { it.copy(errorMessage = libraryErrorMessage(error), galleryLoading = false) }
+                }
+            } finally {
+                _state.update { current ->
+                    if (galleryRefreshGeneration != generation) return@update current
+                    val currentOwner = container.authRepository.currentUser.value ?: container.authRepository.cachedSession.value
+                    val stillUnavailable = !cancelled && remote && current.activeSourceId == target.sourceId &&
+                        currentOwner == owner && container.jellyfinConnectionMonitor.status.value == SourceAvailability.UNAVAILABLE
+                    current.copy(sourceRetryStatus = if (stillUnavailable) SourceRetryStatus.FAILED else SourceRetryStatus.IDLE)
+                }
             }
-            launchGalleryLoad(target)
         }
     }
 
@@ -1229,6 +1283,7 @@ class MainViewModel(
 
     /** Debounced free-text search across the whole library; a blank query restores the normal view. */
     fun onSearchQueryChanged(query: String) {
+        if (query != _state.value.searchQuery) cancelGalleryRefresh()
         val sourceId = _state.value.activeSourceId
         _state.update { it.copy(searchQuery = query, searching = query.isNotBlank()) }
         searchJob?.cancel()
@@ -1267,6 +1322,7 @@ class MainViewModel(
     }
 
     fun clearSearch() {
+        cancelGalleryRefresh()
         searchJob?.cancel()
         _state.update { it.copy(searchQuery = "", searchResults = emptyList(), searching = false) }
     }

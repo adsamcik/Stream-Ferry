@@ -103,6 +103,8 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
@@ -121,6 +123,7 @@ import com.adsamcik.streamferry.ui.components.ExpressiveLoadingIndicator
 import com.adsamcik.streamferry.ui.state.AppUiState
 import com.adsamcik.streamferry.ui.state.SourceItemAvailability
 import com.adsamcik.streamferry.ui.state.Route
+import com.adsamcik.streamferry.ui.state.SourceRetryStatus
 import com.adsamcik.streamferry.ui.theme.StreamFerryTheme
 import kotlinx.coroutines.launch
 import androidx.compose.ui.platform.LocalContext
@@ -197,6 +200,7 @@ fun GalleryScreen(state: AppUiState, viewModel: UiController, compact: Boolean =
                 onSearch = { searchOpen = true },
                 searchVisible = searchActive || searchOpen,
                 showSourceUnavailableNotice = remoteUnavailable,
+                sourceRetryStatus = state.sourceRetryStatus,
                 onRetrySource = viewModel::refreshGallery,
             )
         }
@@ -229,7 +233,8 @@ fun GalleryScreen(state: AppUiState, viewModel: UiController, compact: Boolean =
                 onOpenSearch = { searchOpen = true },
             )
             needsRemoteLogin -> RemoteLoginPrompt(viewModel)
-            (state.galleryLoading && entries.isEmpty()) || state.searching -> CenteredProgress("Loading…")
+            (state.galleryLoading && entries.isEmpty()) ||
+                (state.searching && (entries.isEmpty() || state.sourceRetryStatus != SourceRetryStatus.RETRYING)) -> CenteredProgress("Loading…")
             entries.isEmpty() && searchActive -> Text("No results for \"${state.searchQuery}\".")
             entries.isEmpty() -> EmptyLibraryPrompt(state, viewModel, isLocalSource)
             showingSeasons -> SeasonList(
@@ -528,7 +533,7 @@ private fun LibraryHome(
                     LibraryHomeHeader(onSearch = onOpenSearch, showSearch = compact)
                 }
                 if (compact && !searchOpen && remoteUnavailable) {
-                    SourceUnavailableHeaderNotice(onRetry = viewModel::refreshGallery)
+                    SourceUnavailableHeaderNotice(onRetry = viewModel::refreshGallery, retryStatus = state.sourceRetryStatus)
                 }
                 SourceSwitcher(viewModel.sources, state.activeSourceId, viewModel::selectSource)
                 if (isLocalSource) {
@@ -722,6 +727,7 @@ private fun PhoneGalleryHeader(
     onSearch: () -> Unit,
     searchVisible: Boolean,
     showSourceUnavailableNotice: Boolean = false,
+    sourceRetryStatus: SourceRetryStatus = SourceRetryStatus.IDLE,
     onRetrySource: () -> Unit = {},
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -763,6 +769,7 @@ private fun PhoneGalleryHeader(
         if (showSourceUnavailableNotice) {
             SourceUnavailableHeaderNotice(
                 onRetry = onRetrySource,
+                retryStatus = sourceRetryStatus,
                 modifier = Modifier.padding(bottom = 4.dp),
             )
         }
@@ -772,7 +779,9 @@ private fun PhoneGalleryHeader(
 internal fun SourceUnavailableHeaderNotice(
     onRetry: () -> Unit,
     modifier: Modifier = Modifier,
+    retryStatus: SourceRetryStatus = SourceRetryStatus.IDLE,
 ) {
+    val retrying = retryStatus == SourceRetryStatus.RETRYING
     Surface(
         modifier = modifier.fillMaxWidth(),
         shape = RoundedCornerShape(18.dp),
@@ -784,26 +793,34 @@ internal fun SourceUnavailableHeaderNotice(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            Icon(
+            if (retrying) ExpressiveLoadingIndicator(modifier = Modifier.size(24.dp)) else Icon(
                 Icons.Rounded.ErrorOutline,
                 contentDescription = null,
                 modifier = Modifier.size(20.dp),
             )
             Column(
-                modifier = Modifier.weight(1f),
+                modifier = Modifier.weight(1f).semantics { liveRegion = LiveRegionMode.Polite },
                 verticalArrangement = Arrangement.spacedBy(2.dp),
             ) {
                 Text(
-                    "Source unavailable",
+                    when (retryStatus) {
+                        SourceRetryStatus.IDLE -> "Source unavailable"
+                        SourceRetryStatus.RETRYING -> "Reconnecting…"
+                        SourceRetryStatus.FAILED -> "Still unavailable"
+                    },
                     style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.Bold,
                 )
                 Text(
-                    "Showing saved library data. Downloaded items remain available offline.",
+                    when (retryStatus) {
+                        SourceRetryStatus.IDLE -> "Showing saved library data. Downloaded items remain available offline."
+                        SourceRetryStatus.RETRYING -> "Checking the connection. Saved library data remains available."
+                        SourceRetryStatus.FAILED -> "Check your connection and try again. Downloaded items remain available offline."
+                    },
                     style = MaterialTheme.typography.bodySmall,
                 )
             }
-            TextButton(onClick = onRetry) {
+            TextButton(onClick = onRetry, enabled = !retrying) {
                 Text("Retry")
             }
         }

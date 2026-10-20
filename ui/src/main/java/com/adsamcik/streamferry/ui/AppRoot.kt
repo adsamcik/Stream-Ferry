@@ -189,6 +189,7 @@ fun AppRoot(
                         if (showSourceUnavailableNotice) {
                             SourceUnavailableHeaderNotice(
                                 onRetry = viewModel::refreshGallery,
+                                retryStatus = state.sourceRetryStatus,
                                 modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
                             )
                         }

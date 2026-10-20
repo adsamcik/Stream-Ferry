@@ -28,6 +28,8 @@ enum class Route {
 /** State of the manual server-connection step. */
 enum class ConnectionState { IDLE, TESTING, CONNECTED, FAILED }
 
+enum class SourceRetryStatus { IDLE, RETRYING, FAILED }
+
 /** Immutable UI state for the whole app shell (§2 immutable UI state). */
 data class AppUiState(
     val route: Route = Route.WELCOME,
@@ -51,6 +53,7 @@ data class AppUiState(
     val hasCachedRemoteSession: Boolean = false,
     /** Reachability of the active remote library; never used as a substitute for authentication. */
     val sourceAvailability: SourceAvailability = SourceAvailability.UNKNOWN,
+    val sourceRetryStatus: SourceRetryStatus = SourceRetryStatus.IDLE,
     val servers: List<ServerProfile> = emptyList(),
 
     // ----- quick connect (device-code style login) -----
