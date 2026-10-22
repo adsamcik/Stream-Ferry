@@ -16,7 +16,7 @@ import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [36])
+@Config(sdk = [37])
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
 class SubtitleOverlayTest {
     @Test fun `clipped output renders text and bitmap captions at original source time and clears expired captions`() {

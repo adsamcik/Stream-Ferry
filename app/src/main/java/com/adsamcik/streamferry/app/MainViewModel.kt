@@ -34,6 +34,7 @@ import com.adsamcik.streamferry.data.jellyfin.QuickConnectSession
 import com.adsamcik.streamferry.domain.DiscoveredTarget
 import com.adsamcik.streamferry.domain.AccountLibraryScope
 import com.adsamcik.streamferry.domain.SourceAvailability
+import com.adsamcik.streamferry.data.jellyfin.JellyfinSignInRequiredException
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.domain.MediaSource
 import com.adsamcik.streamferry.domain.MediaSourceIds
@@ -82,6 +83,7 @@ import com.adsamcik.streamferry.ui.state.QuickConnectUiState
 import com.adsamcik.streamferry.ui.state.RendererPlaybackSnapshot
 import com.adsamcik.streamferry.ui.state.Route
 import com.adsamcik.streamferry.ui.state.SourceRetryStatus
+import com.adsamcik.streamferry.ui.state.GalleryParentContext
 import com.adsamcik.streamferry.ui.state.toPlaybackHistoryUiState
 import com.adsamcik.streamferry.ui.state.toUiState
 import com.adsamcik.streamferry.ui.theme.ThemeMode
@@ -200,6 +202,8 @@ class MainViewModel(
     // ----- auto-reconnect after an unexpected renderer disconnect -----
     private var reconnectJob: Job? = null
     private var reconnectGeneration = 0L
+    private var explicitRetryJob: Job? = null
+    private var explicitRetryGeneration = 0L
     // The in-flight device scan, so a play tap can cancel it (its progress spinner is an infinite Compose
     // animation that would otherwise keep posting main-thread frames during the FGS start window).
     private var scanJob: Job? = null
@@ -262,6 +266,7 @@ class MainViewModel(
             override val endpoint: DiscoveredTarget,
             val downloadId: String?,
             val smartResumeSeed: SmartResumeSeed?,
+            val downloadOwner: DownloadOwner? = null,
         ) : ReconnectContext
     }
 
@@ -346,6 +351,7 @@ class MainViewModel(
         }
         viewModelScope.launch {
             container.authRepository.currentUser.collect { user ->
+                if (observedJellyfinSession != user && explicitRetryJob != null) cancelReconnect()
                 if (observedJellyfinSession != user && reconnectContext is ReconnectContext.Online) {
                     failedPlaybackContinuation = null
                 }
@@ -381,6 +387,7 @@ class MainViewModel(
                     val history = container.smartResumeStore.history.value
                     current.copy(
                         loggedIn = user != null,
+                        remoteSignInRequired = if (user != null) false else current.remoteSignInRequired,
                         smartResume = history.firstOrNull()
                             ?.takeUnless(::isSmartResumeBlockedByWatchMutation)
                             ?.toUiState(user),
@@ -407,7 +414,8 @@ class MainViewModel(
         }
         viewModelScope.launch {
             container.authRepository.cachedSession.collect { cached ->
-                _state.update { it.copy(hasCachedRemoteSession = cached != null) }
+                _state.update { it.copy(hasCachedRemoteSession = cached != null,
+                    remoteSignInRequired = if (cached == null) false else it.remoteSignInRequired) }
                 if (cached != null) materializePendingJellyfinWatchStateMutations(cached)
                 refreshDownloadEntries()
             }
@@ -467,7 +475,9 @@ class MainViewModel(
                 if (restoredQuery.isNotBlank()) onSearchQueryChanged(restoredQuery)
             }
 
-            val restored = container.authRepository.ensureOnlineSession().getOrNull()
+            val restoration = container.authRepository.ensureOnlineSession()
+            val restored = restoration.getOrNull()
+            _state.update { it.copy(remoteSignInRequired = restoration.exceptionOrNull() is JellyfinSignInRequiredException) }
             if (restored != null) {
                 container.jellyfinConnectionMonitor.markOnline()
                 _state.update { it.copy(loggedIn = true, connectionState = ConnectionState.CONNECTED) }
@@ -512,7 +522,15 @@ class MainViewModel(
         entries.forEach { entry ->
             owner?.let { downloadTitles[DownloadIdentity(it, entry.itemId)] = entry.title }
         }
-        _state.update { it.copy(downloads = mergeDownloads(container.downloader.states.value)) }
+        val shelfItems = withConfirmedJellyfinWatchState(MediaSourceIds.REMOTE, entries.map { it.playbackItem() })
+        _state.update { current ->
+            val showingDownloads = current.activeSourceId == MediaSourceIds.REMOTE &&
+                current.currentFolder?.id == com.adsamcik.streamferry.data.download.DownloadedJellyfinMediaLibraryRepository.OFFLINE_DOWNLOADS_ROOT_ID
+            current.copy(
+                downloads = mergeDownloads(container.downloader.states.value),
+                items = if (showingDownloads) shelfItems else current.items,
+            )
+        }
     }
 
     private fun mergeDownloads(states: Map<DownloadIdentity, DownloadState>): List<DownloadUiItem> {
@@ -584,10 +602,17 @@ class MainViewModel(
                 pauseDownloadsForAuthTransition()
                 val session = container.authRepository.switchServer(serverId)
                 val cached = container.authRepository.cachedSession.value
+                val selectedProfile = if (session == null) container.authRepository.servers()
+                    .firstOrNull { it.id == serverId && it.active } else null
                 when {
                     session != null -> {
                         container.jellyfinConnectionMonitor.markOnline()
                         openLibraries()
+                    }
+                    selectedProfile?.loggedIn == false -> {
+                        container.jellyfinConnectionMonitor.markUnavailable()
+                        _state.update { it.copy(hasCachedRemoteSession = cached != null, loggedIn = false, serverName = selectedProfile.name) }
+                        showRemoteSignIn()
                     }
                     cached != null -> {
                         container.jellyfinConnectionMonitor.markUnavailable()
@@ -907,7 +932,7 @@ class MainViewModel(
     fun openLibraries() = viewModelScope.launch {
         _state.update {
             it.copy(
-                route = Route.GALLERY, galleryLoading = true, folderStack = emptyList(), items = emptyList(),
+                route = Route.GALLERY, galleryLoading = true, folderStack = emptyList(), galleryParents = emptyList(), items = emptyList(),
                 errorMessage = null, searchQuery = "", searchResults = emptyList(), searching = false,
             )
         }
@@ -992,7 +1017,7 @@ class MainViewModel(
         searchJob?.cancel()
         _state.update {
             it.copy(
-                activeSourceId = sourceId, libraries = emptyList(), folderStack = emptyList(), items = emptyList(),
+                activeSourceId = sourceId, libraries = emptyList(), folderStack = emptyList(), galleryParents = emptyList(), items = emptyList(),
                 searchQuery = "", searchResults = emptyList(), searching = false, errorMessage = null, galleryLoading = true,
                 sourceRetryStatus = SourceRetryStatus.IDLE,
             )
@@ -1021,7 +1046,7 @@ class MainViewModel(
 
     private fun reloadIfLocalActive() {
         if (_state.value.activeSourceId != MediaSourceIds.LOCAL) return
-        _state.update { it.copy(galleryLoading = true, folderStack = emptyList(), items = emptyList()) }
+        _state.update { it.copy(galleryLoading = true, folderStack = emptyList(), galleryParents = emptyList(), items = emptyList()) }
         launchGalleryLoad()
     }
 
@@ -1077,7 +1102,6 @@ class MainViewModel(
         smartResumeOverrideSeconds = null
         queueSelectionGeneration++
         if (item.isFolder) {
-            if (_state.value.searchQuery.isNotBlank()) clearSearch()
             openFolder(item)
         } else {
             openDetail(item)
@@ -1086,7 +1110,14 @@ class MainViewModel(
 
     private fun openFolder(folder: MediaItem) {
         cancelGalleryRefresh()
-        _state.update { it.copy(folderStack = it.folderStack + folder, galleryLoading = true, items = emptyList(), errorMessage = null) }
+        searchJob?.cancel()
+        _state.update {
+            it.copy(
+                galleryParents = (it.galleryParents + GalleryParentContext(it.folderStack, it.searchQuery)).takeLast(32),
+                folderStack = it.folderStack + folder, searchQuery = "", searchResults = emptyList(), searching = false,
+                galleryLoading = true, items = emptyList(), errorMessage = null,
+            )
+        }
         launchGalleryLoad()
     }
 
@@ -1095,9 +1126,19 @@ class MainViewModel(
         val stack = _state.value.folderStack
         if (stack.isEmpty()) return
         cancelGalleryRefresh()
-        val newStack = stack.dropLast(1)
-        _state.update { it.copy(folderStack = newStack, items = emptyList(), galleryLoading = newStack.isNotEmpty()) }
-        if (newStack.isEmpty()) cancelGalleryLoad() else launchGalleryLoad()
+        searchJob?.cancel()
+        val parent = _state.value.galleryParents.lastOrNull()
+        val newStack = parent?.folders ?: stack.dropLast(1)
+        val query = parent?.query.orEmpty()
+        _state.update { it.copy(
+            folderStack = newStack, galleryParents = it.galleryParents.dropLast(1),
+            items = emptyList(), searchQuery = query, searchResults = emptyList(), searching = query.isNotBlank(),
+            galleryLoading = query.isBlank() && newStack.isNotEmpty(),
+        ) }
+        if (query.isNotBlank()) {
+            cancelGalleryLoad()
+            onSearchQueryChanged(query)
+        } else if (newStack.isEmpty()) cancelGalleryLoad() else launchGalleryLoad()
     }
 
     private suspend fun loadChildren(request: GalleryLoadRequest) {
@@ -1233,7 +1274,7 @@ class MainViewModel(
         galleryRefreshJob = viewModelScope.launch {
             var cancelled = false
             try {
-                refreshOnlineJellyfinSessionIfNeeded()
+                if (!refreshOnlineJellyfinSessionIfNeeded()) return@launch
                 val currentOwner = container.authRepository.currentUser.value ?: container.authRepository.cachedSession.value
                 if (_state.value.galleryTarget() != target || _state.value.searchQuery != query ||
                     (remote && currentOwner != owner)) return@launch
@@ -1259,6 +1300,7 @@ class MainViewModel(
                     if (galleryRefreshGeneration != generation) return@update current
                     val currentOwner = container.authRepository.currentUser.value ?: container.authRepository.cachedSession.value
                     val stillUnavailable = !cancelled && remote && current.activeSourceId == target.sourceId &&
+                        !current.remoteSignInRequired && current.route != Route.LOGIN &&
                         currentOwner == owner && container.jellyfinConnectionMonitor.status.value == SourceAvailability.UNAVAILABLE
                     current.copy(sourceRetryStatus = if (stillUnavailable) SourceRetryStatus.FAILED else SourceRetryStatus.IDLE)
                 }
@@ -1267,14 +1309,36 @@ class MainViewModel(
     }
 
     /** A manual refresh is the explicit retry boundary for a cache-only Jellyfin session. */
-    private suspend fun refreshOnlineJellyfinSessionIfNeeded() {
+    private suspend fun refreshOnlineJellyfinSessionIfNeeded(): Boolean {
         val current = _state.value
-        if (current.activeSourceId != MediaSourceIds.REMOTE || current.loggedIn || !current.hasCachedRemoteSession) return
-        if (container.authRepository.ensureOnlineSession().isSuccess) {
+        if (current.activeSourceId != MediaSourceIds.REMOTE || current.loggedIn || !current.hasCachedRemoteSession) return true
+        val result = container.authRepository.ensureOnlineSession()
+        if (result.isSuccess) {
             container.jellyfinConnectionMonitor.markOnline()
+            _state.update { it.copy(remoteSignInRequired = false) }
         } else {
             container.jellyfinConnectionMonitor.markUnavailable()
+            if (result.exceptionOrNull() is JellyfinSignInRequiredException) {
+                showRemoteSignIn()
+                return false
+            }
         }
+        return true
+    }
+
+    private fun showRemoteSignIn() {
+        cancelQuickConnect()
+        _state.update { it.copy(
+            route = Route.LOGIN,
+            serverUrlInput = container.jellyfinClient.baseUrl ?: it.serverUrlInput,
+            connectionState = ConnectionState.CONNECTED,
+            loggedIn = false,
+            remoteSignInRequired = true,
+            isBusy = false,
+            galleryLoading = false,
+            sourceRetryStatus = SourceRetryStatus.IDLE,
+            errorMessage = "Sign in again for this server address. Your saved library and downloads are kept.",
+        ) }
     }
 
     // ----- library search -----
@@ -1516,7 +1580,9 @@ class MainViewModel(
         downloadId: String?,
         queueEntry: PlaylistEntry? = null,
         onResult: (Boolean) -> Unit = {},
-    ): Job = viewModelScope.launch {
+    ): Job {
+        cancelExplicitRetry()
+        return viewModelScope.launch {
         playingQueueEntryId = null
         attemptQueueEntry = queueEntry
         var started = false
@@ -1566,21 +1632,21 @@ class MainViewModel(
             return@launch
         }
         val resumeDeviceContext = smartResumeDeviceContext(physicalTv, target)
-        _state.update { it.copy(selectedTarget = target, nowPlayingItem = requestedItem) }
+        _state.update { it.copy(selectedTarget = target, nowPlayingItem = requestedItem.takeIf { downloadId == null }) }
         val controller = if (target.protocol == Protocol.CAST) container.castController else container.dlnaController
         // Navigate to the playback screen only AFTER the proxy service enters the foreground (via the
         // onForegrounded callback below), so the screen's recomposition can't queue ahead of onStartCommand
         // on the main thread and blow the startForegroundService() deadline
         // (ForegroundServiceDidNotStartInTimeException on a Galaxy S24 / Android 16). See PlaybackEngine.
-        val pendingPlayback = PlaybackUiState(
+        var pendingPlayback = PlaybackUiState(
             targetName = physicalTv.displayName,
             protocol = target.protocol.name,
-            mediaTitle = requestedItem?.title ?: downloadId?.let { itemId ->
+            mediaTitle = requestedItem?.takeIf { downloadId == null }?.title ?: downloadId?.let { itemId ->
                 activeDownloadOwner()?.let { owner ->
                     downloadTitles[DownloadIdentity(owner, itemId)] ?: container.downloader.titleFor(itemId, owner)
                 }
             }.orEmpty(),
-            durationSeconds = requestedItem?.runtimeSeconds,
+            durationSeconds = requestedItem?.takeIf { downloadId == null }?.runtimeSeconds,
             phase = PlaybackPhase.CONNECTING,
             adaptiveNote = "Connecting to the TV…",
             volumeSupported = false,
@@ -1607,6 +1673,12 @@ class MainViewModel(
                 }
                 val entry = container.downloadStore.get(owner, downloadId)
                     ?: throw PlaybackRequestException("The downloaded copy is no longer available. Download this video again.")
+                checkPlaybackRequest(activeDownloadOwner() == owner) {
+                    "Sign in to the Jellyfin account that owns this download."
+                }
+                val downloadedItem = entry.playbackItem()
+                _state.update { it.copy(nowPlayingItem = downloadedItem) }
+                pendingPlayback = pendingPlayback.copy(mediaTitle = entry.title, durationSeconds = entry.runtimeSeconds)
                 val file = container.downloadStore.fileFor(entry)
                 checkPlaybackRequest(file.isFile && file.canRead() && file.length() > 0L &&
                     (entry.sizeBytes <= 0L || file.length() == entry.sizeBytes)) {
@@ -1619,7 +1691,7 @@ class MainViewModel(
                 )
                 reconnectContext = ReconnectContext.Local(
                     file.absolutePath, entry.mimeType, entry.title, entry.runtimeSeconds,
-                    physicalTv, target, downloadId, downloadedSmartResumeSeed(entry),
+                    physicalTv, target, downloadId, downloadedSmartResumeSeed(entry), owner,
                 )
                 // Install ownership before the renderer starts. Early status, immediate Stop, and an
                 // alternate-protocol recovery must all checkpoint this exact download, never the prior item.
@@ -1632,7 +1704,7 @@ class MainViewModel(
                     title = entry.title,
                     runtimeSeconds = entry.runtimeSeconds,
                     allowClientTranscode = container.playbackPreferences.transcodeLocalOnDevice,
-                    prefs = streamPreferences(),
+                    prefs = streamPreferences(downloadedItem),
                     resumePositionSeconds = resumeAt,
                     smartResumeSeed = downloadedSmartResumeSeed(entry),
                     smartResumeDeviceContext = resumeDeviceContext,
@@ -1824,6 +1896,7 @@ class MainViewModel(
         }
         _state.update { it.copy(selectedDownloadId = null) }
         onResult(started)
+        }
     }
 
     /**
@@ -2410,7 +2483,10 @@ class MainViewModel(
         val playback = snapshot.playback ?: return
         if (snapshot.queues.working.current != null || playbackStarting || autoAdvancing) return
         val item = snapshot.nowPlayingItem ?: return
-        val owner = if (item.sourceId == MediaSourceIds.REMOTE) activeJellyfinSession() ?: return else null
+        val downloadOwner = (reconnectContext as? ReconnectContext.Local)?.downloadOwner
+        val owner = if (item.sourceId == MediaSourceIds.REMOTE) {
+            downloadOwner?.let { UserSession(it.userId, it.serverId) } ?: activeJellyfinSession() ?: return
+        } else null
         val entry = PlaylistEntry(++playlistEntrySequence,
             item.copy(resumePositionSeconds = container.playbackEngine.status.value?.recoveryPositionSeconds ?: playback.positionSeconds), owner)
         playingQueueEntryId = entry.entryId
@@ -3450,7 +3526,8 @@ class MainViewModel(
             _state.value.queues.working.current?.takeIf { it.entryId == attempted.entryId } ?: attempted
         }
         cancelReconnect()
-        viewModelScope.launch {
+        val generation = explicitRetryGeneration
+        explicitRetryJob = viewModelScope.launch {
             playbackStarting = true
             _state.update { current ->
                 current.copy(
@@ -3474,22 +3551,36 @@ class MainViewModel(
                     }
                     onlinePlaybackOwner = ctx.owner
                 }
+                if (ctx is ReconnectContext.Local && ctx.downloadOwner != null) {
+                    checkPlaybackRequest(activeDownloadOwner() == ctx.downloadOwner) {
+                        "Sign in to the Jellyfin account that owns this download."
+                    }
+                }
                 playContext(ctx, ctx.endpoint, lastPlaybackPositionSeconds, continuation)
+                currentCoroutineContext().ensureActive()
+                if (generation != explicitRetryGeneration) return@launch
                 failedPlaybackContinuation = null
                 queueEntry?.let(::queueEntryStarted)
             } catch (c: CancellationException) {
                 throw c
             } catch (error: Exception) {
+                currentCoroutineContext().ensureActive()
+                if (generation != explicitRetryGeneration) return@launch
                 container.logger.w("playback", "Explicit playback retry failed", error)
                 surfaceTerminalPlaybackFailure(ctx, "Couldn't start playback on this TV.", error)
             } finally {
-                playbackStarting = false
+                if (generation == explicitRetryGeneration) {
+                    playbackStarting = false
+                    explicitRetryJob = null
+                }
             }
         }
     }
 
     /** User-requested device change leaves recovery intentionally and returns to one physical-TV picker. */
-    fun changeTv() = viewModelScope.launch {
+    fun changeTv(): Job {
+        cancelExplicitRetry()
+        return viewModelScope.launch {
         failedPlaybackContinuation = null
         val ctx = reconnectContext
         container.playbackEngine.status.value?.let { checkpointQueue(it, force = true) }
@@ -3517,6 +3608,7 @@ class MainViewModel(
         }
         runCatching { container.playbackEngine.stop() }
         scanTargets()
+        }
     }
 
     private fun controllerFor(target: DiscoveredTarget) =
@@ -4098,7 +4190,15 @@ class MainViewModel(
         }
     }
 
+    private fun cancelExplicitRetry() {
+        explicitRetryGeneration++
+        explicitRetryJob?.cancel()
+        if (explicitRetryJob != null) playbackStarting = false
+        explicitRetryJob = null
+    }
+
     private fun cancelReconnect() {
+        cancelExplicitRetry()
         reconnectGeneration++
         reconnectJob?.cancel()
         reconnectJob = null

@@ -27,14 +27,14 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [36], qualifiers = "w393dp-h851dp-mdpi")
+@Config(sdk = [37], qualifiers = "w393dp-h851dp-mdpi")
 class GalleryKeyboardInsetsTest {
     @get:Rule val compose = createComposeRule()
 
     @Test fun phoneResultsFillTheSpaceAboveTheKeyboard() = assertKeyboardSpaceIsUsed()
 
     @Test
-    @Config(sdk = [36], qualifiers = "w900dp-h851dp-mdpi")
+    @Config(sdk = [37], qualifiers = "w900dp-h851dp-mdpi")
     fun wideResultsFillTheSpaceAboveTheKeyboard() = assertKeyboardSpaceIsUsed()
 
     private fun assertKeyboardSpaceIsUsed() {

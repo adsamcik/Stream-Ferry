@@ -535,7 +535,7 @@ fun ServersScreen(state: AppUiState, viewModel: UiController) {
                         style = MaterialTheme.typography.bodySmall,
                         color = if (server.active) foreground else MaterialTheme.colorScheme.onSurfaceVariant,
                     )
-                    if (!server.active) {
+                    if (!server.active || !server.loggedIn) {
                         Text(
                             if (server.loggedIn) "Ready to use" else "Sign-in required",
                             style = MaterialTheme.typography.labelLarge,
@@ -543,8 +543,10 @@ fun ServersScreen(state: AppUiState, viewModel: UiController) {
                         )
                     }
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        if (!server.active) {
-                            Button(onClick = { viewModel.switchServer(server.id) }) { Text("Use server") }
+                        if (!server.active || !server.loggedIn) {
+                            Button(onClick = { viewModel.switchServer(server.id) }) {
+                                Text(if (server.loggedIn) "Use server" else "Sign in")
+                            }
                         }
                         OutlinedButton(onClick = { forgetCandidateId = server.id }) { Text("Forget") }
                     }

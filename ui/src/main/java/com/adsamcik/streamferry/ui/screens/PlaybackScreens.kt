@@ -125,6 +125,7 @@ import androidx.compose.ui.semantics.progressBarRangeInfo
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.setProgress
+import androidx.compose.ui.semantics.disabled
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.TextRange
@@ -1355,7 +1356,8 @@ private fun SeekScrubber(
                         progressBarRangeInfo = duration?.let {
                             ProgressBarRangeInfo(shown, 0f..1f)
                         } ?: ProgressBarRangeInfo.Indeterminate
-                        if (duration != null) {
+                        if (!seekable) disabled()
+                        if (seekable && duration != null) {
                             setProgress { requested ->
                                 onSeek((requested.coerceIn(0f, 1f) * duration).toLong())
                                 true

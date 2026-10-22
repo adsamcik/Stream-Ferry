@@ -40,6 +40,10 @@ class JellyfinMediaLibraryRepository(
         runCatching { client.itemDetails(itemId) }
             .onFailure { logger.w("library", "Failed to load item details", it) }
 
+    suspend fun items(itemIds: List<String>): Result<List<MediaItem>> =
+        runCatching { client.itemsByIds(itemIds) }
+            .onFailure { logger.w("library", "Failed to refresh downloaded metadata", it) }
+
     override suspend fun search(query: String): Result<List<MediaItem>> = runCatching {
         client.searchItems(query, SEARCH_LIMIT).items
             .also { logger.event("library", "Search returned ${it.size} result(s)") }

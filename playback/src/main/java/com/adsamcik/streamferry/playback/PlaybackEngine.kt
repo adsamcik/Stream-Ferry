@@ -428,6 +428,10 @@ class PlaybackEngine(
     @Volatile private var recoverySession = PlaybackRecoverySession()
     @Volatile private var pendingRecoveryKind: RecoveryAttemptKind? = null
 
+    init {
+        proxy.beginWork = serviceController::beginWork
+    }
+
     private val absolutePositionSeconds: Long get() = streamStartSeconds + reportedPositionSeconds
     private fun recoveryPositionSeconds(): Long =
         smartResume.pendingSeekPositionSeconds() ?: smartResume.recoveryPositionSeconds() ?: absolutePositionSeconds
@@ -497,7 +501,7 @@ class PlaybackEngine(
         val loadedAddress = streamLanAddress
         if ((gatewayWasUnavailable || (loadedAddress != null && address != loadedAddress)) && !isReloadingStream) {
             handlePlaybackFailure(PlaybackFailureKind.NETWORK,
-                "The phone's local network changed. Reconnecting the stream…",
+                "The phone's local network changed. Reconnecting the streamâ€¦",
                 failureStage = PlaybackFailureStage.PROXY)
         }
     }
@@ -875,7 +879,8 @@ class PlaybackEngine(
             ensureProxyServiceForegrounded()
             onForegrounded()
             eventsJob = scope.launch { target.events.collect { onTargetEvent(target, it) } }
-            target.connect(selectedTarget)
+            networkInfo.retainPlaybackLanNetwork()
+            serviceController.beginWork().use { target.connect(selectedTarget) }
             endpointConnected = true
             synchronizeVolumeFromTargetLocked()
             startPlaybackWithFallback(startPos, requestedBitrate = manualQualityBitrateBps ?: prefs.maxBitrateBps,
@@ -1082,7 +1087,9 @@ class PlaybackEngine(
                             startupWasInterrupted = true
                             throw StreamStartupSuperseded()
                         }
-                        async(dispatcher, start = CoroutineStart.LAZY) { block() }.also {
+                        async(dispatcher, start = CoroutineStart.LAZY) {
+                            serviceController.beginWork().use { block() }
+                        }.also {
                             preparationLanAddress = networkInfo.lanIpv4()
                             attemptNetwork = currentLanNetwork()
                             preparationLanNetwork = attemptNetwork
@@ -1179,22 +1186,29 @@ class PlaybackEngine(
     private suspend fun resumeLocked() {
         requireLocalNetworkAccess()
         val t = target ?: return
-        if (selectedTarget?.protocol == Protocol.DLNA && !localPlayWhenReady &&
-            (onDeviceTranscodeTarget != null || localTranscodeMode == LocalTranscodeMode.ON_DEVICE || automaticPhoneTranscode)
-        ) {
-            // A DLNA renderer can close the unseekable TS response while paused. Give it a fresh
-            // stream at the retained source position instead of asking it to reopen expired bytes.
-            reloadOutput(recoveryPositionSeconds(), "resume phone stream", playWhenReady = true)
-        } else {
-            t.play()
-            isPlaying = true
-            localPlayWhenReady = true
+        serviceController.setPlaybackActive(true)
+        try {
+            if (selectedTarget?.protocol == Protocol.DLNA && !localPlayWhenReady &&
+                (onDeviceTranscodeTarget != null || localTranscodeMode == LocalTranscodeMode.ON_DEVICE || automaticPhoneTranscode)
+            ) {
+                // A DLNA renderer can close the unseekable TS response while paused. Give it a fresh
+                // stream at the retained source position instead of asking it to reopen expired bytes.
+                reloadOutput(recoveryPositionSeconds(), "resume phone stream", playWhenReady = true)
+            } else {
+                t.play()
+                isPlaying = true
+                localPlayWhenReady = true
+            }
+            // A replacement load already reconciled any newer Pause/Resume issued during preparation.
+            if (localPlayWhenReady && !playbackStarted && startupWatchdogJob?.isActive != true) armStartupWatchdog()
+            controlErrorMessage = null
+            reportSourceProgressSoon()
+            publishStatus()
+        } finally {
+            // A rejected Resume leaves the previous paused intent intact. Reconcile even when the
+            // renderer RPC or replacement preparation failed before publishing another status.
+            reconcileServicePlaybackActivity()
         }
-        // A replacement load already reconciled any newer Pause/Resume issued during preparation.
-        if (localPlayWhenReady && !playbackStarted && startupWatchdogJob?.isActive != true) armStartupWatchdog()
-        controlErrorMessage = null
-        reportSourceProgressSoon()
-        publishStatus()
     }
 
     suspend fun pause() {
@@ -1356,7 +1370,8 @@ class PlaybackEngine(
             ensureProxyServiceForegrounded()
             onForegrounded()
             eventsJob = scope.launch { target.events.collect { onTargetEvent(target, it) } }
-            target.connect(selectedTarget)
+            networkInfo.retainPlaybackLanNetwork()
+            serviceController.beginWork().use { target.connect(selectedTarget) }
             endpointConnected = true
             synchronizeVolumeFromTargetLocked()
             loadLocalStreamLocked(startPos,
@@ -1368,6 +1383,17 @@ class PlaybackEngine(
             cleanupCancelledStartup(endpointConnected, PlaybackAttemptSourceKind.LOCAL)
             throw e
         } catch (e: Exception) {
+            if (endpointConnected && !e.isPreparationFailure() &&
+                e.rendererFailureKind() == PlaybackFailureKind.FORMAT && onDeviceTranscodeTarget != null
+            ) {
+                handlePlaybackFailure(PlaybackFailureKind.FORMAT, "The TV rejected the local output format.",
+                    qualifiedFormatEvidence = true, failureStage = PlaybackFailureStage.RENDERER_LOAD)
+                if (isReloadingStream && fallbackJob?.isActive == true) {
+                    // A command-result rejection owns the same recovery as an asynchronous renderer error.
+                    if (monitorJob?.isActive != true) monitorJob = scope.launch { monitorLoop() }
+                    return@withLock
+                }
+            }
             val stage = when {
                 e.isPreparationFailure() -> PlaybackFailureStage.STREAM_RESOLUTION
                 !endpointConnected -> PlaybackFailureStage.ENDPOINT_CONNECTION
@@ -1624,6 +1650,7 @@ class PlaybackEngine(
             session = StreamingTranscodeSession(
                 onDeviceTranscoder, uri, output, logger, hls, startPositionSeconds,
                 sourceMimeType = mimeType, sourceProfile = profile,
+                beginWork = serviceController::beginWork,
                 subtitleTrack = selectedLocalSubtitle(),
                 subtitleContext = appContext,
                 audioTrack = selectedLocalAudio().takeIf { localPlayback != null },
@@ -2408,6 +2435,7 @@ class PlaybackEngine(
     private suspend fun ensureProxyServiceForegrounded() {
         when (val result = serviceController.startAndAwaitForegrounded()) {
             is ForegroundServiceStartResult.Foregrounded -> {
+                serviceController.setPlaybackActive(localPlayWhenReady)
                 logger.event("playback", "Proxy foreground service confirmed (${result.path})")
             }
             is ForegroundServiceStartResult.StartRejected -> {
@@ -3294,7 +3322,7 @@ class PlaybackEngine(
                 if (!canObservePlaybackHealth()) playbackHealth.reset()
                 else if (playbackHealth.isStalled(recoverySession.generation, elapsedRealtime())) {
                     handlePlaybackFailure(PlaybackFailureKind.NETWORK,
-                        "The TV stopped advancing playback. Reconnecting the stream…",
+                        "The TV stopped advancing playback. Reconnecting the streamâ€¦",
                         failureStage = PlaybackFailureStage.ESTABLISHED_PLAYBACK)
                 }
             }
@@ -3903,6 +3931,7 @@ class PlaybackEngine(
         runCatching { serviceController.stop() }
         target = null
         selectedTarget = null
+        networkInfo.releasePlaybackLanNetwork()
         item = null
         adaptive = null
         mediaSegments = emptyList()
@@ -3988,7 +4017,13 @@ class PlaybackEngine(
         else -> codec.uppercase()
     }
 
+    private fun reconcileServicePlaybackActivity() {
+        serviceController.setPlaybackActive(target != null && localPlayWhenReady &&
+            !terminalFailureSurfaced && completedGeneration != playGeneration)
+    }
+
     private fun publishStatus(error: String? = null) {
+        reconcileServicePlaybackActivity()
         val sel = selectedTarget ?: return
         val a = adaptive
         val descriptor = currentProviderSession?.descriptor

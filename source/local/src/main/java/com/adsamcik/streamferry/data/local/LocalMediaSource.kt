@@ -10,7 +10,6 @@ import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import com.adsamcik.streamferry.core.local.LocalMediaRules
-import com.adsamcik.streamferry.core.transcode.SourceCapabilities
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.domain.MediaSource
 import com.adsamcik.streamferry.domain.MediaSourceIds
@@ -63,13 +62,6 @@ class LocalMediaSource(
 
     override val id: String = MediaSourceIds.LOCAL
     override val displayName: String = "On this device"
-    override val capabilities: SourceCapabilities =
-        SourceCapabilities(
-            canServerTranscode = false,
-            isSeekable = true,
-            isReopenable = true,
-            canStreamToClientTranscoder = true,
-        )
 
     /** True when the user has granted any local access (folders, files, or the media permission). */
     fun hasAnyAccess(): Boolean =

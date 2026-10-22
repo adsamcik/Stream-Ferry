@@ -11,7 +11,6 @@ import com.adsamcik.streamferry.source.api.SourceInstanceId
 import com.adsamcik.streamferry.source.api.TrackRef
 import io.mockk.coEvery
 import io.mockk.coVerify
-import io.mockk.every
 import io.mockk.mockk
 import kotlinx.coroutines.test.runTest
 import okhttp3.OkHttpClient
@@ -49,7 +48,7 @@ class JellyfinAudioPlaybackTest {
         coVerify(exactly = 0) { api.postPlaybackInfo(any(), any(), any(), any(), any(), any(), any(), any()) }
 
         assertTrue(repository.prepare(Protocol.DLNA, 9).isFailure)
-        every { api.resolveUpstreamFor(any()) } returns upstream(false)
+        coEvery { api.postPlaybackInfo(any(), any(), any(), any(), any(), any(), any(), any()) } returns info(false)
         val failure = repository.playbackInfo(
             "item", capabilities(Protocol.CAST), null, false, true, 2, null, 45, mediaSourceId = "version",
         ).exceptionOrNull()
@@ -104,16 +103,16 @@ class JellyfinAudioPlaybackTest {
 
     private fun api(): JellyfinApi = mockk<JellyfinApi>().apply {
         coEvery { postPlaybackInfo(any(), any(), any(), any(), any(), any(), any(), any()) } returns
-            JellyfinApi.PlaybackInfoResult(
-                mediaSourceId = "version", playSessionId = "session", container = "mkv", videoCodec = "h264",
-                audioCodec = "aac", isHdr = false, bitDepth = 8, runtimeSeconds = 200,
-                upstreamUrl = "https://server.example/video.ts", contentType = "video/mp2t", isHls = false,
-                totalLength = null,
-                audioTracks = listOf(MediaTrack(1, "eng", "English", isDefault = true), MediaTrack(2, "ces", "Czech")),
-                subtitleTracks = listOf(MediaTrack(3, "eng", "English ASS")),
-            )
-        every { resolveUpstreamFor(any()) } returns upstream(true)
+            info()
     }
+
+    private fun info(transcoding: Boolean = true) = JellyfinApi.PlaybackInfoResult(
+        mediaSourceId = "version", playSessionId = "session", container = "mkv", videoCodec = "h264",
+        audioCodec = "aac", isHdr = false, bitDepth = 8, runtimeSeconds = 200,
+        upstream = upstream(transcoding),
+        audioTracks = listOf(MediaTrack(1, "eng", "English", isDefault = true), MediaTrack(2, "ces", "Czech")),
+        subtitleTracks = listOf(MediaTrack(3, "eng", "English ASS")),
+    )
 
     private fun upstream(transcoding: Boolean) = JellyfinUpstreamSource(
         url = "https://server.example/video.ts", authHeader = null, contentType = "video/mp2t",

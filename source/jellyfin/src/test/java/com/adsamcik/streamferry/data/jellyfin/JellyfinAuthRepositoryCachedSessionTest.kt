@@ -61,6 +61,26 @@ class JellyfinAuthRepositoryCachedSessionTest {
         assertTokenlessPublicInfoRequest(fixture)
     }
 
+    @Test
+    fun legacyUnboundToken_preservesCachedOwnershipButRequiresFreshSignIn() = runBlocking {
+        val fixture = fixture(publicInfoResponse = """{"Id":"$SERVER_ID"}""", credentialBaseUrl = null)
+
+        assertNull(fixture.repository.restoreSession())
+        assertEquals(UserSession(USER_ID, SERVER_ID), fixture.repository.cachedSession.value)
+        assertFalse(fixture.client.isAuthenticated)
+        assertTrue(fixture.responder.requests.isEmpty())
+    }
+
+    @Test
+    fun credentialsBoundToDifferentAddress_areNeverRestoredOrSent() = runBlocking {
+        val fixture = fixture(publicInfoResponse = """{"Id":"$SERVER_ID"}""", credentialBaseUrl = "https://old.example.test")
+
+        assertNull(fixture.repository.restoreSession())
+        assertEquals(UserSession(USER_ID, SERVER_ID), fixture.repository.cachedSession.value)
+        assertFalse(fixture.client.isAuthenticated)
+        assertTrue(fixture.responder.requests.isEmpty())
+    }
+
     private fun assertTokenlessPublicInfoRequest(fixture: Fixture) {
         assertEquals(1, fixture.responder.requests.size)
         val request = fixture.responder.requests.single()
@@ -69,15 +89,17 @@ class JellyfinAuthRepositoryCachedSessionTest {
         assertFalse(request.url.toString().contains(TOKEN))
     }
 
-    private fun fixture(publicInfoResponse: String): Fixture {
+    private fun fixture(publicInfoResponse: String, credentialBaseUrl: String? = "https://jellyfin.example.test"): Fixture {
         val profile = StoredServer(
             serverId = SERVER_ID,
             baseUrl = "https://jellyfin.example.test",
             name = "Test Jellyfin",
             userId = USER_ID,
+            credentialBaseUrl = credentialBaseUrl,
         )
         val configStore = mockk<ServerConfigStore>()
         every { configStore.active() } returns profile
+        every { configStore.get(SERVER_ID) } returns profile
         val responder = RecordingResponder(publicInfoResponse)
         val client = JellyfinClient(
             httpClient = OkHttpClient.Builder().addInterceptor(responder).build(),

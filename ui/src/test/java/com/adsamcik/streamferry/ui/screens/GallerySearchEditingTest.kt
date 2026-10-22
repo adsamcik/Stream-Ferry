@@ -25,7 +25,7 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [36], qualifiers = "w393dp-h851dp-mdpi")
+@Config(sdk = [37], qualifiers = "w393dp-h851dp-mdpi")
 class GallerySearchEditingTest {
     @get:Rule val compose = createComposeRule()
 
@@ -36,7 +36,7 @@ class GallerySearchEditingTest {
         assertEditingSurvivesContentChanges(compact = true, inFolder = true)
 
     @Test
-    @Config(sdk = [36], qualifiers = "w900dp-h851dp-mdpi")
+    @Config(sdk = [37], qualifiers = "w900dp-h851dp-mdpi")
     fun wideRootSearchKeepsItsEditorWhenResultsReplaceHome() =
         assertEditingSurvivesContentChanges(compact = false)
 

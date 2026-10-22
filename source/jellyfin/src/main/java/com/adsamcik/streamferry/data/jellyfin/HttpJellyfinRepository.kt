@@ -79,7 +79,7 @@ class HttpJellyfinRepository(
             )
             val stripSubtitles = subtitleStreamIndex == -1 &&
                 (response.hasEmbeddedSubtitleTracks ?: response.subtitleTracks.isNotEmpty())
-            if (stripSubtitles && !api.resolveUpstreamFor(response.mediaSourceId).isTranscoding) {
+            if (stripSubtitles && !response.upstream.isTranscoding) {
                 // A raw container can still auto-enable default/forced captions on the TV. A
                 // server-generated stream maps only video/audio when SubtitleStreamIndex is -1.
                 response = api.postPlaybackInfo(
@@ -94,7 +94,7 @@ class HttpJellyfinRepository(
                 )
             }
             if (stripSubtitles) {
-                check(api.resolveUpstreamFor(response.mediaSourceId).isTranscoding) {
+                check(response.upstream.isTranscoding) {
                     "Jellyfin did not remove subtitle tracks from the video"
                 }
             }
@@ -102,7 +102,7 @@ class HttpJellyfinRepository(
                 check(response.audioTracks.any { it.index == audioStreamIndex }) {
                     "The selected audio track is no longer available"
                 }
-                check(api.resolveUpstreamFor(response.mediaSourceId).isTranscoding) {
+                check(response.upstream.isTranscoding) {
                     "Jellyfin did not apply the selected audio track"
                 }
             }
@@ -110,7 +110,7 @@ class HttpJellyfinRepository(
                 check(response.subtitleTracks.any { it.index == subtitleStreamIndex }) {
                     "The selected subtitle track is no longer available"
                 }
-                check(api.resolveUpstreamFor(response.mediaSourceId).isTranscoding) {
+                check(response.upstream.isTranscoding) {
                     "Jellyfin did not transcode the selected subtitle into the video"
                 }
             }
@@ -134,13 +134,15 @@ class HttpJellyfinRepository(
                 subtitleTracks = response.subtitleTracks,
                 itemId = itemId,
                 hasEmbeddedSubtitleTracks = response.hasEmbeddedSubtitleTracks,
+                upstream = response.upstream,
             )
         }.onFailure { logger.e("jellyfin", "PlaybackInfo request failed (${it.javaClass.simpleName})", it) }
     }
 
     override suspend fun resolveUpstream(info: JellyfinPlaybackInfo): JellyfinUpstreamSource = withContext(Dispatchers.IO) {
-        // The upstream URL + auth header are secrets resolved from the cached PlaybackInfo response.
-        api.resolveUpstreamFor(info.mediaSourceId)
+        // Keep the URL/auth bound to the exact negotiation even when another request selects the same
+        // media source for a download, seek, or different track/output.
+        checkNotNull(info.upstream) { "Playback negotiation did not supply its upstream stream" }
     }
 
     override suspend fun mediaSegments(itemId: String): List<com.adsamcik.streamferry.core.segments.MediaSegment> =

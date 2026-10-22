@@ -117,6 +117,7 @@ jobs:
           args: >-
             -PversionName=${{ steps.release.outputs.version }}
             :core:test
+            :source:api:test
             checkSourceBoundaries
             testDebugUnitTest
             compileDebugAndroidTestKotlin

@@ -74,7 +74,7 @@ class DlnaTargetControllerControlTest {
             } else {
                 assertEquals("\"urn:schemas-upnp-org:service:AVTransport:1#GetTransportInfo\"", request.header("SOAPACTION"))
                 transportReads++
-                """<CurrentTransportState>$transportState</CurrentTransportState><CurrentTransportStatus>OK</CurrentTransportStatus>"""
+                """<response><CurrentTransportState>$transportState</CurrentTransportState><CurrentTransportStatus>OK</CurrentTransportStatus></response>"""
             }
             Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(200).message("OK")
                 .body(body.toResponseBody("text/xml".toMediaType())).build()
@@ -609,7 +609,7 @@ class DlnaTargetControllerControlTest {
                         <serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>
                         <controlURL>/control</controlURL></service></serviceList></device></root>"""
                 action == "GetTransportInfo" -> fixture.transportState?.let {
-                    "<CurrentTransportState>$it</CurrentTransportState><CurrentTransportStatus>${fixture.transportStatus}</CurrentTransportStatus>"
+                    "<response><CurrentTransportState>$it</CurrentTransportState><CurrentTransportStatus>${fixture.transportStatus}</CurrentTransportStatus></response>"
                 } ?: "<CurrentTransportStatus>${fixture.transportStatus}</CurrentTransportStatus>"
                 action == "GetPositionInfo" -> {
                     val reply = fixture.positionReply ?: "<RelTime>${DidlLite.formatDuration(fixture.positionSeconds)}</RelTime>"
@@ -617,14 +617,14 @@ class DlnaTargetControllerControlTest {
                     reply
                 }
                 action == "SetAVTransportURI" && fixture.setUriFaultCode != null ->
-                    "<upnp:errorCode>${fixture.setUriFaultCode}</upnp:errorCode>"
+                    "<upnp:errorCode xmlns:upnp=\"urn:schemas-upnp-org:control-1-0\">${fixture.setUriFaultCode}</upnp:errorCode>"
                 action == "Play" -> {
                     fixture.playCommands++
                     if (fixture.playIoFailure) throw IOException("Connection lost")
                     val fault = fixture.playFaultCode
                     if (fault != null) {
                         responseCode = 500
-                        "<upnp:errorCode>$fault</upnp:errorCode>"
+                        "<upnp:errorCode xmlns:upnp=\"urn:schemas-upnp-org:control-1-0\">$fault</upnp:errorCode>"
                     } else {
                         if (fixture.playStartsPlayback) fixture.transportState = "PLAYING"
                         "<Response/>"

@@ -21,7 +21,7 @@ import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [34])
+@Config(sdk = [37])
 class MediaSessionControllerTest {
     private val metadataUpdates = mutableListOf<MediaMetadata>()
     private val stateUpdates = mutableListOf<PlaybackState>()

@@ -10,7 +10,7 @@ import org.robolectric.annotation.Config
 import org.junit.runner.RunWith
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [34])
+@Config(sdk = [37])
 class CastOptionsProviderTest {
     @Test fun `cast sdk leaves media session and notification ownership to the app`() {
         val options = CastOptionsProvider().getCastOptions(RuntimeEnvironment.getApplication())

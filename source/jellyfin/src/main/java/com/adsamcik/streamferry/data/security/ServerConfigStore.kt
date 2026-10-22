@@ -14,13 +14,15 @@ data class StoredServer(
     val baseUrl: String,
     val name: String,
     val userId: String? = null,
+    /** Exact normalized endpoint that issued the saved token; absent on legacy profiles. */
+    val credentialBaseUrl: String? = null,
 )
 
 /**
  * Persists ALL known server profiles (encrypted at rest) so the app remembers every server even when one
  * is temporarily unreachable (e.g. you left the home network) — profiles are removed only on explicit
- * "Forget". [serverId] is the server real Jellyfin Id (anti-spoof pin), so the same id keeps pointing at
- * the same server across URLs. Cleared by "Delete all app data".
+ * "Forget". A public Jellyfin Id is not proof of endpoint ownership: credentials additionally stay
+ * bound to the endpoint that issued them. Cleared by "Delete all app data".
  */
 class ServerConfigStore(context: Context) {
 

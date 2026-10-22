@@ -8,7 +8,6 @@ import com.adsamcik.streamferry.data.jellyfin.HttpJellyfinRepository.Companion.T
 import com.adsamcik.streamferry.data.jellyfin.DefaultJellyfinPlaybackReporter
 import com.adsamcik.streamferry.data.jellyfin.JellyfinApi
 import com.adsamcik.streamferry.data.jellyfin.JellyfinPlaybackInfo
-import com.adsamcik.streamferry.data.jellyfin.JellyfinUpstreamSource
 import com.adsamcik.streamferry.source.api.DiagnosticSink
 import com.adsamcik.streamferry.domain.SourceAvailability
 import java.io.IOException
@@ -102,7 +101,6 @@ class DefaultJellyfinPlaybackReporterTest {
             mediaSourceId: String?,
         ): JellyfinApi.PlaybackInfoResult = error("unused")
 
-        override fun resolveUpstreamFor(mediaSourceId: String): JellyfinUpstreamSource = error("unused")
 
         override suspend fun reportPlaying(playSessionId: String?, itemId: String) = error("Expected rich report")
 

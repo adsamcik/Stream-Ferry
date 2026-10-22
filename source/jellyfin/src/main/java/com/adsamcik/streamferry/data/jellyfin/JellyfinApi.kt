@@ -20,11 +20,8 @@ interface JellyfinApi {
         val isHdr: Boolean,
         val bitDepth: Int,
         val runtimeSeconds: Long?,
-        /** Secret upstream locator (DirectStreamUrl or TranscodingUrl) — never exposed to UI/TV. */
-        val upstreamUrl: String,
-        val contentType: String,
-        val isHls: Boolean,
-        val totalLength: Long?,
+        /** Immutable locator/credentials for this exact negotiation; never exposed to UI/TV. */
+        val upstream: JellyfinUpstreamSource,
         /** Source media bitrate (bits/sec), when the server reports it. */
         val sourceBitrateBps: Long? = null,
         /** Source video resolution + video-stream bitrate (bits/sec), when reported. */
@@ -37,7 +34,12 @@ interface JellyfinApi {
         val subtitleTracks: List<MediaTrack> = emptyList(),
         /** Sidecars do not put subtitle packets in the original video; null means not inspected. */
         val hasEmbeddedSubtitleTracks: Boolean? = null,
-    )
+    ) {
+        val upstreamUrl: String get() = upstream.url
+        val contentType: String get() = upstream.contentType
+        val isHls: Boolean get() = upstream.isHls
+        val totalLength: Long? get() = upstream.totalLength
+    }
 
     suspend fun systemInfoPublic(): String?
     suspend fun authenticateByName(username: String, password: String): AuthResult
@@ -52,9 +54,6 @@ interface JellyfinApi {
         requireTranscode: Boolean,
         mediaSourceId: String? = null,
     ): PlaybackInfoResult
-
-    /** Resolve the upstream source for a previously fetched media source id (held in memory). */
-    fun resolveUpstreamFor(mediaSourceId: String): JellyfinUpstreamSource
 
     /** Skippable media segments (intro/outro/recap/…) for an item; empty when none/unsupported. */
     suspend fun mediaSegments(itemId: String): List<com.adsamcik.streamferry.core.segments.MediaSegment> = emptyList()

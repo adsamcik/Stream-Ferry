@@ -21,7 +21,7 @@ import kotlin.test.assertFalse
 import kotlin.test.assertFailsWith
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [35])
+@Config(sdk = [37])
 class LocalMediaSourceGrantTest {
 
     private val context get() = RuntimeEnvironment.getApplication()

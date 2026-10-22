@@ -54,7 +54,7 @@ class AVTransportTest {
 
     @Test fun parsesTransportStateAndStatus() {
         val soap = """
-            <s:Envelope><s:Body><u:GetTransportInfoResponse>
+            <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><s:Body><u:GetTransportInfoResponse>
               <CurrentTransportState>PLAYING</CurrentTransportState>
               <CurrentTransportStatus>OK</CurrentTransportStatus>
               <CurrentSpeed>1</CurrentSpeed>
@@ -68,16 +68,16 @@ class AVTransportTest {
     @Test fun detectsErrorOccurredStatus() {
         // A renderer that can't decode the media parks in STOPPED with an ERROR_OCCURRED status — the
         // signal the poll loop uses to trigger a transcode fallback.
-        val soap = "<CurrentTransportState>STOPPED</CurrentTransportState>" +
-            "<CurrentTransportStatus>ERROR_OCCURRED</CurrentTransportStatus>"
+        val soap = "<Response><CurrentTransportState>STOPPED</CurrentTransportState>" +
+            "<CurrentTransportStatus>ERROR_OCCURRED</CurrentTransportStatus></Response>"
         val info = AVTransport.parseTransportInfo(soap)
         assertEquals("STOPPED", info.state)
         assertEquals("ERROR_OCCURRED", info.status)
     }
 
     @Test fun parsesNamespacePrefixedTags() {
-        val soap = "<u:CurrentTransportState>TRANSITIONING</u:CurrentTransportState>" +
-            "<u:CurrentTransportStatus>OK</u:CurrentTransportStatus>"
+        val soap = "<Response xmlns:u=\"urn:transport\"><u:CurrentTransportState>TRANSITIONING</u:CurrentTransportState>" +
+            "<u:CurrentTransportStatus>OK</u:CurrentTransportStatus></Response>"
         val info = AVTransport.parseTransportInfo(soap)
         assertEquals("TRANSITIONING", info.state)
         assertEquals("OK", info.status)
@@ -87,5 +87,26 @@ class AVTransportTest {
         val info = AVTransport.parseTransportInfo("<Something>else</Something>")
         assertNull(info.state)
         assertNull(info.status)
+    }
+
+    @Test fun acceptsNamespaceResetsAttributesAndEscapedValues() {
+        val soap = """<Response xmlns="urn:renderer" xmlns:r="urn:transport">
+            <CurrentTransportState xmlns="" data-source="tv">PLAYING</CurrentTransportState>
+            <r:CurrentTransportStatus note="a &amp; b">OK</r:CurrentTransportStatus>
+            <RelTime xmlns="" unit="seconds">1:02:03.000</RelTime>
+            <r:CurrentVolume channel="Master"> 35 </r:CurrentVolume>
+            <errorCode xmlns="" detail="format">714</errorCode>
+        </Response>"""
+        assertEquals(AVTransport.TransportInfo("PLAYING", "OK"), AVTransport.parseTransportInfo(soap))
+        assertEquals("1:02:03.000", AVTransport.responseValue(soap, "RelTime"))
+        assertEquals("35", AVTransport.responseValue(soap, "CurrentVolume"))
+        assertEquals("714", AVTransport.responseValue(soap, "errorCode"))
+    }
+
+    @Test fun malformedOrEntityExpandingResponsesCannotSupplyFields() {
+        assertNull(AVTransport.responseValue("<Response><RelTime>1:02:03", "RelTime"))
+        val unsafe = """<!DOCTYPE Response [<!ENTITY x SYSTEM "file:///private">]><Response><RelTime>&x;</RelTime></Response>"""
+        assertNull(AVTransport.responseValue(unsafe, "RelTime"))
+        assertEquals(AVTransport.TransportInfo(null, null), AVTransport.parseTransportInfo(unsafe))
     }
 }

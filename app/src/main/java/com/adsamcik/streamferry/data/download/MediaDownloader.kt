@@ -23,6 +23,7 @@ import kotlinx.coroutines.runInterruptible
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.nio.file.Files
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ThreadLocalRandom
 import kotlin.coroutines.cancellation.CancellationException
@@ -356,10 +357,10 @@ class MediaDownloader(
         val meta = store.partMetaFileFor(item.id, owner)
         part.parentFile?.mkdirs()
 
-        // Resume an interrupted download from the bytes already on disk. We send Range + If-Range, but
-        // because some servers ignore conditional ranges, we ALSO verify the
-        // resumed response's total size matches what we recorded — so a file that changed underneath us
-        // forces a clean restart instead of splicing two different versions into one corrupt file.
+        // Append only when a strong entity tag proves both responses describe identical bytes.
+        // Last-Modified and length alone cannot distinguish same-sized replacements, so legacy partials
+        // lacking a strong ETag restart safely. The provider contract does not expose If-Range; checking
+        // the returned tag is mandatory even if a future provider adds that request optimization.
         // Transcode downloads are re-encoded on each request and are NOT byte-range resumable.
         val existing = if (format is DownloadFormat.Original && part.exists()) part.length() else 0L
         val storedValidator: String?
@@ -372,7 +373,7 @@ class MediaDownloader(
             storedValidator = null
             storedTotal = -1L
         }
-        val tryResume = existing > 0 && (storedValidator != null || storedTotal > 0)
+        val tryResume = existing > 0 && strongEntityTag(storedValidator) != null && storedTotal > existing
 
         var resp = if (tryResume) {
             stream.open(ByteRange(existing, Long.MAX_VALUE)).getOrThrow()
@@ -385,11 +386,16 @@ class MediaDownloader(
         if (tryResume) {
             val range = parseContentRange(resp.header("Content-Range"))
             val startsAtExisting = range?.start == existing
-            val sizeOk = storedTotal <= 0 || range?.total == null || range.total == storedTotal
+            val sizeOk = range != null && range.total == storedTotal && range.endInclusive == storedTotal - 1
+            val rawLength = resp.header("Content-Length")
+            val length = rawLength?.toLongOrNull()
+            val responseSizeOk = rawLength == null ||
+                (range != null && length != null && length == range.endInclusive - range.start + 1)
+            val sameRepresentation = strongEntityTag(resp.header("ETag")) == strongEntityTag(storedValidator)
             when {
                 // A matching total alone is insufficient: appending a 206 that starts elsewhere silently
                 // corrupts the offline copy. Require the exact byte the partial file ends at.
-                resp.statusCode == 206 && startsAtExisting && sizeOk -> {
+                resp.statusCode == 206 && startsAtExisting && sizeOk && responseSizeOk && sameRepresentation -> {
                     resumed = true
                     resumedRange = range
                 }
@@ -398,7 +404,6 @@ class MediaDownloader(
                     // Range ignored, malformed, or for another offset: discard the stale validator and
                     // fetch a complete entity rather than splicing incompatible byte ranges together.
                     resp.close()
-                    runCatching { meta.delete() }
                     resp = stream.open().getOrThrow()
                     resumed = false
                 }
@@ -412,7 +417,7 @@ class MediaDownloader(
             if (!resumed && r.statusCode != 200) {
                 throw IOException("Source returned a partial response to a full download request.")
             }
-            val newValidator = r.header("ETag") ?: r.header("Last-Modified")
+            val newValidator = strongEntityTag(r.header("ETag"))
             val startAt = if (resumed) existing else 0L
             val remaining = r.header("Content-Length")?.toLongOrNull()?.takeIf { it >= 0 }
             val total = when {
@@ -429,6 +434,12 @@ class MediaDownloader(
             // overhead while still interrupting a blocked read as soon as pauseAll() cancels the job.
             runInterruptible(Dispatchers.IO) {
                 r.body.use { ins ->
+                    if (!resumed) {
+                        // Invalidate the old representation BEFORE truncating any bytes. A failed
+                        // best-effort metadata rewrite must never leave an old ETag paired with a new
+                        // prefix. Failure here retains the old partial untouched for a later retry.
+                        Files.deleteIfExists(meta.toPath())
+                    }
                     val fos = FileOutputStream(part, /* append = */ resumed)
                     // Opening in non-append mode truncated the file: record the validator + total for *these*
                     // bytes (after the truncate) so a future resume can verify the same file version.
@@ -498,6 +509,11 @@ class MediaDownloader(
 
     private fun StreamResponse.header(name: String): String? =
         headers.entries.firstOrNull { it.key.equals(name, ignoreCase = true) }?.value
+
+    private fun strongEntityTag(value: String?): String? = value?.trim()?.takeIf {
+        it.length >= 2 && it.first() == '"' && it.last() == '"' &&
+            it.substring(1, it.lastIndex).none { char -> char == '"' || char.code < 0x21 || char.code == 0x7f }
+    }
 
     /** A deliberate session boundary: retain queue/partial bytes until this owner is live again. */
     private class DownloadOwnerInactiveException : IOException(

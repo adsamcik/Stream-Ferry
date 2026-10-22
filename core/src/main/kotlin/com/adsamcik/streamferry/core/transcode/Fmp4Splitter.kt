@@ -252,7 +252,10 @@ object Fmp4Splitter {
         val profileTier = d[hvcC.contentStart + 1].toInt() and 0xFF
         val profileSpace = when ((profileTier ushr 6) and 0x03) { 1 -> "A"; 2 -> "B"; 3 -> "C"; else -> "" }
         val profileIdc = profileTier and 0x1F
-        val compatibility = hexWithoutLeadingZeros(d, hvcC.contentStart + 2, 4)
+        // hvcC stores flag i in bit (31-i); RFC 6381 writes flag i in bit i.
+        val compatibility = Integer.toUnsignedString(
+            Integer.reverse(readU32(d, hvcC.contentStart + 2).toInt()), 16,
+        ).uppercase(java.util.Locale.ROOT)
         val tier = if ((profileTier and 0x20) != 0) "H" else "L"
         val level = d[hvcC.contentStart + 12].toInt() and 0xFF
         val constraints = hexWithoutTrailingZeroBytes(d, hvcC.contentStart + 6, 6)
@@ -325,11 +328,6 @@ object Fmp4Splitter {
         }
         if ((flags and 0x20) != 0) offset += 2
         return offset.takeIf { it <= end }
-    }
-
-    private fun hexWithoutLeadingZeros(d: ByteArray, offset: Int, length: Int): String {
-        val hex = (0 until length).joinToString("") { "%02X".format(d[offset + it].toInt() and 0xFF) }
-        return hex.trimStart('0').ifEmpty { "0" }
     }
 
     private fun hexWithoutTrailingZeroBytes(d: ByteArray, offset: Int, length: Int): String {

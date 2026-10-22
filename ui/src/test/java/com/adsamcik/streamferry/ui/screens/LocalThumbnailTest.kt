@@ -28,7 +28,7 @@ import org.robolectric.annotation.Config
 import kotlin.test.*
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [36], qualifiers = "w393dp-h851dp-mdpi")
+@Config(sdk = [37], qualifiers = "w393dp-h851dp-mdpi")
 class LocalThumbnailTest {
     @get:Rule val compose = createComposeRule()
 

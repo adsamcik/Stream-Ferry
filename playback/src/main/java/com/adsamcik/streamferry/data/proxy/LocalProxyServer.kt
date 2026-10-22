@@ -2,6 +2,8 @@ package com.adsamcik.streamferry.data.proxy
 
 import android.content.ContentResolver
 import android.net.Uri
+import android.os.CancellationSignal
+import android.os.ParcelFileDescriptor
 import com.adsamcik.streamferry.core.buffer.MemoryBufferPolicy
 import com.adsamcik.streamferry.core.hls.HlsRewriter
 import com.adsamcik.streamferry.core.hls.HlsSegmentRegistry
@@ -37,12 +39,12 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.BufferedOutputStream
 import java.io.File
-import java.io.FileInputStream
 import java.io.InputStream
 import java.io.IOException
 import java.io.OutputStream
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
+import java.nio.channels.Channels
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
@@ -92,6 +94,12 @@ class LocalProxyServer(
     private val transcodeInputs = ConcurrentHashMap.newKeySet<String>()
     /** Open bodies are tracked so local teardown can cut renderer access before remote cleanup. */
     private val activeResponses = ConcurrentHashMap<String, MutableSet<StreamResponse>>()
+    private val activeLocalReads = ConcurrentHashMap<String, MutableSet<LocalContentRead>>()
+
+    /** CPU ownership for source work only; a blocked renderer write never owns this lease. */
+    @Volatile var beginWork: (() -> AutoCloseable)? = null
+
+    private inline fun <T> sourceWork(block: () -> T): T = beginWork?.invoke().use { block() }
 
     /**
      * Optional sink notified of each chunk of bytes successfully delivered downstream (to the TV).
@@ -218,6 +226,7 @@ class LocalProxyServer(
     }
 
     fun unregisterStreamLease(sessionId: String) {
+        cancelLocalReads(sessionId)
         transcodeInputs.remove(sessionId)
         deliveryTrackers.remove(sessionId)
         remoteLeases.remove(sessionId)
@@ -226,6 +235,11 @@ class LocalProxyServer(
         }
         responses.forEach { response -> runCatching { response.close() } }
         hlsStates.remove(sessionId)
+    }
+
+    fun cancelLocalReads(sessionId: String) {
+        val reads = synchronized(lifecycleLock) { activeLocalReads.remove(sessionId)?.toList().orEmpty() }
+        reads.forEach { it.close() }
     }
 
     val isRunning: Boolean get() = serverSocket != null
@@ -263,10 +277,13 @@ class LocalProxyServer(
         val clients: List<Socket>
         val listener: ServerSocket?
         val oldScope: CoroutineScope?
+        val localReads: List<LocalContentRead>
         synchronized(lifecycleLock) {
             stopping = true
             sessions.revokeAll()
             responses = activeResponses.values.flatMap { it.toList() }
+            localReads = activeLocalReads.values.flatMap { it.toList() }
+            activeLocalReads.clear()
             clients = activeClients.toList()
             activeResponses.clear()
             remoteLeases.clear()
@@ -278,6 +295,7 @@ class LocalProxyServer(
             scope = null
         }
         responses.forEach { response -> runCatching { response.close() } }
+        localReads.forEach { it.close() }
         clients.forEach { client -> runCatching { client.close() } }
         runCatching { listener?.close() }
         oldScope?.cancel()
@@ -574,7 +592,7 @@ class LocalProxyServer(
                     return
                 }
                 if (playlist) {
-                    val bodyBytes = BoundedBody.readAtMost(response.body, MAX_PLAYLIST_BYTES)
+                    val bodyBytes = sourceWork { BoundedBody.readAtMost(response.body, MAX_PLAYLIST_BYTES) }
                     if (bodyBytes == null) {
                         writeStatus(out, 502, "Bad Gateway")
                         logger.w(TAG, "HLS playlist exceeded the size cap")
@@ -706,7 +724,7 @@ class LocalProxyServer(
         range: ByteRange?,
     ): StreamResponse {
         ensureSessionActive(session)
-        val response = lease.open(range).getOrThrow()
+        val response = sourceWork { lease.open(range).getOrThrow() }
         return trackResponse(session.id, response)
     }
 
@@ -717,7 +735,7 @@ class LocalProxyServer(
         range: ByteRange?,
     ): StreamResponse {
         ensureSessionActive(session)
-        val response = lease.open(resource, range).getOrThrow()
+        val response = sourceWork { lease.open(resource, range).getOrThrow() }
         return trackResponse(session.id, response)
     }
 
@@ -830,7 +848,7 @@ class LocalProxyServer(
                     while (length == null || copied < length) {
                         ensureSessionActive(session)
                         val remaining = length?.minus(copied) ?: Long.MAX_VALUE
-                        val count = response.body.read(buffer, 0, minOf(buffer.size.toLong(), remaining).toInt())
+                        val count = sourceWork { response.body.read(buffer, 0, minOf(buffer.size.toLong(), remaining).toInt()) }
                         if (count < 0) {
                             if (length != null && copied < length) throw IOException("HLS body ended before declared length")
                             break
@@ -904,7 +922,7 @@ class LocalProxyServer(
                 ensureSessionActive(session)
                 val remaining = expectedLength?.let { it - copied } ?: Long.MAX_VALUE
                 if (remaining == 0L) break
-                val n = ins.read(buf, 0, minOf(buf.size.toLong(), remaining).toInt())
+                val n = sourceWork { ins.read(buf, 0, minOf(buf.size.toLong(), remaining).toInt()) }
                 if (n < 0) {
                     if (expectedLength != null && copied < expectedLength) throw IOException("Upstream body ended before declared length")
                     break
@@ -954,14 +972,14 @@ class LocalProxyServer(
         }
         writeHeaders(out, plan)
         if (head) return
-        RandomAccessFile(file, "r").use { raf ->
+        sourceWork { RandomAccessFile(file, "r") }.use { raf ->
             raf.seek(start)
             val buf = ByteArray(MemoryBufferPolicy.COPY_CHUNK_BYTES)
             var remaining = endInclusive - start + 1
             while (remaining > 0) {
                 ensureSessionActive(session)
                 val toRead = minOf(remaining, buf.size.toLong()).toInt()
-                val n = raf.read(buf, 0, toRead)
+                val n = sourceWork { raf.read(buf, 0, toRead) }
                 if (n < 0) throw IOException("Local file ended before declared length")
                 try {
                     out.write(buf, 0, n)
@@ -988,16 +1006,25 @@ class LocalProxyServer(
             logger.w(TAG, "No content resolver to open a local content URI")
             return
         }
-        val pfd = runCatching { resolver.openFileDescriptor(Uri.parse(uriString), "r") }.getOrNull()
+        val cancellation = CancellationSignal()
+        val read = LocalContentRead(cancellation::cancel)
+        synchronized(lifecycleLock) {
+            if (stopping || !sessions.isActive(session.id)) throw IOException("Local media session was cancelled")
+            activeLocalReads.getOrPut(session.id) { ConcurrentHashMap.newKeySet() }.add(read)
+        }
+        try {
+        val pfd = sourceWork { resolver.openFileDescriptor(Uri.parse(uriString), "r", cancellation) }
         if (pfd == null) {
             writeStatus(out, 404, "Not Found"); return
         }
-        pfd.use {
+        read.register(pfd).use {
             val total = pfd.statSize
             if (total < 0) {
                 // Length unknown: can't satisfy ranges, stream the whole entity (no seek).
                 writeSimpleHeaders(out, 200, "OK", session.contentType, null, acceptRanges = false, extra = null)
-                if (!head) FileInputStream(pfd.fileDescriptor).use { copyTo(session, it, out) }
+                if (!head) read.register(ParcelFileDescriptor.AutoCloseInputStream(pfd).channel).use { channel ->
+                    copyTo(session, Channels.newInputStream(channel), out)
+                }
                 return
             }
             val rangeResult = HttpRange.parse(req.rangeHeader, total)
@@ -1018,7 +1045,7 @@ class LocalProxyServer(
             }
             writeHeaders(out, plan)
             if (head) return
-            FileInputStream(pfd.fileDescriptor).channel.use { channel ->
+            read.register(ParcelFileDescriptor.AutoCloseInputStream(pfd).channel).use { channel ->
                 channel.position(start)
                 val buf = ByteArray(MemoryBufferPolicy.COPY_CHUNK_BYTES)
                 val bb = ByteBuffer.wrap(buf)
@@ -1027,7 +1054,7 @@ class LocalProxyServer(
                     ensureSessionActive(session)
                     bb.clear()
                     if (remaining < buf.size) bb.limit(remaining.toInt())
-                    val n = channel.read(bb)
+                    val n = sourceWork { channel.read(bb) }
                     if (n < 0) throw IOException("Local content ended before declared length")
                     try {
                         out.write(buf, 0, n)
@@ -1040,6 +1067,15 @@ class LocalProxyServer(
                 }
                 runCatching { out.flush() }
             }
+        }
+        } finally {
+            synchronized(lifecycleLock) {
+                activeLocalReads[session.id]?.let { reads ->
+                    reads.remove(read)
+                    if (reads.isEmpty()) activeLocalReads.remove(session.id)
+                }
+            }
+            read.close()
         }
     }
 
@@ -1296,7 +1332,7 @@ class LocalProxyServer(
             var sinceFlush = 0L
             while (true) {
                 ensureSessionActive(session)
-                val n = ins.read(buf)
+                val n = sourceWork { ins.read(buf) }
                 if (n < 0) {
                     // Clean EOF only counts as complete when we have delivered the whole window
                     // (or the length is unknown, e.g. a transcode that is not byte-resumable).

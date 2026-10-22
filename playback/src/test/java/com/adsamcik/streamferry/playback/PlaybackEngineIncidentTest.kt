@@ -72,6 +72,9 @@ class PlaybackEngineIncidentTest {
                 ForegroundServiceStartResult.Foregrounded(ProxyForegroundStartPath.START_SERVICE)
             val network = mockk<com.adsamcik.streamferry.diagnostics.NetworkInfoProvider>()
             every { network.lanIpv4() } returns "127.0.0.1"
+            every { network.lanNetwork() } returns null
+            every { network.retainPlaybackLanNetwork() } returns null
+            every { network.releasePlaybackLanNetwork() } just Runs
             engine = PlaybackEngine(
                 provider, coordinator, proxy, network, service, logger,
                 mockk(relaxed = true), mockk(relaxed = true), { mockk(relaxed = true) },

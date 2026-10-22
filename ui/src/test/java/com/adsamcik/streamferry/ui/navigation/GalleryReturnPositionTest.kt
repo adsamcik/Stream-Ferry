@@ -29,7 +29,7 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [36], qualifiers = "w393dp-h851dp-mdpi")
+@Config(sdk = [37], qualifiers = "w393dp-h851dp-mdpi")
 class GalleryReturnPositionTest {
     @get:Rule val compose = createComposeRule()
 

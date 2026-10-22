@@ -125,7 +125,6 @@ class JellyfinClient(
     private val retryBudget = RetryBudget(maxConsecutiveFailures = 3)
 
     /** Upstream sources resolved during PlaybackInfo, keyed by media source id (secret values). */
-    private val upstreamCache = ConcurrentHashMap<String, JellyfinUpstreamSource>()
     /** Provider artwork tags stay source-private; shared catalogue items carry only ArtworkRef. */
     private val artworkMetadata = ConcurrentHashMap<String, JellyfinArtworkMetadata>()
 
@@ -164,7 +163,6 @@ class JellyfinClient(
     fun clearAuth() {
         accessToken = null
         userId = null
-        upstreamCache.clear()
         artworkMetadata.clear()
     }
 
@@ -323,6 +321,19 @@ class JellyfinClient(
         // Request Chapters so the detail/playback seek-preview scrubber has section thumbnails.
         val body = exec(get(path("Users", uid, "Items", itemId), "fields" to "Chapters"))
         json.decodeFromString(BaseItemDto.serializer(), body).toMediaItem()
+    }
+
+    /** Bounded metadata-only refresh for an existing set of downloaded titles. */
+    suspend fun itemsByIds(itemIds: List<String>): List<MediaItem> = withContext(Dispatchers.IO) {
+        require(itemIds.size in 1..50) { "Metadata refresh must contain between 1 and 50 items." }
+        val uid = userId ?: error("Not authenticated")
+        val requested = itemIds.toSet()
+        val body = exec(get(
+            path("Items"), "userId" to uid, "ids" to itemIds.joinToString(","),
+            "limit" to itemIds.size.toString(), "enableTotalRecordCount" to "false", "fields" to "Overview,Chapters",
+        ))
+        json.decodeFromString(ItemsResult.serializer(), body).items.map { it.toMediaItem() }
+            .filter { it.id in requested }.distinctBy { it.id }
     }
 
     /**
@@ -499,7 +510,6 @@ class JellyfinClient(
         }
         val msId = source.id ?: itemId
         val resolved = resolveUpstream(itemId, source, response.playSessionId, requireTranscode)
-        upstreamCache[msId] = resolved
 
         // Pick the PRIMARY video stream: the largest real video, ignoring attached cover-art/thumbnail
         // "video" streams (mjpeg/png/…) some files embed — otherwise the reported resolution can be wrong
@@ -532,10 +542,7 @@ class JellyfinClient(
             isHdr = video.isHdr(),
             bitDepth = video?.bitDepth ?: 8,
             runtimeSeconds = source.runTimeTicks?.let { it / TICKS_PER_SECOND },
-            upstreamUrl = resolved.url,
-            contentType = resolved.contentType,
-            isHls = resolved.isHls,
-            totalLength = resolved.totalLength,
+            upstream = resolved,
             sourceBitrateBps = source.bitrate,
             videoWidth = video?.width,
             videoHeight = video?.height,
@@ -555,9 +562,6 @@ class JellyfinClient(
             ?: "Track $idx"
         MediaTrack(index = idx, language = s.language, label = label, isDefault = s.isDefault, isForced = s.isForced)
     }
-
-    override fun resolveUpstreamFor(mediaSourceId: String): JellyfinUpstreamSource =
-        upstreamCache[mediaSourceId] ?: error("No resolved upstream for media source")
 
     private fun resolveUpstream(
         itemId: String,

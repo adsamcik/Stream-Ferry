@@ -111,6 +111,7 @@ class PlaybackEngineLocalTranscodeTest {
             assertNotNull(deliveryListener).invoke(MediaDelivery(session.id, deliveryEpoch, startMs, endMs))
         }
         val coordinator = mockk<DefaultPlaybackSessionCoordinator>(relaxed = true)
+        val service = mockk<PlaybackServiceController>(relaxed = true)
         val provider = mockk<PlaybackProvider>(relaxed = true)
         val providerSession = mockk<ProviderPlaybackSession>(relaxed = true)
         val requests = mutableListOf<PlaybackRequest>()
@@ -153,13 +154,14 @@ class PlaybackEngineLocalTranscodeTest {
                 requests += firstArg<PlaybackRequest>()
                 Result.success(providerSession)
             }
-            val service = mockk<PlaybackServiceController>(relaxed = true)
             every { service.isForegroundActive() } returns true
             coEvery { service.startAndAwaitForegrounded(any()) } returns
                 ForegroundServiceStartResult.Foregrounded(ProxyForegroundStartPath.START_SERVICE)
             val network = mockk<NetworkInfoProvider>()
             every { network.lanIpv4() } answers { phoneIp }
             every { network.lanNetwork() } answers { phoneNetwork }
+            every { network.retainPlaybackLanNetwork() } answers { phoneNetwork }
+            every { network.releasePlaybackLanNetwork() } just Runs
             val context = mockk<Context>(relaxed = true)
             every { context.cacheDir } returns File(System.getProperty("java.io.tmpdir"), "local-transcode-test")
             engine = PlaybackEngine(
@@ -3600,6 +3602,84 @@ class PlaybackEngineLocalTranscodeTest {
                 coEvery { anyConstructed<StreamingTranscodeSession>().awaitReady() } returns Unit
                 clearAllMocks(answers = false)
             }
+        }
+    }
+
+    @Test fun `synchronous local format rejection retries one codec preserving paused source position and resolution`() = runTest {
+        for (protocol in Protocol.entries) for (path in listOf(
+            "/download/movie.mp4", "file:///download/movie.mp4", "content://media/external/video/42",
+        )) {
+            val f = Fixture(this, protocol)
+            val label = "$path/$protocol"
+            var first = true
+            coEvery { f.target.load(any(), any(), any(), any(), any(), any()) } coAnswers {
+                f.loads += LoadedStream(firstArg(), arg(3), arg(4), arg(5))
+                if (first) {
+                    first = false
+                    f.engine.pause()
+                    throw PlaybackTargetException(PlaybackFailureKind.FORMAT, "Renderer rejected output codec", true)
+                }
+            }
+            try {
+                f.start(filePath = path, prefs = StreamPreferences(maxVideoHeight = 480))
+                runCurrent()
+                assertEquals(2, f.loads.size, "$label did not make exactly one fallback load")
+                assertTrue(f.loads.all { it.url == TRANSCODE_URL && it.position == 0L }, label)
+                assertFalse(f.loads.last().playWhenReady, "$label lost the latest pause intent")
+                val status = assertNotNull(f.engine.status.value)
+                assertEquals(123L, status.positionSeconds, "$label lost the source position")
+                assertEquals(480, status.maxVideoHeight, label)
+                assertFalse(status.playWhenReady, label)
+                assertFalse(status.isTerminal, label)
+                val recovery = f.engine.recoverySnapshot()
+                assertEquals(1, recovery.usage.compatibilityOrQualityVariants, label)
+                assertEquals(0, recovery.usage.sameStreamNetworkRetries, label)
+                val attemptedCodecs = recovery.attempts.mapNotNull { it.codec }.distinct()
+                assertEquals(2, attemptedCodecs.size, "$label retried the rejected codec")
+                assertNull(status.errorMessage, label)
+            } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `synchronous local connectivity failure never spends a codec attempt`() = runTest {
+        for (protocol in Protocol.entries) for (path in listOf(
+            "/download/movie.mp4", "file:///download/movie.mp4", "content://media/external/video/42",
+        )) {
+            val f = Fixture(this, protocol)
+            val label = "$path/$protocol"
+            coEvery { f.target.load(any(), any(), any(), any(), any(), any()) } coAnswers {
+                f.loads += LoadedStream(firstArg(), arg(3), arg(4), arg(5))
+                throw PlaybackTargetException(PlaybackFailureKind.NETWORK, "TV connection was lost")
+            }
+            try {
+                assertFailsWith<PlaybackTargetException>(label) {
+                    f.start(filePath = path, prefs = StreamPreferences(maxVideoHeight = 480))
+                }
+                runCurrent()
+                assertEquals(1, f.loads.size, label)
+                val recovery = f.engine.recoverySnapshot()
+                assertEquals(0, recovery.usage.compatibilityOrQualityVariants, label)
+                assertEquals(PlaybackFailureCause.TRANSIENT_NETWORK, recovery.attempts.last().failureCause, label)
+            } finally { f.engine.stop(); runCurrent() }
+        }
+    }
+
+    @Test fun `failed paused resume reconciles CPU activity for every source and protocol`() = runTest {
+        for (protocol in Protocol.entries) for (source in SourceCase.entries) {
+            val f = Fixture(this, protocol)
+            val activity = mutableListOf<Boolean>()
+            every { f.service.setPlaybackActive(any()) } answers { activity += firstArg<Boolean>() }
+            try {
+                f.startSource(source); runCurrent()
+                f.engine.pause(); runCurrent()
+                activity.clear()
+                coEvery { f.target.play() } throws PlaybackTargetException(PlaybackFailureKind.NETWORK, "Resume failed")
+                assertFailsWith<PlaybackTargetException> { f.engine.resume() }
+                runCurrent()
+                assertFalse(assertNotNull(f.engine.status.value).playWhenReady, "$source/$protocol lost pause")
+                assertTrue(activity.first(), "$source/$protocol did not reacquire CPU before resume")
+                assertFalse(activity.last(), "$source/$protocol leaked CPU activity after failed resume")
+            } finally { f.engine.stop(); runCurrent() }
         }
     }
 

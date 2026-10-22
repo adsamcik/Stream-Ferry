@@ -60,6 +60,8 @@ import com.adsamcik.streamferry.diagnostics.ReportShare
 import com.adsamcik.streamferry.domain.SourceAvailability
 import com.adsamcik.streamferry.domain.AccountLibraryScope
 import com.adsamcik.streamferry.domain.MediaLibraryRepository
+import com.adsamcik.streamferry.domain.MediaItem
+import com.adsamcik.streamferry.domain.UserSession
 import com.adsamcik.streamferry.domain.MediaSource
 import com.adsamcik.streamferry.domain.MediaSourceIds
 import com.adsamcik.streamferry.domain.SecureTokenStore
@@ -187,25 +189,36 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
         if (imageLoaderDelegate.isInitialized()) imageLoaderDelegate.value.memoryCache?.clear()
     }
     val mediaRepository: MediaLibraryRepository by lazy {
+        val remote = JellyfinMediaLibraryRepository(jellyfinClient, logger)
+        val cached = CachingMediaLibraryRepository(
+            delegate = remote,
+            cache = libraryCache,
+            // A tokenless cached session keeps the account scope but never enables remote requests.
+            scope = {
+                (authRepository.currentUser.value ?: authRepository.cachedSession.value)
+                    ?.let { AccountLibraryScope(it.serverId, it.userId).cacheKey }
+                    ?: "unauthenticated"
+            },
+            isLiveSession = { authRepository.currentUser.value != null },
+            connectionMonitor = jellyfinConnectionMonitor,
+        )
         DownloadedJellyfinMediaLibraryRepository(
-            delegate = CachingMediaLibraryRepository(
-                delegate = JellyfinMediaLibraryRepository(jellyfinClient, logger),
-                cache = libraryCache,
-                // Library/resume data is account-specific. A tokenless cached session has the same stable
-                // scope but never enables a remote request; it only unlocks that account's local metadata.
-                scope = {
-                    (authRepository.currentUser.value ?: authRepository.cachedSession.value)
-                        ?.let { AccountLibraryScope(it.serverId, it.userId).cacheKey }
-                        ?: "unauthenticated"
-                },
-                // A cached session intentionally has no token installed. It may read disk metadata but
-                // never cause the Jellyfin repository to issue a request until verification succeeds.
-                isLiveSession = { authRepository.currentUser.value != null },
-                connectionMonitor = jellyfinConnectionMonitor,
-            ),
+            delegate = cached,
             downloadStore = downloadStore,
             canRefreshDownloads = { authRepository.currentUser.value != null },
             isRemoteUnavailable = { jellyfinConnectionMonitor.status.value == SourceAvailability.UNAVAILABLE },
+            refreshScope = ioScope,
+            refreshMetadata = { requestedOwner, ids ->
+                var result: Result<List<MediaItem>>? = null
+                val expected = UserSession(requestedOwner.userId, requestedOwner.serverId)
+                val stillActive = authRepository.runWithActiveSession(expected) {
+                    // Keep URL/token stable from batch request construction through ordered cache and
+                    // download-index commit. A queued profile switch runs only after this batch exits.
+                    result = cached.refreshItems(ids, remote::items)
+                }
+                if (stillActive) checkNotNull(result)
+                else Result.failure(IllegalStateException("The active Jellyfin profile changed."))
+            },
             owner = {
                 (authRepository.currentUser.value ?: authRepository.cachedSession.value)
                     ?.let { DownloadOwner(it.serverId, it.userId) }
@@ -227,7 +240,6 @@ class AppContainer(context: Context, val logger: DiagnosticsLogger, val crashRep
         object : MediaSource {
             override val id = rawJellyfinMediaSource.id
             override val displayName = rawJellyfinMediaSource.displayName
-            override val capabilities = rawJellyfinMediaSource.capabilities
 
             override suspend fun roots() = currentJellyfinBackend()
                 ?.catalog?.roots()

@@ -18,7 +18,7 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [35])
+@Config(sdk = [37])
 class CachingMediaLibraryRepositoryTest {
 
     private val context get() = RuntimeEnvironment.getApplication()

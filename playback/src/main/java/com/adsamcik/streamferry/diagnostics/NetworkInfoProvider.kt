@@ -16,6 +16,19 @@ import java.net.NetworkInterface
 class NetworkInfoProvider(context: Context) {
 
     private val appContext = context.applicationContext
+    private var retainPlaybackNetwork = false
+    private var playbackNetwork: Network? = null
+
+    /** A second LAN appearing must not reroute an already selected receiver. */
+    @Synchronized fun retainPlaybackLanNetwork(): Network? {
+        retainPlaybackNetwork = true
+        return lanNetwork()
+    }
+
+    @Synchronized fun releasePlaybackLanNetwork() {
+        retainPlaybackNetwork = false
+        playbackNetwork = null
+    }
 
     /**
      * Best LAN IPv4 address to bind the proxy and advertise to the TV, or null if none.
@@ -79,13 +92,17 @@ class NetworkInfoProvider(context: Context) {
 
     /** Selected physical LAN Network, preferring Wi-Fi and then Ethernet, never a VPN/default tunnel. */
     @Suppress("DEPRECATION")
-    fun lanNetwork(): Network? {
+    @Synchronized fun lanNetwork(): Network? {
         val cm = appContext.getSystemService(ConnectivityManager::class.java) ?: return null
-        return cm.allNetworks.firstOrNull { net ->
-            val caps = cm.getNetworkCapabilities(net) ?: return@firstOrNull false
-            !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
-                (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) || caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET))
+        val physical = cm.allNetworks.sortedBy { it.networkHandle }.mapNotNull { net ->
+            val caps = cm.getNetworkCapabilities(net) ?: return@mapNotNull null
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) null else net to caps
         }
+        val selected = chooseLanNetwork(if (retainPlaybackNetwork) playbackNetwork else null,
+            physical.filter { it.second.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) }.map { it.first },
+            physical.filter { it.second.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) }.map { it.first })
+        if (retainPlaybackNetwork) playbackNetwork = selected
+        return selected
     }
 
     /**
@@ -110,3 +127,7 @@ class NetworkInfoProvider(context: Context) {
         return wifi.createMulticastLock(tag)
     }
 }
+
+/** Prefer Wi-Fi for a new session; keep its current physical network until that network disappears. */
+internal fun <T> chooseLanNetwork(retained: T?, wifi: List<T>, ethernet: List<T>): T? =
+    retained?.takeIf { it in wifi || it in ethernet } ?: wifi.firstOrNull() ?: ethernet.firstOrNull()

@@ -5,6 +5,8 @@ import com.adsamcik.streamferry.data.jellyfin.JellyfinHttpException
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.domain.MediaLibraryRepository
 import java.io.IOException
+import kotlinx.coroutines.ensureActive
+import kotlin.coroutines.coroutineContext
 
 /**
  * Wraps a [MediaLibraryRepository] with account-scoped, persistent metadata caching. A tokenless cached
@@ -46,6 +48,32 @@ class CachingMediaLibraryRepository(
                 } else {
                     result
                 }
+            },
+        )
+    }
+
+    /** Refresh one bounded batch in the same ordering domain as details and watch-state edits. */
+    suspend fun refreshItems(
+        itemIds: List<String>,
+        fetch: suspend (List<String>) -> Result<List<MediaItem>>,
+    ): Result<List<MediaItem>> {
+        val requestScope = scope()
+        if (!isLiveSession()) return Result.failure(JellyfinOfflineCacheMissException())
+        val remoteWrite = cache.beginRemoteWrite(requestScope)
+        val result = fetch(itemIds)
+        coroutineContext.ensureActive()
+        if (scope() != requestScope || !isLiveSession()) return Result.failure(OfflineCacheScopeChangedException())
+        return result.fold(
+            onSuccess = { items ->
+                val requested = itemIds.toSet()
+                // A missing/removed remote item does not delete the independently usable local copy.
+                val cached = cache.put(remoteWrite, "downloaded_metadata", items.filter { it.id in requested })
+                connectionMonitor?.markOnline()
+                Result.success(cached)
+            },
+            onFailure = { error ->
+                if (isConnectivityFailure(error)) connectionMonitor?.markUnavailable()
+                Result.failure(error)
             },
         )
     }

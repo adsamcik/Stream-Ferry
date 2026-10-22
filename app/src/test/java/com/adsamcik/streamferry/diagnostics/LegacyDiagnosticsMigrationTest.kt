@@ -20,7 +20,7 @@ import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [34], application = Application::class)
+@Config(sdk = [37], application = Application::class)
 class LegacyDiagnosticsMigrationTest {
     @Test fun importsRedactedHistoryBeforeRetiringLegacyFiles() = runBlocking {
         val context = RuntimeEnvironment.getApplication()

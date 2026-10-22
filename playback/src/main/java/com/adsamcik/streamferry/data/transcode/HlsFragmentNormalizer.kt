@@ -2,17 +2,30 @@ package com.adsamcik.streamferry.data.transcode
 
 import com.adsamcik.streamferry.core.transcode.Fmp4Splitter
 import java.nio.ByteBuffer
+import java.util.ArrayDeque
 
 /** Converts pinned Media3's file-relative fragments into independently addressable HLS fragments. */
-internal class HlsFragmentNormalizer {
+internal class HlsFragmentNormalizer(private val publish: (ByteArray) -> Unit) {
     private var timescales: Map<Int, Long> = emptyMap()
-    private val firstPtsUs = mutableMapOf<Int, Long>()
-    private val nextDecodeTime = mutableMapOf<Int, Long>()
+    private val timestamps = mutableMapOf<Int, ArrayDeque<Long>>()
+    private val ended = mutableMapOf<Int, Long>()
+    private data class Pending(val moof: ByteArray, val mdat: ByteArray)
+    private val pending = ArrayDeque<Pending>()
+    private var pendingBytes = 0L
+    private var finished = false
     private val lastSampleDuration = mutableMapOf<Int, Long>()
 
-    fun setTrackStart(initTrackId: Int, ptsUs: Long) {
+    /** Called before forwarding each rebased encoded sample to Media3, including EOS. No B frames. */
+    fun sample(initTrackId: Int, ptsUs: Long, endOfStream: Boolean = false) {
         require(ptsUs >= 0)
-        firstPtsUs.putIfAbsent(initTrackId, ptsUs)
+        if (endOfStream) ended[initTrackId] = ptsUs else {
+            val queue = timestamps.getOrPut(initTrackId) { ArrayDeque() }
+            require(queue.size < 100_000 && (queue.peekLast()?.let { ptsUs > it } != false)) {
+                "Streaming output requires bounded, monotonically increasing encoded timestamps"
+            }
+            queue.addLast(ptsUs)
+        }
+        drain()
     }
 
     fun setInitialization(bytes: ByteArray) {
@@ -20,10 +33,44 @@ internal class HlsFragmentNormalizer {
         require(timescales.isNotEmpty()) { "Streaming init has no track clocks" }
     }
 
-    fun normalize(bytes: ByteArray): ByteArray {
-        val top = boxes(bytes, 0, bytes.size)
-        require(top.size == 2 && top[0].type == "moof" && top[1].type == "mdat")
-        val moof = top[0]
+    fun submit(moof: ByteArray, mdat: ByteArray) {
+        require(!finished)
+        require(pendingBytes + moof.size + mdat.size <= 24 * 1024 * 1024L) {
+            "Encoded tracks did not provide bounded fragment timing lookahead"
+        }
+        pending.addLast(Pending(moof, mdat))
+        pendingBytes += moof.size + mdat.size
+        drain()
+    }
+
+    /** The only durations that may need estimation are the actual end-of-stream tails. */
+    fun finish() {
+        check(!finished)
+        finished = true
+        drain()
+        check(pending.isEmpty()) { "Streaming fragment timestamps are incomplete" }
+    }
+
+    private fun drain() {
+        while (pending.isNotEmpty()) {
+            val item = pending.first()
+            val trafs = boxes(item.moof, 8, item.moof.size).filter { it.type == "traf" }
+            if (trafs.any { traf ->
+                    val children = boxes(item.moof, traf.start + 8, traf.end)
+                    val id = int(item.moof, children.single { it.type == "tfhd" }.start + 12)
+                    val count = children.filter { it.type == "trun" }.sumOf { int(item.moof, it.start + 12) }
+                    val available = timestamps[id]?.size ?: 0
+                    available < count || (available == count && id !in ended && !finished)
+                }) return
+            pending.removeFirst()
+            pendingBytes -= item.moof.size + item.mdat.size
+            publish(normalize(item.moof, item.mdat))
+        }
+    }
+
+    private fun normalize(bytes: ByteArray, mdat: ByteArray): ByteArray {
+        val moof = boxes(bytes, 0, bytes.size).single().also { require(it.type == "moof") }
+        require(boxes(mdat, 0, mdat.size).single().type == "mdat")
         val children = boxes(bytes, moof.start + 8, moof.end)
         val trafCount = children.count { it.type == "traf" }
         require(trafCount > 0)
@@ -31,12 +78,16 @@ internal class HlsFragmentNormalizer {
         val sizeDelta = trafCount * 12
         val normalizedChildren = children.map { child ->
             if (child.type != "traf") bytes.copyOfRange(child.start, child.end)
-            else normalizeTrack(bytes, child, sizeDelta, top[1])
+            else normalizeTrack(bytes, child, sizeDelta, moof.end, mdat.size)
         }
-        return box("moof", normalizedChildren.reduce(ByteArray::plus)) + bytes.copyOfRange(top[1].start, top[1].end)
+        // Only the small header is rebuilt; the payload has one final destination allocation.
+        val result = ByteBuffer.allocate(bytes.size + sizeDelta + mdat.size)
+            .putInt(bytes.size + sizeDelta).put("moof".toByteArray(Charsets.US_ASCII))
+        normalizedChildren.forEach { result.put(it) }
+        return result.put(mdat).array()
     }
 
-    private fun normalizeTrack(bytes: ByteArray, traf: Box, sizeDelta: Int, mdat: Box): ByteArray {
+    private fun normalizeTrack(bytes: ByteArray, traf: Box, sizeDelta: Int, mdatStart: Int, mdatSize: Int): ByteArray {
         val children = boxes(bytes, traf.start + 8, traf.end)
         val tfhd = children.single { it.type == "tfhd" }
         require(tfhd.end - tfhd.start == 24 && int(bytes, tfhd.start + 8) == 1) {
@@ -45,10 +96,8 @@ internal class HlsFragmentNormalizer {
         require(children.none { it.type == "tfdt" }) { "Unexpected pre-timed Media3 fragment" }
         val trackId = int(bytes, tfhd.start + 12)
         val scale = timescales[trackId] ?: error("Fragment track is absent from its init")
-        val start = nextDecodeTime[trackId] ?: run {
-            val ptsUs = firstPtsUs[trackId] ?: error("Fragment track has no first encoded timestamp")
-            Math.round(ptsUs.toDouble() * scale / 1_000_000)
-        }
+        val queue = timestamps.getValue(trackId)
+        val start = ticks(queue.first(), scale)
         var duration = 0L
         val timing = box("tfdt", ByteBuffer.allocate(12).putInt(0x01000000).putLong(start).array())
         val normalized = children.map { child ->
@@ -65,20 +114,17 @@ internal class HlsFragmentNormalizer {
                     var mediaBytes = 0L
                     repeat(count) { sample ->
                         val sampleOffset = 20 + sample * stride
-                        val writtenDuration = uint(trun, sampleOffset)
-                        // Media3 repeats the preceding duration at EOF, but a fragment containing
-                        // only its final frame has no local predecessor. Carry the actual prior
-                        // fragment's duration instead of dropping that frame or publishing zero time.
-                        val sampleDuration = if (writtenDuration == 0L && count == 1) {
-                            lastSampleDuration[trackId] ?: 0L
-                        } else writtenDuration
-                        require(sampleDuration > 0 && duration <= Long.MAX_VALUE - sampleDuration)
-                        if (sampleDuration != writtenDuration) ByteBuffer.wrap(trun).putInt(sampleOffset, sampleDuration.toInt())
+                        val pts = queue.removeFirst()
+                        val next = queue.peekFirst() ?: ended[trackId]?.takeIf { it > pts }
+                        val sampleDuration = if (next != null) ticks(next, scale) - ticks(pts, scale)
+                            else lastSampleDuration[trackId] ?: uint(trun, sampleOffset)
+                        require(sampleDuration in 1..Int.MAX_VALUE.toLong() && duration <= Long.MAX_VALUE - sampleDuration)
+                        ByteBuffer.wrap(trun).putInt(sampleOffset, sampleDuration.toInt())
                         lastSampleDuration[trackId] = sampleDuration
                         duration += sampleDuration
                         mediaBytes += uint(trun, sampleOffset + 4)
                     }
-                    require(offset >= mdat.start + 8 && offset.toLong() + mediaBytes <= mdat.end) {
+                    require(offset >= mdatStart + 8 && offset.toLong() + mediaBytes <= mdatStart.toLong() + mdatSize) {
                         "Streaming sample offsets escape their media data"
                     }
                     ByteBuffer.wrap(trun).putInt(16, Math.addExact(offset, sizeDelta))
@@ -87,9 +133,11 @@ internal class HlsFragmentNormalizer {
             }
         }
         require(duration > 0 && start <= Long.MAX_VALUE - duration)
-        nextDecodeTime[trackId] = start + duration
         return box("traf", normalized.reduce(ByteArray::plus))
     }
+
+    private fun ticks(us: Long, scale: Long): Long =
+        Math.addExact(Math.multiplyExact(us / 1_000_000, scale), (us % 1_000_000) * scale / 1_000_000)
 
     private data class Box(val type: String, val start: Int, val end: Int)
     private fun boxes(bytes: ByteArray, from: Int, to: Int): List<Box> = buildList {

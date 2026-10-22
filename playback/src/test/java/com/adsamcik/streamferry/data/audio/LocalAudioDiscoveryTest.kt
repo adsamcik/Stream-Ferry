@@ -30,7 +30,7 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [36])
+@Config(sdk = [37])
 class LocalAudioDiscoveryTest {
     @Test
     fun `container audio identities distinguish languages and same-language commentary in deterministic order`() = runBlocking {

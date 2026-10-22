@@ -634,9 +634,10 @@ class DlnaTargetController(
     override suspend fun readCurrentVolume(): Float? = withContext(Dispatchers.IO) {
         val endpoint = connected?.renderingControl ?: return@withContext null
         runCatching {
-            val reported = TAG_CURRENT_VOLUME.find(
+            val reported = AVTransport.responseValue(
                 soap(endpoint, "GetVolume", "<InstanceID>0</InstanceID><Channel>Master</Channel>"),
-            )?.groupValues?.get(1)?.trim()?.toIntOrNull() ?: return@runCatching null
+                "CurrentVolume",
+            )?.toIntOrNull() ?: return@runCatching null
             reported.takeIf { it in 0..100 }?.div(100f)
         }.onFailure { logger.w(TAG, "DLNA GetVolume failed", it) }.getOrNull()
     }
@@ -937,7 +938,7 @@ class DlnaTargetController(
 
     private fun positionSeconds(r: Renderer): Long? {
         val resp = soap(r.avTransport, "GetPositionInfo", "<InstanceID>0</InstanceID>")
-        val rel = TAG_REL_TIME.find(resp)?.groupValues?.get(1)?.trim() ?: return null
+        val rel = AVTransport.responseValue(resp, "RelTime") ?: return null
         return parseClock(rel)
     }
 
@@ -997,7 +998,9 @@ class DlnaTargetController(
             }
             val text = bytes.toString(Charsets.UTF_8)
             logger.trace(TAG, "SOAP <- $action ${resp.code}: ${LogRedactor.redact(text).take(1200)}")
-            val upnp = TAG_UPNP_ERROR.find(text)?.groupValues?.get(1)?.toIntOrNull()
+            // Most poll replies have no fault field and are parsed by their caller. Avoid building
+            // a second DOM for every healthy poll; namespaced/attributed fault fields still use XML.
+            val upnp = if (text.contains("errorCode")) AVTransport.responseValue(text, "errorCode")?.toIntOrNull() else null
             if (!resp.isSuccessful || upnp != null) {
                 throw SoapFaultException(action, resp.code, upnp)
             }
@@ -1090,9 +1093,6 @@ class DlnaTargetController(
         // switching videos quickly doesn't drop to a "TV won't play it" error.
         private const val UPNP_TRANSITION_NOT_AVAILABLE = 701
         private const val SET_URI_RETRY_DELAY_MS = 800L
-        private val TAG_REL_TIME = Regex("<(?:[\\w-]+:)?RelTime>([^<]*)</", RegexOption.IGNORE_CASE)
-        private val TAG_CURRENT_VOLUME = Regex("<(?:[\\w-]+:)?CurrentVolume>\\s*([^<]+?)\\s*</", RegexOption.IGNORE_CASE)
-        private val TAG_UPNP_ERROR = Regex("<(?:[\\w-]+:)?errorCode>\\s*(\\d+)\\s*</(?:[\\w-]+:)?errorCode>", RegexOption.IGNORE_CASE)
 
         /**
          * Conservative capability baseline for an unknown DLNA renderer: assume common H.264 + AAC/AC3

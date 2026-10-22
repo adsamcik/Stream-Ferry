@@ -16,7 +16,7 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [36])
+@Config(sdk = [37])
 class Media3TsMuxerTest {
     @Test
     fun `audio may be delivered first and track formats are available before output begins`() {

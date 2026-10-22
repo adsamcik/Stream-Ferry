@@ -28,6 +28,8 @@ class JellyfinDownloadProviderTest {
         assertEquals(2_000_000, repository.downloadProfile?.maxBitrateBps)
         assertEquals("item-7", prepared.media.nativeId)
         assertEquals("mp4", prepared.container)
+        assertEquals("mp4", prepared.stream.descriptor.outputContainer)
+        assertEquals("video/mp4", prepared.stream.descriptor.contentType)
         assertFalse(prepared.stream.descriptor.isHls)
     }
 
@@ -68,7 +70,7 @@ class JellyfinDownloadProviderTest {
                 JellyfinPlaybackInfo(
                     mediaSourceId = "media-source",
                     playSessionId = "play-session",
-                    profile = MediaProfile("mp4", "h264", audioCodec = "aac"),
+                    profile = MediaProfile("mkv", "h264", audioCodec = "aac"),
                     runtimeSeconds = 90,
                     itemId = itemId,
                 ),

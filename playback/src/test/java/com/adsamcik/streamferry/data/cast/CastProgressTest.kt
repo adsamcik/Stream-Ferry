@@ -40,10 +40,11 @@ import kotlin.test.assertFalse
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 import java.io.IOException
+import org.json.JSONObject
 
 @OptIn(ExperimentalCoroutinesApi::class)
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [34])
+@Config(sdk = [37])
 class CastProgressTest {
     private val dispatcher = StandardTestDispatcher()
     private val client = mockk<RemoteMediaClient>(relaxed = true)
@@ -62,6 +63,8 @@ class CastProgressTest {
     private var cachedState = MediaStatus.PLAYER_STATE_PLAYING
     private var receiverState = MediaStatus.PLAYER_STATE_PLAYING
     private var cachedMediaUrl = "http://phone/previous/index.m3u8"
+    private val ownLoadData = mutableMapOf<String, JSONObject?>()
+    private var foreignLoadData: JSONObject? = null
     private var loadStatus = Status.RESULT_SUCCESS
     private var loadDetailedErrorCode: Int? = null
     private var completeLoad = true
@@ -89,6 +92,7 @@ class CastProgressTest {
         every { context.sessionManager } returns manager
         every { manager.currentCastSession } answers { currentSession }
         every { manager.endCurrentSession(true) } answers { currentSession = null }
+        every { manager.endCurrentSession(false) } answers { currentSession = null }
         every { manager.addSessionManagerListener(capture(sessionListener), CastSession::class.java) } just Runs
         every { session.castDevice } returns device
         every { session.sessionId } returns "session"
@@ -100,9 +104,13 @@ class CastProgressTest {
         every { status.idleReason } answers { cachedIdleReason }
         every { status.mediaInfo } returns mediaInfo
         every { mediaInfo.contentId } answers { cachedMediaUrl }
+        every { mediaInfo.customData } answers { foreignLoadData ?: ownLoadData[cachedMediaUrl] }
         every { client.approximateStreamPosition } answers { cachedPositionMs }
         every { client.requestStatus() } returns pending
-        every { client.load(any<MediaLoadRequestData>()) } returns loadPending
+        every { client.load(any<MediaLoadRequestData>()) } answers {
+            firstArg<MediaLoadRequestData>().mediaInfo?.let { ownLoadData[it.contentId] = it.customData }
+            loadPending
+        }
         every { loadPending.setResultCallback(any<ResultCallback<RemoteMediaClient.MediaChannelResult>>()) } answers {
             val result = mockk<RemoteMediaClient.MediaChannelResult>()
             every { result.status } returns loadStatus
@@ -159,6 +167,103 @@ class CastProgressTest {
     }
 
     private fun latestPosition() = events.filterIsInstance<PlaybackTargetEvent.StatusChanged>().last()
+
+    @Test fun `another sender replacing media retires our controls without stopping their receiver`() = progressTest {
+        startPlaying()
+        val ourUrl = "http://phone/our/video"
+        controller.load(ourUrl, RendererStream("video/mp4"), "Movie", 400, 123, true)
+        cachedMediaUrl = ourUrl
+        mediaCallback.captured.onStatusUpdated()
+        events.clear()
+
+        cachedMediaUrl = "https://other-sender.example/movie.mp4"
+        foreignLoadData = JSONObject().put(CastTargetController.LOAD_TOKEN_KEY, "other-sender-load")
+        mediaCallback.captured.onStatusUpdated()
+        mediaCallback.captured.onStatusUpdated()
+        assertEquals(1, events.count { it is PlaybackTargetEvent.Cancelled })
+        assertFailsWith<IllegalStateException> { controller.pause() }
+        assertFailsWith<IllegalStateException> { controller.seekTo(200) }
+        assertFailsWith<IllegalStateException> { controller.stop() }
+        controller.disconnect()
+        verify(exactly = 1) { manager.endCurrentSession(false) }
+        verify(exactly = 0) { manager.endCurrentSession(true) }
+        verify(exactly = 0) { client.pause() }
+        verify(exactly = 0) { client.stop() }
+    }
+
+    @Test fun `rapid pending reloads ignore all recent own loads in shared SDK cache`() = progressTest {
+        startPlaying()
+        val firstUrl = "http://phone/own/a"
+        val pendingUrl = "http://phone/own/b"
+        val latestUrl = "http://phone/own/c"
+        controller.load(firstUrl, RendererStream("video/mp4"), "Movie", 400, 123, true)
+        cachedMediaUrl = firstUrl
+        mediaCallback.captured.onStatusUpdated()
+        controller.prepareReload()
+        completeLoad = false
+        val pendingLoad = async { runCatching {
+            controller.load(pendingUrl, RendererStream("video/mp4"), "Movie", 400, 0, false)
+        } }
+        try {
+            runCurrent()
+            // C can begin while the SDK cache exposes pending B instead of accepted A.
+            cachedMediaUrl = pendingUrl
+            controller.prepareReload()
+            completeLoad = true
+            controller.load(latestUrl, RendererStream("video/mp4"), "Movie", 400, 0, false)
+            cachedMediaUrl = latestUrl
+            cachedState = MediaStatus.PLAYER_STATE_PAUSED
+            mediaCallback.captured.onStatusUpdated()
+            events.clear()
+            for (oldUrl in listOf(firstUrl, pendingUrl)) {
+                cachedMediaUrl = oldUrl
+                mediaCallback.captured.onStatusUpdated()
+                assertTrue(events.isEmpty(), "Late app-owned load $oldUrl must not retire the current stream")
+            }
+            cachedMediaUrl = latestUrl
+            cachedPositionMs = 2_000
+            mediaCallback.captured.onStatusUpdated()
+            assertEquals(2L, latestPosition().positionSeconds)
+            assertFalse(latestPosition().isPlaying)
+            assertTrue(events.none { it is PlaybackTargetEvent.Cancelled })
+        } finally { pendingLoad.cancel(); runCurrent() }
+    }
+
+    @Test fun `foreign media from before our load returning retires ownership instead of becoming ours`() = progressTest {
+        startPlaying()
+        val foreignUrl = cachedMediaUrl
+        val ourUrl = "http://phone/our/video"
+        controller.load(ourUrl, RendererStream("video/mp4"), "Movie", 400, 123, true)
+        cachedMediaUrl = ourUrl
+        mediaCallback.captured.onStatusUpdated()
+        events.clear()
+        cachedMediaUrl = foreignUrl
+        mediaCallback.captured.onStatusUpdated()
+        assertEquals(1, events.count { it is PlaybackTargetEvent.Cancelled })
+        assertFailsWith<IllegalStateException> { controller.stop() }
+        controller.disconnect()
+        verify(exactly = 0) { manager.endCurrentSession(true) }
+        verify(exactly = 0) { client.stop() }
+    }
+
+    @Test fun `same URL from another sender is distinguished by its load token`() = progressTest {
+        startPlaying()
+        val url = "http://phone/our/video"
+        controller.load(url, RendererStream("video/mp4"), "Movie", 400, 123, true)
+        val token = ownLoadData.getValue(url)?.optString(CastTargetController.LOAD_TOKEN_KEY)
+        assertTrue(!token.isNullOrEmpty(), "Each public Cast LOAD must carry its own identity")
+        cachedMediaUrl = url
+        mediaCallback.captured.onStatusUpdated()
+        events.clear()
+        foreignLoadData = JSONObject().put(CastTargetController.LOAD_TOKEN_KEY, "foreign-token")
+        mediaCallback.captured.onStatusUpdated()
+        assertEquals(1, events.count { it is PlaybackTargetEvent.Cancelled })
+        assertFailsWith<IllegalStateException> { controller.pause() }
+        controller.disconnect()
+        verify(exactly = 0) { manager.endCurrentSession(true) }
+        verify(exactly = 0) { client.pause() }
+        verify(exactly = 0) { client.stop() }
+    }
 
     @Test fun `external Cast cancellation stops current playback while retired media cancellation is ignored`() = progressTest {
         startPlaying()
@@ -382,6 +487,10 @@ class CastProgressTest {
 
     @Test fun `reload rejects prior timeline before and after load while current pause resume remains live`() = progressTest {
         startPlaying()
+        // This is an app-owned reload: establish ownership of the original LOAD first. Media
+        // merely cached when connecting may belong to another sender and must not stay exempt.
+        controller.load(cachedMediaUrl, RendererStream("application/vnd.apple.mpegurl"), "Movie", 400, 120, true)
+        mediaCallback.captured.onStatusUpdated()
         val previousCallback = mediaCallback.captured
         val beforeReload = events.size
         controller.prepareReload()

@@ -3,6 +3,13 @@ package com.adsamcik.streamferry.data.download
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.domain.MediaLibraryRepository
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.job
+import kotlinx.coroutines.withTimeout
 import java.nio.file.Files
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -13,35 +20,76 @@ class DownloadedJellyfinMediaLibraryRepositoryTest {
     @Test
     fun unavailableShelfRefreshStopsAfterOneProbeAndRetriesOnNextRefresh() = runBlocking {
         val root = Files.createTempDirectory("downloaded-refresh-recovery").toFile()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         try {
             val owner = DownloadOwner("server", "user")
             val store = DownloadStore.forFilesDir(root)
-            val items = listOf(media("one", "One"), media("two", "Two"))
+            val items = (1..51).map { media("item-$it", "Movie ${it.toString().padStart(2, '0')}") }
             items.forEach { store.savePlayable(owner, it) }
             var unavailable = false
             var recovered = false
             var live = true
             var calls = 0
-            val delegate = object : MediaLibraryRepository by EmptyRepository() {
-                override suspend fun item(itemId: String): Result<MediaItem> {
+            val batchSizes = mutableListOf<Int>()
+            val started = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            val repository = DownloadedJellyfinMediaLibraryRepository(EmptyRepository(), store, { owner },
+                canRefreshDownloads = { live }, isRemoteUnavailable = { unavailable }, refreshScope = scope,
+                refreshMetadata = { _, ids ->
                     calls++
+                    batchSizes += ids.size
+                    started.complete(Unit)
+                    release.await()
                     unavailable = !recovered
-                    // Like the caching delegate, a transport error can still return a cached item.
-                    return Result.success(items.single { it.id == itemId })
-                }
-            }
-            val repository = DownloadedJellyfinMediaLibraryRepository(delegate, store, { owner },
-                canRefreshDownloads = { live }, isRemoteUnavailable = { unavailable })
+                    Result.success(items.filter { it.id in ids })
+                })
             val shelf = DownloadedJellyfinMediaLibraryRepository.OFFLINE_DOWNLOADS_ROOT_ID
+            // A blocked metadata request cannot delay the verified local shelf.
+            assertEquals(items, withTimeout(5_000) { repository.children(shelf).getOrThrow() })
+            withTimeout(5_000) { started.await() }
+            // Repeated opens coalesce while this refresh is pending.
             assertEquals(items, repository.children(shelf).getOrThrow())
+            release.complete(Unit)
+            scope.coroutineContext.job.children.toList().forEach { it.join() }
             assertEquals(1, calls)
             recovered = true
             assertEquals(items, repository.children(shelf).getOrThrow())
+            scope.coroutineContext.job.children.toList().forEach { it.join() }
             assertEquals(3, calls, "A fresh request must probe again and continue after recovery")
+            assertEquals(listOf(50, 50, 1), batchSizes)
             live = false
             assertEquals(items, repository.children(shelf).getOrThrow())
             assertEquals(3, calls, "A cache-only session must not attempt remote refresh")
         } finally {
+            scope.cancel()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun accountChangeDuringRefreshStopsRemainingBatchesAndPreservesLocalFiles() = runBlocking {
+        val root = Files.createTempDirectory("downloaded-refresh-owner").toFile()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val firstOwner = DownloadOwner("server", "first")
+            var currentOwner = firstOwner
+            val store = DownloadStore.forFilesDir(root)
+            (1..51).forEach { store.savePlayable(firstOwner, media("item-$it", "Movie $it")) }
+            var calls = 0
+            val repository = DownloadedJellyfinMediaLibraryRepository(EmptyRepository(), store, { currentOwner },
+                canRefreshDownloads = { true }, refreshScope = scope, refreshMetadata = { _, _ ->
+                    calls++
+                    currentOwner = DownloadOwner("server", "second")
+                    Result.success(emptyList())
+                })
+
+            assertEquals(51, repository.children(DownloadedJellyfinMediaLibraryRepository.OFFLINE_DOWNLOADS_ROOT_ID).getOrThrow().size)
+            scope.coroutineContext.job.children.toList().forEach { it.join() }
+            assertEquals(1, calls)
+            assertEquals(51, store.listForOwner(firstOwner).size)
+            assertTrue(repository.children(DownloadedJellyfinMediaLibraryRepository.OFFLINE_DOWNLOADS_ROOT_ID).getOrThrow().isEmpty())
+        } finally {
+            scope.cancel()
             root.deleteRecursively()
         }
     }

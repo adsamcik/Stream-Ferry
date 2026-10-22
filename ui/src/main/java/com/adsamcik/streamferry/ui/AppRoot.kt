@@ -172,6 +172,7 @@ fun AppRoot(
         val showMiniPlayer = state.playback != null && state.route != Route.PLAYBACK
         val galleryOwnsPhoneHeader = !useNavigationRail && state.route == Route.GALLERY
         val showSourceUnavailableNotice = state.activeSourceId == MediaSourceIds.REMOTE &&
+            state.route != Route.LOGIN &&
             state.sourceAvailability == SourceAvailability.UNAVAILABLE
         val spatialMotion = MaterialTheme.motionScheme.defaultSpatialSpec<IntOffset>()
         val effectsMotion = MaterialTheme.motionScheme.defaultEffectsSpec<Float>()
@@ -194,6 +195,7 @@ fun AppRoot(
                             SourceUnavailableHeaderNotice(
                                 onRetry = viewModel::refreshGallery,
                                 retryStatus = state.sourceRetryStatus,
+                                signInRequired = state.remoteSignInRequired,
                                 modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
                             )
                         }
@@ -695,7 +697,7 @@ private fun CrashAlertDialog(count: Int, onReview: () -> Unit, onDismiss: () -> 
 private fun backActionFor(state: AppUiState, viewModel: UiController): (() -> Unit)? = when (state.route) {
     Route.WELCOME -> null
     Route.SERVER_SETUP -> ({ viewModel.navigate(Route.WELCOME) })
-    Route.LOGIN -> ({ viewModel.navigate(Route.SERVER_SETUP) })
+    Route.LOGIN -> ({ viewModel.navigate(if (state.hasCachedRemoteSession) Route.GALLERY else Route.SERVER_SETUP) })
     Route.GALLERY -> if (state.folderStack.isNotEmpty()) ({ viewModel.popFolder() }) else null
     Route.MEDIA_DETAIL -> ({ viewModel.navigate(Route.GALLERY) })
     Route.TARGET_PICKER -> ({

@@ -17,6 +17,8 @@ data class JellyfinPlaybackInfo(
     val subtitleTracks: List<MediaTrack> = emptyList(),
     val itemId: String = mediaSourceId,
     val hasEmbeddedSubtitleTracks: Boolean? = null,
+    /** This negotiation's secret upstream; optional only for repository fakes/report-only data. */
+    val upstream: JellyfinUpstreamSource? = null,
 )
 
 data class JellyfinDownloadTranscodeProfile(

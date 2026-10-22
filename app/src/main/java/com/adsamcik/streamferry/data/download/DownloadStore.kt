@@ -65,7 +65,7 @@ class DownloadStore private constructor(filesDir: File) {
     fun partFileFor(itemId: String, owner: DownloadOwner? = null): File =
         File(dir, DownloadIdentity(owner, itemId).fileStem + ".part")
 
-    /** Sidecar holding the upstream validator (ETag/Last-Modified) for a `.part`, used for safe resume. */
+    /** Sidecar holding a strong upstream ETag for a `.part`, used for representation-safe resume. */
     fun partMetaFileFor(itemId: String, owner: DownloadOwner? = null): File =
         File(dir, DownloadIdentity(owner, itemId).fileStem + ".partmeta")
 

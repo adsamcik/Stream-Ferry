@@ -14,6 +14,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 
 /**
  * One Quick Connect code bound to the exact server configuration that issued it. The user-facing code
@@ -24,6 +25,11 @@ class QuickConnectSession internal constructor(
     internal val handshake: QuickConnectHandshake,
     internal val serverId: String,
     internal val generation: Long,
+)
+
+/** Saved library data remains usable, but the active endpoint requires fresh authentication. */
+class JellyfinSignInRequiredException : IllegalStateException(
+    "Sign in again to verify the saved credentials for this server address. Your cached library and downloads are kept.",
 )
 
 /** Multiple Jellyfin servers, with a stable server-Id verified before a persisted token is reused. */
@@ -85,11 +91,15 @@ class JellyfinAuthRepository(
                         ?: throw IllegalStateException("Couldn't reach a Jellyfin server at that address.")
                     val id = discovery.info.serverId?.takeIf { it.isNotBlank() }
                         ?: throw IllegalStateException("This server did not provide a stable identity.")
+                    val existing = configStore.get(id)
+                    check(existing == null || credentialEndpoint(existing.baseUrl) == credentialEndpoint(discovery.canonicalBaseUrl)) {
+                        "This server identity is already saved at a different address. Your saved profile was kept. To use the new address, forget the saved profile and sign in again."
+                    }
                     // Pin the final canonical discovery origin only if this operation is still current.
                     if (!adoptDiscoveryIfCurrent(generation, id, discovery.canonicalBaseUrl)) throw SupersededAuthOperation()
                     persistConfiguredProfile(generation, id, discovery.canonicalBaseUrl, discovery.info.name)
                     requireCurrent(generation)
-                    val loggedIn = tokenStore.get(id) != null
+                    val loggedIn = existing?.hasBoundCredentials() == true && tokenStore.get(id) != null
                     requireCurrent(generation)
                     logger.event("auth", "Server configured + reachable: ${discovery.info.name}")
                     ServerProfile(id, LogRedactor.redactUrl(discovery.canonicalBaseUrl), discovery.info.name, active = true, loggedIn = loggedIn)
@@ -172,7 +182,7 @@ class JellyfinAuthRepository(
             persistenceMutex.withLock {
                 if (isCurrent(operation.generation, operation.serverId)) {
                     configStore.get(operation.serverId)?.let {
-                        configStore.upsert(it.copy(userId = auth.userId), makeActive = false)
+                        configStore.upsert(it.copy(userId = auth.userId, credentialBaseUrl = credentialEndpoint(it.baseUrl)), makeActive = false)
                     }
                 }
             }
@@ -240,7 +250,7 @@ class JellyfinAuthRepository(
                 LogRedactor.redactUrl(s.baseUrl),
                 s.name,
                 active = s.serverId == active,
-                loggedIn = tokenStore.get(s.serverId) != null,
+                loggedIn = s.hasBoundCredentials() && tokenStore.get(s.serverId) != null,
             )
         }
     }
@@ -281,7 +291,11 @@ class JellyfinAuthRepository(
     suspend fun ensureOnlineSession(): Result<UserSession> = authOperationMutex.withLock {
         (currentSessionForActiveProfile() ?: restoreSessionLocked(expectedServerId = null))
             ?.let { Result.success(it) }
-            ?: Result.failure(JellyfinServerUnavailableException())
+            ?: Result.failure(
+                if (configStore.active()?.let { it.userId == null || !it.hasBoundCredentials() || tokenStore.get(it.serverId) == null } == true) {
+                    JellyfinSignInRequiredException()
+                } else JellyfinServerUnavailableException(),
+            )
     }
 
     /**
@@ -304,7 +318,22 @@ class JellyfinAuthRepository(
 
     /** Caller holds [authOperationMutex], keeping the mutable client bound to this saved profile. */
     private suspend fun restoreSessionLocked(expectedServerId: String?): UserSession? {
+        val active = configStore.active() ?: return null
+        if (expectedServerId != null && active.serverId != expectedServerId) return null
+        if (active.userId == null || tokenStore.get(active.serverId) == null) {
+            // A selected signed-out profile must still configure its own endpoint for the login form;
+            // otherwise it could retain the previously selected profile's address.
+            beginRestore(active)
+            return null
+        }
         val cached = restoreCachedSessionLocked(expectedServerId) ?: return null
+        val saved = configStore.get(cached.serverId) ?: return null
+        // An old token has no authenticated endpoint provenance. Preserve it and the cache identity,
+        // but require a fresh sign-in instead of trusting a potentially overwritten legacy address.
+        if (!saved.hasBoundCredentials()) {
+            logger.event("auth", "Saved credentials need a fresh sign-in for this server address")
+            return null
+        }
         // Never send a persisted token until a fresh unauthenticated discovery confirms the server
         // identity. A timeout, malformed response, or missing Id is fail-closed: the token remains
         // uninstalled, while the non-secret cache scope stays available for offline browsing.
@@ -423,14 +452,21 @@ class JellyfinAuthRepository(
     private suspend fun persistConfiguredProfile(generation: Long, id: String, baseUrl: String, name: String) {
         persistenceMutex.withLock {
             requireCurrent(generation, id)
-            val priorUserId = configStore.get(id)?.userId
+            val prior = configStore.get(id)
             requireCurrent(generation, id)
             // Writing without activation first means a newer server-selection action always gets the
             // final active-profile decision, even if this encrypted write overlaps it.
-            configStore.upsert(StoredServer(id, baseUrl, name, priorUserId), makeActive = false)
+            configStore.upsert(StoredServer(id, baseUrl, name, prior?.userId, prior?.credentialBaseUrl), makeActive = false)
             requireCurrent(generation, id)
             configStore.setActive(id)
             requireCurrent(generation, id)
         }
     }
+
+    private fun StoredServer.hasBoundCredentials(): Boolean =
+        credentialBaseUrl?.let(::credentialEndpoint)?.let { it == credentialEndpoint(baseUrl) } == true
+
+    /** Include the reverse-proxy path as well as origin: separate applications can share a host. */
+    private fun credentialEndpoint(url: String): String? =
+        url.toHttpUrlOrNull()?.newBuilder()?.query(null)?.fragment(null)?.build()?.toString()?.trimEnd('/')
 }

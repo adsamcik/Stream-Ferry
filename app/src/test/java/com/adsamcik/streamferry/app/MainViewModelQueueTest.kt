@@ -37,7 +37,7 @@ import kotlin.test.*
 
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [34], application = Application::class)
+@Config(sdk = [37], application = Application::class)
 class MainViewModelQueueTest {
     private val container = mockk<AppContainer>(relaxed = true)
     private val local = MediaItem("content://media/video/1", "Local video", null, 600, null, null, false, sourceId = "local")

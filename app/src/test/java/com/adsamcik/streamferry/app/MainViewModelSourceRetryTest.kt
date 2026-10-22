@@ -2,6 +2,8 @@ package com.adsamcik.streamferry.app
 
 import androidx.lifecycle.viewModelScope
 import com.adsamcik.streamferry.data.cache.JellyfinConnectionMonitor
+import com.adsamcik.streamferry.data.jellyfin.JellyfinSignInRequiredException
+import com.adsamcik.streamferry.domain.ServerProfile
 import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.domain.MediaSourceIds
 import com.adsamcik.streamferry.domain.UserSession
@@ -65,6 +67,44 @@ class MainViewModelSourceRetryTest {
         runCurrent()
         vm.navigate(Route.GALLERY)
         runCurrent()
+        assertEquals(listOf(saved), vm.state.value.libraries)
+    }
+
+    @Test fun `legacy credentials preserve cached browsing and explicit retry opens sign in at saved address`() = runTest {
+        coEvery { container.authRepository.ensureOnlineSession() } returns Result.failure(JellyfinSignInRequiredException())
+        every { container.jellyfinClient.baseUrl } returns "https://saved.example/jellyfin"
+        openGallery()
+        assertTrue(vm.state.value.remoteSignInRequired)
+        assertTrue(vm.state.value.hasCachedRemoteSession)
+        assertEquals(listOf(saved), vm.state.value.libraries)
+
+        vm.refreshGallery()
+        advanceUntilIdle()
+        assertEquals(Route.LOGIN, vm.state.value.route)
+        assertEquals("https://saved.example/jellyfin", vm.state.value.serverUrlInput)
+        assertEquals(SourceRetryStatus.IDLE, vm.state.value.sourceRetryStatus)
+        assertTrue(vm.state.value.hasCachedRemoteSession)
+        assertEquals(listOf(saved), vm.state.value.libraries)
+
+        vm.navigate(Route.GALLERY)
+        advanceUntilIdle()
+        assertEquals(listOf(saved), vm.state.value.libraries)
+    }
+
+    @Test fun `using active sign in required profile opens login instead of offline loop`() = runTest {
+        openGallery()
+        every { container.jellyfinClient.baseUrl } returns "https://saved.example/jellyfin"
+        coEvery { container.authRepository.switchServer("server") } returns null
+        coEvery { container.authRepository.servers() } returns listOf(ServerProfile(
+            "server", "https://saved.example/jellyfin", "Saved server", active = true, loggedIn = false,
+        ))
+
+        vm.switchServer("server")
+        advanceUntilIdle()
+        assertEquals(Route.LOGIN, vm.state.value.route)
+        assertEquals("https://saved.example/jellyfin", vm.state.value.serverUrlInput)
+        assertTrue(vm.state.value.remoteSignInRequired)
+        assertTrue(vm.state.value.hasCachedRemoteSession)
         assertEquals(listOf(saved), vm.state.value.libraries)
     }
 

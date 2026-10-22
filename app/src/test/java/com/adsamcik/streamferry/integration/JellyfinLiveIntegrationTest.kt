@@ -265,7 +265,7 @@ class JellyfinLiveIntegrationTest {
     }
 
     /** Follow the rewritten playlist's proxy ?seg= URLs, asserting no leak at every nested level. */
-    private fun followHlsAndAssertNoLeak(masterPlaylist: String, token: String) {
+    internal fun followHlsAndAssertNoLeak(masterPlaylist: String, token: String) {
         var next = firstSegUrl(masterPlaylist)
         var level = 0
         while (next != null && level < 4) {
@@ -283,6 +283,7 @@ class JellyfinLiveIntegrationTest {
                 return
             }
         }
+        throw AssertionError("HLS traversal did not reach media within the playlist depth limit")
     }
 
     private fun firstSegUrl(playlist: String): String? = playlist.lineSequence()
@@ -298,10 +299,14 @@ class JellyfinLiveIntegrationTest {
         assertFalse(probe.contains("MediaBrowser Token", ignoreCase = true), "MediaBrowser auth leaked to the TV")
     }
 
-    private fun fetch(url: String, range: String?): ByteArray {
+    internal fun fetch(url: String, range: String?): ByteArray {
         val b = Request.Builder().url(url).get()
         range?.let { b.header("Range", it) }
-        http.newCall(b.build()).execute().use { r -> return r.body?.bytes() ?: ByteArray(0) }
+        http.newCall(b.build()).execute().use { r ->
+            val expectedStatus = if (range == null) 200 else 206
+            assertEquals(expectedStatus, r.code, "stream fetch returned HTTP ${r.code}")
+            return r.body?.bytes() ?: ByteArray(0)
+        }
     }
 
     private fun asText(bytes: ByteArray): String = String(bytes.copyOf(minOf(bytes.size, 16_384)), Charsets.ISO_8859_1)

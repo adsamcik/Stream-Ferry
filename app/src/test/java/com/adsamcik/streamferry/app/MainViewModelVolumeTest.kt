@@ -36,7 +36,7 @@ import kotlin.test.assertNull
 
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [34], application = Application::class)
+@Config(sdk = [37], application = Application::class)
 class MainViewModelVolumeTest {
     private val container = mockk<AppContainer>(relaxed = true)
     private val statuses = MutableStateFlow<PlaybackStatus?>(null)

@@ -63,7 +63,7 @@ import kotlin.test.assertTrue
 /** Uses the real TS session and encoder callback, rather than constructor-mocking reconnect wiring. */
 @OptIn(ExperimentalCoroutinesApi::class)
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [36])
+@Config(sdk = [37])
 class PlaybackEngineDlnaReconnectTest {
     private val profile = MediaProfile("mp4", "h264", audioCodec = "aac", widthPx = 640, heightPx = 360)
     private data class Load(val position: Long, val duration: Long?, val playing: Boolean)
@@ -245,6 +245,9 @@ class PlaybackEngineDlnaReconnectTest {
                 ForegroundServiceStartResult.Foregrounded(ProxyForegroundStartPath.START_SERVICE)
             val network = mockk<NetworkInfoProvider>()
             every { network.lanIpv4() } returns "127.0.0.1"
+            every { network.lanNetwork() } returns null
+            every { network.retainPlaybackLanNetwork() } returns null
+            every { network.releasePlaybackLanNetwork() } just Runs
             val transcoder = mockk<OnDeviceTranscoder>()
             every { transcoder.cancelOwnedInFlightAndAwait(any(), any()) } returns true
             coEvery { transcoder.transcodeStream(any(), any(), any(), any(), any(), any(), any(), any(), any(), any()) } coAnswers {

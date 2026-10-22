@@ -67,7 +67,7 @@ import kotlin.test.*
  */
 @OptIn(ExperimentalCoroutinesApi::class, DelicateCoroutinesApi::class)
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [34], application = Application::class)
+@Config(sdk = [37], application = Application::class)
 class LiveWatchStateValidationTest {
     private lateinit var base: String
     private lateinit var client: JellyfinClient
@@ -93,6 +93,7 @@ class LiveWatchStateValidationTest {
     @Volatile private var activePlaybackItemId: String? = null
     @Volatile private var automaticReports = true
     private var reportingCoordinator: DefaultPlaybackSessionCoordinator? = null
+    private val metadataRefreshScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val scopeKey get() = AccountLibraryScope(session.serverId, session.userId).cacheKey
 
     @Before
@@ -135,13 +136,18 @@ class LiveWatchStateValidationTest {
         resumes.save(DownloadIdentity(owner, item.id).resumeKey, 300, 1200)
 
         users.value = session
+        val remoteLibrary = JellyfinMediaLibraryRepository(client, logger)
+        val cachedLibrary = CachingMediaLibraryRepository(remoteLibrary, cache, { scopeKey }, { users.value == session }, monitor)
         val source = JellyfinMediaSource(DownloadedJellyfinMediaLibraryRepository(
-            delegate = CachingMediaLibraryRepository(
-                JellyfinMediaLibraryRepository(client, logger), cache, { scopeKey }, { users.value == session }, monitor,
-            ),
+            delegate = cachedLibrary,
             downloadStore = downloads,
             owner = { users.value?.let { DownloadOwner(it.serverId, it.userId) } },
             canRefreshDownloads = { users.value == session },
+            refreshScope = metadataRefreshScope,
+            refreshMetadata = { expectedOwner, ids ->
+                if (expectedOwner == owner && users.value == session) cachedLibrary.refreshItems(ids, remoteLibrary::items)
+                else Result.failure(IllegalStateException("Profile changed"))
+            },
         ))
         val identity = JellyfinSourceBackend.identity(session.serverId, session.userId, "Validation")
         val provider = JellyfinUserStateProvider(identity.id, client)
@@ -199,6 +205,8 @@ class LiveWatchStateValidationTest {
 
     @After
     fun tearDown() = runBlocking {
+        metadataRefreshScope.cancel()
+        metadataRefreshScope.coroutineContext.job.children.toList().forEach { it.join() }
         if (::vm.isInitialized) withContext(main) { vm.viewModelScope.cancel() }
         if (::main.isInitialized) { Dispatchers.resetMain(); main.close() }
         if (::journal.isInitialized) journal.clear()
@@ -479,9 +487,13 @@ class LiveWatchStateValidationTest {
     fun downloadedShelfRefreshFetchesExternalWatchedAndPartialProgressChanges() = runBlocking {
         seedRemote(true, 0)
         val shelf = DownloadedJellyfinMediaLibraryRepository.OFFLINE_DOWNLOADS_ROOT_ID
-        assertTrue(container.jellyfinMediaSource.children(shelf).getOrThrow().single().played)
+        container.jellyfinMediaSource.children(shelf).getOrThrow()
+        metadataRefreshScope.coroutineContext.job.children.toList().forEach { it.join() }
+        assertTrue(assertNotNull(downloads.get(owner, item.id)?.mediaItem).played)
         seedRemote(false, 450)
-        val refreshed = container.jellyfinMediaSource.children(shelf).getOrThrow().single()
+        container.jellyfinMediaSource.children(shelf).getOrThrow()
+        metadataRefreshScope.coroutineContext.job.children.toList().forEach { it.join() }
+        val refreshed = assertNotNull(downloads.get(owner, item.id)?.mediaItem)
         assertFalse(refreshed.played)
         assertEquals(450L, refreshed.resumePositionSeconds)
         assertEquals(refreshed, downloads.get(owner, item.id)?.mediaItem)

@@ -7,9 +7,12 @@ import android.os.Handler
 import android.os.HandlerThread
 import androidx.media3.common.MediaItem
 import androidx.media3.common.C
+import androidx.media3.common.Format
+import androidx.media3.common.Metadata
+import androidx.media3.muxer.BufferInfo
+import java.nio.ByteBuffer
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.util.Clock
-import androidx.media3.effect.Presentation
 import androidx.media3.effect.OverlayEffect
 import com.adsamcik.streamferry.data.subtitle.SubtitleCueSource
 import com.adsamcik.streamferry.data.subtitle.SubtitleOverlay
@@ -114,17 +117,11 @@ class OnDeviceTranscoder(
         }
 
         val codec = codecLabel(target.videoCodec)
-        val sourceHeight = if (profile?.rotationDegrees?.mod(180) == 90) {
-            profile.widthPx
-        } else {
-            profile?.heightPx
-        }
-        val maxHeight = sourceHeight?.takeIf { it > 0 }
-            ?.coerceAtMost(target.maxResolution.maxHeightPx) ?: target.maxResolution.maxHeightPx
+        val envelope = target.maxResolution
         val startedAt = System.currentTimeMillis()
         logger.trace(
             TAG,
-            "HW stream transcode start: $codec ${maxHeight}p from ${startMs}ms",
+            "HW stream transcode start: $codec within ${envelope.maxWidthPx}x${envelope.maxHeightPx} from ${startMs}ms",
         )
         val posted = runCatching {
             handler.post {
@@ -145,12 +142,11 @@ class OnDeviceTranscoder(
                         mediaItemBuilder.setClippingConfiguration(clipping.build())
                     }
                     val mediaItem = mediaItemBuilder.build()
-                    // Cap the OUTPUT height to the negotiated tier (preserving aspect ratio). Without this
-                    // the encoder is handed the source's full resolution, which frequently makes a 4K
-                    // source exceed a phone hardware encoder's practical throughput.
+                    // Actual decoded display dimensions include rotation/PAR, even for unknown remote
+                    // inputs. Fit both sides at configuration time rather than trusting profile metadata.
                     val edited = EditedMediaItem.Builder(mediaItem)
                         .setEffects(Effects(emptyList(), buildList {
-                            add(Presentation.createForHeight(maxHeight))
+                            add(EncoderEnvelopeEffect(envelope.maxWidthPx, envelope.maxHeightPx))
                             subtitleCues?.let { add(OverlayEffect(listOf(SubtitleOverlay(appContext, it, startMs * 1_000)))) }
                         }))
                         .build()
@@ -170,7 +166,28 @@ class OnDeviceTranscoder(
                                 )
                                 .build(),
                         )
-                        .setMuxerFactory(muxerFactory)
+                        .setMuxerFactory(object : Muxer.Factory {
+                            override fun getSupportedSampleMimeTypes(trackType: Int) = muxerFactory.getSupportedSampleMimeTypes(trackType)
+                            override fun create(path: String): Muxer {
+                                val delegate = muxerFactory.create(path)
+                                return object : Muxer {
+                                    override fun addTrack(format: Format): Int {
+                                        if (MimeTypes.isVideo(format.sampleMimeType)) {
+                                            val rotated = format.rotationDegrees.mod(180) == 90
+                                            val width = if (rotated) format.height else format.width
+                                            val height = if (rotated) format.width else format.height
+                                            require(width in 1..envelope.maxWidthPx && height in 1..envelope.maxHeightPx) {
+                                                "Encoder output exceeds the admitted resolution envelope"
+                                            }
+                                        }
+                                        return delegate.addTrack(format)
+                                    }
+                                    override fun addMetadataEntry(metadataEntry: Metadata.Entry) = delegate.addMetadataEntry(metadataEntry)
+                                    override fun writeSampleData(trackId: Int, byteBuffer: ByteBuffer, bufferInfo: BufferInfo) = delegate.writeSampleData(trackId, byteBuffer, bufferInfo)
+                                    override fun close() = delegate.close()
+                                }
+                            }
+                        })
                         .setLooper(thread.looper)
                     if (localSourceUri.scheme in setOf("http", "https") || audioTrack != null) {
                         builder.setAssetLoaderFactory(

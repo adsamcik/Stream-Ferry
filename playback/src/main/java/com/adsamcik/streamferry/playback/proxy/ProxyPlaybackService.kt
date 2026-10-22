@@ -55,6 +55,9 @@ class ProxyPlaybackService : Service() {
 
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
+    private val cpuOwnership = PlaybackCpuOwnership { required ->
+        if (required) acquireLocks() else releaseLocks()
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -101,7 +104,7 @@ class ProxyPlaybackService : Service() {
         logForegroundLatency()
         val c = controller ?: run { stopSelfSafely(startId); return }
         try {
-            acquireLocks()
+            cpuOwnership.setPlaybackActive(true)
         } catch (error: Exception) {
             logger?.e(TAG, "Playback CPU lock unavailable; refusing unprotected playback", error)
             stopSelfSafely(startId)
@@ -155,6 +158,7 @@ class ProxyPlaybackService : Service() {
 
     override fun onDestroy() {
         if (activeInstance === this) activeInstance = null
+        cpuOwnership.close()
         releaseLocks()
         logger?.event("service", "Playback service destroyed; locks released")
         super.onDestroy()
@@ -165,7 +169,7 @@ class ProxyPlaybackService : Service() {
      * is an additional screen-on optimization; it cannot guarantee screen-off radio behavior.
      * Idempotent; both locks are released in [releaseLocks].
      */
-    @Suppress("WakelockTimeout") // intentionally held for the whole casting session, released on stop.
+    @Suppress("WakelockTimeout") // scoped to playback intent or active source/encoding work; idle pause releases.
     private fun acquireLocks() {
         if (wakeLock == null) {
             wakeLock = checkNotNull(getSystemService(PowerManager::class.java))
@@ -196,6 +200,8 @@ class ProxyPlaybackService : Service() {
     companion object {
         @Volatile private var activeInstance: ProxyPlaybackService? = null
         fun isForegroundActive(): Boolean = activeInstance != null
+        fun setPlaybackActive(active: Boolean) { activeInstance?.cpuOwnership?.setPlaybackActive(active) }
+        fun beginWork(): AutoCloseable = activeInstance?.cpuOwnership?.beginWork() ?: AutoCloseable {}
         private const val WAKE_TAG = "StreamFerry:ProxyPlayback"
         private const val TAG = "ProxyPlaybackService"
         const val ACTION_START = "com.adsamcik.streamferry.action.START"

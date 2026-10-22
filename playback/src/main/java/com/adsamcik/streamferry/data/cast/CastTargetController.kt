@@ -51,6 +51,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.resume
 import kotlin.time.Duration.Companion.milliseconds
 import java.io.IOException
+import org.json.JSONObject
 
 /**
  * Cast backend using the direct Google Cast Sender SDK + AndroidX MediaRouter (§10).
@@ -157,7 +158,7 @@ class CastTargetController(
     private var connectionGeneration = 0L
     /** A receiver connection survives many loads; its previous media timeline must not survive them. */
     private var mediaLoadGeneration = 0L
-    private var expectedMediaUrl: String? = null
+    private val mediaOwnership = CastMediaOwnership()
     private var activeBinding: ActiveCastBinding? = null
     /** Prevent resume-failed followed by ended from emitting two disconnected events for one session. */
     private var terminalDisconnectGeneration: Long? = null
@@ -297,8 +298,11 @@ class CastTargetController(
         playWhenReady: Boolean,
     ) = withContext(Dispatchers.Main) {
         val activeClient = requireActiveMediaClient()
+        check(!mediaOwnership.isLost) { "Playback was replaced by another sender." }
+        val previousMedia = activeClient.client.mediaStatus
         invalidateMediaLoad()
-        expectedMediaUrl = proxyUrl
+        val loadToken = mediaOwnership.beginLoad(proxyUrl, previousMedia?.mediaInfo?.contentId,
+            previousMedia?.mediaInfo?.loadToken())
         val loadGeneration = mediaLoadGeneration
         registerMediaCallback()
         lastPlayerState = null // a fresh load: log the new session's first state transition from "none"
@@ -309,6 +313,7 @@ class CastTargetController(
             .setStreamType(MediaInfo.STREAM_TYPE_BUFFERED)
             .setContentType(stream.mimeType)
             .setMetadata(metadata)
+            .setCustomData(JSONObject().put(LOAD_TOKEN_KEY, loadToken))
         durationSeconds?.let { mediaInfoBuilder.setStreamDuration(it * 1000L) }
         // Cast defaults HLS media to MPEG-TS unless told otherwise. The phone's on-device
         // transcode is CMAF/fMP4, and remote sources can also select fMP4 for HLS profiles, so both
@@ -423,17 +428,23 @@ class CastTargetController(
         action: (RemoteMediaClient) -> PendingResult<RemoteMediaClient.MediaChannelResult>,
     ) = withContext(Dispatchers.Main) {
         val activeClient = requireActiveMediaClient()
+        check(isExpectedMedia(activeClient.client)) { "Playback is no longer owned by this sender." }
         awaitMediaCommand(command, activeClient) { action(activeClient.client) }
     }
 
     override suspend fun disconnect() = withContext(Dispatchers.Main) {
+        activeMediaClientOrNull()?.client?.let { isExpectedMedia(it) }
+        val receiverWasReplaced = mediaOwnership.isLost
         val generation = ++connectionGeneration
         // Remove callbacks/listeners before our intentional end so it cannot look like a terminal drop.
         detachActiveSession()
         removeRouteCallback()
         // Session shutdown is asynchronous. Let the old receiver release the TV before a same-TV
         // DLNA handoff starts, while bounding the wait if the receiver cannot acknowledge shutdown.
-        castContext?.let { clearCurrentSession(it, reason = "disconnecting") }
+        castContext?.let {
+            if (receiverWasReplaced) it.sessionManager.endCurrentSession(false)
+            else clearCurrentSession(it, reason = "disconnecting")
+        }
         if (isCurrentGeneration(generation)) _events.tryEmit(PlaybackTargetEvent.Disconnected)
         Unit
     }
@@ -891,6 +902,7 @@ class CastTargetController(
             session = session,
             sessionId = session.sessionId,
         )
+        mediaOwnership.reset()
         terminalDisconnectGeneration = null
     }
 
@@ -927,8 +939,21 @@ class CastTargetController(
             activeMediaClientOrNull()?.let { it.client === client && it.generation == generation } == true
     }
 
-    private fun isExpectedMedia(client: RemoteMediaClient): Boolean =
-        expectedMediaUrl?.let { client.mediaStatus?.mediaInfo?.contentId == it } ?: true
+    private fun isExpectedMedia(client: RemoteMediaClient): Boolean {
+        val wasLost = mediaOwnership.isLost
+        val status = client.mediaStatus
+        val accepted = mediaOwnership.observe(status?.mediaInfo?.contentId, status?.mediaInfo?.loadToken(),
+            status?.playerState == MediaStatus.PLAYER_STATE_IDLE && status.idleReason == MediaStatus.IDLE_REASON_INTERRUPTED)
+        if (!wasLost && mediaOwnership.isLost) {
+            // Retire only our media and proxy. disconnect() must leave the other sender's receiver alive.
+            invalidateMediaLoad()
+            logger.event("cast", "Another sender replaced the active Cast media")
+            _events.tryEmit(PlaybackTargetEvent.Cancelled)
+        }
+        return accepted
+    }
+
+    private fun MediaInfo.loadToken(): String? = customData?.optString(LOAD_TOKEN_KEY)?.takeIf { it.isNotEmpty() }
 
     private fun invalidateMediaLoad() {
         ++mediaLoadGeneration
@@ -942,7 +967,7 @@ class CastTargetController(
 
     private fun detachActiveSession(clearTerminalDisconnectMarker: Boolean = true) {
         ++mediaLoadGeneration
-        expectedMediaUrl = null
+        mediaOwnership.reset()
         cancelPositionHeartbeat()
         cancelStatusRefresh()
         nextStatusRefreshAtMs = 0L
@@ -1006,6 +1031,7 @@ class CastTargetController(
     }
 
     companion object {
+        internal const val LOAD_TOKEN_KEY = "streamFerryLoadToken"
         private const val TAG = "CastTargetController"
         private const val CONNECT_TIMEOUT_MS = 20_000L
         // A transient Cast session-start failure clears on a fresh attempt, so connect() auto-retries

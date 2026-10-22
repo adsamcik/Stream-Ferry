@@ -19,7 +19,7 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertNotNull
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [36])
+@Config(sdk = [37])
 @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 class AudioLanguageTrackSelectorTest {
     private fun format(id: String?, language: String, label: String, default: Boolean = false) = Format.Builder()

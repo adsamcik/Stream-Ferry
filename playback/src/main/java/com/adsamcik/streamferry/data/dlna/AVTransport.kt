@@ -1,6 +1,7 @@
 package com.adsamcik.streamferry.data.dlna
 
 import com.adsamcik.streamferry.core.dlna.SsdpParser
+import com.adsamcik.streamferry.core.dlna.SecureXml
 import org.w3c.dom.Document
 import org.w3c.dom.Element
 import java.net.URI
@@ -16,20 +17,24 @@ object AVTransport {
     /** Parsed subset of a UPnP `AVTransport:GetTransportInfo` response. */
     data class TransportInfo(val state: String?, val status: String?)
 
-    // GetTransportInfo returns CurrentTransportState (STOPPED/PLAYING/…) and CurrentTransportStatus
-    // (OK/ERROR_OCCURRED). The response is small and namespace-prefixed variably, so match by local name.
-    private val TRANSPORT_STATE = Regex("<(?:[\\w-]+:)?CurrentTransportState>([^<]*)</", RegexOption.IGNORE_CASE)
-    private val TRANSPORT_STATUS = Regex("<(?:[\\w-]+:)?CurrentTransportStatus>([^<]*)</", RegexOption.IGNORE_CASE)
-
     /**
      * Parse the transport state + status out of a raw `GetTransportInfo` SOAP response. ERROR_OCCURRED
      * is deliberately unclassified: UPnP also permits it for network congestion and server problems,
      * including while playback continues. Only an explicit action fault can establish format rejection.
      */
-    fun parseTransportInfo(soapResponse: String): TransportInfo = TransportInfo(
-        state = TRANSPORT_STATE.find(soapResponse)?.groupValues?.get(1)?.trim()?.takeIf { it.isNotEmpty() },
-        status = TRANSPORT_STATUS.find(soapResponse)?.groupValues?.get(1)?.trim()?.takeIf { it.isNotEmpty() },
-    )
+    fun parseTransportInfo(soapResponse: String): TransportInfo {
+        val document = runCatching { SecureXml.parse(soapResponse) }.getOrNull()
+        return TransportInfo(document?.let { responseValue(it, "CurrentTransportState") },
+            document?.let { responseValue(it, "CurrentTransportStatus") })
+    }
+
+    /** Namespace declarations and attributes are valid on every SOAP result field. */
+    fun responseValue(soapResponse: String, localName: String): String? =
+        runCatching { responseValue(SecureXml.parse(soapResponse), localName) }.getOrNull()
+
+    private fun responseValue(document: Document, localName: String): String? =
+        document.getElementsByTagNameNS("*", localName).item(0)?.textContent
+            ?.trim()?.takeIf { it.isNotEmpty() }
 
     /**
      * @param doc parsed device description.

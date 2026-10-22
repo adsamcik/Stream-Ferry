@@ -15,14 +15,34 @@ import org.junit.runner.RunWith
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import org.robolectric.shadows.ShadowPowerManager
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [34], application = ProxyPlaybackServiceTest.TestApplication::class)
+@Config(sdk = [37], application = ProxyPlaybackServiceTest.TestApplication::class)
 class ProxyPlaybackServiceTest {
     class TestApplication : Application(), PlaybackServiceOwner {
         override fun playbackServiceDependencies() = PlaybackServiceDependencies(
             mockk<MediaSessionController>(relaxed = true), mockk<DiagnosticSink>(relaxed = true),
         )
+    }
+
+    @Test fun `paused foreground service releases CPU lock and reacquires for a source request`() {
+        val service = Robolectric.buildService(ProxyPlaybackService::class.java).create()
+        try {
+            service.get().onStartCommand(Intent().setAction(ProxyPlaybackService.ACTION_START), 0, 1)
+            val initial = ShadowPowerManager.getLatestWakeLock()
+            assertTrue(initial.isHeld)
+            ProxyPlaybackService.setPlaybackActive(false)
+            assertFalse(initial.isHeld)
+            assertTrue(ProxyPlaybackService.isForegroundActive(), "pause keeps the session serviceable")
+            val work = ProxyPlaybackService.beginWork()
+            val resumed = ShadowPowerManager.getLatestWakeLock()
+            assertTrue(resumed.isHeld)
+            work.close()
+            assertFalse(resumed.isHeld)
+            ProxyPlaybackService.setPlaybackActive(true)
+            assertTrue(ShadowPowerManager.getLatestWakeLock().isHeld)
+        } finally { service.destroy() }
     }
 
     @Test fun `stop revokes service directly and never creates a queued stop command`() {

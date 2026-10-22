@@ -4,6 +4,14 @@ import com.adsamcik.streamferry.domain.MediaItem
 import com.adsamcik.streamferry.domain.MediaLibraryRepository
 import com.adsamcik.streamferry.domain.MediaSourceIds
 import java.util.Locale
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.coroutines.cancellation.CancellationException
+import kotlin.coroutines.coroutineContext
 
 /**
  * Adds verified, owner-scoped offline copies to the Jellyfin browse surface. The shelf is virtual rather
@@ -17,7 +25,13 @@ class DownloadedJellyfinMediaLibraryRepository(
     private val owner: () -> DownloadOwner?,
     private val canRefreshDownloads: () -> Boolean = { false },
     private val isRemoteUnavailable: () -> Boolean = { false },
+    private val refreshScope: CoroutineScope? = null,
+    private val refreshMetadata: (suspend (DownloadOwner, List<String>) -> Result<List<MediaItem>>)? = null,
 ) : MediaLibraryRepository {
+
+    private val refreshLock = Any()
+    private var refreshJob: Job? = null
+    private var refreshOwner: DownloadOwner? = null
 
     override suspend fun videoLibraries(): Result<List<MediaItem>> {
         val requestOwner = owner()
@@ -38,19 +52,38 @@ class DownloadedJellyfinMediaLibraryRepository(
     override suspend fun children(parentId: String): Result<List<MediaItem>> {
         if (parentId != OFFLINE_DOWNLOADS_ROOT_ID) return delegate.children(parentId)
         val requestOwner = owner()
-        // This virtual folder has no remote parent. Refresh its members explicitly so an external
-        // watch-state edit is discoverable even when the user browses only the Downloaded shelf.
-        for (item in downloadedItems(requestOwner)) {
-            if (owner() != requestOwner) return Result.failure(DownloadedScopeChangedException())
-            if (!canRefreshDownloads()) break
-            delegate.item(item.id) // The caching delegate synchronizes successful ordered metadata writes.
-            // One offline fallback is enough; do not repeat the connection timeout for every title.
-            // Check after the request so a later explicit refresh can probe for recovery.
-            if (isRemoteUnavailable()) break
-        }
         val downloaded = downloadedItems(requestOwner)
-        return if (owner() == requestOwner) Result.success(downloaded)
-        else Result.failure(DownloadedScopeChangedException())
+        if (owner() != requestOwner) return Result.failure(DownloadedScopeChangedException())
+        // Publish verified local files immediately. Ordered cache writes later invalidate the visible
+        // shelf through DownloadStore.metadataRevision, without another network-backed gallery load.
+        scheduleMetadataRefresh(requestOwner, downloaded.map { it.id })
+        return Result.success(downloaded)
+    }
+
+    private fun scheduleMetadataRefresh(requestOwner: DownloadOwner?, itemIds: List<String>) {
+        val scope = refreshScope ?: return
+        val refresh = refreshMetadata ?: return
+        synchronized(refreshLock) {
+            if (refreshOwner != requestOwner) refreshJob?.cancel()
+            if (requestOwner == null || itemIds.isEmpty() || !canRefreshDownloads()) return
+            if (refreshJob?.isActive == true) return
+            refreshOwner = requestOwner
+            refreshJob = scope.launch(start = CoroutineStart.LAZY) {
+                for (batch in itemIds.distinct().chunked(50)) {
+                    coroutineContext.ensureActive()
+                    if (owner() != requestOwner || !canRefreshDownloads()) return@launch
+                    val result = try {
+                        withTimeoutOrNull(15_000) { refresh(requestOwner, batch) }
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        return@launch
+                    }
+                    coroutineContext.ensureActive()
+                    if (owner() != requestOwner || result?.isSuccess != true || isRemoteUnavailable()) return@launch
+                }
+            }.also { it.start() }
+        }
     }
 
     override suspend fun item(itemId: String): Result<MediaItem> {

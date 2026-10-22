@@ -27,6 +27,10 @@ import org.junit.Assert.*
 import org.junit.Rule
 import org.junit.Test
 import java.io.File
+import android.media.MediaCodec
+import android.media.MediaExtractor
+import android.media.MediaFormat
+import android.os.SystemClock
 
 /** Uses only generated 720p video and a generated sine wave; no personal media. */
 class LocalTranscodeOutputTest {
@@ -71,7 +75,7 @@ class LocalTranscodeOutputTest {
         }
     }
 
-    @Test fun realHardwareStreamingPublishesPlayableFirstFragmentFromDownloadedPath() = runBlocking {
+    @Test fun realHardwareStreamingDecodesVideoAndAudioThroughLaterFragmentsFromDownloadedPath() = runBlocking {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val context = instrumentation.targetContext
         val directory = File(context.cacheDir, "local-transcode-device-test").apply { mkdirs() }
@@ -99,12 +103,99 @@ class LocalTranscodeOutputTest {
             assertEquals("720p input must actually be encoded to 480p", 480, info?.height)
             val fragment = (first as ClientTranscodeSource.Resource.Ready).bytes
             assertTrue(Fmp4Splitter.isValidMediaSegment(fragment))
-            File(context.filesDir, "synthetic-stream-first-fragment.mp4").writeBytes(init.bytes + fragment)
+            val fragments = mutableListOf(fragment)
+            for (index in 1..8) {
+                when (val next = session.mediaSegment(index, allowExport = true)) {
+                    is ClientTranscodeSource.Resource.Ready -> {
+                        assertTrue("Later fragment $index is valid", Fmp4Splitter.isValidMediaSegment(next.bytes))
+                        fragments += next.bytes
+                    }
+                    else -> {
+                        assertTrue("Export must finish normally: $next", session.mediaPlaylist("http://synthetic").contains("#EXT-X-ENDLIST"))
+                        break
+                    }
+                }
+            }
+            assertTrue("Inspect several actual fragments, including the end", fragments.size >= 3)
+            val complete = File(directory, "streamed-output.mp4")
+            complete.outputStream().use { output ->
+                output.write(init.bytes)
+                fragments.forEach { output.write(it) }
+            }
+            val video = decodeTrack(complete, "video/")
+            val audio = decodeTrack(complete, "audio/")
+            assertTrue("Video decoder reaches later fragments", video.frames >= 100 && video.lastPtsUs >= 5_800_000)
+            assertTrue("AAC decoder reaches later fragments", audio.frames >= 100 && audio.lastPtsUs >= 5_800_000)
+            assertTrue("Generated sine must decode to non-silent PCM", audio.hasNonzeroPcm)
+            assertTrue("Audio/video end timestamps remain aligned", kotlin.math.abs(video.lastPtsUs - audio.lastPtsUs) < 150_000)
             assertTrue(session.mediaPlaylist("http://synthetic").contains("#EXTINF:"))
         } finally {
             session.release()
             transcoder.release()
             directory.deleteRecursively()
+        }
+    }
+
+    private data class Decoded(val frames: Int, val lastPtsUs: Long, val hasNonzeroPcm: Boolean)
+
+    /** Real platform decoding of the assembled continuous stream; receiver qualification is separate. */
+    private fun decodeTrack(file: File, mimePrefix: String): Decoded {
+        val extractor = MediaExtractor()
+        var decoder: MediaCodec? = null
+        try {
+            extractor.setDataSource(file.absolutePath)
+            val track = (0 until extractor.trackCount).firstOrNull {
+                extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME)?.startsWith(mimePrefix) == true
+            } ?: error("Encoded output is missing $mimePrefix")
+            val format = extractor.getTrackFormat(track)
+            extractor.selectTrack(track)
+            val codec = MediaCodec.createDecoderByType(requireNotNull(format.getString(MediaFormat.KEY_MIME)))
+            decoder = codec
+            codec.configure(format, null, null, 0)
+            codec.start()
+            var inputEnded = false
+            var outputEnded = false
+            var frames = 0
+            var lastPtsUs = -1L
+            var nonzero = false
+            val info = MediaCodec.BufferInfo()
+            val deadline = SystemClock.elapsedRealtime() + 30_000
+            while (!outputEnded && SystemClock.elapsedRealtime() < deadline) {
+                if (!inputEnded) {
+                    val index = codec.dequeueInputBuffer(10_000)
+                    if (index >= 0) {
+                        val size = extractor.readSampleData(requireNotNull(codec.getInputBuffer(index)), 0)
+                        if (size < 0) {
+                            codec.queueInputBuffer(index, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                            inputEnded = true
+                        } else {
+                            codec.queueInputBuffer(index, 0, size, extractor.sampleTime, 0)
+                            extractor.advance()
+                        }
+                    }
+                }
+                val index = codec.dequeueOutputBuffer(info, 10_000)
+                if (index >= 0) {
+                    if (info.size > 0 && info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
+                        frames++
+                        assertTrue("Decoded timestamps must be monotonic", info.presentationTimeUs >= lastPtsUs)
+                        lastPtsUs = info.presentationTimeUs
+                        if (mimePrefix == "audio/") {
+                            val pcm = requireNotNull(codec.getOutputBuffer(index))
+                            for (offset in info.offset until info.offset + info.size) {
+                                if (pcm.get(offset).toInt() != 0) { nonzero = true; break }
+                            }
+                        }
+                    }
+                    outputEnded = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
+                    codec.releaseOutputBuffer(index, false)
+                }
+            }
+            assertTrue("Decoder must reach EOS instead of hanging", outputEnded)
+            return Decoded(frames, lastPtsUs, nonzero)
+        } finally {
+            decoder?.let { runCatching { it.stop() }; it.release() }
+            extractor.release()
         }
     }
 }

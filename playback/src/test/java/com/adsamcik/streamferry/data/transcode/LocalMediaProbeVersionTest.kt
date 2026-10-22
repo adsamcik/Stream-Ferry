@@ -26,7 +26,7 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [36])
+@Config(sdk = [37])
 class LocalMediaProbeVersionTest {
     @Test fun `file replacement changes its version and missing files cannot reuse probes`() = runBlocking {
         val context = RuntimeEnvironment.getApplication()

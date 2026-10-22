@@ -5,7 +5,6 @@ import com.adsamcik.streamferry.core.stream.Protocol
 import com.adsamcik.streamferry.core.stream.StreamDecision
 import com.adsamcik.streamferry.core.stream.StreamPreferences
 import com.adsamcik.streamferry.core.stream.TargetCapabilities
-import com.adsamcik.streamferry.core.transcode.SourceCapabilities
 import com.adsamcik.streamferry.source.api.MediaRef
 import com.adsamcik.streamferry.source.api.ArtworkRef
 import com.adsamcik.streamferry.source.api.SourceInstanceId
@@ -114,13 +113,12 @@ object MediaSourceIds {
 
 /**
  * A browsable source of video [MediaItem]s (remote servers, on-device local files, …). The gallery routes
- * browsing/search through the active source; [capabilities] tells the player whether the source can
- * transcode server-side (otherwise the phone transcodes on-device).
+ * browsing/search through the active source. Playback capabilities belong to the source registry's
+ * playback provider, rather than this gallery interface.
  */
 interface MediaSource {
     val id: String
     val displayName: String
-    val capabilities: SourceCapabilities
 
     /** Top-level entries: server libraries, or local granted folders / videos. */
     suspend fun roots(): Result<List<MediaItem>>
@@ -320,8 +318,4 @@ interface NetworkPermissionManager {
     fun hasNotificationsPermission(): Boolean
     /** Human-readable local-network access status for diagnostics ("granted" / "denied" / not-enforced). */
     fun localNetworkStatus(): String
-}
-
-interface StreamSelectionService {
-    fun select(caps: TargetCapabilities, media: MediaProfile, prefs: StreamPreferences): StreamDecision
 }

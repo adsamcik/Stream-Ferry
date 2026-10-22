@@ -30,6 +30,9 @@ enum class ConnectionState { IDLE, TESTING, CONNECTED, FAILED }
 
 enum class SourceRetryStatus { IDLE, RETRYING, FAILED }
 
+/** Only navigation context is retained; media results are revalidated on return. */
+data class GalleryParentContext(val folders: List<MediaItem>, val query: String)
+
 /** Immutable UI state for the whole app shell (§2 immutable UI state). */
 data class AppUiState(
     val route: Route = Route.WELCOME,
@@ -54,6 +57,8 @@ data class AppUiState(
     /** Reachability of the active remote library; never used as a substitute for authentication. */
     val sourceAvailability: SourceAvailability = SourceAvailability.UNKNOWN,
     val sourceRetryStatus: SourceRetryStatus = SourceRetryStatus.IDLE,
+    /** A saved remote profile needs fresh authentication, rather than another connection retry. */
+    val remoteSignInRequired: Boolean = false,
     val servers: List<ServerProfile> = emptyList(),
 
     // ----- quick connect (device-code style login) -----
@@ -66,6 +71,7 @@ data class AppUiState(
     /** Source-provided "Continue Watching" list shown at the library root; empty otherwise. */
     val continueWatching: List<MediaItem> = emptyList(),
     val folderStack: List<MediaItem> = emptyList(), // breadcrumb of opened folders
+    val galleryParents: List<GalleryParentContext> = emptyList(),
     val items: List<MediaItem> = emptyList(),       // children of the current folder
     val galleryLoading: Boolean = false,
     val selectedItem: MediaItem? = null,

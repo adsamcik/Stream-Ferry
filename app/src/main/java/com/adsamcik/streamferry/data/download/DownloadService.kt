@@ -20,7 +20,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
+import kotlin.coroutines.cancellation.CancellationException
 
 /**
  * Foreground service that keeps the process alive while downloads are active and shows a progress
@@ -56,41 +59,65 @@ class DownloadService : Service() {
     }
 
     private fun startObservingWithResume() {
+        // Cancel before any early exit or suspended authentication: an older observer must never stop
+        // or republish the notification belonging to this newer service start.
+        observerJob?.cancel()
         val container = (application as? StreamFerryApplication)?.container
         val downloader = container?.downloader
-        // The downloader uses the active Jellyfin client, which can authenticate only one account at a
-        // time. Never resurrect an arbitrary persisted owner from a sticky service restart: wait until
-        // the app has restored a live, identity-verified session and resume that exact account only.
-        val user = container?.authRepository?.currentUser?.value
-        if (downloader == null || user == null) {
+        if (container == null || downloader == null) {
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
             return
         }
-        val owner = DownloadOwner(serverId = user.serverId, userId = user.userId)
         // Each download enqueue re-sends ACTION_START; keep exactly ONE observer (cancel any prior)
         // so we don't accumulate N collectors racing the notification/stop logic.
-        observerJob?.cancel()
         observerJob = serviceScope.launch {
+            // Foreground ownership already exists. Restore the saved *active* profile asynchronously,
+            // without waiting for Activity startup or choosing an arbitrary owner from the queue.
+            val owner = try {
+                restoreDownloadOwner(
+                    ensureOnlineSession = { container.authRepository.ensureOnlineSession() },
+                    currentSession = { container.authRepository.currentUser.value },
+                )
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                container.logger.w("download", "Couldn't restore the active download account", failure)
+                null
+            }
+            ensureActive()
+            if (owner == null) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+                return@launch
+            }
             // Re-enqueue persisted-but-unfinished downloads BEFORE observing, so the first emitted
             // state reflects them and the idle check below can't stop the service prematurely.
             runCatching { downloader.resumePending(owner) }
                 .onFailure {
                     container.logger.w("download", "resumePending failed", it)
                 }
-            downloader.states.collect { states ->
-                val active = states.count { (identity, state) ->
-                    identity.owner == owner && (state is DownloadState.Queued || state is DownloadState.Running)
+            ensureActive()
+            combine(container.authRepository.currentUser, downloader.states) { user, states -> user to states }
+                .collect { (user, states) ->
+                    if (user?.let { DownloadOwner(it.serverId, it.userId) } != owner) {
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                        stopSelf()
+                        cancel()
+                        return@collect
+                    }
+                    val active = states.count { (identity, state) ->
+                        identity.owner == owner && (state is DownloadState.Queued || state is DownloadState.Running)
+                    }
+                    if (active == 0) {
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                        stopSelf()
+                        cancel() // stop collecting; onDestroy will cancel the scope
+                    } else {
+                        getSystemService(NotificationManager::class.java)
+                            .notify(NOTIF_ID, buildNotification(active, aggregateFraction(states, owner)))
+                    }
                 }
-                if (active == 0) {
-                    stopForeground(STOP_FOREGROUND_REMOVE)
-                    stopSelf()
-                    cancel() // stop collecting; onDestroy will cancel the scope
-                } else {
-                    getSystemService(NotificationManager::class.java)
-                        .notify(NOTIF_ID, buildNotification(active, aggregateFraction(states, owner)))
-                }
-            }
         }
     }
 
@@ -157,6 +184,7 @@ class DownloadService : Service() {
     }
 
     private fun stopService() {
+        observerJob?.cancel()
         runCatching { (application as? StreamFerryApplication)?.container?.downloader?.pauseAll() }
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()

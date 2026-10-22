@@ -11,7 +11,6 @@ import com.adsamcik.streamferry.source.api.SourceInstanceId
 import com.adsamcik.streamferry.source.api.TrackRef
 import io.mockk.coEvery
 import io.mockk.coVerify
-import io.mockk.every
 import io.mockk.mockk
 import kotlinx.coroutines.test.runTest
 import okhttp3.OkHttpClient
@@ -49,7 +48,7 @@ class JellyfinSubtitlePlaybackTest {
         coVerify(exactly = 0) { api.postPlaybackInfo(any(), any(), any(), any(), any(), any(), any(), any()) }
 
         assertTrue(repository.prepare(Protocol.DLNA, subtitle = 8).isFailure)
-        every { api.resolveUpstreamFor(any()) } returns upstream(transcoding = false)
+        coEvery { api.postPlaybackInfo(any(), any(), any(), any(), any(), any(), any(), any()) } returns info(false)
         assertTrue(repository.prepare(Protocol.CAST, subtitle = 3).isFailure)
     }
 
@@ -159,9 +158,8 @@ class JellyfinSubtitlePlaybackTest {
             var transcoding = false
             coEvery { api.postPlaybackInfo(any(), any(), any(), any(), any(), any(), any(), any()) } answers {
                 transcoding = arg(6)
-                info()
+                info(transcoding)
             }
-            every { api.resolveUpstreamFor(any()) } answers { upstream(transcoding) }
             val repository = HttpJellyfinRepository(api, NoopLogger, OkHttpClient())
 
             assertTrue(repository.prepare(protocol, subtitle = -1).isSuccess)
@@ -174,7 +172,7 @@ class JellyfinSubtitlePlaybackTest {
             }
             assertTrue(transcoding)
 
-            every { api.resolveUpstreamFor(any()) } returns upstream(transcoding = false)
+            coEvery { api.postPlaybackInfo(any(), any(), any(), any(), any(), any(), any(), any()) } returns info(false)
             assertTrue(repository.prepare(protocol, subtitle = -1).isFailure)
         }
     }
@@ -183,8 +181,7 @@ class JellyfinSubtitlePlaybackTest {
     fun `off preserves direct playback when the source has no subtitle tracks`() = runTest {
         val api = api()
         coEvery { api.postPlaybackInfo(any(), any(), any(), any(), any(), any(), any(), any()) } returns
-            info().copy(subtitleTracks = emptyList())
-        every { api.resolveUpstreamFor(any()) } returns upstream(transcoding = false)
+            info(false).copy(subtitleTracks = emptyList())
         val repository = HttpJellyfinRepository(api, NoopLogger, OkHttpClient())
 
         assertTrue(repository.prepare(Protocol.DLNA, subtitle = -1).isSuccess)
@@ -197,8 +194,7 @@ class JellyfinSubtitlePlaybackTest {
         for (protocol in Protocol.entries) {
             val api = api()
             coEvery { api.postPlaybackInfo(any(), any(), any(), any(), any(), any(), any(), any()) } returns
-                info().copy(hasEmbeddedSubtitleTracks = false)
-            every { api.resolveUpstreamFor(any()) } returns upstream(transcoding = false)
+                info(false).copy(hasEmbeddedSubtitleTracks = false)
             val repository = HttpJellyfinRepository(api, NoopLogger, OkHttpClient())
 
             val prepared = repository.prepare(protocol, subtitle = -1).getOrThrow()
@@ -214,14 +210,12 @@ class JellyfinSubtitlePlaybackTest {
 
     private fun api(): JellyfinApi = mockk<JellyfinApi>().apply {
         coEvery { postPlaybackInfo(any(), any(), any(), any(), any(), any(), any(), any()) } returns info()
-        every { resolveUpstreamFor(any()) } returns upstream(transcoding = true)
     }
 
-    private fun info() = JellyfinApi.PlaybackInfoResult(
+    private fun info(transcoding: Boolean = true) = JellyfinApi.PlaybackInfoResult(
         mediaSourceId = "version", playSessionId = "session", container = "mkv", videoCodec = "h264",
         audioCodec = "aac", isHdr = false, bitDepth = 8, runtimeSeconds = 120,
-        upstreamUrl = "https://server.example/video.ts", contentType = "video/mp2t", isHls = false,
-        totalLength = null, subtitleTracks = listOf(MediaTrack(3, "eng", "English ASS")),
+        upstream = upstream(transcoding), subtitleTracks = listOf(MediaTrack(3, "eng", "English ASS")),
     )
 
     private fun upstream(transcoding: Boolean) = JellyfinUpstreamSource(

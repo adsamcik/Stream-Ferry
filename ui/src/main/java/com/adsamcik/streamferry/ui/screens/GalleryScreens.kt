@@ -99,6 +99,8 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.customActions
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.role
@@ -139,6 +141,13 @@ fun GalleryScreen(state: AppUiState, viewModel: UiController, compact: Boolean =
     var searchOpen by rememberSaveable { mutableStateOf(searchActive) }
     val focusManager = LocalFocusManager.current
     val keyboard = LocalSoftwareKeyboardController.current
+    LaunchedEffect(state.currentFolder?.id) {
+        if (!searchActive) {
+            searchOpen = false
+            focusManager.clearFocus()
+            keyboard?.hide()
+        }
+    }
     fun closeSearch() {
         focusManager.clearFocus()
         keyboard?.hide()
@@ -152,19 +161,13 @@ fun GalleryScreen(state: AppUiState, viewModel: UiController, compact: Boolean =
         else -> state.items
     }
 
-    val gridState = rememberSaveable(
-        state.activeSourceId,
-        state.currentFolder?.id,
-        state.searchQuery,
-        saver = LazyGridState.Saver,
-    ) { LazyGridState() }
+    val scrollHistory = rememberSaveable(saver = GalleryScrollHistory.Saver) { GalleryScrollHistory() }
+    val browseKey = listOf(state.activeSourceId, state.currentFolder?.id.orEmpty(), state.searchQuery).joinToString("\u0000")
+    val layoutStates = remember(browseKey) { scrollHistory.statesFor(browseKey) }
+    val gridState = layoutStates.grid
     // A lazy layout only retains its anchor if the state lives above the content branch. This keeps
     // a long Jellyfin series at its current season across metadata updates and configuration changes.
-    val seasonListState = rememberSaveable(
-        state.activeSourceId,
-        state.currentFolder?.id,
-        saver = LazyListState.Saver,
-    ) { LazyListState() }
+    val seasonListState = layoutStates.seasons
     val scope = rememberCoroutineScope()
     // First grid index for each A–Z/# section, in display (server SortName) order.
     val firstIndexBySection = remember(entries) {
@@ -201,6 +204,7 @@ fun GalleryScreen(state: AppUiState, viewModel: UiController, compact: Boolean =
                 searchVisible = searchActive || searchOpen,
                 showSourceUnavailableNotice = remoteUnavailable,
                 sourceRetryStatus = state.sourceRetryStatus,
+                remoteSignInRequired = state.remoteSignInRequired,
                 onRetrySource = viewModel::refreshGallery,
             )
         }
@@ -533,7 +537,8 @@ private fun LibraryHome(
                     LibraryHomeHeader(onSearch = onOpenSearch, showSearch = compact)
                 }
                 if (compact && !searchOpen && remoteUnavailable) {
-                    SourceUnavailableHeaderNotice(onRetry = viewModel::refreshGallery, retryStatus = state.sourceRetryStatus)
+                    SourceUnavailableHeaderNotice(onRetry = viewModel::refreshGallery, retryStatus = state.sourceRetryStatus,
+                        signInRequired = state.remoteSignInRequired)
                 }
                 SourceSwitcher(viewModel.sources, state.activeSourceId, viewModel::selectSource)
                 if (isLocalSource) {
@@ -728,6 +733,7 @@ private fun PhoneGalleryHeader(
     searchVisible: Boolean,
     showSourceUnavailableNotice: Boolean = false,
     sourceRetryStatus: SourceRetryStatus = SourceRetryStatus.IDLE,
+    remoteSignInRequired: Boolean = false,
     onRetrySource: () -> Unit = {},
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -770,6 +776,7 @@ private fun PhoneGalleryHeader(
             SourceUnavailableHeaderNotice(
                 onRetry = onRetrySource,
                 retryStatus = sourceRetryStatus,
+                signInRequired = remoteSignInRequired,
                 modifier = Modifier.padding(bottom = 4.dp),
             )
         }
@@ -780,6 +787,7 @@ internal fun SourceUnavailableHeaderNotice(
     onRetry: () -> Unit,
     modifier: Modifier = Modifier,
     retryStatus: SourceRetryStatus = SourceRetryStatus.IDLE,
+    signInRequired: Boolean = false,
 ) {
     val retrying = retryStatus == SourceRetryStatus.RETRYING
     Surface(
@@ -803,7 +811,7 @@ internal fun SourceUnavailableHeaderNotice(
                 verticalArrangement = Arrangement.spacedBy(2.dp),
             ) {
                 Text(
-                    when (retryStatus) {
+                    if (signInRequired) "Sign in required" else when (retryStatus) {
                         SourceRetryStatus.IDLE -> "Source unavailable"
                         SourceRetryStatus.RETRYING -> "Reconnecting…"
                         SourceRetryStatus.FAILED -> "Still unavailable"
@@ -812,7 +820,7 @@ internal fun SourceUnavailableHeaderNotice(
                     fontWeight = FontWeight.Bold,
                 )
                 Text(
-                    when (retryStatus) {
+                    if (signInRequired) "Sign in to reconnect. Your saved library and downloads remain available." else when (retryStatus) {
                         SourceRetryStatus.IDLE -> "Showing saved library data. Downloaded items remain available offline."
                         SourceRetryStatus.RETRYING -> "Checking the connection. Saved library data remains available."
                         SourceRetryStatus.FAILED -> "Check your connection and try again. Downloaded items remain available offline."
@@ -821,7 +829,7 @@ internal fun SourceUnavailableHeaderNotice(
                 )
             }
             TextButton(onClick = onRetry, enabled = !retrying) {
-                Text("Retry")
+                Text(if (signInRequired) "Sign in" else "Retry")
             }
         }
     }
@@ -1290,7 +1298,9 @@ private fun ItemAvailabilityLabel(
     if (availability == SourceItemAvailability.AVAILABLE) return
     val downloaded = availability == SourceItemAvailability.DOWNLOADED
     Surface(
-        modifier = modifier,
+        modifier = modifier.clearAndSetSemantics {
+            contentDescription = if (downloaded) "Downloaded; available offline" else "Unavailable; Jellyfin offline"
+        },
         shape = RoundedCornerShape(10.dp),
         color = if (downloaded) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.errorContainer,
         contentColor = if (downloaded) MaterialTheme.colorScheme.onSecondaryContainer else MaterialTheme.colorScheme.onErrorContainer,
@@ -1306,7 +1316,7 @@ private fun ItemAvailabilityLabel(
                 modifier = Modifier.size(14.dp),
             )
             Text(
-                if (downloaded) "Downloaded · available offline" else "Unavailable · Jellyfin offline",
+                if (downloaded) "Offline" else "Unavailable",
                 style = MaterialTheme.typography.labelSmall,
                 fontWeight = FontWeight.SemiBold,
                 maxLines = 1,

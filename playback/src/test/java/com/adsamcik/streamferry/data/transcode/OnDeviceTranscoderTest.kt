@@ -13,7 +13,7 @@ import androidx.media3.transformer.EditedMediaItem
 import androidx.media3.transformer.Composition
 import androidx.media3.muxer.Muxer
 import androidx.media3.transformer.Transformer
-import androidx.media3.effect.Presentation
+import androidx.media3.effect.GlMatrixTransformation
 import com.adsamcik.streamferry.core.stream.MediaProfile
 import com.adsamcik.streamferry.core.transcode.AudioCodec
 import com.adsamcik.streamferry.core.transcode.ResolutionTier
@@ -53,13 +53,14 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [36])
+@Config(sdk = [37])
 @LooperMode(LooperMode.Mode.PAUSED)
 class OnDeviceTranscoderTest {
     private val startedItems = LinkedBlockingQueue<EditedMediaItem>()
     private val startedCompositions = LinkedBlockingQueue<Composition>()
     private val transformer = mockk<Transformer>(relaxed = true)
     private lateinit var transcoder: OnDeviceTranscoder
+    private lateinit var admittedMuxer: Muxer.Factory
     private val target = TranscodeTarget(
         VideoCodec.H264, AudioCodec.AAC, StreamContainer.HLS_FMP4, ResolutionTier.HD_720P, 30,
     )
@@ -74,7 +75,10 @@ class OnDeviceTranscoderTest {
         every { anyConstructed<Transformer.Builder>().setVideoMimeType(any()) } answers { self as Transformer.Builder }
         every { anyConstructed<Transformer.Builder>().setAudioMimeType(any()) } answers { self as Transformer.Builder }
         every { anyConstructed<Transformer.Builder>().setEncoderFactory(any()) } answers { self as Transformer.Builder }
-        every { anyConstructed<Transformer.Builder>().setMuxerFactory(any()) } answers { self as Transformer.Builder }
+        every { anyConstructed<Transformer.Builder>().setMuxerFactory(any()) } answers {
+            admittedMuxer = firstArg()
+            self as Transformer.Builder
+        }
         every { anyConstructed<Transformer.Builder>().setLooper(any<Looper>()) } answers { self as Transformer.Builder }
         every { anyConstructed<Transformer.Builder>().setAssetLoaderFactory(any()) } answers { self as Transformer.Builder }
         every { anyConstructed<Transformer.Builder>().addListener(any()) } answers { self as Transformer.Builder }
@@ -153,10 +157,24 @@ class OnDeviceTranscoderTest {
         every { LocalMediaProbe.probe(any(), any(), any()) } returns MediaProfile(
             container = "mp4", videoCodec = "h264", audioCodec = "aac", widthPx = 640, heightPx = 360,
         )
-        val effect = startAndCancel("file:///data/local/tmp/small.mp4").effects.videoEffects.single() as Presentation
+        val effect = startAndCancel("file:///data/local/tmp/small.mp4").effects.videoEffects.single() as GlMatrixTransformation
         val size = effect.configure(640, 360)
         assertEquals(640, size.width)
         assertEquals(360, size.height)
+    }
+
+    @Test
+    fun `actual decoded dimensions fit the tier and out of envelope encoded tracks are rejected`() = runBlocking {
+        val effect = startAndCancel("file:///data/local/tmp/ultrawide.mp4").effects.videoEffects.single() as GlMatrixTransformation
+        val size = effect.configure(3840, 1080)
+        assertEquals(1280, size.width)
+        assertEquals(360, size.height)
+        val sink = admittedMuxer.create("unused")
+        assertFailsWith<IllegalArgumentException> {
+            sink.addTrack(androidx.media3.common.Format.Builder().setSampleMimeType("video/avc").setWidth(3840).setHeight(1080).build())
+        }
+        sink.addTrack(androidx.media3.common.Format.Builder().setSampleMimeType("video/avc").setWidth(1280).setHeight(360).build())
+        sink.close()
     }
 
     @Test
@@ -193,7 +211,9 @@ class OnDeviceTranscoderTest {
             val item = composition.sequences.single().editedMediaItems.single().mediaItem
             assertEquals("http://127.0.0.1:1234/stream", item.localConfiguration?.uri.toString())
             assertEquals("application/x-mpegURL", item.localConfiguration?.mimeType)
-            verify { anyConstructed<Transformer.Builder>().setMuxerFactory(streamMuxer) }
+            // The exported stream still reaches the supplied streaming muxer through admission.
+            admittedMuxer.create("unused")
+            verify { streamMuxer.create("unused") }
             assertTrue(transcoder.cancelOwnedInFlightAndAwait(owner))
             assertIs<CancellationException>(withTimeout(5_000) { failure.await() })
             export.join()

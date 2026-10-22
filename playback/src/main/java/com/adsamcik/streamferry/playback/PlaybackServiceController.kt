@@ -29,6 +29,9 @@ sealed interface ForegroundServiceStartResult {
 interface PlaybackServiceController {
     fun stop()
     fun isForegroundActive(): Boolean
+    /** Hold playback ownership before resume; pause releases only after outstanding source work drains. */
+    fun setPlaybackActive(active: Boolean) {}
+    fun beginWork(): AutoCloseable = AutoCloseable {}
 
     /**
      * Request the service and suspend until it has actually called `startForeground()`. The engine must
@@ -51,6 +54,8 @@ class AndroidPlaybackServiceController(context: Context) : PlaybackServiceContro
 
     override fun stop() = ProxyPlaybackService.stop(appContext)
     override fun isForegroundActive(): Boolean = ProxyPlaybackService.isForegroundActive()
+    override fun setPlaybackActive(active: Boolean) = ProxyPlaybackService.setPlaybackActive(active)
+    override fun beginWork(): AutoCloseable = ProxyPlaybackService.beginWork()
 
     override suspend fun startAndAwaitForegrounded(timeoutMs: Long): ForegroundServiceStartResult {
         // Arm the latch BEFORE asking Android to start the service. The request token is carried in the

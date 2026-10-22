@@ -56,6 +56,7 @@ class StreamingTranscodeSession(
     private val subtitleTrack: LocalSubtitleTrack? = null,
     private val subtitleContext: Context? = null,
     private val audioTrack: LocalAudioTrack? = null,
+    private val beginWork: () -> AutoCloseable = { AutoCloseable {} },
 ) : ClientTranscodeSource {
     private val lock = Object()
     private val scope = CoroutineScope(SupervisorJob() + exportDispatcher)
@@ -68,7 +69,7 @@ class StreamingTranscodeSession(
     private var failure: Throwable? = null
     private var init: ByteArray? = null
     private var codecInfo: Fmp4Splitter.CodecInfo? = null
-    private val fragmentNormalizer = HlsFragmentNormalizer()
+    private val fragmentNormalizer = HlsFragmentNormalizer(::publishSegment)
     private data class Segment(val index: Int, val bytes: ByteArray, val seconds: Double)
     private val segments = ArrayDeque<Segment>()
     private var nextIndex = 0
@@ -80,6 +81,22 @@ class StreamingTranscodeSession(
     private val startupReplay = ByteArrayOutputStream()
     private var replayAvailable = true
     private var reconnectRequested = false
+    private var producerWork: AutoCloseable? = null
+
+    private fun setProducerActive(active: Boolean) = synchronized(lock) {
+        if (active && !released) {
+            if (producerWork == null) producerWork = beginWork()
+        } else {
+            producerWork?.close()
+            producerWork = null
+        }
+    }
+
+    /** Called only while holding lock: receiver backpressure is idle, not ongoing encoder work. */
+    private fun waitForCapacity() {
+        setProducerActive(false)
+        try { lock.wait() } finally { if (!finished) setProducerActive(true) }
+    }
 
     override val isProgressive: Boolean get() = !hls
     override val segmentContentType: String get() = "video/mp4"
@@ -92,6 +109,7 @@ class StreamingTranscodeSession(
                 started = true
                 scope.launch {
                     try {
+                        setProducerActive(true)
                         val cues = subtitleTrack?.let {
                             LocalSubtitleReader.open(requireNotNull(subtitleContext), sourceUri, sourceMimeType, it)
                         }
@@ -99,21 +117,22 @@ class StreamingTranscodeSession(
                         if (released) { cues?.close(); return@launch }
                         val factory = if (hls) fragmentedFactory() else Media3TsMuxer.Factory(::publishPacket)
                         transcoder.transcodeStream(
-                            sourceUri, target, TimestampOriginFactory(factory) { track, ptsUs ->
-                                if (hls) fragmentNormalizer.setTrackStart(track + 1, ptsUs)
-                            },
+                            sourceUri, target, TimestampOriginFactory(factory, onSample = { track, ptsUs, eos ->
+                                if (hls) fragmentNormalizer.sample(track + 1, ptsUs, eos)
+                            }),
                             startMs = startPositionSeconds.coerceAtLeast(0) * 1_000,
                             sourceMimeType = sourceMimeType, sourceProfile = sourceProfile,
                             owner = owner, abortIf = { released },
                             subtitleCues = cues,
                             audioTrack = audioTrack,
                         )
+                        if (hls) fragmentNormalizer.finish()
                         finish(null)
                     } catch (error: Exception) {
                         if (!released) logger.w("transcode", "Continuous on-device stream failed", error)
                         finish(error)
                         if (!released) runCatching { onFailure(error) }
-                    } finally { subtitleCues?.close() }
+                    } finally { setProducerActive(false); subtitleCues?.close() }
                 }
             }
         }
@@ -130,7 +149,7 @@ class StreamingTranscodeSession(
 
     private fun fragmentedFactory(): Muxer.Factory = object : Muxer.Factory {
         override fun create(path: String): Muxer = FragmentedMp4Muxer.Builder(
-            FragmentOutput(::publishInit, ::publishSegment),
+            FragmentOutput(::publishInit, fragmentNormalizer::submit),
         // The muxer compares already queued sample timestamps before accepting the next keyframe.
         // A minimum below the encoder's two-second GOP prevents it from skipping that boundary.
         ).setFragmentDurationMs(1_000).build()
@@ -154,10 +173,9 @@ class StreamingTranscodeSession(
         lock.notifyAll()
     }
 
-    private fun publishSegment(encodedBytes: ByteArray) = synchronized(lock) {
-        checkOpen()
-        val bytes = fragmentNormalizer.normalize(encodedBytes)
-        val header = init ?: throw IOException("Streaming fragment has no initialization")
+    private fun publishSegment(bytes: ByteArray) {
+        // Producer owns normalization/validation; substantial copying/parsing never holds reader lock.
+        val header = synchronized(lock) { checkOpen(); init } ?: throw IOException("Streaming fragment has no initialization")
         require(Fmp4Splitter.isValidMediaSegment(bytes)) { "Invalid streaming MP4 fragment" }
         val duration = Fmp4Splitter.mediaDurationSeconds(bytes, Fmp4Splitter.trackTimescales(header))
             ?: throw IOException("Streaming fragment has no sample duration")
@@ -165,30 +183,32 @@ class StreamingTranscodeSession(
             "Streaming fragment duration ${duration}s exceeded its ${TARGET_DURATION_SECONDS}s keyframe bound"
         }
         require(bytes.size <= MAX_BUFFER_BYTES) { "Streaming fragment exceeds buffer budget" }
-        while (!released && !finished && (segments.size >= MAX_SEGMENTS || bufferedBytes + bytes.size > MAX_BUFFER_BYTES)) {
-            // Retrying the previous two segments is useful only while capacity permits. Retaining a
-            // large delivered segment must never prevent production of the receiver's next segment.
-            while (segments.peekFirst()?.index?.let { oldest ->
-                    oldest < receiverCursor - 2 ||
-                        (bufferedBytes + bytes.size > MAX_BUFFER_BYTES && oldest <= receiverCursor)
-                } == true &&
-                (segments.size >= MAX_SEGMENTS || bufferedBytes + bytes.size > MAX_BUFFER_BYTES)
-            ) {
-                bufferedBytes -= segments.removeFirst().bytes.size
+        synchronized(lock) {
+            while (!released && !finished && (segments.size >= MAX_SEGMENTS || bufferedBytes + bytes.size > MAX_BUFFER_BYTES)) {
+                // Retrying the previous two segments is useful only while capacity permits. Retaining a
+                // large delivered segment must never prevent production of the receiver's next segment.
+                while (segments.peekFirst()?.index?.let { oldest ->
+                        oldest < receiverCursor - 2 ||
+                            (bufferedBytes + bytes.size > MAX_BUFFER_BYTES && oldest <= receiverCursor)
+                    } == true &&
+                    (segments.size >= MAX_SEGMENTS || bufferedBytes + bytes.size > MAX_BUFFER_BYTES)
+                ) {
+                    bufferedBytes -= segments.removeFirst().bytes.size
+                }
+                if (segments.size < MAX_SEGMENTS && bufferedBytes + bytes.size <= MAX_BUFFER_BYTES) break
+                waitForCapacity()
             }
-            if (segments.size < MAX_SEGMENTS && bufferedBytes + bytes.size <= MAX_BUFFER_BYTES) break
-            lock.wait()
+            checkOpen()
+            segments.addLast(Segment(nextIndex++, bytes, duration))
+            peakBandwidthBps = maxOf(peakBandwidthBps, (bytes.size * 8.0 / duration * 1.1).toLong())
+            bufferedBytes += bytes.size
+            ready.complete(Unit)
+            lock.notifyAll()
         }
-        checkOpen()
-        segments.addLast(Segment(nextIndex++, bytes, duration))
-        peakBandwidthBps = maxOf(peakBandwidthBps, (bytes.size * 8.0 / duration * 1.1).toLong())
-        bufferedBytes += bytes.size
-        ready.complete(Unit)
-        lock.notifyAll()
     }
 
     private fun publishPacket(bytes: ByteArray) = synchronized(lock) {
-        while (!released && !finished && bufferedBytes + bytes.size > MAX_TS_BUFFER_BYTES) lock.wait()
+        while (!released && !finished && bufferedBytes + bytes.size > MAX_TS_BUFFER_BYTES) waitForCapacity()
         checkOpen()
         packets.addLast(bytes)
         bufferedBytes += bytes.size
@@ -370,6 +390,7 @@ class StreamingTranscodeSession(
         synchronized(lock) {
             if (released) return
             released = true
+            setProducerActive(false)
             packets.clear()
             segments.clear()
             startupReplay.reset()
@@ -397,12 +418,13 @@ class StreamingTranscodeSession(
 /** Parses complete top-level MP4 boxes as Media3 writes them; a partial mdat is never published. */
 internal class FragmentOutput(
     private val onInit: (ByteArray) -> Unit,
-    private val onMedia: (ByteArray) -> Unit,
+    private val onMedia: (ByteArray, ByteArray) -> Unit,
 ) : OutputStream() {
     private val header = ByteArray(16)
     private var headerSize = 0
     private var boxSize = 0
-    private var box: ByteArrayOutputStream? = null
+    private var box: ByteArray? = null
+    private var boxWritten = 0
     private val initialization = ByteArrayOutputStream()
     private var moof: ByteArray? = null
     private var initialized = false
@@ -410,6 +432,7 @@ internal class FragmentOutput(
     override fun write(value: Int) = write(byteArrayOf(value.toByte()), 0, 1)
 
     override fun write(bytes: ByteArray, off: Int, len: Int) {
+        require(off >= 0 && len >= 0 && off <= bytes.size - len)
         var cursor = off
         val end = off + len
         while (cursor < end) {
@@ -427,14 +450,16 @@ internal class FragmentOutput(
                 } else shortSize
                 require(size in headerSize.toLong()..MAX_BOX_BYTES.toLong()) { "Invalid or oversized streaming MP4 box" }
                 boxSize = size.toInt()
-                box = ByteArrayOutputStream(boxSize).apply { write(header, 0, headerSize) }
+                box = ByteArray(boxSize).also { header.copyInto(it, 0, 0, headerSize) }
+                boxWritten = headerSize
             }
             val output = box!!
-            val count = minOf(boxSize - output.size(), end - cursor)
-            output.write(bytes, cursor, count)
+            val count = minOf(boxSize - boxWritten, end - cursor)
+            bytes.copyInto(output, boxWritten, cursor, cursor + count)
+            boxWritten += count
             cursor += count
-            if (output.size() == boxSize) {
-                val complete = output.toByteArray()
+            if (boxWritten == boxSize) {
+                val complete = output
                 val type = String(complete, 4, 4, Charsets.US_ASCII)
                 when (type) {
                     "ftyp", "moov" -> {
@@ -450,7 +475,7 @@ internal class FragmentOutput(
                     "mdat" -> {
                         val fragment = moof ?: throw IOException("MP4 mdat without fragment header")
                         require(fragment.size + complete.size <= MAX_BOX_BYTES)
-                        onMedia(fragment + complete)
+                        onMedia(fragment, complete)
                         moof = null
                     }
                 }
@@ -478,7 +503,7 @@ internal class FragmentOutput(
 @SuppressLint("UnsafeOptInUsageError")
 internal class TimestampOriginFactory(
     private val factory: Muxer.Factory,
-    private val onFirstSample: (Int, Long) -> Unit = { _, _ -> },
+    private val onSample: (Int, Long, Boolean) -> Unit = { _, _, _ -> },
 ) : Muxer.Factory {
     private data class Sample(val track: Int, val bytes: ByteArray, val info: BufferInfo)
     override fun getSupportedSampleMimeTypes(trackType: Int): ImmutableList<String> = factory.getSupportedSampleMimeTypes(trackType)
@@ -489,13 +514,14 @@ internal class TimestampOriginFactory(
         private val pending = mutableListOf<Sample>()
         private var pendingBytes = 0
         private var originUs: Long? = null
-        private val publishedTracks = mutableSetOf<Int>()
         override fun addTrack(format: Format): Int = muxer.addTrack(format).also { tracks += it }
         override fun addMetadataEntry(metadataEntry: Metadata.Entry) = muxer.addMetadataEntry(metadataEntry)
         override fun writeSampleData(trackId: Int, byteBuffer: ByteBuffer, bufferInfo: BufferInfo) {
             if (bufferInfo.size == 0) {
                 if (originUs != null && bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
-                    muxer.writeSampleData(trackId, byteBuffer, rebased(bufferInfo))
+                    val adjusted = rebased(bufferInfo)
+                    onSample(trackId, adjusted.presentationTimeUs, true)
+                    muxer.writeSampleData(trackId, byteBuffer, adjusted)
                 }
                 return
             }
@@ -514,7 +540,7 @@ internal class TimestampOriginFactory(
         private fun rebased(info: BufferInfo) = BufferInfo((info.presentationTimeUs - originUs!!).coerceAtLeast(0), info.size, info.flags)
         private fun writeRebased(track: Int, bytes: ByteBuffer, info: BufferInfo) {
             val adjusted = rebased(info)
-            if (publishedTracks.add(track)) onFirstSample(track, adjusted.presentationTimeUs)
+            onSample(track, adjusted.presentationTimeUs, false)
             muxer.writeSampleData(track, bytes, adjusted)
         }
         private fun flushPending() {

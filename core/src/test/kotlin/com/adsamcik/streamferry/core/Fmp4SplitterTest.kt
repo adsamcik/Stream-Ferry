@@ -244,17 +244,31 @@ class Fmp4SplitterTest {
     private fun audioTrak() =
         box("trak", box("mdia", box("minf", box("stbl", stsd(box("mp4a", ByteArray(28) + aacEsds()))))))
 
-    private fun hvc1(width: Int, height: Int): ByteArray {
+    private fun hvc1(width: Int, height: Int, type: String = "hvc1", compatibility: Int = 0x60000000): ByteArray {
         val fixed = ByteArray(78)
         fixed[24] = (width ushr 8).toByte(); fixed[25] = width.toByte()
         fixed[26] = (height ushr 8).toByte(); fixed[27] = height.toByte()
         // hvcC: Main profile, compatibility 6, constraint B0, level 120.
-        val hvcC = box("hvcC", byteArrayOf(1, 1, 0, 0, 0, 6, 0xB0.toByte(), 0, 0, 0, 0, 0, 120.toByte()))
-        return box("hvc1", fixed + hvcC)
+        val hvcC = box("hvcC", byteArrayOf(1, 1,
+            (compatibility ushr 24).toByte(), (compatibility ushr 16).toByte(),
+            (compatibility ushr 8).toByte(), compatibility.toByte(),
+            0xB0.toByte(), 0, 0, 0, 0, 0, 120.toByte()))
+        return box(type, fixed + hvcC)
     }
 
     private fun fingerprintTrak(trackId: Long, timescale: Long, entry: ByteArray): ByteArray =
         box("trak", tkhd(trackId) + box("mdia", mdhd(timescale) + box("minf", box("stbl", stsd(entry)))))
+
+    @Test fun hevcCompatibilityReversesAll32FlagsForBothSampleEntries() {
+        for ((bits, expected) in listOf(0x60000000 to "6", 1 to "80000000", Int.MIN_VALUE to "1", 0 to "0")) {
+            for (type in listOf("hvc1", "hev1")) {
+                val init = box("ftyp", ByteArray(4)) + box("moov", videoTrak(hvc1(1920, 1080, type, bits)) + audioTrak())
+                val info = Fmp4Splitter.codecInfo(init)!!
+                assertEquals("$type.1.$expected.L120.B0", info.videoCodec)
+                assertEquals("$type.1.$expected.L120.B0,mp4a.40.2", info.hlsCodecs)
+            }
+        }
+    }
 
     @Test fun codecInfoParsesAvcAndAacAndResolution() {
         val init = box("ftyp", ByteArray(4)) +

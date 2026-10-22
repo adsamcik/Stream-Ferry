@@ -57,7 +57,7 @@ jobs:
       - name: Run unit tests
         uses: ./.github/actions/gradle-retry
         with:
-          args: testDebugUnitTest
+          args: :core:test :source:api:test checkSourceBoundaries testDebugUnitTest
 
       - name: Run Android lint
         uses: ./.github/actions/gradle-retry

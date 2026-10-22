@@ -196,7 +196,7 @@ class JellyfinDownloadProvider(
             DownloadStream(
                 media = media,
                 stream = JellyfinStreamLease(upstream, httpClient),
-                container = info.profile.container,
+                container = upstream.outputContainer,
                 runtimeSeconds = info.runtimeSeconds,
             )
         }

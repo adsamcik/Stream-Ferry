@@ -30,7 +30,7 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [36])
+@Config(sdk = [37])
 class LocalSubtitleReaderTest {
     @Test
     fun `sidecar formats use source timestamps including after seek and preserve text styles`() {

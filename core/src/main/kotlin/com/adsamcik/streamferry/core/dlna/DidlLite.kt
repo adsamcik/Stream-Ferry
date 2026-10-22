@@ -1,6 +1,7 @@
 package com.adsamcik.streamferry.core.dlna
 
 import com.adsamcik.streamferry.core.metadata.MetadataSanitizer
+import java.util.Locale
 
 /**
  * DIDL-Lite metadata for AVTransport SetAVTransportURI (§11).
@@ -54,7 +55,7 @@ object DidlLite {
         val h = totalSecs / 3600
         val m = (totalSecs % 3600) / 60
         val s = totalSecs % 60
-        return "%d:%02d:%02d".format(h, m, s)
+        return String.format(Locale.ROOT, "%d:%02d:%02d", h, m, s)
     }
 
     /** XML-escape for element/attribute text (defence against metadata injection). */

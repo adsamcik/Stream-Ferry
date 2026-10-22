@@ -45,7 +45,7 @@ import kotlin.test.assertTrue
 import kotlin.test.assertFailsWith
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [36])
+@Config(sdk = [37])
 class StreamingTranscodeSessionTest {
     private val target = TranscodeTarget(VideoCodec.H264, AudioCodec.AAC, StreamContainer.HLS_FMP4, ResolutionTier.HD_720P, 30)
 
@@ -253,21 +253,30 @@ class StreamingTranscodeSessionTest {
         every { transcoder.cancelOwnedInFlightAndAwait(any(), any()) } returns true
         val tenSamples = CompletableDeferred<Unit>()
         val keepRunning = CompletableDeferred<Unit>()
+        val activeWork = AtomicInteger()
         coEvery { transcoder.transcodeStream(any(), any(), any(), any(), any(), any(), any(), any(), any(), any()) } coAnswers {
             val muxer = arg<Muxer.Factory>(2).create("unused")
             val video = muxer.addTrack(videoFormat())
-            writeFrames(muxer, video, segments = 20) { if (it == 10) tenSamples.complete(Unit) }
+            writeFrames(muxer, video, segments = 20) {
+                if (it == 10) {
+                    assertTrue(activeWork.get() > 0, "encoding reacquires CPU ownership before resuming")
+                    tenSamples.complete(Unit)
+                }
+            }
             keepRunning.await()
             muxer.close()
         }
         val session = StreamingTranscodeSession(
             transcoder, "content://source/video", target, mockk<DiagnosticSink>(relaxed = true), hls = true,
+            beginWork = { activeWork.incrementAndGet(); AutoCloseable { activeWork.decrementAndGet() } },
         )
         try {
             withTimeout(5_000) {
                 session.awaitReady()
                 while (session.mediaPlaylist("http://phone").lineSequence().count { it.startsWith("#EXTINF") } < 8) delay(5)
+                while (activeWork.get() != 0) delay(5)
             }
+            assertEquals(0, activeWork.get(), "a paused receiver filling the bounded buffer releases CPU ownership")
             assertFalse(tenSamples.isCompleted, "the encoder must block when its eight-segment buffer is full")
             assertIs<ClientTranscodeSource.Resource.Ready>(session.mediaSegment(5, true))
             assertIs<ClientTranscodeSource.Resource.Ready>(session.mediaSegment(3, true), "two prior segments remain available for parallel retries")
@@ -278,6 +287,56 @@ class StreamingTranscodeSessionTest {
         } finally {
             session.release()
             keepRunning.complete(Unit)
+            assertEquals(0, activeWork.get(), "teardown drains the producer lease")
+        }
+    }
+
+    @Test
+    fun `DLNA producer releases CPU ownership under backpressure and reacquires before encoding`() = runBlocking {
+        val transcoder = mockk<OnDeviceTranscoder>()
+        every { transcoder.cancelOwnedInFlightAndAwait(any(), any()) } returns true
+        val activeWork = AtomicInteger()
+        val resumed = CompletableDeferred<Unit>()
+        val keepRunning = CompletableDeferred<Unit>()
+        coEvery { transcoder.transcodeStream(any(), any(), any(), any(), any(), any(), any(), any(), any(), any()) } coAnswers {
+            val muxer = arg<Muxer.Factory>(2).create("unused")
+            val video = muxer.addTrack(videoFormat())
+            val sample = ByteArray(128 * 1024) { 1 }.apply {
+                this[0] = 0; this[1] = 0; this[2] = 0; this[3] = 1; this[4] = 0x65
+            }
+            for (frame in 0..31) {
+                muxer.writeSampleData(video, ByteBuffer.wrap(sample), BufferInfo(frame * 40_000L, sample.size, C.BUFFER_FLAG_KEY_FRAME))
+                if (frame == 20) {
+                    assertTrue(activeWork.get() > 0)
+                    resumed.complete(Unit)
+                }
+            }
+            keepRunning.await()
+            muxer.close()
+        }
+        val session = StreamingTranscodeSession(
+            transcoder, "content://source/video", target, mockk<DiagnosticSink>(relaxed = true), hls = false,
+            beginWork = { activeWork.incrementAndGet(); AutoCloseable { activeWork.decrementAndGet() } },
+        )
+        try {
+            withTimeout(5_000) {
+                session.awaitReady()
+                while (activeWork.get() != 0) delay(5)
+            }
+            assertFalse(resumed.isCompleted, "producer should be waiting on its 2 MiB buffer")
+            assertNotNull(session.openProgressive()).use { input ->
+                val bytes = ByteArray(64 * 1024)
+                withTimeout(5_000) {
+                    while (!resumed.isCompleted) {
+                        assertTrue(input.read(bytes) > 0)
+                        delay(1)
+                    }
+                }
+            }
+        } finally {
+            session.release()
+            keepRunning.complete(Unit)
+            assertEquals(0, activeWork.get())
         }
     }
 
@@ -320,7 +379,7 @@ class StreamingTranscodeSessionTest {
     fun `fragment writer publishes complete boxes while retaining incomplete media`() {
         val init = mutableListOf<ByteArray>()
         val media = mutableListOf<ByteArray>()
-        val writer = FragmentOutput(init::add, media::add)
+        val writer = FragmentOutput(init::add) { moof, mdat -> media += moof + mdat }
         val header = box("ftyp", byteArrayOf(1)) + box("moov", byteArrayOf(2))
         val fragment = box("moof", byteArrayOf(3)) + box("mdat", byteArrayOf(4, 5, 6))
         for (byte in header + fragment.dropLast(1)) writer.write(byte.toInt())
@@ -333,7 +392,7 @@ class StreamingTranscodeSessionTest {
 
     @Test
     fun `fragment writer fails a truncated stream instead of publishing it`() {
-        val writer = FragmentOutput({}, {})
+        val writer = FragmentOutput({}, { _, _ -> })
         writer.write(box("moof", byteArrayOf(1)))
         assertFailsWith<IOException> { writer.close() }
     }

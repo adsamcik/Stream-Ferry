@@ -25,7 +25,7 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [35])
+@Config(sdk = [37])
 class LocalMediaSourceSearchTest {
     private val context get() = RuntimeEnvironment.getApplication()
     private lateinit var store: LocalSourceStore

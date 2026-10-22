@@ -21,7 +21,7 @@ import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [35])
+@Config(sdk = [37])
 class SmartResumeRecordVersioningTest {
     @Test fun estimateSurvivesAtomicStoreReloadWithoutPromotingItToConfirmed() {
         val record = SmartResumeRecordVersioning.migrate(2, v1Fields())!!.record
