@@ -6,9 +6,10 @@ and two P3 optimization or cleanup opportunities. Resolution notes and actual ve
 recorded below. V01 separately tracks the transcode qualification gap; it is not an additional
 production defect.
 
-Status: **AR01–AR24 resolved** in local implementation commit
-`f935b219e487d9329cfa67fe8a27a572114a4fc1`; independent review found no remaining blocking issue.
-V01 remains open for Android execution and receiver qualification.
+Initial implementation: `f935b219e487d9329cfa67fe8a27a572114a4fc1`.
+The [follow-up review](#follow-up-review-2026-10-22) reopened **AR09 and AR14** with two reproduced
+P2 defects; the other 22 fixes have no newly confirmed defect. V01 remains open for Android execution
+and receiver qualification. The initial verification below is historical, not proof these two cases pass.
 
 The original review was source-backed, with a small DLNA regex probe and no new build, test-suite or
 device run. The subsequent fixes have build, regression and host-render evidence below. Physical
@@ -122,7 +123,9 @@ Keep credential/account boundaries, Stop and cancellation guarantees intact.
   - Verify: Arabic/Persian default locales still produce ASCII timestamps in metadata, seeks and
     deferred resume; restore the test process's original locale afterwards.
 
-- [x] **AR09 — Relinquish Cast media ownership after another sender replaces it.**
+- [ ] **AR09 — Relinquish Cast media ownership after another sender replaces it.**
+  - Reopened: R01 below reproduces stopping another sender's replacement during our pending LOAD,
+    before the first matching media status establishes acceptance.
   - Resolution: Public Cast custom data carries a lifecycle UUID and per-load ordinal; older app-issued updates
     are ignored without retaining a growing history. Foreign replacement retires local controls and disconnects
     without stopping its receiver. Coverage: `CastMediaOwnershipTest`, `CastProgressTest`, including pending
@@ -191,7 +194,9 @@ Keep credential/account boundaries, Stop and cancellation guarantees intact.
   - Verify: Stop and replacement unblock a stalled provider open/read, close descriptors and release
     connection permits without cancelling newer sessions. Include unknown-size content sources.
 
-- [x] **AR14 — Retain the receiver's LAN when multiple physical networks exist.**
+- [ ] **AR14 — Retain the receiver's LAN when multiple physical networks exist.**
+  - Reopened: R02 below reproduces returning Ethernet's address while retaining the Wi-Fi Network
+    after the Wi-Fi address disappears.
   - Resolution: Fresh selection deterministically prefers Wi-Fi; active playback retains its physical LAN until
     disappearance. Coverage: `LanNetworkSelectionTest` and existing engine network-change/recovery tests.
   - Problem: taking the first Wi-Fi/Ethernet network can switch a healthy Wi-Fi TV session to unrelated
@@ -405,3 +410,57 @@ latency, allocation and battery measurements remain separate runtime evidence.
 
 An independent review-only agent reviewed the final changes and follow-up corrections. No remote
 publication or workflow dispatch was performed.
+
+## Follow-up review (2026-10-22)
+
+Reviewed all 24 fixes at `bf253dc` / implementation `f935b21`, with separate review-only passes over
+transcoding/proxy/CPU ownership, Jellyfin/download/account integrity, and app/UI/retry/CI behavior.
+The remaining concrete defects are R01 and R02 below. No new production fix is included in this review.
+
+### R01 — P2 — Pending Cast LOAD cleanup can stop another sender's content (AR09)
+
+- Trigger: start our LOAD without accepting a matching media status, then receive another sender's
+  distinct URL/token. Complete our pending LOAD with Cast `REPLACED`, causing startup cancellation.
+- Cause: [CastMediaOwnership.kt:48](../playback/src/main/java/com/adsamcik/streamferry/data/cast/CastMediaOwnership.kt#L48)
+  recognizes foreign media as ownership loss only after `accepted` is true. The new foreign stream is
+  ignored during pending startup and `isLost` stays false. [disconnect:437](../playback/src/main/java/com/adsamcik/streamferry/data/cast/CastTargetController.kt#L437)
+  therefore follows normal receiver termination, ultimately calling `endCurrentSession(true)`.
+  `REPLACED` cancellation reaches this path through engine `cleanupCancelledStartup` and
+  `stopInternalLocked`.
+- Consequence: cleanup stops the other sender's video instead of detaching, for local, downloaded or
+  Jellyfin playback on Cast. DLNA does not use this ownership policy.
+- Reproduction: the temporary SDK 37 controller probe held LOAD pending, published the new foreign
+  URL/token, returned `REPLACED`, then disconnected. Verification expecting
+  `endCurrentSession(false)` failed: the sole matching call passed **true**.
+- Required fix/regression: identify a newly observed foreign load during pending startup while
+  retaining explicit exclusions for the initial cached snapshot and earlier app-issued LOADs.
+  Cleanup must preserve that foreign receiver. Cover takeover before first acceptance as well as the
+  already-tested after-acceptance and rapid app-owned replacement cases.
+
+### R02 — P2 — Retained TV network can advertise another LAN's address (AR14)
+
+- Trigger: retain Wi-Fi for playback, remove its usable IPv4 while keeping that Network present, and
+  leave a separate Ethernet LAN with a private IPv4 address available.
+- Cause: [NetworkInfoProvider.kt:42](../playback/src/main/java/com/adsamcik/streamferry/diagnostics/NetworkInfoProvider.kt#L42)
+  falls back to all OS interfaces when the selected Network has no usable IPv4. It can return
+  Ethernet's address while `lanNetwork()` still returns retained Wi-Fi.
+- Consequence: unavailable-LAN deferral sees a nonnull address, and the network identity check sees no
+  change. Recovery can reload using the unrelated Ethernet address, unreachable by a TV on a disjoint
+  Wi-Fi LAN. The shared phone URL path affects local, downloaded and Jellyfin sources on Cast and DLNA;
+  DLNA additionally keeps transport discovery/control bound to the retained Network.
+- Reproduction: the temporary SDK 37 probe retained Wi-Fi at `192.168.1.5`, removed its link address,
+  and exposed `eth0` at `192.168.99.2`. Wi-Fi remained selected; the assertion requiring a null
+  advertised address failed with **192.168.99.2**.
+- Required fix/regression: when a physical Network is selected, use only its usable IPv4 or return
+  null and wait for that LAN's address to return. Do not substitute an unrelated interface's address.
+  Exercise IPv4 loss/return, retained Network identity and recovery with playback choices intact.
+
+Both code paths were independently confirmed. The final focused command ran two temporary probes;
+both reached their intended assertions and failed against unchanged production code:
+`:playback:testDebugUnitTest --tests '*CastProgressTest.review probe*'
+--tests '*NetworkAddressReviewProbeTest'` (log: `build/adversarial-rereview-probes-3.log`).
+
+Temporary source probes were removed after preserving local evidence under
+`build/adversarial-rereview-evidence/`; no production or permanent test changes were made.
+No full build, full-suite rerun, physical phone/TV test, hardware codec test or live-provider run was
+performed in this follow-up review. V01's runtime qualification gap remains open.
