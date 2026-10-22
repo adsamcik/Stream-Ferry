@@ -96,6 +96,7 @@ Implemented end-to-end:
 
 | Doc | |
 | --- | --- |
+| [ADVERSARIAL_REVIEW_TODO.md](docs/ADVERSARIAL_REVIEW_TODO.md) | Prioritized review findings, fixes and verification criteria. |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Layering, packages, session lifecycle, verified core. |
 | [THREAT_MODEL.md](docs/THREAT_MODEL.md) | Threats, vectors, mitigations, residual risks. |
 | [PROXY_DESIGN.md](docs/PROXY_DESIGN.md) | HTTP/Range semantics, session security, FGS-type decision. |

@@ -2,6 +2,9 @@
 
 Ordered follow-ups from the current implementation toward device-verified releases.
 
+Track the 2026-10-22 review findings in the [adversarial review TODO](ADVERSARIAL_REVIEW_TODO.md):
+24 prioritized issues and opportunities, plus the separate transcode qualification follow-up.
+
 1. **Keep the connected build gate green.** Run
    `assembleDebug / testDebugUnitTest / lintDebug / dependencies` for changes and releases, and review
    dependency/version drift ([API37_MIGRATION.md](API37_MIGRATION.md)).
